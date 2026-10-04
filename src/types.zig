@@ -19,6 +19,7 @@ pub const INT_MAX: i64 = std.math.maxInt(i64);
 pub var I64: *PyObject = undefined;
 pub var Error: *PyObject = undefined;
 pub var LoadError: *PyObject = undefined;
+pub var CompileError: *PyObject = undefined;
 pub var IntegerOverflow: *PyObject = undefined;
 pub var Return: *PyObject = undefined;
 pub var Break: *PyObject = undefined;
@@ -45,6 +46,7 @@ fn initTypes(module: *PyObject) !void {
     IntegerOverflow = try newException(module, "IntegerOverflow", py.PyExc_ArithmeticError(), "An integer result outside the 64-bit range.");
     Error = try newException(module, "Error", py.PyExc_Exception(), "A runtime error of the program. `diagnostic` is where (a zgram.Diagnostic at the failing node), `stack` the language's calls that led there (innermost first, (function, Diagnostic) pairs); str() renders it with the source.");
     LoadError = try newException(module, "LoadError", py.PyExc_Exception(), "The program has errors found before it runs (syntax errors, the rules' errors): `diagnostics` lists them, warnings included.");
+    CompileError = try newException(module, "CompileError", py.PyExc_Exception(), "A semantic can't be compiled: it uses Python outside the compilable subset (`file`, `line` and `column` say where), or something it calls can't be. Mark it native=False to run it as Python.");
     Return = try newException(module, "Return", py.PyExc_Exception(), "raise rt.Return(value): return from the function being run.");
     Break = try newException(module, "Break", py.PyExc_Exception(), "raise rt.Break(): leave the loop rt.loop() is running.");
     Continue = try newException(module, "Continue", py.PyExc_Exception(), "raise rt.Continue(): go on with the loop's next iteration.");

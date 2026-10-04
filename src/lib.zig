@@ -21,6 +21,7 @@ const grammar_mod = @import("grammar.zig");
 const program_mod = @import("program.zig");
 const tree_mod = @import("tree.zig");
 const zabi = @import("zrules_abi.zig");
+const front = @import("front.zig");
 
 const allocator = std.heap.c_allocator;
 const NONE = program_mod.NONE;
@@ -60,6 +61,10 @@ const Language = struct {
     _exec_of: []?*PyObject = &.{},
     _resolved: bool = false,
     _max_depth: u32 = 1000,
+    /// The semantics read by the compiler's front, by function object
+    /// (each holds a reference to its function); those marked
+    /// native=False aren't here
+    _read: std.AutoHashMapUnmanaged(*PyObject, *front.Function) = .empty,
 
     pub fn __new__(args: pyoz.Args(struct { parser: *PyObject, rules: ?*PyObject = null, max_depth: i64 = 1000 })) ?Language {
         const v = args.value;
@@ -111,6 +116,45 @@ const Language = struct {
         self._functions = &.{};
         self._eval_of = &.{};
         self._exec_of = &.{};
+        var it = self._read.valueIterator();
+        while (it.next()) |f| f.*.destroy(allocator);
+        self._read.deinit(allocator);
+        self._read = .empty;
+    }
+
+    /// `lang.ir(fn)`: a semantic (or any function) as the compiler's front
+    /// reads it, as text: for tests and for seeing what gets compiled.
+    pub fn ir(self: *Language, func: *PyObject) ?*PyObject {
+        if (!self.readSemantic(func)) return null;
+        const f = self._read.get(func).?;
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        front.dump(f, &out, allocator) catch return oom(*PyObject);
+        return ph.newString(out.items);
+    }
+
+    /// Read a semantic with the compiler's front (once per function);
+    /// false with zrun.CompileError (or another exception) set.
+    fn readSemantic(self: *Language, func: *PyObject) bool {
+        if (self._read.contains(func)) return true;
+        var failure = front.Failure{};
+        const f = front.read(allocator, func, &failure) catch |e| switch (e) {
+            error.Unsupported => {
+                raiseCompileError(func, &failure);
+                return false;
+            },
+            error.OutOfMemory => {
+                _ = py.c.PyErr_NoMemory();
+                return false;
+            },
+            error.Python => return false,
+        };
+        self._read.put(allocator, func, f) catch {
+            f.destroy(allocator);
+            _ = py.c.PyErr_NoMemory();
+            return false;
+        };
+        return true;
     }
 
     // (No __traverse__: PyOZ 0.13.7 frees a collected class's objects with
@@ -120,22 +164,23 @@ const Language = struct {
         self.release();
     }
 
-    /// `@lang.eval(kind)`: the semantics of an expression kind (a kind or
-    /// rule name, or a list of them): `fn(node, rt) -> value`.
-    pub fn eval(self: *Language, kind: *PyObject) ?*PyObject {
-        return self.registrar(kind, 0);
+    /// `@lang.eval(kind, native=True)`: the semantics of an expression kind
+    /// (a kind or rule name, or a list of them): `fn(node, rt) -> value`.
+    /// It is compiled with the program; native=False runs it as Python.
+    pub fn eval(self: *Language, args: pyoz.Args(struct { kind: *PyObject, native: bool = true })) ?*PyObject {
+        return self.registrar(args.value.kind, 0, args.value.native);
     }
 
-    /// `@lang.exec(kind)`: the semantics of a statement kind:
+    /// `@lang.exec(kind, native=True)`: the semantics of a statement kind:
     /// `fn(node, rt) -> None`.
-    pub fn exec(self: *Language, kind: *PyObject) ?*PyObject {
-        return self.registrar(kind, 1);
+    pub fn exec(self: *Language, args: pyoz.Args(struct { kind: *PyObject, native: bool = true })) ?*PyObject {
+        return self.registrar(args.value.kind, 1, args.value.native);
     }
 
-    fn registrar(self: *Language, kind: *PyObject, which: u8) ?*PyObject {
+    fn registrar(self: *Language, kind: *PyObject, which: u8, native: bool) ?*PyObject {
         // Check the names now: a typo is an error where it's written
         if (!self.checkKinds(kind)) return null;
-        var r = Registrar{ ._which = which };
+        var r = Registrar{ ._which = which, ._native = native };
         r._lang = ref(Module.selfObject(Language, self));
         r._kind = ref(kind);
         return Module.toPy(Registrar, r);
@@ -164,12 +209,15 @@ const Language = struct {
         return true;
     }
 
-    /// Register `fn` for each name in `kind` (str or sequence).
-    fn register(self: *Language, which: u8, kind: *PyObject, func: *PyObject) bool {
+    /// Register `fn` for each name in `kind` (str or sequence); a native
+    /// one is read by the compiler's front first (CompileError if it can't
+    /// be compiled).
+    fn register(self: *Language, which: u8, kind: *PyObject, func: *PyObject, native: bool) bool {
         if (!py.PyCallable_Check(func)) {
             ph.raise(py.PyExc_TypeError(), "semantics must be callable: fn(node, rt)", .{});
             return false;
         }
+        if (native and !self.readSemantic(func)) return false;
         const dict = if (which == 0) self._evals.? else self._execs.?;
         if (py.PyUnicode_Check(kind)) {
             if (py.c.PyDict_SetItem(dict, kind, func) != 0) return false;
@@ -329,6 +377,56 @@ const Language = struct {
     pub const load__doc__: [*:0]const u8 = "load(source, path=None): parse and check a program; a Program. Raises zrun.LoadError listing its errors.";
 };
 
+/// Raise zrun.CompileError for a semantic outside the subset: "file:line:
+/// col: in name(): reason", with file, line and column attributes.
+fn raiseCompileError(func: *PyObject, failure: *const front.Failure) void {
+    var file: []const u8 = "<unknown>";
+    var line: u32 = failure.pos.line;
+    var name: []const u8 = "?";
+    var file_buf: [512]u8 = undefined;
+    var name_buf: [128]u8 = undefined;
+    if (ph.attr(func, "__code__")) |code| {
+        defer py.Py_DecRef(code);
+        if (ph.attr(code, "co_filename")) |f| {
+            defer py.Py_DecRef(f);
+            if (ph.utf8(f, "file")) |s| {
+                const n = @min(s.len, file_buf.len);
+                @memcpy(file_buf[0..n], s[0..n]);
+                file = file_buf[0..n];
+            } else py.c.PyErr_Clear();
+        } else py.c.PyErr_Clear();
+        if (line == 0) line = @intCast((ph.attrInt(code, "co_firstlineno") catch null) orelse 0);
+    } else py.c.PyErr_Clear();
+    if (ph.attr(func, "__name__")) |n| {
+        defer py.Py_DecRef(n);
+        if (ph.utf8(n, "name")) |s| {
+            const k = @min(s.len, name_buf.len);
+            @memcpy(name_buf[0..k], s[0..k]);
+            name = name_buf[0..k];
+        } else py.c.PyErr_Clear();
+    } else py.c.PyErr_Clear();
+    py.c.PyErr_Clear();
+    var buf: [1024]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "{s}:{d}:{d}: in {s}(): {s}", .{ file, line, failure.pos.col, name, failure.text() }) catch buf[0..];
+    const text = ph.newString(msg) orelse return;
+    defer py.Py_DecRef(text);
+    const exc = py.c.PyObject_CallFunctionObjArgs(types.CompileError, text, @as(?*PyObject, null)) orelse return;
+    defer py.Py_DecRef(exc);
+    const attrs = .{
+        .{ "file", ph.newString(file) },
+        .{ "line", py.c.PyLong_FromUnsignedLong(line) },
+        .{ "column", py.c.PyLong_FromUnsignedLong(failure.pos.col) },
+        .{ "reason", ph.newString(failure.text()) },
+    };
+    inline for (attrs) |a| {
+        if (a[1]) |v| {
+            _ = py.c.PyObject_SetAttrString(exc, a[0], v);
+            py.Py_DecRef(v);
+        }
+    }
+    py.c.PyErr_SetObject(types.CompileError, exc);
+}
+
 /// parser.parse_tree(source, recover=True)
 fn parseTree(parser: *PyObject, source: *PyObject) ?*PyObject {
     const method = py.c.PyObject_GetAttrString(parser, "parse_tree") orelse return null;
@@ -360,10 +458,11 @@ const Registrar = struct {
     _kind: ?*PyObject = null,
     /// 0 eval, 1 exec, 2 host
     _which: u8 = 0,
+    _native: bool = true,
 
     pub fn __call__(self: *Registrar, func: *PyObject) ?*PyObject {
         const lang = unwrap(Language, self._lang.?) orelse return null;
-        const ok = if (self._which == 2) lang.addHost(self._kind.?, func) else lang.register(self._which, self._kind.?, func);
+        const ok = if (self._which == 2) lang.addHost(self._kind.?, func) else lang.register(self._which, self._kind.?, func, self._native);
         if (!ok) return null;
         return ref(func);
     }
