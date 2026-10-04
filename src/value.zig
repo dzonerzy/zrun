@@ -103,6 +103,8 @@ pub const Str = extern struct {
     /// Bytes (UTF-8) and code points
     len: u64,
     chars: u64,
+    /// Its hash once worked out (0: not yet; literals have theirs)
+    hash: u64 = 0,
     // the bytes follow
 
     pub fn bytes(self: *const Str) []const u8 {
@@ -417,7 +419,7 @@ pub fn equal(a: Value, b: Value) bool {
     if (a.tag != b.tag) return false;
     return switch (a.kind()) {
         .none => true,
-        .str => std.mem.eql(u8, @as(*Str, @ptrCast(a.ptr())).bytes(), @as(*Str, @ptrCast(b.ptr())).bytes()),
+        .str => a.bits == b.bits or std.mem.eql(u8, @as(*Str, @ptrCast(a.ptr())).bytes(), @as(*Str, @ptrCast(b.ptr())).bytes()),
         .list => blk: {
             const x = @as(*List, @ptrCast(@alignCast(a.ptr()))).slice();
             const y = @as(*List, @ptrCast(@alignCast(b.ptr()))).slice();
@@ -445,24 +447,44 @@ pub fn equal(a: Value, b: Value) bool {
 }
 
 /// A hash where equal values hash alike (1, 1.0 and True too).
-pub fn hash(v: Value) u64 {
+/// A string's hash (never 0: 0 marks one not worked out yet).
+pub fn strHash(bytes: []const u8) u64 {
+    const h = std.hash.Wyhash.hash(2, bytes);
+    return if (h == 0) 1 else h;
+}
+
+pub inline fn hash(v: Value) u64 {
+    return hashOf(v.tag, v.bits);
+}
+
+/// (a value's two words as scalars: a Value read back whole right after
+/// its words were written stalls the CPU)
+fn hashOf(tag: u64, bits: u64) u64 {
+    const v = Value{ .tag = tag, .bits = bits };
     switch (v.kind()) {
-        .bool, .int => return std.hash.Wyhash.hash(0, std.mem.asBytes(&v.bits)),
+        .bool, .int => return std.hash.Wyhash.hash(0, std.mem.asBytes(&bits)),
         .float => {
             const f = v.asFloat();
             if (f == @trunc(f) and @abs(f) < 9.2e18) {
                 const i: i64 = @intFromFloat(f);
                 return std.hash.Wyhash.hash(0, std.mem.asBytes(&i));
             }
-            return std.hash.Wyhash.hash(1, std.mem.asBytes(&v.bits));
+            return std.hash.Wyhash.hash(1, std.mem.asBytes(&bits));
         },
-        .str => return std.hash.Wyhash.hash(2, @as(*Str, @ptrCast(v.ptr())).bytes()),
-        .tuple => {
-            var h: u64 = 3;
-            for (@as(*Tuple, @ptrCast(@alignCast(v.ptr()))).slice()) |item| h = h *% 0x100000001B3 ^ hash(item);
+        .str => {
+            const s: *Str = @ptrCast(v.ptr());
+            if (s.hash != 0) return s.hash;
+            const h = strHash(s.bytes());
+            // (literals are read-only: they come with theirs)
+            s.hash = h;
             return h;
         },
-        else => return std.hash.Wyhash.hash(4, std.mem.asBytes(&v.bits)),
+        .tuple => {
+            var h: u64 = 3;
+            for (@as(*Tuple, @ptrCast(@alignCast(v.ptr()))).slice()) |item| h = h *% 0x100000001B3 ^ hashOf(item.tag, item.bits);
+            return h;
+        },
+        else => return std.hash.Wyhash.hash(4, std.mem.asBytes(&bits)),
     }
 }
 

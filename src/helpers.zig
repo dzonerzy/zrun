@@ -366,7 +366,10 @@ export fn zr_compare(ctx: *Ctx, node: u32, cmp_code: u32, ta: u64, ba: u64, tb: 
                 return true;
             }
         },
-        .in, .not_in => {},
+        .in, .not_in => if (contains(a, b)) |r| {
+            out.* = Value.boolean(if (cmp == .in) r else !r);
+            return true;
+        },
     }
     // Through Python
     var objs: [2]*PyObject = undefined;
@@ -389,6 +392,32 @@ export fn zr_compare(ctx: *Ctx, node: u32, cmp_code: u32, ta: u64, ba: u64, tb: 
     if (r < 0) return failPython(ctx, node);
     out.* = Value.boolean(if (cmp == .not_in) r == 0 else r == 1);
     return true;
+}
+
+/// a in b, natively (lists, tuples, dicts, strings); null: Python decides.
+fn contains(a: Value, b: Value) ?bool {
+    if (a.kind() == .host) return null;
+    switch (b.kind()) {
+        .list, .tuple => {
+            const items = if (b.kind() == .list) @as(*value.List, @ptrCast(@alignCast(b.ptr()))).slice() else @as(*value.Tuple, @ptrCast(@alignCast(b.ptr()))).slice();
+            for (items) |x| {
+                if (x.kind() == .host) return null;
+                if (value.equal(a, x)) return true;
+            }
+            return false;
+        },
+        .dict => {
+            if (!value.hashable(a)) return null;
+            return value.dictGet(@ptrCast(@alignCast(b.ptr())), a) != null;
+        },
+        .str => {
+            if (a.kind() != .str) return null;
+            const x: *value.Str = @ptrCast(a.ptr());
+            const y: *value.Str = @ptrCast(b.ptr());
+            return std.mem.indexOf(u8, y.bytes(), x.bytes()) != null;
+        },
+        else => return null,
+    }
 }
 
 const Unary = enum(u32) { neg, pos, not_, invert };
@@ -709,8 +738,14 @@ export fn zr_setitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
 export fn zr_items(ctx: *Ctx, node: u32, t: u64, bits: u64, out: *Value) callconv(.c) bool {
     const v = Value{ .tag = t, .bits = bits };
     switch (v.kind()) {
-        .list, .tuple => {
-            const items = if (v.kind() == .list) @as(*value.List, @ptrCast(@alignCast(v.ptr()))).slice() else @as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).slice();
+        // (a list itself: a loop over it sees it change, as Python's does)
+        .list => {
+            value.incref(v);
+            out.* = v;
+            return true;
+        },
+        .tuple => {
+            const items = @as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).slice();
             const l = value.newList(items.len) orelse return oomFail(ctx, node);
             for (items) |x| {
                 value.incref(x);

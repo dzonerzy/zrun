@@ -3,6 +3,7 @@
 //! (compile.zig) writes through this; zgram's LLVM parses and compiles it.
 
 const std = @import("std");
+const value = @import("value.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Module = struct {
@@ -62,7 +63,8 @@ pub const Module = struct {
         self.next_global += 1;
         try self.strings.put(self.gpa, try self.gpa.dupe(u8, bytes), n);
         const chars = std.unicode.utf8CountCodepoints(bytes) catch bytes.len;
-        try self.headPrint("@{s}_s{d} = private unnamed_addr constant {{ i64, i32, i32, i64, i64, [{d} x i8] }} {{ i64 4611686018427387904, i32 4, i32 0, i64 {d}, i64 {d}, [{d} x i8] c\"", .{ self.prefix, n, bytes.len, bytes.len, chars, bytes.len });
+        const h: i64 = @bitCast(value.strHash(bytes));
+        try self.headPrint("@{s}_s{d} = private unnamed_addr constant {{ i64, i32, i32, i64, i64, i64, [{d} x i8] }} {{ i64 4611686018427387904, i32 4, i32 0, i64 {d}, i64 {d}, i64 {d}, [{d} x i8] c\"", .{ self.prefix, n, bytes.len, bytes.len, chars, h, bytes.len });
         for (bytes) |c| {
             if (c >= 0x20 and c < 0x7F and c != '"' and c != '\\') {
                 try self.head.append(self.gpa, c);
@@ -83,6 +85,8 @@ pub const Function = struct {
     next_label: u32 = 0,
     /// Whether the current block has its terminator
     terminated: bool = false,
+    /// The current block's label (for phis)
+    current: []const u8 = "entry",
 
     pub fn init(m: *Module) Function {
         return .{ .m = m };
@@ -148,6 +152,12 @@ pub const Function = struct {
         if (!self.terminated) try self.code.print(self.m.gpa, "  br label %{s}\n", .{name});
         try self.code.print(self.m.gpa, "{s}:\n", .{name});
         self.terminated = false;
+        self.current = name;
+    }
+
+    /// A value from two predecessors: `phi <ty> [a, %from_a], [b, %from_b]`.
+    pub fn phi(self: *Function, ty: []const u8, a: []const u8, from_a: []const u8, b: []const u8, from_b: []const u8) ![]const u8 {
+        return self.value("phi {s} [ {s}, %{s} ], [ {s}, %{s} ]", .{ ty, a, from_a, b, from_b });
     }
 
     pub fn br(self: *Function, target: []const u8) !void {

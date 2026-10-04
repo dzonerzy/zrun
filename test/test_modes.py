@@ -180,7 +180,7 @@ def _python_lang():
                 use="Name",
                 hoist="FuncDef > .name",
                 after="Let > .name",
-                builtins=("print", "nums", "total", "evens", "grid", "table", "swap", "setat", "bump"),
+                builtins=("print", "nums", "total", "evens", "grid", "table", "swap", "setat", "bump", "grow", "pairs", "indexed", "pairs_whole", "triples", "has", "text"),
             ),
         ],
     )
@@ -217,6 +217,25 @@ def _python_lang():
             xs = args[0]
             xs[args[1]] = args[2]
             return xs
+        if name == "grow":
+            xs = args[0]
+            for x in xs:
+                if x < 5:
+                    xs.append(x + 3)
+            return xs
+        if name == "pairs":
+            return [a * b for a, b in zip(args[0], args[1])]
+        if name == "indexed":
+            s = 0
+            for i, x in enumerate(args[0]):
+                s += i * x
+            return s
+        if name == "pairs_whole":
+            return [p for p in zip(args[0], args[1])]
+        if name == "triples":
+            return [a for a, b, c in zip(args[0], args[1])]
+        if name == "has":
+            return [args[0] in args[1], args[0] not in args[1]]
         if name == "bump":
             xs = args[0]
             xs[0] += args[1]
@@ -245,6 +264,10 @@ PYTHON_FEATURES = {
     "unpack": "print(swap(nums(2)));\n",
     "setitem": "print(setat(nums(3), 1, 9), setat(nums(3), -1, 7));\n",
     "aug_item": "print(bump(nums(2), 5));\n",
+    "grow": "print(grow(nums(3)));\n",
+    "zip": "print(pairs(nums(4), nums(3)), pairs_whole(nums(2), evens(nums(4))));\n",
+    "enumerate": "print(indexed(nums(5)));\n",
+    "in": 'print(has(2, nums(3)), has(5, nums(3)), has("b", "abc"), has(1, table(nums(2), nums(2))));\n',
     "in_function": "fn f(n) { let s = 0; let i = 0; while i < n { s = s + total(nums(i)); i = i + 1; } return s; }\nprint(f(6));\n",
 }
 
@@ -253,6 +276,8 @@ PYTHON_FEATURE_ERRORS = {
     "unpack_few": "print(swap(nums(1)));\n",
     "unpack_int": "print(swap(5));\n",
     "setitem_range": "print(setat(nums(2), 5, 1));\n",
+    "zip_width": "print(triples(nums(2), nums(2)));\n",
+    "in_int": "print(has(1, 2));\n",
     "for_over_int": "print(total(3));\n",
 }
 

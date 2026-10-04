@@ -1411,11 +1411,9 @@ const Gen = struct {
     }
 
     fn forLoop(self: *Gen, inst: *Inst, target: front.Target, iter_e: *const front.Expr, body: []const front.Stmt, else_: []const front.Stmt, pos: front.Pos) Error!void {
-        const it = try self.expr(inst, iter_e);
-        const items: []const SVal = switch (it) {
-            .list => |l| l.items.items,
-            .tuple => |t| t,
-            else => return self.runtimeFor(inst, target, it, body, else_, pos),
+        const items: []const SVal = switch (try self.iteration(inst, iter_e)) {
+            .known => |x| x,
+            .runtime => |it| return self.runtimeFor(inst, target, it, body, else_, pos),
         };
         // Known items: unrolled (break / continue jump within it)
         const exit = try self.f.label("endfor");
@@ -1437,22 +1435,131 @@ const Gen = struct {
         try self.f.block(exit);
     }
 
-    /// A for loop over the items of a run-time value (a list of them made
-    /// first, as Python iterates a copy... of a list that may change: the
-    /// items when the loop starts).
-    fn runtimeFor(self: *Gen, inst: *Inst, target: front.Target, it: SVal, body: []const front.Stmt, else_: []const front.Stmt, pos: front.Pos) Error!void {
+    /// What a loop goes over: items known now, or lists at run time
+    const Iteration = union(enum) { known: []const SVal, runtime: RtIter };
+
+    /// Lists iterated at run time (held in temporary slots): one, or
+    /// several in step (zip), or one with its indexes (enumerate)
+    const RtIter = struct {
+        kind: enum { plain, zip, enumerate },
+        slots: []const []const u8,
+        /// The index slot (an i64)
+        index: []const u8 = "",
+    };
+
+    /// The iteration of a loop's iterable; zip() and enumerate() of
+    /// run-time values go in step over their arguments (no tuples made).
+    fn iteration(self: *Gen, inst: *Inst, e: *const front.Expr) Error!Iteration {
+        if (e.kind == .call and e.kind.call.keywords.len == 0 and e.kind.call.func.kind == .global) {
+            const x = e.kind.call;
+            const callee = try self.global(inst, x.func.kind.global, x.func.pos);
+            if (callee == .py and (isBuiltin(callee.py, "zip") or (isBuiltin(callee.py, "enumerate") and x.args.len == 1))) {
+                const args = try self.a().alloc(SVal, x.args.len);
+                for (args, x.args) |*slot, ae| slot.* = try self.expr(inst, ae);
+                const all_known = for (args) |v| {
+                    if (v != .list and v != .tuple) break false;
+                } else true;
+                if (all_known or args.len == 0) return self.iterationOf(inst, (try self.builtinCall(inst, callee.py, args, e.pos)).?);
+                const slots = try self.a().alloc([]const u8, args.len);
+                for (args, slots) |v, *slot| {
+                    slot.* = try self.tempSlot(inst);
+                    try self.storeSlot(slot.*, try self.itemsOf(inst, v));
+                }
+                return .{ .runtime = .{ .kind = if (isBuiltin(callee.py, "zip")) .zip else .enumerate, .slots = slots } };
+            }
+        }
+        return self.iterationOf(inst, try self.expr(inst, e));
+    }
+
+    fn iterationOf(self: *Gen, inst: *Inst, v: SVal) Error!Iteration {
+        switch (v) {
+            .list => |l| return .{ .known = l.items.items },
+            .tuple => |t| return .{ .known = t },
+            else => {
+                const slots = try self.a().alloc([]const u8, 1);
+                slots[0] = try self.tempSlot(inst);
+                try self.storeSlot(slots[0], try self.itemsOf(inst, v));
+                return .{ .runtime = .{ .kind = .plain, .slots = slots } };
+            },
+        }
+    }
+
+    /// Before the loop: its index, 0.
+    fn iterStart(self: *Gen, it: *RtIter) Error!void {
+        it.index = try self.f.alloca("i64");
+        try self.f.emit("store i64 0, ptr {s}", .{it.index});
+    }
+
+    /// The loop's head: whether there's an item at the index (the lengths
+    /// read each time: a list growing in the loop is gone over, as Python
+    /// does).
+    fn iterHead(self: *Gen, it: RtIter) Error![]const u8 {
         const f = &self.f;
+        const i = try f.value("load i64, ptr {s}", .{it.index});
+        var more: []const u8 = "true";
+        for (it.slots) |slot| {
+            const l = try self.loadSlot(slot, .list);
+            const n = try f.value("call i64 @zr_list_len(i64 {s}, i64 {s})", .{ l.tag, l.bits });
+            const c = try f.value("icmp slt i64 {s}, {s}", .{ i, n });
+            more = try f.value("and i1 {s}, {s}", .{ more, c });
+        }
+        return more;
+    }
+
+    /// The item at the index, into the loop's target.
+    fn iterItem(self: *Gen, inst: *Inst, it: RtIter, target: front.Target, pos: front.Pos) Error!void {
+        const f = &self.f;
+        const i = try f.value("load i64, ptr {s}", .{it.index});
+        const parts = try self.a().alloc(Dyn, if (it.kind == .enumerate) 2 else it.slots.len);
+        var k: usize = 0;
+        if (it.kind == .enumerate) {
+            parts[0] = .{ .tag = "2", .bits = i, .shape = .int };
+            k = 1;
+        }
+        for (it.slots) |slot| {
+            const l = try self.loadSlot(slot, .list);
+            try f.emit("call void @zr_list_at(i64 {s}, i64 {s}, i64 {s}, ptr {s})", .{ l.tag, l.bits, i, self.out });
+            parts[k] = try self.loadOut(.any);
+            k += 1;
+        }
+        if (it.kind == .plain) return self.assign(inst, target, .{ .dyn = parts[0] }, pos);
+        // (a, b) in zip(...): each straight into its name
+        if (target == .tuple and target.tuple.len == parts.len) {
+            for (target.tuple, parts) |t, d| try self.assign(inst, t, .{ .dyn = d }, pos);
+            return;
+        }
+        const sv = try self.a().alloc(SVal, parts.len);
+        for (sv, parts) |*s, d| s.* = .{ .dyn = d };
+        try self.assign(inst, target, .{ .dyn = try self.buildSequence("zr_tuple", sv, inst.node, .tuple) }, pos);
+    }
+
+    fn iterStep(self: *Gen, it: RtIter) Error!void {
+        const f = &self.f;
+        const i = try f.value("load i64, ptr {s}", .{it.index});
+        const next = try f.value("add i64 {s}, 1", .{i});
+        try f.emit("store i64 {s}, ptr {s}", .{ next, it.index });
+    }
+
+    fn iterEnd(self: *Gen, it: RtIter) Error!void {
+        for (it.slots) |slot| try self.dropTemp(slot);
+    }
+
+    /// Before a run-time loop: the variables its targets (and body) assign
+    /// become slots, set before it so none is left unset when it doesn't run.
+    fn slotTargets(self: *Gen, inst: *Inst, targets: []const front.Target) Error!void {
         var set = std.AutoHashMapUnmanaged(u32, void).empty;
-        collectTarget(target, &set, self.a()) catch return error.OutOfMemory;
+        for (targets) |t| collectTarget(t, &set, self.a()) catch return error.OutOfMemory;
         var sit = set.keyIterator();
         while (sit.next()) |slot| try self.toSlot(inst, slot.*);
+    }
+
+    /// A for loop over run-time items.
+    fn runtimeFor(self: *Gen, inst: *Inst, target: front.Target, it_arg: RtIter, body: []const front.Stmt, else_: []const front.Stmt, pos: front.Pos) Error!void {
+        const f = &self.f;
+        var it = it_arg;
+        try self.slotTargets(inst, &.{target});
         try self.prepareDynamic(inst, &.{ body, else_ });
-        const items = try self.itemsOf(inst, it);
-        const list_slot = try self.tempSlot(inst);
-        try self.storeSlot(list_slot, items);
-        const n = try f.value("call i64 @zr_list_len(i64 {s}, i64 {s})", .{ items.tag, items.bits });
-        const i_slot = try f.alloca("i64");
-        try f.emit("store i64 0, ptr {s}", .{i_slot});
+        try self.iterStart(&it);
         const head = try f.label("for");
         const step = try f.label("for_next");
         const loop_body = try f.label("for_body");
@@ -1460,29 +1567,23 @@ const Gen = struct {
         const exit = try f.label("endfor");
         try f.br(head);
         try f.block(head);
-        const i = try f.value("load i64, ptr {s}", .{i_slot});
-        const more = try f.value("icmp slt i64 {s}, {s}", .{ i, n });
-        try f.condBr(more, loop_body, els);
+        try f.condBr(try self.iterHead(it), loop_body, els);
         try f.block(loop_body);
         inst.dyn_depth += 1;
-        const l = try self.loadSlot(list_slot, .list);
-        try f.emit("call void @zr_list_at(i64 {s}, i64 {s}, i64 {s}, ptr {s})", .{ l.tag, l.bits, i, self.out });
-        try self.assign(inst, target, .{ .dyn = try self.loadOut(.any) }, pos);
+        try self.iterItem(inst, it, target, pos);
         try inst.loops.append(self.a(), .{ .brk = exit, .cont = step });
         try self.stmts(inst, body);
         _ = inst.loops.pop();
         try f.br(step);
         try f.block(step);
-        const i_now = try f.value("load i64, ptr {s}", .{i_slot});
-        const next = try f.value("add i64 {s}, 1", .{i_now});
-        try f.emit("store i64 {s}, ptr {s}", .{ next, i_slot });
+        try self.iterStep(it);
         try f.br(head);
         try f.block(els);
         try self.stmts(inst, else_);
         inst.dyn_depth -= 1;
         try f.br(exit);
         try f.block(exit);
-        try self.dropTemp(list_slot);
+        try self.iterEnd(it);
     }
 
     // ------------------------------------------------------------------
@@ -2455,25 +2556,66 @@ const Gen = struct {
         const f = &self.f;
         const ld = try self.materialize(l, inst.node);
         const rd = try self.materialize(r, inst.node);
-        // Ints: inline, checked
-        if (ld.shape == .int and rd.shape == .int and (op == .add or op == .sub or op == .mul)) {
-            const intrinsic = switch (op) {
-                .add => "sadd",
-                .sub => "ssub",
-                else => "smul",
-            };
-            const pair = try f.value("call {{ i64, i1 }} @llvm.{s}.with.overflow.i64(i64 {s}, i64 {s})", .{ intrinsic, ld.bits, rd.bits });
-            const res = try f.value("extractvalue {{ i64, i1 }} {s}, 0", .{pair});
-            const ovf = try f.value("extractvalue {{ i64, i1 }} {s}, 1", .{pair});
-            const bad = try f.label("overflow");
-            const good = try f.label("no_overflow");
-            try f.condBr(ovf, bad, good);
-            try f.block(bad);
-            _ = try f.value("call i1 @zr_overflow(ptr %ctx, i32 {d})", .{inst.node});
-            try f.br(self.err_label);
-            try f.block(good);
-            return dyn("2", res, .int);
+        // Ints: inline, checked; for values that may be ints, behind a check
+        // of their tags (anything else: the helper, off the fast path)
+        if (canBeInt(ld) and canBeInt(rd) and (op == .add or op == .sub or op == .mul)) {
+            if (ld.shape == .int and rd.shape == .int) return dyn("2", try self.checkedInt(inst, op, ld.bits, rd.bits), .int);
+            const fast = try f.label("int");
+            const slow = try f.label("generic");
+            const join = try f.label("joined");
+            try f.condBr(try self.intGuard(ld, rd), fast, slow);
+            try f.block(fast);
+            const res = try self.checkedInt(inst, op, ld.bits, rd.bits);
+            const fast_end = f.current;
+            try f.br(join);
+            try f.block(slow);
+            const g = try self.binaryHelper(inst, op, ld, rd);
+            const slow_end = f.current;
+            try f.br(join);
+            try f.block(join);
+            const tag = try f.phi("i64", "2", fast_end, g.tag, slow_end);
+            const bits = try f.phi("i64", res, fast_end, g.bits, slow_end);
+            return dyn(tag, bits, .any);
         }
+        return .{ .dyn = try self.binaryHelper(inst, op, ld, rd) };
+    }
+
+    fn canBeInt(d: Dyn) bool {
+        return d.shape == .int or d.shape == .any;
+    }
+
+    /// Both values are ints (an i1): their tags checked where not known.
+    fn intGuard(self: *Gen, ld: Dyn, rd: Dyn) Error![]const u8 {
+        const f = &self.f;
+        const a_ = if (ld.shape == .int) "true" else try f.value("icmp eq i64 {s}, 2", .{ld.tag});
+        const b = if (rd.shape == .int) "true" else try f.value("icmp eq i64 {s}, 2", .{rd.tag});
+        return f.value("and i1 {s}, {s}", .{ a_, b });
+    }
+
+    /// a op b on i64s, an overflow an error at the node.
+    fn checkedInt(self: *Gen, inst: *Inst, op: front.BinOp, a_: []const u8, b: []const u8) Error![]const u8 {
+        const f = &self.f;
+        const intrinsic = switch (op) {
+            .add => "sadd",
+            .sub => "ssub",
+            else => "smul",
+        };
+        const pair = try f.value("call {{ i64, i1 }} @llvm.{s}.with.overflow.i64(i64 {s}, i64 {s})", .{ intrinsic, a_, b });
+        const res = try f.value("extractvalue {{ i64, i1 }} {s}, 0", .{pair});
+        const ovf = try f.value("extractvalue {{ i64, i1 }} {s}, 1", .{pair});
+        const bad = try f.label("overflow");
+        const good = try f.label("no_overflow");
+        try f.condBr(ovf, bad, good);
+        try f.block(bad);
+        _ = try f.value("call i1 @zr_overflow(ptr %ctx, i32 {d})", .{inst.node});
+        try f.br(self.err_label);
+        try f.block(good);
+        return res;
+    }
+
+    /// a op b by the runtime (both taken).
+    fn binaryHelper(self: *Gen, inst: *Inst, op: front.BinOp, ld: Dyn, rd: Dyn) Error!Dyn {
+        const f = &self.f;
         const ok = try f.value("call i1 @zr_binary(ptr %ctx, i32 {d}, i32 {d}, i64 {s}, i64 {s}, i64 {s}, i64 {s}, ptr {s})", .{ inst.node, @intFromEnum(op), ld.tag, ld.bits, rd.tag, rd.bits, self.out });
         try self.drop(.{ .dyn = ld });
         try self.drop(.{ .dyn = rd });
@@ -2484,7 +2626,7 @@ const Gen = struct {
             .float
         else
             .any;
-        return .{ .dyn = try self.loadOut(shape) };
+        return self.loadOut(shape);
     }
 
     fn isScalar(v: SVal) bool {
@@ -2601,26 +2743,46 @@ const Gen = struct {
         const f = &self.f;
         const ld = try self.materialize(l, inst.node);
         const rd = try self.materialize(r, inst.node);
-        if (ld.shape == .int and rd.shape == .int) {
-            const pred: ?[]const u8 = switch (op) {
-                .eq => "eq",
-                .ne => "ne",
-                .lt => "slt",
-                .le => "sle",
-                .gt => "sgt",
-                .ge => "sge",
-                else => null,
-            };
-            if (pred) |p| {
-                const t = try f.value("icmp {s} i64 {s}, {s}", .{ p, ld.bits, rd.bits });
+        const pred: ?[]const u8 = switch (op) {
+            .eq => "eq",
+            .ne => "ne",
+            .lt => "slt",
+            .le => "sle",
+            .gt => "sgt",
+            .ge => "sge",
+            else => null,
+        };
+        if (pred != null and canBeInt(ld) and canBeInt(rd)) {
+            if (ld.shape == .int and rd.shape == .int) {
+                const t = try f.value("icmp {s} i64 {s}, {s}", .{ pred.?, ld.bits, rd.bits });
                 return dyn("1", try f.value("zext i1 {s} to i64", .{t}), .bool);
             }
+            // (ints: inline, behind a check of the tags)
+            const fast = try f.label("int_cmp");
+            const slow = try f.label("generic_cmp");
+            const join = try f.label("cmp_joined");
+            try f.condBr(try self.intGuard(ld, rd), fast, slow);
+            try f.block(fast);
+            const t = try f.value("icmp {s} i64 {s}, {s}", .{ pred.?, ld.bits, rd.bits });
+            const res = try f.value("zext i1 {s} to i64", .{t});
+            const fast_end = f.current;
+            try f.br(join);
+            try f.block(slow);
+            const g = try self.compareHelper(inst, op, ld, rd);
+            const slow_end = f.current;
+            try f.br(join);
+            try f.block(join);
+            return dyn("1", try f.phi("i64", res, fast_end, g.bits, slow_end), .bool);
         }
-        const ok = try f.value("call i1 @zr_compare(ptr %ctx, i32 {d}, i32 {d}, i64 {s}, i64 {s}, i64 {s}, i64 {s}, ptr {s})", .{ inst.node, @intFromEnum(op), ld.tag, ld.bits, rd.tag, rd.bits, self.out });
+        return .{ .dyn = try self.compareHelper(inst, op, ld, rd) };
+    }
+
+    fn compareHelper(self: *Gen, inst: *Inst, op: front.CmpOp, ld: Dyn, rd: Dyn) Error!Dyn {
+        const ok = try self.f.value("call i1 @zr_compare(ptr %ctx, i32 {d}, i32 {d}, i64 {s}, i64 {s}, i64 {s}, i64 {s}, ptr {s})", .{ inst.node, @intFromEnum(op), ld.tag, ld.bits, rd.tag, rd.bits, self.out });
         try self.drop(.{ .dyn = ld });
         try self.drop(.{ .dyn = rd });
         try self.check(ok);
-        return .{ .dyn = try self.loadOut(.bool) };
+        return self.loadOut(.bool);
     }
 
     fn unary(self: *Gen, inst: *Inst, op: front.UnaryOp, v: SVal) Error!SVal {
@@ -2766,52 +2928,39 @@ const Gen = struct {
     fn compLoops(self: *Gen, inst: *Inst, gens: []const front.Generator, level: usize, pos: front.Pos, sink: *Sink) Error!void {
         if (level == gens.len) return self.compEmit(inst, sink);
         const g = gens[level];
-        const it = try self.expr(inst, g.iter);
-        const known: ?[]const SVal = switch (it) {
-            .list => |l| l.items.items,
-            .tuple => |t| t,
-            else => null,
+        var it = switch (try self.iteration(inst, g.iter)) {
+            .known => |items| {
+                for (items) |item| {
+                    if (item == .dyn) try self.increfDyn(item.dyn);
+                    try self.assign(inst, g.target, item, pos);
+                    try self.compFiltered(inst, gens, level, g.ifs, pos, sink);
+                }
+                return;
+            },
+            .runtime => |x| x,
         };
-        if (known) |items| {
-            for (items) |item| {
-                if (item == .dyn) try self.increfDyn(item.dyn);
-                try self.assign(inst, g.target, item, pos);
-                try self.compFiltered(inst, gens, level, g.ifs, pos, sink);
-            }
-            return;
-        }
-        // At run time: a loop over the items (its variables in slots, set
-        // before it so none is left unset when it doesn't run)
+        // At run time: a loop over the items
         try self.sinkToRuntime(inst, sink);
-        var assigned = std.AutoHashMapUnmanaged(u32, void).empty;
-        for (gens[level..]) |g2| collectTarget(g2.target, &assigned, self.a()) catch return error.OutOfMemory;
-        var ait = assigned.keyIterator();
-        while (ait.next()) |slot| try self.toSlot(inst, slot.*);
+        const targets = try self.a().alloc(front.Target, gens.len - level);
+        for (gens[level..], targets) |g2, *t| t.* = g2.target;
+        try self.slotTargets(inst, targets);
         const f = &self.f;
-        const items = try self.itemsOf(inst, it);
-        const n = try f.value("call i64 @zr_list_len(i64 {s}, i64 {s})", .{ items.tag, items.bits });
-        const i_slot = try f.alloca("i64");
-        try f.emit("store i64 0, ptr {s}", .{i_slot});
+        try self.iterStart(&it);
         const head = try f.label("comp");
         const body = try f.label("comp_body");
         const done = try f.label("comp_done");
         try f.br(head);
         try f.block(head);
-        const i = try f.value("load i64, ptr {s}", .{i_slot});
-        const more = try f.value("icmp slt i64 {s}, {s}", .{ i, n });
-        try f.condBr(more, body, done);
+        try f.condBr(try self.iterHead(it), body, done);
         try f.block(body);
         inst.dyn_depth += 1;
-        try f.emit("call void @zr_list_at(i64 {s}, i64 {s}, i64 {s}, ptr {s})", .{ items.tag, items.bits, i, self.out });
-        const item = try self.loadOut(.any);
-        try self.assign(inst, g.target, .{ .dyn = item }, pos);
+        try self.iterItem(inst, it, g.target, pos);
         try self.compFiltered(inst, gens, level, g.ifs, pos, sink);
         inst.dyn_depth -= 1;
-        const next = try f.value("add i64 {s}, 1", .{i});
-        try f.emit("store i64 {s}, ptr {s}", .{ next, i_slot });
+        try self.iterStep(it);
         try f.br(head);
         try f.block(done);
-        try self.drop(.{ .dyn = items });
+        try self.iterEnd(it);
     }
 
     /// The comprehension's filters, then its next level.
