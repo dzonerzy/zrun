@@ -97,6 +97,10 @@ pub fn fail(ctx: *Ctx, node: u32, comptime fmt: []const u8, args: anytype) bool 
 /// The Python exception being raised as the run's error (as the reference
 /// mode words it); false.
 fn failPython(ctx: *Ctx, node: u32) bool {
+    // (a rt.Throw, a zrun.Error: carried up as itself, for Python code
+    // above to catch, as the bridge does it)
+    if (py.c.PyErr_Occurred() != null and (py.c.PyErr_ExceptionMatches(types.Throw) != 0 or py.c.PyErr_ExceptionMatches(types.Error) != 0))
+        return @import("bridge.zig").pythonFailure(ctx, node) != 0;
     const msg = pythonMessage() orelse {
         py.c.PyErr_Clear();
         return fail(ctx, node, "error", .{});
@@ -1016,6 +1020,91 @@ export fn zr_call_python(ctx: *Ctx, node: u32, callee_index: u64, args: [*]const
     return fromResult(ctx, node, py.c.PyObject_CallObject(callee, tuple), out);
 }
 
+/// v[lo:hi:step] with bounds only known at run time: lists, tuples and
+/// ASCII strings natively, the rest (and the errors) as Python does it.
+export fn zr_slice(ctx: *Ctx, node: u32, t: u64, bits: u64, lt: u64, lb: u64, ht: u64, hb: u64, st: u64, sb: u64, out: *Value) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    const bounds = [3]Value{ .{ .tag = lt, .bits = lb }, .{ .tag = ht, .bits = hb }, .{ .tag = st, .bits = sb } };
+    native: {
+        // (ints or None: else Python's error)
+        for (bounds) |b| if (b.kind() != .none and !isInt(b)) break :native;
+        const step: i64 = if (bounds[2].kind() == .none) 1 else bounds[2].asInt();
+        if (step == 0) return fail(ctx, node, "slice step cannot be zero", .{});
+        const len: i64 = switch (v.kind()) {
+            .list => @intCast(@as(*value.List, @ptrCast(@alignCast(v.ptr()))).len),
+            .tuple => @intCast(@as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).len),
+            .str => blk: {
+                const s: *value.Str = @ptrCast(v.ptr());
+                if (s.chars != s.len) break :native;
+                break :blk @intCast(s.len);
+            },
+            else => break :native,
+        };
+        // (PySlice_AdjustIndices)
+        var start: i64 = if (step > 0) 0 else len - 1;
+        var stop: i64 = if (step > 0) len else -1;
+        if (bounds[0].kind() != .none) start = adjust(bounds[0].asInt(), len, step);
+        if (bounds[1].kind() != .none) stop = adjust(bounds[1].asInt(), len, step);
+        var count: usize = 0;
+        if (step > 0 and start < stop) count = @intCast(@divFloor(stop - start - 1, step) + 1);
+        if (step < 0 and stop < start) count = @intCast(@divFloor(start - stop - 1, -step) + 1);
+        switch (v.kind()) {
+            .str => {
+                const src = @as(*value.Str, @ptrCast(v.ptr())).bytes();
+                const buf = allocator.alloc(u8, count) catch return oomFail(ctx, node);
+                defer allocator.free(buf);
+                var i = start;
+                for (buf) |*c| {
+                    c.* = src[@intCast(i)];
+                    i += step;
+                }
+                const s = value.newStr(buf) orelse return oomFail(ctx, node);
+                out.* = Value.obj(.str, &s.head);
+            },
+            .list => {
+                const items = @as(*value.List, @ptrCast(@alignCast(v.ptr()))).slice();
+                const l = value.newList(count) orelse return oomFail(ctx, node);
+                var i = start;
+                for (0..count) |_| {
+                    value.incref(items[@intCast(i)]);
+                    _ = value.listPush(l, items[@intCast(i)]);
+                    i += step;
+                }
+                out.* = Value.obj(.list, &l.head);
+            },
+            else => {
+                const items = @as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).slice();
+                const tu = value.newTuple(count) orelse return oomFail(ctx, node);
+                var i = start;
+                for (tu.slice()) |*slot| {
+                    value.incref(items[@intCast(i)]);
+                    slot.* = items[@intCast(i)];
+                    i += step;
+                }
+                out.* = Value.obj(.tuple, &tu.head);
+            },
+        }
+        return true;
+    }
+    var objs: [4]*PyObject = undefined;
+    if (!objects(ctx, &.{ v, bounds[0], bounds[1], bounds[2] }, &objs)) return failPython(ctx, node);
+    defer for (objs) |o| py.Py_DecRef(o);
+    const sl = py.c.PySlice_New(objs[1], objs[2], objs[3]) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(sl);
+    return fromResult(ctx, node, py.c.PyObject_GetItem(objs[0], sl), out);
+}
+
+/// A slice bound made an index of a sequence of `len` (Python's clamping).
+fn adjust(i: i64, len: i64, step: i64) i64 {
+    if (i < 0) {
+        const j = i +| len;
+        if (j < 0) return if (step < 0) -1 else 0;
+        return j;
+    }
+    if (i >= len) return if (step < 0) len - 1 else len;
+    return i;
+}
+
 /// rt.call(f, args) with the arguments a sequence only known at run time
 /// (a list, a tuple, anything Python iterates), borrowed.
 export fn zr_call_seq(ctx: *Ctx, node: u32, ft: u64, fb: u64, st: u64, sb: u64, receiver: ?*const Value, out: *Value) callconv(.c) bool {
@@ -1141,7 +1230,7 @@ const helper_names = [_][]const u8{
     "zr_getattr",  "zr_setattr",    "zr_getitem",    "zr_setitem",       "zr_items",
     "zr_list_len", "zr_list_at",    "zr_append",     "zr_call_method",   "zr_call_python",
     "zr_is_type",  "zr_global",     "zr_format",     "zr_concat",        "zr_unpack",
-    "zr_varargs",  "zr_record_new", "zr_isinstance", "zr_call_seq",
+    "zr_varargs",  "zr_record_new", "zr_isinstance", "zr_call_seq",      "zr_slice",
 };
 
 /// The names compiled code calls them by, and their addresses

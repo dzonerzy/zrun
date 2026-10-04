@@ -123,6 +123,8 @@ pub const Function = struct {
     /// The function object (owned): its module globals and closure, for
     /// resolving the global names
     py_function: *PyObject,
+    /// How big it is: its expressions (whether to run it inline)
+    size: u32 = 0,
 
     pub fn destroy(self: *Function, gpa: Allocator) void {
         py.Py_DecRef(self.py_function);
@@ -230,6 +232,7 @@ pub fn read(gpa: Allocator, func: *PyObject, failure: *Failure) ReadError!*Funct
         .locals = r.locals.items,
         .body = out,
         .py_function = func,
+        .size = r.exprs,
     };
     _ = a;
     return f;
@@ -244,6 +247,8 @@ const Reader = struct {
     locals: std.ArrayList([]const u8) = .empty,
     /// Names bound by the comprehensions being read, innermost last
     comp_scope: std.ArrayList(struct { name: []const u8, slot: u32 }) = .empty,
+    /// Expressions read
+    exprs: u32 = 0,
 
     fn alloc(self: *Reader) Allocator {
         return self.arena.allocator();
@@ -463,6 +468,7 @@ const Reader = struct {
     fn new(self: *Reader, pos: Pos, kind: Expr.Kind) ReadError!*Expr {
         const e = try self.alloc().create(Expr);
         e.* = .{ .pos = pos, .kind = kind };
+        self.exprs += 1;
         return e;
     }
 

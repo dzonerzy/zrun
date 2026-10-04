@@ -418,6 +418,39 @@ var rebound_cache: std.AutoHashMapUnmanaged(*PyObject, struct { len: isize, name
 // The compiler
 // ======================================================================
 
+/// A helper compiled out of line for some arguments: those known when
+/// compiling are part of it (a node, rt, a str...: its code is decided
+/// for them), the others (`.dyn` here) are given at run time
+const HelperSpec = struct {
+    func: *const front.Function,
+    /// The node errors in it are reported at (the semantic calling it)
+    at: u32,
+    /// The scope whose frames it runs in
+    owner: u32,
+    args: []const SVal,
+    name: [:0]const u8,
+    /// The semantic it runs for (run as Python if the helper can't be
+    /// compiled)
+    semantic: ?*PyObject,
+
+    fn matches(self: *const HelperSpec, func: *const front.Function, at: u32, owner: u32, args: []const SVal) bool {
+        if (self.func != func or self.at != at or self.owner != owner or self.args.len != args.len) return false;
+        for (self.args, args) |x, y| {
+            if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
+            const same = switch (x) {
+                .dyn, .none, .rt => true,
+                .bool => |b| b == y.bool,
+                .node => |n| n == y.node,
+                .str => |s| std.mem.eql(u8, s, y.str),
+                .py => |o| o == y.py,
+                else => false,
+            };
+            if (!same) return false;
+        }
+        return true;
+    }
+};
+
 /// Where a language function keeps its variables
 const Layout = struct {
     /// The symbols living in it, by slot
@@ -463,6 +496,15 @@ pub const Compiler = struct {
     need_frames: bool = false,
     /// A literal was marked to be built at run time: compile again
     need_retry: bool = false,
+    /// Helpers compiled out of line (one already being run inline, called
+    /// again: a recursive one), each a specialization; and those still to
+    /// generate. `helpers_kept`: how many the JIT has (a failed module's
+    /// are forgotten).
+    helper_fns: std.ArrayListUnmanaged(*HelperSpec) = .empty,
+    helper_queue: std.ArrayListUnmanaged(*HelperSpec) = .empty,
+    helpers_kept: usize = 0,
+    /// Semantic and helper bodies run inline so far (ZRUN_STATS)
+    inlined: usize = 0,
 
     /// Whether every function's (and block's) variables are in frames.
     pub fn allHeap(self: *const Compiler) bool {
@@ -489,6 +531,7 @@ pub const Compiler = struct {
         self.m.deinit();
         self.m = ir.Module.init(self.a, self.m.prefix);
         self.new_fns.clearRetainingCapacity();
+        self.helpers_kept = self.helper_fns.items.len;
         try self.declareRuntime();
     }
 
@@ -498,6 +541,58 @@ pub const Compiler = struct {
         for (self.new_fns.items) |f| _ = self.compiled_fns.remove(f);
         self.new_fns.clearRetainingCapacity();
         self.queue.clearRetainingCapacity();
+        self.helper_fns.shrinkRetainingCapacity(self.helpers_kept);
+        self.helper_queue.clearRetainingCapacity();
+    }
+
+    /// Generate what the code generated so far calls: language functions,
+    /// helpers out of line.
+    pub fn drainQueues(self: *Compiler) Error!void {
+        while (true) {
+            if (self.queue.pop()) |f| {
+                try self.genFunction(f);
+            } else if (self.helper_queue.pop()) |h| {
+                try self.genHelper(h);
+            } else return;
+        }
+    }
+
+    /// A helper's code out of line: `i32 <name>(ctx, frame, args, out)`,
+    /// a status as a thunk's (its result in out), the run-time arguments
+    /// in `args`, in the frames of `frame` (the caller's: rt.eval... there).
+    fn genHelper(self: *Compiler, h: *HelperSpec) Error!void {
+        const t = self.m.t;
+        const fun = try self.m.function(h.name, t.i32, &.{ t.ptr, t.ptr, t.ptr, t.ptr }, true);
+        var fnode = h.owner;
+        while (fnode != NONE and !self.isFunctionNode(fnode)) fnode = self.ownerOf(fnode);
+        var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = fnode, .layout = try self.layoutOf(fnode), .thunk = true, .helper_semantic = h.semantic };
+        // (one that can't be compiled: its semantic runs as Python)
+        errdefer if (self.failed_semantic == null) {
+            self.failed_semantic = h.semantic;
+        };
+        g.ctx = g.f.param(0);
+        g.out_param = g.f.param(3);
+        try g.thunkPrologue(h.owner, g.f.param(1));
+        // (its arguments: the known ones, the others from the array, a
+        // reference each)
+        const args = try self.a.alloc(SVal, h.args.len);
+        var j: usize = 0;
+        for (h.args, 0..) |x, i| {
+            if (x != .dyn) {
+                args[i] = x;
+                continue;
+            }
+            const d = try g.loadSlot(g.elem(g.f.param(2), j), .any);
+            try g.increfDyn(d);
+            args[i] = .{ .dyn = d };
+            j += 1;
+        }
+        const v = try g.materialize(try g.runFunction(h.func, h.at, args), h.at);
+        try g.storeSlot(g.out_param, v);
+        try g.f.ret(self.m.k32(1));
+        try g.f.block(g.err_label);
+        try g.f.ret(self.m.k32(0));
+        g.f.finish();
     }
 
     /// Whether any of the language's semantics run as Python.
@@ -536,7 +631,7 @@ pub const Compiler = struct {
         try g.f.block(g.err_label);
         try g.f.ret(self.m.k32(0));
         g.f.finish();
-        while (self.queue.pop()) |f| try self.genFunction(f);
+        try self.drainQueues();
         return name;
     }
 
@@ -560,7 +655,7 @@ pub const Compiler = struct {
         try self.declareRuntime();
         try self.computeLayouts();
         try self.genFunction(NONE);
-        while (self.queue.pop()) |fnode| try self.genFunction(fnode);
+        try self.drainQueues();
     }
 
     /// The runtime's helpers (helpers.zig), by name and signature: the
@@ -603,6 +698,7 @@ pub const Compiler = struct {
         .{ "zr_runtime", "bpipip" },
         .{ "zr_call_seq", "bpillllpp" },
         .{ "zr_raise", "bpill" },
+        .{ "zr_slice", "bpillllllllp" },
         .{ "zr_is_type", "blli" },
         .{ "zr_format", "bpillipp" },
         .{ "zr_concat", "bpiplp" },
@@ -925,6 +1021,8 @@ const Gen = struct {
     /// semantic run as Python): it returns a status, its value in
     /// `out_param`; the first `base_scopes` scopes are the caller's
     thunk: bool = false,
+    /// A helper's code out of line: the semantic it runs for
+    helper_semantic: ?*PyObject = null,
     out_param: ir.Value = null,
     base_scopes: usize = 0,
 
@@ -2026,9 +2124,88 @@ const Gen = struct {
         try self.f.br(if (kind == .Break) target.brk else target.cont);
     }
 
+    /// Call a helper: inline if it's small; out of line (its code for these
+    /// arguments, shared by the calls like it) if it's big, or recursive
+    /// (being run inline already). (Inline everywhere, big helpers calling
+    /// big helpers would make code without end.)
+    fn callHelper(self: *Gen, func: *const front.Function, at: u32, args: []const SVal) Error!SVal {
+        for (self.insts.items) |i| if (i.func == func) return self.outOfLine(func, at, args);
+        // (out of line needs the variables in frames: without them, big
+        // helpers stay inline)
+        if (func.size > inline_size and self.c.allHeap()) return self.outOfLine(func, at, args);
+        return self.runFunction(func, at, args);
+    }
+
+    /// The biggest helper run inline (expressions)
+    const inline_size = 40;
+    /// The longest range() known when compiling that's unrolled
+    const max_unrolled = 16;
+
+    /// A call of a helper's code out of line (made for the arguments known
+    /// here, the first time: HelperSpec); the arguments are taken.
+    fn outOfLine(self: *Gen, func: *const front.Function, at: u32, args: []const SVal) Error!SVal {
+        const c = self.c;
+        // (its code sees the variables here through the frames)
+        if (!c.allHeap()) {
+            c.need_frames = true;
+            return c.unsupported("a recursive helper is called here: the program needs its variables in frames", .{});
+        }
+        if (args.len != func.param_count) return c.unsupportedAt(func, .{ .line = func.first_line }, "called with {d} arguments, takes {d}", .{ args.len, func.param_count });
+        // What it's made for: nodes, rt, strs... (all but run-time values
+        // and containers: those are given); past a few versions of it, only
+        // what can't be given (rt, Python objects)
+        var versions: usize = 0;
+        for (c.helper_fns.items) |h| {
+            if (h.func == func) versions += 1;
+        }
+        const general = versions >= 8;
+        const key = try self.a().alloc(SVal, args.len);
+        var given: usize = 0;
+        for (args, key) |x, *slot| {
+            slot.* = switch (x) {
+                .rt, .py, .none => x,
+                .bool, .node, .str => if (general) .{ .dyn = undefined } else x,
+                .rt_method, .control, .method => return c.unsupportedAt(func, .{ .line = func.first_line }, "a {s} can't be given to a recursive helper", .{@tagName(x)}),
+                else => .{ .dyn = undefined },
+            };
+            if (slot.* == .dyn) given += 1;
+        }
+        const owner = self.currentOwner();
+        const spec = for (c.helper_fns.items) |h| {
+            if (h.matches(func, at, owner, key)) break h;
+        } else blk: {
+            const h = try c.a.create(HelperSpec);
+            // (the semantic: the outermost one run here, or the one this
+            // helper's code runs for)
+            const semantic = self.helper_semantic orelse if (self.insts.items.len > 0) self.insts.items[0].func.py_function else null;
+            h.* = .{ .func = func, .at = at, .owner = owner, .args = key, .name = try std.fmt.allocPrintSentinel(c.a, "{s}_h{d}", .{ c.m.prefix, c.helper_fns.items.len }, 0), .semantic = semantic };
+            try c.helper_fns.append(c.a, h);
+            try c.helper_queue.append(c.a, h);
+            break :blk h;
+        };
+        // The arguments given, in an array (borrowed by it)
+        const arr = try self.valueSlots(@max(given, 1));
+        const ds = try self.a().alloc(Dyn, given);
+        var j: usize = 0;
+        for (args, key) |x, slot| {
+            if (slot != .dyn) continue;
+            ds[j] = try self.materialize(x, at);
+            try self.storeSlot(self.elem(arr, j), ds[j]);
+            j += 1;
+        }
+        const t = c.m.t;
+        const fun = try c.m.function(spec.name, t.i32, &.{ t.ptr, t.ptr, t.ptr, t.ptr }, true);
+        const status = self.f.call(fun, &.{ self.ctx, try self.currentFrame(), arr, self.out });
+        for (ds) |d| try self.drop(.{ .dyn = d });
+        try self.statusJumps(status, at);
+        return .{ .dyn = try self.loadOut(.any) };
+    }
+
     /// Run a front function inline with arguments.
     fn runFunction(self: *Gen, func: *const front.Function, at: u32, args: []const SVal) Error!SVal {
         if (self.insts.items.len > 200) return self.c.unsupported("semantics nest more than 200 deep (recursive helpers aren't compiled yet)", .{});
+        self.c.inlined += 1;
+        if (std.c.getenv("ZRUN_STATS") != null and self.c.inlined % 2000 == 0) std.debug.print("  inlined {d} bodies (depth {d}, {s})\n", .{ self.c.inlined, self.insts.items.len, func.name });
         const locals = try self.a().alloc(Local, func.locals.len);
         @memset(locals, .unset);
         if (args.len != func.param_count) return self.c.unsupportedAt(func, .{ .line = func.first_line }, "called with {d} arguments, takes {d}", .{ args.len, func.param_count });
@@ -2748,11 +2925,19 @@ const Gen = struct {
                     }
                     py.c.PyErr_Clear();
                 }
-                // At run time: Python's slice of the value
-                const sl = try self.sliceObject(lo, hi, step);
-                defer py.Py_DecRef(sl);
-                _ = try c.objectIndex(sl);
-                return self.getItem(inst, obj, .{ .py = sl });
+                // At run time: Python's slice of the value (known bounds: a
+                // slice object; else zr_slice)
+                if (isScalar(lo) and isScalar(hi) and isScalar(step)) {
+                    const sl = try self.sliceObject(lo, hi, step);
+                    defer py.Py_DecRef(sl);
+                    _ = try c.objectIndex(sl);
+                    return self.getItem(inst, obj, .{ .py = sl });
+                }
+                const ds = [_]Dyn{ try self.materialize(obj, inst.node), try self.materialize(lo, inst.node), try self.materialize(hi, inst.node), try self.materialize(step, inst.node) };
+                const ok = self.call("zr_slice", &.{ self.ctx, self.k32(inst.node), ds[0].tag, ds[0].bits, ds[1].tag, ds[1].bits, ds[2].tag, ds[2].bits, ds[3].tag, ds[3].bits, self.out });
+                for (ds) |d| try self.drop(.{ .dyn = d });
+                try self.check(ok);
+                return .{ .dyn = try self.loadOut(.any) };
             },
             .fstring => |parts| return self.fstring(inst, parts, e.pos),
         }
@@ -3152,6 +3337,15 @@ const Gen = struct {
             .Break, .Continue => 0,
         };
         if (args.len != want) return c.unsupportedAt(inst.func, pos, "rt.{s}() takes {d} arguments here", .{ @tagName(m), want });
+        // A node only known at run time: the method of an rt over the
+        // frames here, then
+        switch (m) {
+            .load, .store, .function, .kind, .text, .span, .scope, .symbol, .type_of, .node_at => if (args[0] == .dyn) {
+                const r = try self.materialize(.rt, inst.node);
+                return self.methodCall(inst, .{ .dyn = r }, @tagName(m), args, pos);
+            },
+            else => {},
+        }
         switch (m) {
             .eval => return self.evalValue(args[0]),
             .exec => {
@@ -3337,7 +3531,7 @@ const Gen = struct {
         // compiled too
         if (try isInstanceOf(o, pt.function)) {
             const func = try self.helperFunction(o);
-            return self.runFunction(func, inst.node, args);
+            return self.callHelper(func, inst.node, args);
         }
         // A class whose objects are records: made natively
         if (try isInstanceOf(o, @ptrCast(@alignCast(py.types.typeObject("PyType_Type"))))) if (try c.recordType(o)) |rtype| {
@@ -3360,7 +3554,7 @@ const Gen = struct {
                 all[0] = .{ .dyn = rec };
                 @memcpy(all[1..], args);
                 _ = try c.objectIndex(init);
-                try self.drop(try self.runFunction(try self.helperFunction(init), inst.node, all));
+                try self.drop(try self.callHelper(try self.helperFunction(init), inst.node, all));
             } else if (args.len != 0) {
                 for (args) |x| try self.drop(x);
                 try self.drop(.{ .dyn = rec });
@@ -3485,7 +3679,10 @@ const Gen = struct {
                 }
                 if (step == 0) return null;
                 const count: i128 = if (step > 0) @max(0, @divFloor(hi - lo + step - 1, step)) else @max(0, @divFloor(lo - hi - step - 1, -step));
-                if (count <= 4096) {
+                // (a few: unrolled where it's looped over; more, a loop at
+                // run time: a body copied each time over would make code
+                // without end)
+                if (count <= max_unrolled) {
                     const out = try self.a().create(SList);
                     out.* = .{};
                     var i: i128 = 0;

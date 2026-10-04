@@ -126,7 +126,7 @@ pub const Compiled = struct {
             c.need_retry = false;
             c.newModule() catch return oomA();
             _ = c.functionCode(fnode) catch return oomA();
-            while (c.queue.pop()) |f| c.genFunction(f) catch |e| {
+            c.drainQueues() catch |e| {
                 c.forgetModule();
                 switch (e) {
                     error.Unsupported => {
@@ -154,6 +154,10 @@ pub const Compiled = struct {
     fn add(self: *Compiled, name: [:0]const u8) ?usize {
         var err: [2048]u8 = undefined;
         @memset(&err, 0);
+        if (std.c.getenv("ZRUN_STATS") != null) {
+            std.debug.print("module {s}: {d} bodies inlined, {d} helpers out of line\n", .{ name, self.compiler.inlined, self.compiler.helper_fns.items.len });
+            self.compiler.inlined = 0;
+        }
         const module = llvm.compile(self.view, self.compiler.m.take(), 2, &err) catch {
             ph.raise(py.PyExc_RuntimeError(), "zrun: LLVM rejected the compiled program (a zrun bug): {s}", .{std.mem.sliceTo(&err, 0)});
             return null;

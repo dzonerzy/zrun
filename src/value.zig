@@ -941,6 +941,9 @@ fn convert(o: *PyObject, unique: bool) ?Value {
         }
         return Value.obj(.dict, &d.head);
     }
+    // A node (of the program running: nodes don't go from one program to
+    // another), back: the node itself
+    if (objects.asNode(o)) |n| return .{ .tag = @intFromEnum(Tag.node), .bits = n.idx };
     // A compiled function given to Python, back: itself
     if (objects.asFunction(o)) |f| if (f.native) |n| {
         increfObj(&n.head);

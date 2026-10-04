@@ -178,7 +178,7 @@ fn fromPythonError(ctx: *Ctx, idx: u32, out: *Value) i32 {
 /// A Python exception (being raised) as the run's error at `idx`: a Throw
 /// or a zrun.Error kept to raise again in Python (Ctx.pending); anything
 /// else worded as the reference mode words it. 0.
-fn pythonFailure(ctx: *Ctx, idx: u32) i32 {
+pub fn pythonFailure(ctx: *Ctx, idx: u32) i32 {
     if (py.c.PyErr_Occurred() == null) {
         _ = helpers.fail(ctx, idx, "error", .{});
         return 0;

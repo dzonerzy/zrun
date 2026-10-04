@@ -35,6 +35,7 @@ BUILTINS = (
     "same",
     "back",
     "bigmath",
+    "slices",
 )
 
 
@@ -144,6 +145,10 @@ def make_lang():
             d[k[1]] = "fs"
             d[k[3]] = "box"
             return d.get(1, "no") + d.get(k[2], "no") + d.get(k[3], "no") + d.get(Box(1), "no") + str(len(d))
+        if name == "slices":
+            xs = rt.call(rt.load(node.name), [])
+            n = len(xs)
+            return (xs[1 : n - 1], xs[:: n - 7], xs[n:], tuple(xs)[n - 7 :], "hello"[n - 4 :], "héllo"[n - 4 :], xs[n - 105 : 2], xs[n - 5 : n - 6])
         if name == "bigmath":
             # A semantic's own ints are Python's (beyond 64 bits on the way)
             m = -1 & 0xFFFFFFFFFFFFFFFF
@@ -306,6 +311,10 @@ def make_lang():
         return (Color.RED, frozenset({1}), frozenset({1}), Box(2))
 
     @lang.host
+    def slices():
+        return [1, 2, 3, 4, 5]
+
+    @lang.host
     def fresh():
         return [1, 2, 3]
 
@@ -346,6 +355,7 @@ PROGRAMS = {
     "live": "print(unlive(), live());\n",
     "identity": "print(same(), back());\n",
     "bigmath": "print(bigmath());\n",
+    "slices": "print(slices());\n",
 }
 
 
@@ -354,7 +364,7 @@ def test_shared_with_python(name, capsys):
     out, err = same_in_every_mode(lang, PROGRAMS[name], capsys)
     assert err is None, err
     # (len * 1000 + first * 100 + last, after the host's changes...)
-    assert out.strip() == {"list": "4531", "dict": "231", "record": "53", "from_python": "0 203 5 4 34", "keys": "redfsboxno3", "live": "0 50801161", "identity": "1 32", "bigmath": "-78"}[name]
+    assert out.strip() == {"list": "4531", "dict": "231", "record": "53", "from_python": "0 203 5 4 34", "keys": "redfsboxno3", "live": "0 50801161", "identity": "1 32", "bigmath": "-78", "slices": "([2, 3, 4], [5, 3, 1], [], (4, 5), 'ello', 'éllo', [1, 2], [1, 2, 3, 4])"}[name]
     if name == "from_python":
         assert SHARED == [2, 7] and SHARED_DICT == {"k": 5}
     # (compiled: none of them ran as Python)
