@@ -52,8 +52,25 @@ pub const Compiled = struct {
     globals: usize,
     /// Thunks compiled, by node, eval or exec, and the frame's owner
     thunks: std.AutoHashMapUnmanaged(ThunkKey, Thunk) = .empty,
+    /// Kind and rule names as values (node.kind of a node known only at
+    /// run time), made once (immortal: freed with the program)
+    names: std.AutoHashMapUnmanaged(u32, *value.Str) = .empty,
 
     const ThunkKey = struct { node: u32, which: compile_mod.Which, owner: u32 };
+
+    /// A kind's (or rule's) name as a str value (borrowed: immortal).
+    pub fn nameStr(self: *Compiled, text: []const u8, rid: u32, is_kind: bool) ?*value.Str {
+        const key = rid | (@as(u32, @intFromBool(is_kind)) << 31);
+        if (self.names.get(key)) |s| return s;
+        const s = value.newStr(text) orelse return null;
+        s.head.rc = value.IMMORTAL;
+        self.names.put(allocator, key, s) catch {
+            s.head.rc = 1;
+            value.decref(value.Value.obj(.str, &s.head));
+            return null;
+        };
+        return s;
+    }
 
     /// The Python objects the code refers to (owned), by index
     pub fn objects(self: *const Compiled) []*PyObject {
@@ -64,6 +81,12 @@ pub const Compiled = struct {
         for (self.modules.items) |*m| m.release();
         self.modules.deinit(allocator);
         self.thunks.deinit(allocator);
+        var it = self.names.valueIterator();
+        while (it.next()) |s| {
+            s.*.head.rc = 1;
+            value.decref(value.Value.obj(.str, &s.*.head));
+        }
+        self.names.deinit(allocator);
         for (self.compiler.objects.items) |o| py.Py_DecRef(o);
         self.compiler.m.deinit();
         self.compiler.deinit(allocator);

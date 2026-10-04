@@ -801,6 +801,7 @@ const Program = struct {
             .link = @constCast(&link),
         };
         defer ectx.deinit();
+        defer helpers.printStats();
         // (semantics run as Python recurse through Python: room for
         // max_depth calls, as in the reference mode)
         const saved_limit = py.c.Py_GetRecursionLimit();

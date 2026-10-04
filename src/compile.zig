@@ -719,6 +719,9 @@ pub const Compiler = struct {
         .{ "zr_slice", "bpillllllllp" },
         .{ "zr_exc_matches", "bpl" },
         .{ "zr_exc_catch", "bpip" },
+        .{ "zr_type", "vllp" },
+        .{ "zr_builtin", "bpiilllp" },
+        .{ "zr_range", "bpiplp" },
         .{ "zr_is_type", "blli" },
         .{ "zr_format", "bpillipp" },
         .{ "zr_concat", "bpiplp" },
@@ -2999,10 +3002,13 @@ const Gen = struct {
     /// Lists iterated at run time (held in temporary slots): one, or
     /// several in step (zip), or one with its indexes (enumerate)
     const RtIter = struct {
-        kind: enum { plain, zip, enumerate },
+        kind: enum { plain, zip, enumerate, range },
         slots: []const ir.Value,
-        /// The index slot (an i64)
+        /// The index slot (an i64); a range's: its next value
         index: ir.Value = null,
+        /// A range's stop and step (i64 slots)
+        stop: ir.Value = null,
+        step: ir.Value = null,
     };
 
     /// The iteration of a loop's iterable; zip() and enumerate() of
@@ -3025,8 +3031,37 @@ const Gen = struct {
                 }
                 return .{ .runtime = .{ .kind = if (isBuiltin(callee.py, "zip")) .zip else .enumerate, .slots = slots } };
             }
+            // range() of run-time (or many) values: counted, no list made
+            if (callee == .py and isBuiltin(callee.py, "range") and x.args.len >= 1 and x.args.len <= 3) {
+                const args = try self.a().alloc(SVal, x.args.len);
+                for (args, x.args) |*slot, ae| slot.* = try self.expr(inst, ae);
+                // (known bounds, few values: unrolled)
+                if (allScalar(args)) if (try self.builtinCall(inst, callee.py, args, e.pos)) |v| {
+                    if (v == .list) return .{ .known = v.list.items.items };
+                    try self.drop(v);
+                };
+                return self.rangeIteration(inst, args);
+            }
         }
         return self.iterationOf(inst, try self.expr(inst, e));
+    }
+
+    /// range(args) counted at run time: the bounds checked (and their
+    /// errors raised) by zr_range.
+    fn rangeIteration(self: *Gen, inst: *Inst, args: []const SVal) Error!Iteration {
+        const f = &self.f;
+        const t = self.c.m.t;
+        const arr = try self.valueArray(args, inst.node);
+        const bounds = try f.alloca(L("LLVMArrayType2")(t.i64, 3));
+        const ok = self.call("zr_range", &.{ self.ctx, self.k32(inst.node), arr, self.k(@intCast(args.len)), bounds });
+        try self.dropArray(arr, args.len);
+        try self.check(ok);
+        var it = RtIter{ .kind = .range, .slots = &.{} };
+        it.index = try f.alloca(t.i64);
+        it.stop = try f.alloca(t.i64);
+        it.step = try f.alloca(t.i64);
+        for ([_]ir.Value{ it.index, it.stop, it.step }, 0..) |slot, i| f.store(f.load(t.i64, f.at(t.i64, bounds, self.k(@intCast(i)))), slot);
+        return .{ .runtime = it };
     }
 
     fn iterationOf(self: *Gen, inst: *Inst, v: SVal) Error!Iteration {
@@ -3044,6 +3079,8 @@ const Gen = struct {
 
     /// Before the loop: its index, 0.
     fn iterStart(self: *Gen, it: *RtIter) Error!void {
+        // (a range: its first value there already)
+        if (it.kind == .range) return;
         it.index = try self.f.alloca(self.c.m.t.i64);
         self.f.store(self.k(0), it.index);
     }
@@ -3054,6 +3091,12 @@ const Gen = struct {
     fn iterHead(self: *Gen, it: RtIter) Error!ir.Value {
         const f = &self.f;
         const i = f.load(self.c.m.t.i64, it.index);
+        if (it.kind == .range) {
+            // (up to stop going up, down to it going down)
+            const stop = f.load(self.c.m.t.i64, it.stop);
+            const up = f.icmp(jit_c.LLVMIntSGT, f.load(self.c.m.t.i64, it.step), self.k(0));
+            return f.select(up, f.icmp(jit_c.LLVMIntSLT, i, stop), f.icmp(jit_c.LLVMIntSGT, i, stop));
+        }
         var more = self.c.m.k1(true);
         for (it.slots) |slot| {
             const l = try self.loadSlot(slot, .list);
@@ -3067,6 +3110,8 @@ const Gen = struct {
     fn iterItem(self: *Gen, inst: *Inst, it: RtIter, target: front.Target, pos: front.Pos) Error!void {
         const f = &self.f;
         const i = f.load(self.c.m.t.i64, it.index);
+        // (a range's values: plain ints)
+        if (it.kind == .range) return self.assign(inst, target, .{ .dyn = .{ .tag = self.k(@intCast(value.PINT_TAG)), .bits = i, .shape = .int } }, pos);
         const parts = try self.a().alloc(Dyn, if (it.kind == .enumerate) 2 else it.slots.len);
         var n: usize = 0;
         if (it.kind == .enumerate) {
@@ -3093,6 +3138,12 @@ const Gen = struct {
     fn iterStep(self: *Gen, it: RtIter) Error!void {
         const f = &self.f;
         const i = f.load(self.c.m.t.i64, it.index);
+        if (it.kind == .range) {
+            // (past the 64 bits: the end, as no value can be beyond stop)
+            const pair = f.call(self.c.sadd, &.{ i, f.load(self.c.m.t.i64, it.step) });
+            f.store(f.select(f.extract(pair, 1), f.load(self.c.m.t.i64, it.stop), f.extract(pair, 0)), it.index);
+            return;
+        }
         f.store(f.add(i, self.k(1)), it.index);
     }
 
@@ -3611,13 +3662,96 @@ const Gen = struct {
             try self.check(ok);
             return .none;
         }
+        // A record's method: its compiled code, for each record class of the
+        // semantics' module having it (the record's type checked); else
+        // as Python does it
+        const cands = try self.methodCandidates(inst, name, args.len + 1);
+        if (cands.len > 0 and c.allHeap()) return self.recordMethodCall(inst, d, name, args, cands);
+        return self.genericMethodCall(inst, d, name, args);
+    }
+
+    fn genericMethodCall(self: *Gen, inst: *Inst, d: Dyn, name: []const u8, args: []const SVal) Error!SVal {
         const arr = try self.valueArray(args, inst.node);
-        const s = try c.m.string(name);
+        const s = try self.c.m.string(name);
         const ok = self.call("zr_call_method", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, s, arr, self.k(@intCast(args.len)), self.out });
         try self.dropArray(arr, args.len);
         try self.drop(.{ .dyn = d });
         try self.check(ok);
         return .{ .dyn = try self.loadOut(.any) };
+    }
+
+    const MethodCandidate = struct { rtype: *value.RecordType, func: *const front.Function };
+
+    /// The record classes of the semantic's module (its globals) whose
+    /// `name` is a method (a Python function) taking `nargs` (self
+    /// included), with it read. (One taking others: Python's TypeError,
+    /// through the generic call.)
+    fn methodCandidates(self: *Gen, inst: *Inst, name: []const u8, nargs: usize) Error![]const MethodCandidate {
+        const c = self.c;
+        const globals = ph.attr(inst.func.py_function, "__globals__") orelse return error.Python;
+        defer py.Py_DecRef(globals);
+        var out: std.ArrayListUnmanaged(MethodCandidate) = .empty;
+        const pt = try pyTypes();
+        const key = ph.newString(name) orelse return error.Python;
+        defer py.Py_DecRef(key);
+        var pos: py.Py_ssize_t = 0;
+        var gk: ?*PyObject = null;
+        var v: ?*PyObject = null;
+        while (py.c.PyDict_Next(globals, &pos, @ptrCast(&gk), @ptrCast(&v)) != 0) {
+            if (!try isInstanceOf(v.?, @ptrCast(@alignCast(py.types.typeObject("PyType_Type"))))) continue;
+            const rtype = try recordOf(v.?) orelse continue;
+            const m = py.c.PyObject_GetAttr(v.?, key) orelse {
+                py.c.PyErr_Clear();
+                continue;
+            };
+            defer py.Py_DecRef(m);
+            if (!try isInstanceOf(m, pt.function)) continue;
+            // (one the front can't read: not a candidate, Python runs it)
+            const func = self.helperFunction(m) catch |e| switch (e) {
+                error.Unsupported => continue,
+                else => return e,
+            };
+            if (func.param_count != nargs) continue;
+            _ = try c.objectIndex(m);
+            try out.append(self.a(), .{ .rtype = rtype, .func = func });
+        }
+        return out.items;
+    }
+
+    /// obj.name(args) checked against each candidate's record type: its
+    /// method's compiled code (out of line); none: the generic call.
+    fn recordMethodCall(self: *Gen, inst: *Inst, d: Dyn, name: []const u8, args: []const SVal, cands: []const MethodCandidate) Error!SVal {
+        const f = &self.f;
+        const t = self.c.m.t;
+        // (the arguments run-time values first: each path takes them)
+        const all = try self.a().alloc(SVal, args.len + 1);
+        all[0] = .{ .dyn = d };
+        for (args, all[1..]) |x, *slot| slot.* = .{ .dyn = try self.materialize(x, inst.node) };
+        const result = try self.valSlot();
+        const join = try f.label("method_done");
+        const is_record = f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.record)));
+        inst.dyn_depth += 1;
+        defer inst.dyn_depth -= 1;
+        for (cands) |cand| {
+            const yes = try f.label("method_of");
+            const no = try f.label("method_next");
+            const of_type = try f.label("method_check");
+            try f.condBr(is_record, of_type, no);
+            try f.block(of_type);
+            // (a record's type: the word after its header)
+            const rt = f.load(t.i64, f.offset(f.intToPtr(d.bits), 16));
+            try f.condBr(f.icmp(jit_c.LLVMIntEQ, rt, self.k(@intCast(@intFromPtr(cand.rtype)))), yes, no);
+            try f.block(yes);
+            const r = try self.materialize(try self.outOfLine(cand.func, inst.node, all), inst.node);
+            try self.storeSlot(result, r);
+            try f.br(join);
+            try f.block(no);
+        }
+        const g = try self.materialize(try self.genericMethodCall(inst, d, name, all[1..]), inst.node);
+        try self.storeSlot(result, g);
+        try f.br(join);
+        try f.block(join);
+        return .{ .dyn = try self.loadSlot(result, .any) };
     }
 
     fn allScalar(items: []const SVal) bool {
@@ -3980,6 +4114,39 @@ const Gen = struct {
                 break;
             };
         }
+        // int(), float(), len(), abs(), str(), bool() of a run-time value:
+        // natively where it can be (zr_builtin)
+        if (args.len == 1 and args[0] == .dyn) {
+            inline for (@typeInfo(helpers.Builtin).@"enum".fields) |fd| {
+                if (isBuiltin(o, fd.name)) {
+                    const d = args[0].dyn;
+                    const idx = try c.objectIndex(o);
+                    const ok = self.call("zr_builtin", &.{ self.ctx, self.k32(inst.node), self.k32(fd.value), self.k(@intCast(idx)), d.tag, d.bits, self.out });
+                    try self.drop(args[0]);
+                    try self.check(ok);
+                    // (len() is always an int, bool() a bool; the others
+                    // may be anything a class's method made)
+                    const shape: Shape = comptime if (std.mem.eql(u8, fd.name, "len")) .int else if (std.mem.eql(u8, fd.name, "bool")) .bool else .any;
+                    return SVal{ .dyn = try self.loadOut(shape) };
+                }
+            }
+        }
+        // type(v): its class (known for a known value; else from its tag)
+        if (isBuiltin(o, "type") and args.len == 1) switch (args[0]) {
+            .dyn => |d| {
+                _ = self.call("zr_type", &.{ d.tag, d.bits, self.out });
+                try self.drop(args[0]);
+                return SVal{ .dyn = try self.loadOut(.any) };
+            },
+            .rt, .rt_method, .control, .method => {},
+            else => {
+                const x = try self.pyOf(args[0]);
+                defer py.Py_DecRef(x);
+                const t: *PyObject = @ptrCast(@alignCast(ph.typeOf(x)));
+                _ = try c.objectIndex(t);
+                return SVal{ .py = t };
+            },
+        };
         if (isBuiltin(o, "isinstance")) {
             if (args.len != 2) return c.unsupportedAt(inst.func, pos, "isinstance() takes 2 arguments", .{});
             return try self.isInstance(inst, args[0], args[1], pos);
@@ -4054,7 +4221,9 @@ const Gen = struct {
                     return SVal{ .list = out };
                 }
             }
-            return try self.callPython(inst, o, args);
+            // (else Python's range object, a loop over it counted:
+            // iteration())
+            return null;
         }
         return null;
     }

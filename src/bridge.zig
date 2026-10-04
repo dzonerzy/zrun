@@ -23,6 +23,7 @@ const helpers = @import("helpers.zig");
 const value = @import("value.zig");
 const types = @import("types.zig");
 const program_mod = @import("program.zig");
+const grammar_mod = @import("grammar.zig");
 const compile_mod = @import("compile.zig");
 const driver = @import("driver.zig");
 
@@ -47,6 +48,97 @@ pub const Link = struct {
     error_object: *const fn (program: *anyopaque, idx: u32, message: []const u8, stack: []const helpers.CallEntry) ?*PyObject,
 };
 
+/// node.name of a node only known at run time, read from the program's
+/// tree as the compiler reads a known node's: true / false (an error), or
+/// null for one not read here (Python's Node then: a field whose value an
+/// action makes...).
+pub fn nodeAttr(ctx: *Ctx, idx: u32, name: []const u8, out: *Value) ?bool {
+    const link = linkOf(ctx);
+    const d = link.data;
+    const n = d.nodes[idx];
+    const rid = n.ruleId();
+    const eq = std.mem.eql;
+    if (d.grammar.field_ids.get(name)) |field| {
+        const label = d.grammar.labelOf(rid, field);
+        const many = label != null and label.?.many;
+        var count: usize = 0;
+        var only: Value = Value.none_v;
+        var ch = idx + 1;
+        const stop = d.end(idx);
+        // (the labelled children: nodes; one an action makes a value of:
+        // Python's)
+        while (ch < stop) : (ch = d.end(ch)) {
+            if (d.nodes[ch].fieldId() != field) continue;
+            const v = childValue(d, ch) orelse return null;
+            if (v.kind() == .none) continue;
+            count += 1;
+            only = v;
+        }
+        if (!many and count <= 1) {
+            out.* = only;
+            return true;
+        }
+        const l = value.newList(count) orelse return helpers.fail(ctx, idx, "out of memory", .{});
+        ch = idx + 1;
+        while (ch < stop) : (ch = d.end(ch)) {
+            if (d.nodes[ch].fieldId() != field) continue;
+            const v = childValue(d, ch).?;
+            if (v.kind() != .none) _ = value.listPush(l, v);
+        }
+        out.* = Value.obj(.list, &l.head);
+        return true;
+    }
+    if (eq(u8, name, "kind") or eq(u8, name, "rule")) {
+        const is_kind = eq(u8, name, "kind");
+        const s = link.compiled.nameStr(if (is_kind) d.grammar.kind_names[rid] else d.grammar.rule_names[rid], rid, is_kind) orelse return helpers.fail(ctx, idx, "out of memory", .{});
+        out.* = Value.obj(.str, &s.head);
+        return true;
+    }
+    if (eq(u8, name, "text")) {
+        const s = value.newStr(d.text(idx)) orelse return helpers.fail(ctx, idx, "out of memory", .{});
+        out.* = Value.obj(.str, &s.head);
+        return true;
+    }
+    // (plain ints, as the reference mode's Node gives them)
+    if (eq(u8, name, "start")) out.* = Value.pint(n.text_start) else if (eq(u8, name, "end")) out.* = Value.pint(n.text_end) else if (eq(u8, name, "line")) out.* = Value.pint(d.lineCol(n.text_start).line) else if (eq(u8, name, "column")) out.* = Value.pint(d.lineCol(n.text_start).col) else if (eq(u8, name, "index")) out.* = Value.pint(idx) else if (eq(u8, name, "parent")) {
+        const p = d.parents[idx];
+        out.* = if (p == program_mod.NONE) Value.none_v else .{ .tag = @intFromEnum(value.Tag.node), .bits = p };
+    } else if (eq(u8, name, "children")) {
+        var count: usize = 0;
+        var ch = idx + 1;
+        const stop = d.end(idx);
+        while (ch < stop) : (ch = d.end(ch)) {
+            _ = childValue(d, ch) orelse return null;
+            if (!dropped(d, ch)) count += 1;
+        }
+        const l = value.newList(count) orelse return helpers.fail(ctx, idx, "out of memory", .{});
+        ch = idx + 1;
+        while (ch < stop) : (ch = d.end(ch)) {
+            if (dropped(d, ch)) continue;
+            _ = value.listPush(l, childValue(d, ch).?);
+        }
+        out.* = Value.obj(.list, &l.head);
+    } else return null;
+    return true;
+}
+
+fn dropped(d: *const program_mod.Data, ch: u32) bool {
+    const crid = d.rule(ch);
+    return crid < d.grammar.actions.len and d.grammar.actions[crid] == .drop;
+}
+
+/// A child's value as a field: the node (None: dropped), or null for one
+/// whose action makes a value (Python's conversion).
+fn childValue(d: *const program_mod.Data, ch: u32) ?Value {
+    const crid = d.rule(ch);
+    const action: grammar_mod.Action = if (crid < d.grammar.actions.len) d.grammar.actions[crid] else .none;
+    return switch (action) {
+        .none, .class => .{ .tag = @intFromEnum(value.Tag.node), .bits = ch },
+        .drop => Value.none_v,
+        else => null,
+    };
+}
+
 fn linkOf(ctx: *Ctx) *const Link {
     return @ptrCast(@alignCast(ctx.link.?));
 }
@@ -60,6 +152,7 @@ fn linkOf(ctx: *Ctx) *const Link {
 /// value in `out`, 2 Return: its value in `out`, 3 Break, 4 Continue).
 pub export fn zr_py_semantic(ctx: *Ctx, which: u32, idx: u32, frame_slot: **value.Frame, owner: u32, out: *Value) callconv(.c) i32 {
     out.* = Value.none_v;
+    helpers.stat("py_semantic", .{});
     const link = linkOf(ctx);
     const w: compile_mod.Which = @enumFromInt(which);
     const func = link.semantic(link.program, idx, w) orelse {
@@ -91,6 +184,7 @@ pub export fn zr_py_semantic(ctx: *Ctx, which: u32, idx: u32, frame_slot: **valu
 pub export fn zr_run_value(ctx: *Ctx, which: u32, at: u32, tag: u64, bits: u64, frame_slot: **value.Frame, owner: u32, out: *Value) callconv(.c) i32 {
     out.* = Value.none_v;
     const v = Value{ .tag = tag, .bits = bits };
+    helpers.stat("run_value {s}", .{@tagName(v.kind())});
     const loop = which == 2;
     const w: compile_mod.Which = if (which == 0) .eval else .exec;
     switch (v.kind()) {
@@ -274,8 +368,8 @@ fn raiseCompiledError(ctx: *Ctx) ?*PyObject {
     }
     // (a Python exception behind it: raised as itself, as in the reference
     // mode)
-    if (ctx.exc) |e| {
-        ctx.exc = null;
+    if (ctx.exc != null or ctx.exc_class != null) {
+        const e = ctx.exceptionOf() orelse return null;
         py.c.PyErr_SetObject(@ptrCast(@alignCast(ph.typeOf(e))), e);
         py.Py_DecRef(e);
         ctx.clearError();
@@ -353,7 +447,7 @@ pub export fn zr_exc_matches(ctx: *Ctx, cls_index: u64) callconv(.c) bool {
     const r = if (ctx.pending orelse ctx.exc) |e|
         py.c.PyObject_IsInstance(e, cls)
     else
-        py.c.PyObject_IsSubclass(types.Error, cls);
+        py.c.PyObject_IsSubclass(ctx.exc_class orelse types.Error, cls);
     if (r < 0) py.c.PyErr_Clear();
     return r == 1;
 }
@@ -362,9 +456,12 @@ pub export fn zr_exc_matches(ctx: *Ctx, cls_index: u64) callconv(.c) bool {
 /// object in `out` (a host value), the error cleared.
 pub export fn zr_exc_catch(ctx: *Ctx, at: u32, out: *Value) callconv(.c) bool {
     var exc: *PyObject = undefined;
-    if (ctx.pending orelse ctx.exc) |e| {
-        py.Py_IncRef(e);
-        exc = e;
+    if (ctx.pending != null or ctx.exc != null or ctx.exc_class != null) {
+        exc = ctx.exceptionOf() orelse {
+            py.c.PyErr_Clear();
+            ctx.clearError();
+            return helpers.fail(ctx, at, "out of memory", .{});
+        };
     } else {
         const link = linkOf(ctx);
         exc = link.error_object(link.program, ctx.err_node, ctx.err_msg.items, ctx.err_stack.items) orelse {
