@@ -79,11 +79,16 @@ class TestSubset:
         def defaults(node, rt=None):
             return 1
 
+        def keyword_only(node, *, rt):
+            return 1
+
         def star(node, *rest):
             return 1
 
+        # (defaults: the function's own, when called without)
+        assert lang().ir(defaults).splitlines()[0] == "def defaults(node, rt):"
         with pytest.raises(zrun.CompileError, match="only plain parameters"):
-            lang().ir(defaults)
+            lang().ir(keyword_only)
         with pytest.raises(zrun.CompileError, match=r"\*args and \*\*kwargs"):
             lang().ir(star)
 

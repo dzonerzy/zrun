@@ -165,6 +165,7 @@ pub const Compiled = struct {
                 c.forgetModule();
                 // (a literal made at run time: again; anything else: Python)
                 if (e == error.Unsupported and c.need_retry) continue;
+                if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("not compiled: {s}\n", .{self.failure.message.items});
                 py.c.PyErr_Clear();
                 break;
             };

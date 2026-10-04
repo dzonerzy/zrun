@@ -693,7 +693,7 @@ pub const Compiler = struct {
             try g.increfDyn(d);
             args[i] = .{ .dyn = d };
         }
-        const params = if (h.closure) args[0 .. args.len - 1] else args;
+        const params = try g.withDefaults(h.func, if (h.closure) args[0 .. args.len - 1] else args);
         const v = try g.materialize(try g.runFunction(h.func, AT_PARAM, params), AT_PARAM);
         try g.storeSlot(g.out_param, v);
         try g.f.ret(self.m.k32(1));
@@ -736,7 +736,7 @@ pub const Compiler = struct {
     pub fn compileCalled(self: *Compiler, o: *PyObject, nargs: usize, rt_mask: u64, closure: bool) Error![:0]const u8 {
         try self.newModule();
         const func = try self.readFunction(o);
-        if (func.param_count != nargs) return self.unsupported("{s}() takes {d} arguments, called with {d}", .{ func.name, func.param_count, nargs });
+        if (nargs < func.required or nargs > func.param_count) return self.unsupported("{s}() takes {d} to {d} arguments, called with {d}", .{ func.name, func.required, func.param_count, nargs });
         // (a closure: the function called given last, its variables read
         // from it)
         const key = try self.a.alloc(SVal, nargs + @intFromBool(closure));
@@ -2478,7 +2478,8 @@ const Gen = struct {
     /// arguments, shared by the calls like it) if it's big, or recursive
     /// (being run inline already). (Inline everywhere, big helpers calling
     /// big helpers would make code without end.)
-    fn callHelper(self: *Gen, func: *const front.Function, at: u32, args: []const SVal) Error!SVal {
+    fn callHelper(self: *Gen, func: *const front.Function, at: u32, given: []const SVal) Error!SVal {
+        const args = try self.withDefaults(func, given);
         for (self.insts.items) |i| if (i.func == func) return self.outOfLine(func, at, args);
         // (out of line needs the variables in frames: without them, big
         // helpers stay inline)
@@ -2505,6 +2506,33 @@ const Gen = struct {
         try f.br(join);
         try f.block(join);
         return self.loadSlot(slot, .any);
+    }
+
+    /// A call's arguments, those not given (the last ones) its defaults
+    /// (the function's __defaults__: made when it was defined, the same
+    /// objects each call, as Python's).
+    fn withDefaults(self: *Gen, func: *const front.Function, args: []const SVal) Error![]const SVal {
+        if (args.len == func.param_count) return args;
+        if (args.len < func.required or args.len > func.param_count)
+            return self.c.unsupportedAt(func, .{ .line = func.first_line }, "{s}() called with {d} arguments, takes {d} to {d}", .{ func.name, args.len, func.required, func.param_count });
+        const all = try self.a().alloc(SVal, func.param_count);
+        @memcpy(all[0..args.len], args);
+        for (args.len..func.param_count) |i| all[i] = try self.defaultOf(func, i);
+        return all;
+    }
+
+    /// The default value of parameter `i` (one of the last ones).
+    fn defaultOf(self: *Gen, func: *const front.Function, i: usize) Error!SVal {
+        const defaults = ph.attr(func.py_function, "__defaults__") orelse return error.Python;
+        defer py.Py_DecRef(defaults);
+        if (defaults == py.Py_None()) return self.c.unsupportedAt(func, .{ .line = func.first_line }, "{s}()'s defaults changed", .{func.name});
+        const n: usize = @intCast(py.c.PyTuple_Size(defaults));
+        const first = func.param_count - n;
+        if (i < first) return self.c.unsupportedAt(func, .{ .line = func.first_line }, "{s}() missing an argument", .{func.name});
+        const o = py.c.PyTuple_GetItem(defaults, @intCast(i - first)).?;
+        // (kept: the function's defaults may change)
+        _ = try self.c.objectIndex(o);
+        return self.constant(o, self.atNode());
     }
 
     /// The biggest helper run inline (expressions)
@@ -3910,7 +3938,7 @@ const Gen = struct {
                 error.Unsupported => continue,
                 else => return e,
             };
-            if (func.param_count != nargs) continue;
+            if (nargs < func.required or nargs > func.param_count) continue;
             _ = try c.objectIndex(m);
             try out.append(self.a(), .{ .rtype = rtype, .func = func });
         }
@@ -3941,7 +3969,7 @@ const Gen = struct {
             const rt = f.load(t.i64, f.offset(f.intToPtr(d.bits), 16));
             try f.condBr(f.icmp(jit_c.LLVMIntEQ, rt, self.k(@intCast(@intFromPtr(cand.rtype)))), yes, no);
             try f.block(yes);
-            const r = try self.materialize(try self.outOfLine(cand.func, inst.node, all), inst.node);
+            const r = try self.materialize(try self.outOfLine(cand.func, inst.node, try self.withDefaults(cand.func, all)), inst.node);
             try self.storeSlot(result, r);
             try f.br(join);
             try f.block(no);
@@ -4002,6 +4030,24 @@ const Gen = struct {
         const args = try self.a().alloc(SVal, args_e.len);
         for (args, args_e) |*slot, ae| slot.* = try self.expr(inst, ae);
         var receiver: ?SVal = null;
+        // A helper's keyword arguments: in their parameters' places
+        if (kws.len > 0 and callee == .py and try isInstanceOf(callee.py, (try pyTypes()).function)) {
+            const func = try self.helperFunction(callee.py);
+            const all = try self.a().alloc(?SVal, func.param_count);
+            @memset(all, null);
+            if (args.len > func.param_count) return c.unsupportedAt(inst.func, pos, "{s}() takes {d} arguments", .{ func.name, func.param_count });
+            for (args, 0..) |x, i| all[i] = x;
+            for (kws) |kw| {
+                const i = for (func.locals[0..func.param_count], 0..) |p, j| {
+                    if (std.mem.eql(u8, p, kw.name)) break j;
+                } else return c.unsupportedAt(inst.func, pos, "{s}() has no parameter {s}", .{ func.name, kw.name });
+                if (all[i] != null) return c.unsupportedAt(inst.func, pos, "{s}() given {s} twice", .{ func.name, kw.name });
+                all[i] = try self.expr(inst, kw.value);
+            }
+            const full = try self.a().alloc(SVal, func.param_count);
+            for (all, full, 0..) |x, *slot, i| slot.* = x orelse (if (i < func.required) return c.unsupportedAt(inst.func, pos, "{s}() missing its argument {s}", .{ func.name, func.locals[i] }) else try self.defaultOf(func, i));
+            return self.callHelper(func, inst.node, full);
+        }
         for (kws) |kw| {
             if (callee == .rt_method and callee.rt_method == .call and std.mem.eql(u8, kw.name, "receiver")) {
                 receiver = try self.expr(inst, kw.value);

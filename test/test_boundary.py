@@ -42,6 +42,7 @@ BUILTINS = (
     "wide",
     "tables",
     "untables",
+    "defaults",
 )
 
 
@@ -76,6 +77,10 @@ class Holder:
 
     def get(self, k):
         return self.v + k
+
+
+def scaled(x, factor=2, offset=0):
+    return x * factor + offset
 
 
 def returns_in_try(log):
@@ -260,6 +265,10 @@ def make_lang():
             before = LIVE_TABLE["a"]
             rt.call(rt.load(node.name), [])
             return ("a" in FROZEN_TABLE, FROZEN_TABLE.get("b"), [k for k in FROZEN_TABLE], before, LIVE_TABLE["a"], "z" in LIVE_TABLE)
+        if name == "defaults":
+            # helpers' defaults and keyword arguments
+            n = rt.call(rt.load(node.name), [])
+            return (scaled(n), scaled(n, 3), scaled(n, offset=1), scaled(x=n, factor=4, offset=1), scaled(n, offset=2, factor=0))
         if name == "bigmath":
             # A semantic's own ints are Python's (beyond 64 bits on the way)
             m = -1 & 0xFFFFFFFFFFFFFFFF
@@ -428,6 +437,10 @@ def make_lang():
         raise KeyError("k")
 
     @lang.host
+    def defaults():
+        return 3
+
+    @lang.host
     def untables():
         LIVE_TABLE.clear()
         LIVE_TABLE["a"] = 1
@@ -502,6 +515,7 @@ PROGRAMS = {
     "strs": "print(strs());\n",
     "wide": "print(wide());\n",
     "tables": "print(untables(), tables());\n",
+    "defaults": "print(defaults());\n",
 }
 
 
@@ -522,6 +536,7 @@ def test_shared_with_python(name, capsys):
         "bigmath": "-78",
         "slices": "([2, 3, 4], [5, 3, 1], [], (4, 5), 'ello', 'éllo', [1, 2], [1, 2, 3, 4])",
         "genexp": "(True, False, 12, 2, True, False, '123')",
+        "defaults": "(6, 9, 7, 13, 2)",
         "trying": "[\"value:invalid literal for int() with base 10: 'x'\", 'key', 'fin', 'body', 'else', 'loop0', 'f0', 'f1', 'f2', 'g1', 'g2', 'rf', 'ret', 'v', 'again', 'inner', 'zero']",
     }.get(name)
     if expected is not None:

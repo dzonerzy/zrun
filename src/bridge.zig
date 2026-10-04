@@ -508,7 +508,16 @@ pub fn compiledCall(ctx: *Ctx, node: u32, callee: *PyObject, args: []const Value
         given[n] = if (checked) a.checked() else a;
         n += 1;
     }
-    const code = lk.compiled.calledCode(callee, args.len, mask, closure) orelse return null;
+    const code = lk.compiled.calledCode(callee, args.len, mask, closure) orelse {
+        if (std.c.getenv("ZRUN_STATS") != null) {
+            if (ph.attr(callee, "__qualname__")) |nm| {
+                defer py.Py_DecRef(nm);
+                helpers.stat("python function {s}", .{ph.utf8(nm, "name") orelse "?"});
+            }
+            py.c.PyErr_Clear();
+        }
+        return null;
+    };
     if (closure) {
         given[n] = .{ .tag = @intFromEnum(value.Tag.host), .bits = @intFromPtr(callee) };
         n += 1;
@@ -530,10 +539,10 @@ pub fn compiledCall(ctx: *Ctx, node: u32, callee: *PyObject, args: []const Value
 
 /// obj.name(args) where obj.name is a Python function, or a bound method
 /// of one (its object first): by its compiled code (compiledCall).
-pub fn compiledMethod(ctx: *Ctx, node: u32, m: *PyObject, args: []const Value, out: *Value) ?bool {
-    if (args.len >= 64) return null;
+pub fn compiledMethod(ctx: *Ctx, node: u32, m: *PyObject, args: []const Value, checked: bool, out: *Value) ?bool {
+    if (args.len >= 63) return null;
     const pt = compile_mod.pyMethodType() orelse return null;
-    if (ph.typeOf(m) != @as(*py.c.PyTypeObject, @ptrCast(@alignCast(pt)))) return compiledCall(ctx, node, m, args, false, out);
+    if (ph.typeOf(m) != @as(*py.c.PyTypeObject, @ptrCast(@alignCast(pt)))) return compiledCall(ctx, node, m, args, checked, out);
     const func = py.c.PyObject_GetAttrString(m, "__func__") orelse {
         py.c.PyErr_Clear();
         return null;
@@ -551,7 +560,7 @@ pub fn compiledMethod(ctx: *Ctx, node: u32, m: *PyObject, args: []const Value, o
     };
     defer value.decref(all[0]);
     @memcpy(all[1 .. args.len + 1], args);
-    return compiledCall(ctx, node, func, all[0 .. args.len + 1], false, out);
+    return compiledCall(ctx, node, func, all[0 .. args.len + 1], checked, out);
 }
 
 /// The compiled run going on (the innermost): what an rt value reaching

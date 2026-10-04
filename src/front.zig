@@ -128,8 +128,10 @@ pub const Function = struct {
     file: []const u8,
     /// The line of its `def` (or first decorator) in the file
     first_line: u32,
-    /// Its parameters are locals 0 .. param_count
+    /// Its parameters are locals 0 .. param_count; those from `required`
+    /// on have defaults (the function's __defaults__)
     param_count: u32,
+    required: u32 = 0,
     /// Every local's name, by slot
     locals: []const []const u8,
     body: []const Stmt,
@@ -205,14 +207,18 @@ pub fn read(gpa: Allocator, func: *PyObject, failure: *Failure) ReadError!*Funct
     while (indent < raw_text.len and (raw_text[indent] == ' ' or raw_text[indent] == '\t')) indent += 1;
     r.col_offset = indent;
 
-    // Parameters: plain ones only
+    // Parameters: plain ones, the last ones with defaults maybe (their
+    // values the function's __defaults__, made when it was defined)
     const args = ph.attr(def, "args") orelse return error.Python;
     defer py.Py_DecRef(args);
-    inline for (.{ "posonlyargs", "kwonlyargs", "defaults", "kw_defaults" }) |f| {
+    inline for (.{ "posonlyargs", "kwonlyargs", "kw_defaults" }) |f| {
         const l = try listAttr(args, f);
         defer py.Py_DecRef(l);
-        if (py.c.PyList_Size(l) != 0) return r.unsupported(try r.posOf(def), "only plain parameters can be compiled (no defaults, keyword-only or positional-only ones)", .{});
+        if (py.c.PyList_Size(l) != 0) return r.unsupported(try r.posOf(def), "only plain parameters can be compiled (no keyword-only or positional-only ones)", .{});
     }
+    const defaults = try listAttr(args, "defaults");
+    const n_defaults: usize = @intCast(py.c.PyList_Size(defaults));
+    py.Py_DecRef(defaults);
     inline for (.{ "vararg", "kwarg" }) |f| {
         const o = ph.attr(args, f) orelse return error.Python;
         defer py.Py_DecRef(o);
@@ -242,6 +248,7 @@ pub fn read(gpa: Allocator, func: *PyObject, failure: *Failure) ReadError!*Funct
         .file = file,
         .first_line = @intCast(first),
         .param_count = @intCast(n_params),
+        .required = @intCast(n_params - n_defaults),
         .locals = r.locals.items,
         .body = out,
         .py_function = func,
