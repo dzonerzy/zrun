@@ -1277,20 +1277,33 @@ const Gen = struct {
     base_scopes: usize = 0,
 
     /// Code that runs many times (a function's, a loop's): reference
-    /// counts inline; else calls (less code for LLVM to compile).
-    /// Code that runs many times (a function's, a loop's): reference
     /// counts inline. (Elsewhere, calls: each inline one is blocks for
     /// LLVM to compile.)
     fn hot(self: *const Gen) bool {
         return self.fnode != NONE or self.loop_level > 0;
     }
 
-    fn incName(self: *const Gen) []const u8 {
-        return if (self.hot()) "zr_inc" else "zr_incref";
-    }
-
-    fn decName(self: *const Gen) []const u8 {
-        return if (self.hot()) "zr_dec" else "zr_decref";
+    /// A value's count up (or down): inline in hot code; else a call,
+    /// made only for a counted tag (most values aren't: ints, None,
+    /// bools, nodes; one branch instead of a call).
+    fn refcount(self: *Gen, dec: bool, tag: ir.Value, bits: ir.Value) Error!void {
+        if (self.hot()) {
+            _ = self.call(if (dec) "zr_dec" else "zr_inc", &.{ tag, bits });
+            return;
+        }
+        const f = &self.f;
+        const m = &self.c.m;
+        // (counted: 4 to 10, 13; as bits of a mask: tags under 16)
+        const mask: u64 = 0x7F0 | (1 << @intFromEnum(value.Tag.big));
+        const bit = f.and_(f.lshr(m.k64(mask), f.and_(tag, m.k64(15))), m.k64(1));
+        const counted = f.and_(f.icmp(jit_c.LLVMIntULT, tag, m.k64(16)), f.icmp(jit_c.LLVMIntNE, bit, m.k64(0)));
+        const yes = try f.label("rc");
+        const done = try f.label("rc_done");
+        try f.condBr(counted, yes, done);
+        try f.block(yes);
+        _ = self.call(if (dec) "zr_decref" else "zr_incref", &.{ tag, bits });
+        try f.br(done);
+        try f.block(done);
     }
 
     fn a(self: *Gen) Allocator {
@@ -1464,7 +1477,7 @@ const Gen = struct {
         for (self.var_slots.items) |slot| {
             const v = try self.loadSlot(slot, .any);
             // (an unset slot holds no reference: decrefs ignore its tag)
-            _ = self.call(self.decName(), &.{ v.tag, v.bits });
+            try self.refcount(true, v.tag, v.bits);
         }
     }
 
@@ -1705,7 +1718,7 @@ const Gen = struct {
     fn dropArray(self: *Gen, arr: ir.Value, n: usize) Error!void {
         for (0..n) |i| {
             const v = try self.loadSlot(self.elem(arr, i), .any);
-            _ = self.call(self.decName(), &.{ v.tag, v.bits });
+            try self.refcount(true, v.tag, v.bits);
         }
     }
 
@@ -1717,15 +1730,13 @@ const Gen = struct {
     /// Give up a dynamic value (decref it).
     fn drop(self: *Gen, v: SVal) Error!void {
         switch (v) {
-            .dyn => |d| if (d.heapish()) {
-                _ = self.call(self.decName(), &.{ d.tag, d.bits });
-            },
+            .dyn => |d| if (d.heapish()) try self.refcount(true, d.tag, d.bits),
             else => {},
         }
     }
 
     fn increfDyn(self: *Gen, d: Dyn) Error!void {
-        if (d.heapish()) _ = self.call(self.incName(), &.{ d.tag, d.bits });
+        if (d.heapish()) try self.refcount(false, d.tag, d.bits);
     }
 
     /// A slot ({i64, i64}) of the stack: its pointer.
@@ -1937,7 +1948,7 @@ const Gen = struct {
         const slot = try self.varSlot(si);
         const old = try self.loadSlot(slot, .any);
         try self.storeSlot(slot, v);
-        _ = self.call(self.decName(), &.{ old.tag, old.bits });
+        try self.refcount(true, old.tag, old.bits);
     }
 
     fn notAVariable(self: *Gen, idx: u32) Error!SVal {
@@ -3098,7 +3109,7 @@ const Gen = struct {
                 try self.increfDyn(vd);
                 try self.storeSlot(p, vd);
                 // (an unset slot's old "value" isn't counted: the tag)
-                _ = self.call(self.decName(), &.{ old.tag, old.bits });
+                try self.refcount(true, old.tag, old.bits);
                 try f.br(join);
                 try f.block(no);
             }
@@ -3958,7 +3969,7 @@ const Gen = struct {
             try self.increfDyn(v);
             try self.storeSlot(result, v);
             // (the record: dropped, the field's taken)
-            _ = self.call(self.decName(), &.{ d.tag, d.bits });
+            try self.refcount(true, d.tag, d.bits);
             try f.br(join);
             try f.block(no);
         }
