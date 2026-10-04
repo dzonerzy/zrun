@@ -19,6 +19,7 @@ const PyObject = ph.PyObject;
 const program_mod = @import("program.zig");
 const grammar_mod = @import("grammar.zig");
 const types = @import("types.zig");
+const value = @import("value.zig");
 
 const NONE = program_mod.NONE;
 const allocator = std.heap.c_allocator;
@@ -548,15 +549,15 @@ pub fn asFrame(obj: *PyObject) *FrameObject {
 }
 
 /// Set a slot (takes a new reference to `value`).
-pub fn setSlot(f: *FrameObject, sym: u32, value: *PyObject) !void {
+pub fn setSlot(f: *FrameObject, sym: u32, obj: *PyObject) !void {
     const slots = f.slots orelse return error.OutOfMemory;
-    py.Py_IncRef(value);
+    py.Py_IncRef(obj);
     const entry = slots.getOrPut(allocator, sym) catch {
-        py.Py_DecRef(value);
+        py.Py_DecRef(obj);
         return error.OutOfMemory;
     };
     if (entry.found_existing) py.Py_DecRef(entry.value_ptr.*);
-    entry.value_ptr.* = value;
+    entry.value_ptr.* = obj;
 }
 
 fn frameClear(obj: ?*PyObject) callconv(.c) c_int {
@@ -637,7 +638,22 @@ pub const FunctionObject = extern struct {
     env: ?*PyObject,
     /// Its name (str), owned
     name: ?*PyObject,
+    /// A compiled program's function given to Python (owned; state and
+    /// env are null): it comes back as itself
+    native: ?*value.Function = null,
 };
+
+/// A compiled function as Python sees it (as the reference mode's).
+pub fn newNativeFunction(f: *value.Function) ?*PyObject {
+    const name = ph.newString(f.name.bytes()) orelse return null;
+    defer py.Py_DecRef(name);
+    const obj = allocObject(FunctionType) orelse return null;
+    const fo: *FunctionObject = @ptrCast(@alignCast(obj));
+    value.increfObj(&f.head);
+    py.Py_IncRef(name);
+    fo.* = .{ .ob_base = fo.ob_base, .state = null, .node = @intCast(f.node), .env = null, .name = name, .native = f };
+    return obj;
+}
 
 pub fn newFunction(state: *PyObject, node: u32, env: ?*PyObject, name: *PyObject) ?*PyObject {
     const obj = allocObject(FunctionType) orelse return null;
@@ -684,6 +700,7 @@ fn functionDealloc(obj: ?*PyObject) callconv(.c) void {
     _ = functionClear(obj);
     const f: *FunctionObject = @ptrCast(@alignCast(obj.?));
     if (f.name) |n| py.Py_DecRef(n);
+    if (f.native) |n| value.decref(value.Value.obj(.function, &n.head));
     freeObject(obj.?);
 }
 

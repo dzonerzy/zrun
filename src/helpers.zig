@@ -516,8 +516,8 @@ fn hostFailed(ctx: *Ctx, node: u32, f: *PyObject) bool {
 }
 
 /// A host object of the program (a host function...) as a value.
-export fn zr_object(ctx: *Ctx, index: u64, out: *Value) callconv(.c) void {
-    const o = ctx.objects[index];
+export fn zr_object(ctx: *Ctx, idx: u64, out: *Value) callconv(.c) void {
+    const o = ctx.objects[idx];
     py.Py_IncRef(o);
     out.* = .{ .tag = @intFromEnum(Tag.host), .bits = @intFromPtr(o) };
 }
@@ -535,6 +535,423 @@ export fn zr_frame_release(f: *value.Frame) callconv(.c) void {
 
 /// The tag of a variable without a value yet
 pub const UNSET: u64 = 0xFFFF_0000;
+
+// ======================================================================
+// Containers and records
+// ======================================================================
+
+fn oomFail(ctx: *Ctx, node: u32) bool {
+    return fail(ctx, node, "out of memory", .{});
+}
+
+/// A new list of n items (taking the references).
+export fn zr_list(ctx: *Ctx, node: u32, items: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
+    const l = value.newList(n) orelse return oomFail(ctx, node);
+    for (items[0..n]) |v| _ = value.listPush(l, v);
+    out.* = Value.obj(.list, &l.head);
+    return true;
+}
+
+/// A new tuple of n items (taking the references).
+export fn zr_tuple(ctx: *Ctx, node: u32, items: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
+    const t = value.newTuple(n) orelse return oomFail(ctx, node);
+    @memcpy(t.slice(), items[0..n]);
+    out.* = Value.obj(.tuple, &t.head);
+    return true;
+}
+
+/// A new dict from n keys and values (borrowing them), in order.
+export fn zr_dict(ctx: *Ctx, node: u32, keys: [*]const Value, vals: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
+    const d = value.newDict() orelse return oomFail(ctx, node);
+    for (0..n) |i| {
+        if (!value.hashable(keys[i])) {
+            value.decref(Value.obj(.dict, &d.head));
+            return fail(ctx, node, "unhashable type: '{s}'", .{value.typeName(keys[i])});
+        }
+        if (!value.dictSet(d, keys[i], vals[i])) return oomFail(ctx, node);
+    }
+    out.* = Value.obj(.dict, &d.head);
+    return true;
+}
+
+/// A new record of a type with its fields (taking the references).
+export fn zr_record(ctx: *Ctx, node: u32, rtype: *const value.RecordType, fields: [*]const Value, out: *Value) callconv(.c) bool {
+    const r = value.newRecord(rtype) orelse return oomFail(ctx, node);
+    @memcpy(r.fields(), fields[0..rtype.fields.len]);
+    out.* = Value.obj(.record, &r.head);
+    return true;
+}
+
+/// Is `v` a record of `rtype`?
+export fn zr_is_record(t: u64, bits: u64, rtype: *const value.RecordType) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    if (v.kind() != .record) return false;
+    const r: *value.Record = @ptrCast(@alignCast(v.ptr()));
+    return r.rtype == rtype;
+}
+
+/// v.name
+export fn zr_getattr(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value.Str, out: *Value) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    if (v.kind() == .record) {
+        const r: *value.Record = @ptrCast(@alignCast(v.ptr()));
+        for (r.rtype.fields, 0..) |f, i| {
+            if (std.mem.eql(u8, f, name.bytes())) {
+                const x = r.fields()[i];
+                value.incref(x);
+                out.* = x;
+                return true;
+            }
+        }
+    }
+    // Anything else (and the errors): Python's getattr
+    var objs: [1]*PyObject = undefined;
+    if (!objects(ctx, &.{v}, &objs)) return failPython(ctx, node);
+    defer py.Py_DecRef(objs[0]);
+    const key = ph.newString(name.bytes()) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(key);
+    return fromResult(ctx, node, py.c.PyObject_GetAttr(objs[0], key), out);
+}
+
+/// v.name = x (records; anything else as Python does it, which for a
+/// copied value changes nothing visible: an error is raised instead)
+export fn zr_setattr(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value.Str, xt: u64, xb: u64) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    const x = Value{ .tag = xt, .bits = xb };
+    if (v.kind() == .record) {
+        const r: *value.Record = @ptrCast(@alignCast(v.ptr()));
+        for (r.rtype.fields, 0..) |f, i| {
+            if (std.mem.eql(u8, f, name.bytes())) {
+                value.incref(x);
+                value.decref(r.fields()[i]);
+                r.fields()[i] = x;
+                return true;
+            }
+        }
+    }
+    if (v.kind() == .host) {
+        const o: *PyObject = @ptrFromInt(v.bits);
+        const val = value.toPython(x, ctx.node_maker) orelse return failPython(ctx, node);
+        defer py.Py_DecRef(val);
+        const key = ph.newString(name.bytes()) orelse return failPython(ctx, node);
+        defer py.Py_DecRef(key);
+        if (py.c.PyObject_SetAttr(o, key, val) != 0) return failPython(ctx, node);
+        return true;
+    }
+    return fail(ctx, node, "'{s}' object has no attribute '{s}'", .{ value.typeName(v), name.bytes() });
+}
+
+/// Normalize an index (negative from the end); null if out of range.
+fn index(i: i64, len: u64) ?usize {
+    const n: i64 = @intCast(len);
+    const k = if (i < 0) i + n else i;
+    if (k < 0 or k >= n) return null;
+    return @intCast(k);
+}
+
+/// v[k]
+export fn zr_getitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, out: *Value) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    const k = Value{ .tag = kt, .bits = kb };
+    switch (v.kind()) {
+        .list, .tuple => if (isInt(k)) {
+            const items = if (v.kind() == .list) @as(*value.List, @ptrCast(@alignCast(v.ptr()))).slice() else @as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).slice();
+            const i = index(k.asInt(), items.len) orelse return fail(ctx, node, "{s} index out of range", .{@tagName(v.kind())});
+            value.incref(items[i]);
+            out.* = items[i];
+            return true;
+        },
+        .dict => {
+            const d: *value.Dict = @ptrCast(@alignCast(v.ptr()));
+            if (value.hashable(k)) {
+                if (value.dictGet(d, k)) |x| {
+                    value.incref(x);
+                    out.* = x;
+                    return true;
+                }
+            }
+        },
+        else => {},
+    }
+    // Strings, slices of everything, the errors: Python's
+    var objs: [2]*PyObject = undefined;
+    if (!objects(ctx, &.{ v, k }, &objs)) return failPython(ctx, node);
+    defer for (objs) |o| py.Py_DecRef(o);
+    return fromResult(ctx, node, py.c.PyObject_GetItem(objs[0], objs[1]), out);
+}
+
+/// v[k] = x
+export fn zr_setitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, xt: u64, xb: u64) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    const k = Value{ .tag = kt, .bits = kb };
+    const x = Value{ .tag = xt, .bits = xb };
+    switch (v.kind()) {
+        .list => if (isInt(k)) {
+            const l: *value.List = @ptrCast(@alignCast(v.ptr()));
+            const i = index(k.asInt(), l.len) orelse return fail(ctx, node, "list assignment index out of range", .{});
+            value.incref(x);
+            value.decref(l.items.?[i]);
+            l.items.?[i] = x;
+            return true;
+        } else return fail(ctx, node, "list indices must be integers or slices, not {s}", .{value.typeName(k)}),
+        .dict => {
+            const d: *value.Dict = @ptrCast(@alignCast(v.ptr()));
+            if (!value.hashable(k)) return fail(ctx, node, "unhashable type: '{s}'", .{value.typeName(k)});
+            if (!value.dictSet(d, k, x)) return oomFail(ctx, node);
+            return true;
+        },
+        else => return fail(ctx, node, "'{s}' object does not support item assignment", .{value.typeName(v)}),
+    }
+}
+
+/// The items of an iterable as a new list (lists, tuples, a dict's keys, a
+/// string's characters, anything Python iterates).
+export fn zr_items(ctx: *Ctx, node: u32, t: u64, bits: u64, out: *Value) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    switch (v.kind()) {
+        .list, .tuple => {
+            const items = if (v.kind() == .list) @as(*value.List, @ptrCast(@alignCast(v.ptr()))).slice() else @as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).slice();
+            const l = value.newList(items.len) orelse return oomFail(ctx, node);
+            for (items) |x| {
+                value.incref(x);
+                _ = value.listPush(l, x);
+            }
+            out.* = Value.obj(.list, &l.head);
+            return true;
+        },
+        .dict => {
+            const d: *value.Dict = @ptrCast(@alignCast(v.ptr()));
+            const l = value.newList(d.len) orelse return oomFail(ctx, node);
+            for (value.dictEntries(d)) |e| {
+                if (value.isDeleted(e)) continue;
+                value.incref(e.key);
+                _ = value.listPush(l, e.key);
+            }
+            out.* = Value.obj(.list, &l.head);
+            return true;
+        },
+        else => {},
+    }
+    var objs: [1]*PyObject = undefined;
+    if (!objects(ctx, &.{v}, &objs)) return failPython(ctx, node);
+    defer py.Py_DecRef(objs[0]);
+    const seq = py.c.PySequence_List(objs[0]);
+    return fromResult(ctx, node, seq, out);
+}
+
+/// Python functions unpacking into n names (`a0, a1 = x`), by n: what
+/// Python does (and raises) for anything not a list or tuple of n items.
+var unpackers: ?*PyObject = null;
+
+fn unpacker(n: u64) ?*PyObject {
+    if (unpackers == null) unpackers = py.c.PyDict_New() orelse return null;
+    const key = py.c.PyLong_FromUnsignedLongLong(n) orelse return null;
+    defer py.Py_DecRef(key);
+    if (py.c.PyDict_GetItemWithError(unpackers.?, key)) |f| return f;
+    if (py.c.PyErr_Occurred() != null) return null;
+    var src: std.ArrayListUnmanaged(u8) = .empty;
+    defer src.deinit(allocator);
+    src.appendSlice(allocator, "def unpack(x):\n    ") catch return null;
+    for (0..n) |i| src.print(allocator, "a{d}, ", .{i}) catch return null;
+    src.appendSlice(allocator, "= x\n    return (") catch return null;
+    for (0..n) |i| src.print(allocator, "a{d}, ", .{i}) catch return null;
+    src.appendSlice(allocator, ")\n") catch return null;
+    const code = ph.newString(src.items) orelse return null;
+    defer py.Py_DecRef(code);
+    const ns = py.c.PyDict_New() orelse return null;
+    defer py.Py_DecRef(ns);
+    const builtins = py.c.PyEval_GetBuiltins() orelse return null;
+    const exec = py.c.PyDict_GetItemString(builtins, "exec") orelse return null;
+    const r = py.c.PyObject_CallFunctionObjArgs(exec, code, ns, @as(?*PyObject, null)) orelse return null;
+    py.Py_DecRef(r);
+    const f = py.c.PyDict_GetItemString(ns, "unpack") orelse return null;
+    if (py.c.PyDict_SetItem(unpackers.?, key, f) != 0) return null;
+    return f;
+}
+
+/// `a0, ..., an-1 = v`: the n items in out (new references).
+export fn zr_unpack(ctx: *Ctx, node: u32, t: u64, bits: u64, n: u64, out: [*]Value) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    switch (v.kind()) {
+        .list, .tuple => {
+            const items = if (v.kind() == .list) @as(*value.List, @ptrCast(@alignCast(v.ptr()))).slice() else @as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).slice();
+            if (items.len == n) {
+                for (items, 0..) |x, i| {
+                    value.incref(x);
+                    out[i] = x;
+                }
+                return true;
+            }
+        },
+        else => {},
+    }
+    const f = unpacker(n) orelse return failPython(ctx, node);
+    var objs: [1]*PyObject = undefined;
+    if (!objects(ctx, &.{v}, &objs)) return failPython(ctx, node);
+    defer py.Py_DecRef(objs[0]);
+    const r = py.c.PyObject_CallFunctionObjArgs(f, objs[0], @as(?*PyObject, null)) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(r);
+    for (0..n) |i| {
+        const x = py.c.PyTuple_GetItem(r, @intCast(i)) orelse return failPython(ctx, node);
+        out[i] = value.fromPython(x) orelse {
+            for (out[0..i]) |y| value.decref(y);
+            return failPython(ctx, node);
+        };
+    }
+    return true;
+}
+
+/// The length of a list (its items' count), for loops over it.
+export fn zr_list_len(t: u64, bits: u64) callconv(.c) u64 {
+    const v = Value{ .tag = t, .bits = bits };
+    return @as(*value.List, @ptrCast(@alignCast(v.ptr()))).len;
+}
+
+/// A list's i-th item (a new reference), for loops over it.
+export fn zr_list_at(t: u64, bits: u64, i: u64, out: *Value) callconv(.c) void {
+    const v = Value{ .tag = t, .bits = bits };
+    const x = @as(*value.List, @ptrCast(@alignCast(v.ptr()))).items.?[i];
+    value.incref(x);
+    out.* = x;
+}
+
+/// list.append(x) (borrowing x)
+export fn zr_append(ctx: *Ctx, node: u32, t: u64, bits: u64, xt: u64, xb: u64) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    const x = Value{ .tag = xt, .bits = xb };
+    if (v.kind() != .list) return fail(ctx, node, "'{s}' object has no attribute 'append'", .{value.typeName(v)});
+    value.incref(x);
+    if (!value.listPush(@ptrCast(@alignCast(v.ptr())), x)) return oomFail(ctx, node);
+    return true;
+}
+
+/// A method of a value called with arguments, as Python does it (for
+/// methods that don't change the value: str's, a dict's get...).
+export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value.Str, args: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    // A dict's get(): natively (Python would see a copy)
+    if (v.kind() == .dict and std.mem.eql(u8, name.bytes(), "get") and (n == 1 or n == 2)) {
+        const d: *value.Dict = @ptrCast(@alignCast(v.ptr()));
+        if (value.hashable(args[0])) {
+            const x = value.dictGet(d, args[0]) orelse (if (n == 2) args[1] else Value.none_v);
+            value.incref(x);
+            out.* = x;
+            return true;
+        }
+    }
+    var objs: [1]*PyObject = undefined;
+    if (!objects(ctx, &.{v}, &objs)) return failPython(ctx, node);
+    defer py.Py_DecRef(objs[0]);
+    const key = ph.newString(name.bytes()) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(key);
+    const method = py.c.PyObject_GetAttr(objs[0], key) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(method);
+    const tuple = py.c.PyTuple_New(@intCast(n)) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(tuple);
+    for (args[0..n], 0..) |a, i| {
+        const o = value.toPython(a, ctx.node_maker) orelse return failPython(ctx, node);
+        _ = py.c.PyTuple_SetItem(tuple, @intCast(i), o);
+    }
+    return fromResult(ctx, node, py.c.PyObject_CallObject(method, tuple), out);
+}
+
+/// A builtin called with arguments, as Python does it (int(), float(),
+/// len(), zip()... of run-time values): a host object of the program.
+export fn zr_call_python(ctx: *Ctx, node: u32, callee_index: u64, args: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
+    const callee = ctx.objects[callee_index];
+    const tuple = py.c.PyTuple_New(@intCast(n)) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(tuple);
+    for (args[0..n], 0..) |a, i| {
+        const o = value.toPython(a, ctx.node_maker) orelse return failPython(ctx, node);
+        _ = py.c.PyTuple_SetItem(tuple, @intCast(i), o);
+    }
+    return fromResult(ctx, node, py.c.PyObject_CallObject(callee, tuple), out);
+}
+
+/// isinstance(v, <a builtin type>): by tag (int, float, str, bool, list,
+/// tuple, dict); `code` says which.
+export fn zr_is_type(t: u64, bits: u64, code: u32) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    return switch (code) {
+        0 => v.kind() == .int or v.kind() == .bool, // int (bool is an int)
+        1 => v.kind() == .float,
+        2 => v.kind() == .str,
+        3 => v.kind() == .bool,
+        4 => v.kind() == .list,
+        5 => v.kind() == .tuple,
+        6 => v.kind() == .dict,
+        7 => v.kind() == .none,
+        else => false,
+    };
+}
+
+/// A value formatted for an f-string ({v!conversion:spec}), as Python does.
+export fn zr_format(ctx: *Ctx, node: u32, t: u64, bits: u64, conversion: u32, spec: *const value.Str, out: *Value) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    var objs: [1]*PyObject = undefined;
+    if (!objects(ctx, &.{v}, &objs)) return failPython(ctx, node);
+    var o = objs[0];
+    defer py.Py_DecRef(o);
+    if (conversion != 0) {
+        const conv = switch (conversion) {
+            'r' => py.c.PyObject_Repr(o),
+            'a' => py.c.PyObject_ASCII(o),
+            else => py.c.PyObject_Str(o),
+        } orelse return failPython(ctx, node);
+        py.Py_DecRef(o);
+        o = conv;
+    }
+    const s = ph.newString(spec.bytes()) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(s);
+    return fromResult(ctx, node, py.c.PyObject_Format(o, s), out);
+}
+
+/// Strings joined (an f-string's pieces): n strs, borrowed.
+export fn zr_concat(ctx: *Ctx, node: u32, items: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
+    var total: usize = 0;
+    for (items[0..n]) |v| total += @as(*value.Str, @ptrCast(v.ptr())).len;
+    const buf = allocator.alloc(u8, total) catch return oomFail(ctx, node);
+    defer allocator.free(buf);
+    var at: usize = 0;
+    for (items[0..n]) |v| {
+        const b = @as(*value.Str, @ptrCast(v.ptr())).bytes();
+        @memcpy(buf[at..][0..b.len], b);
+        at += b.len;
+    }
+    const s = value.newStr(buf) orelse return oomFail(ctx, node);
+    out.* = Value.obj(.str, &s.head);
+    return true;
+}
+
+/// The other helpers, by name
+pub fn moreSymbols() [16]struct { []const u8, usize } {
+    return .{
+        .{ "zr_list", @intFromPtr(&zr_list) },
+        .{ "zr_tuple", @intFromPtr(&zr_tuple) },
+        .{ "zr_dict", @intFromPtr(&zr_dict) },
+        .{ "zr_record", @intFromPtr(&zr_record) },
+        .{ "zr_is_record", @intFromPtr(&zr_is_record) },
+        .{ "zr_getattr", @intFromPtr(&zr_getattr) },
+        .{ "zr_setattr", @intFromPtr(&zr_setattr) },
+        .{ "zr_getitem", @intFromPtr(&zr_getitem) },
+        .{ "zr_setitem", @intFromPtr(&zr_setitem) },
+        .{ "zr_items", @intFromPtr(&zr_items) },
+        .{ "zr_list_len", @intFromPtr(&zr_list_len) },
+        .{ "zr_list_at", @intFromPtr(&zr_list_at) },
+        .{ "zr_append", @intFromPtr(&zr_append) },
+        .{ "zr_call_method", @intFromPtr(&zr_call_method) },
+        .{ "zr_call_python", @intFromPtr(&zr_call_python) },
+        .{ "zr_is_type", @intFromPtr(&zr_is_type) },
+    };
+}
+
+pub fn formatSymbols() [3]struct { []const u8, usize } {
+    return .{
+        .{ "zr_format", @intFromPtr(&zr_format) },
+        .{ "zr_concat", @intFromPtr(&zr_concat) },
+        .{ "zr_unpack", @intFromPtr(&zr_unpack) },
+    };
+}
 
 /// The names compiled code calls them by, and their addresses
 pub fn symbols() [14]struct { []const u8, usize } {

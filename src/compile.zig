@@ -24,6 +24,7 @@ const ir = @import("ir.zig");
 const program_mod = @import("program.zig");
 const grammar_mod = @import("grammar.zig");
 const helpers = @import("helpers.zig");
+const value = @import("value.zig");
 
 const Allocator = std.mem.Allocator;
 const NONE = program_mod.NONE;
@@ -78,6 +79,30 @@ pub const SList = struct {
     items: std.ArrayListUnmanaged(SVal) = .empty,
 };
 
+/// A dict known at compile time: keys known (scalars), values maybe not
+pub const SDict = struct {
+    keys: std.ArrayListUnmanaged(SVal) = .empty,
+    values: std.ArrayListUnmanaged(SVal) = .empty,
+
+    fn find(self: *const SDict, key: SVal) ?usize {
+        for (self.keys.items, 0..) |k, i| if (sameKey(k, key)) return i;
+        return null;
+    }
+};
+
+/// Equal keys known when compiling (Python's equality for scalars).
+fn sameKey(a: SVal, b: SVal) bool {
+    return switch (a) {
+        .str => |s| b == .str and std.mem.eql(u8, s, b.str),
+        .int => |n| (b == .int and b.int == n) or (b == .bool and @as(i64, @intFromBool(b.bool)) == n) or (b == .float and b.float == @as(f64, @floatFromInt(n))),
+        .bool => |x| (b == .bool and b.bool == x) or (b == .int and b.int == @intFromBool(x)),
+        .float => |x| (b == .float and b.float == x) or (b == .int and @as(f64, @floatFromInt(b.int)) == x),
+        .none => b == .none,
+        .node => |n| b == .node and b.node == n,
+        else => false,
+    };
+}
+
 pub const SVal = union(enum) {
     none,
     bool: bool,
@@ -87,6 +112,7 @@ pub const SVal = union(enum) {
     node: u32,
     list: *SList,
     tuple: []const SVal,
+    dict: *SDict,
     rt,
     rt_method: RtMethod,
     /// A Python object known at compile time (a module-level name)
@@ -133,6 +159,10 @@ pub const Compiler = struct {
     /// Helper functions (module-level Python functions semantics call),
     /// read once
     helpers_read: std.AutoHashMapUnmanaged(*PyObject, *front.Function) = .empty,
+    /// Record types, by the dataclass they come from (allocated outside
+    /// the arena: the compiled program keeps them)
+    record_types: std.AutoHashMapUnmanaged(*PyObject, *value.RecordType) = .empty,
+    record_list: std.ArrayListUnmanaged(*value.RecordType) = .empty,
 
     pub fn init(a: Allocator, data: *program_mod.Data, lang: LangView, prefix: []const u8, failure: *Failure) Compiler {
         return .{ .a = a, .data = data, .lang = lang, .m = ir.Module.init(a, prefix), .failure = failure };
@@ -183,6 +213,25 @@ pub const Compiler = struct {
             .{ "zr_object", "void @zr_object(ptr, i64, ptr)" },
             .{ "zr_frame_new", "ptr @zr_frame_new(ptr, i64)" },
             .{ "zr_frame_release", "void @zr_frame_release(ptr)" },
+            .{ "zr_list", "i1 @zr_list(ptr, i32, ptr, i64, ptr)" },
+            .{ "zr_tuple", "i1 @zr_tuple(ptr, i32, ptr, i64, ptr)" },
+            .{ "zr_dict", "i1 @zr_dict(ptr, i32, ptr, ptr, i64, ptr)" },
+            .{ "zr_record", "i1 @zr_record(ptr, i32, ptr, ptr, ptr)" },
+            .{ "zr_is_record", "i1 @zr_is_record(i64, i64, ptr)" },
+            .{ "zr_getattr", "i1 @zr_getattr(ptr, i32, i64, i64, ptr, ptr)" },
+            .{ "zr_setattr", "i1 @zr_setattr(ptr, i32, i64, i64, ptr, i64, i64)" },
+            .{ "zr_getitem", "i1 @zr_getitem(ptr, i32, i64, i64, i64, i64, ptr)" },
+            .{ "zr_setitem", "i1 @zr_setitem(ptr, i32, i64, i64, i64, i64, i64, i64)" },
+            .{ "zr_items", "i1 @zr_items(ptr, i32, i64, i64, ptr)" },
+            .{ "zr_list_len", "i64 @zr_list_len(i64, i64)" },
+            .{ "zr_list_at", "void @zr_list_at(i64, i64, i64, ptr)" },
+            .{ "zr_append", "i1 @zr_append(ptr, i32, i64, i64, i64, i64)" },
+            .{ "zr_call_method", "i1 @zr_call_method(ptr, i32, i64, i64, ptr, ptr, i64, ptr)" },
+            .{ "zr_call_python", "i1 @zr_call_python(ptr, i32, i64, ptr, i64, ptr)" },
+            .{ "zr_is_type", "i1 @zr_is_type(i64, i64, i32)" },
+            .{ "zr_format", "i1 @zr_format(ptr, i32, i64, i64, i32, ptr, ptr)" },
+            .{ "zr_concat", "i1 @zr_concat(ptr, i32, ptr, i64, ptr)" },
+            .{ "zr_unpack", "i1 @zr_unpack(ptr, i32, i64, i64, i64, ptr)" },
         };
         for (decls) |d| try self.m.declare(d[0], d[1]);
         try self.m.declare("llvm.sadd.with.overflow.i64", "{ i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)");
@@ -249,6 +298,32 @@ pub const Compiler = struct {
         return self.fnName(fnode);
     }
 
+    /// The record type of a dataclass (made once).
+    fn recordType(self: *Compiler, cls: *PyObject) Error!*value.RecordType {
+        if (self.record_types.get(cls)) |t| return t;
+        const dataclasses = py.c.PyImport_ImportModule("dataclasses") orelse return error.Python;
+        defer py.Py_DecRef(dataclasses);
+        const fields = py.c.PyObject_CallMethod(dataclasses, "fields", "(O)", cls) orelse return error.Python;
+        defer py.Py_DecRef(fields);
+        const n: usize = @intCast(py.c.PyTuple_Size(fields));
+        const gpa = std.heap.c_allocator;
+        const names = try gpa.alloc([]const u8, n);
+        for (names, 0..) |*slot, i| {
+            const f = py.c.PyTuple_GetItem(fields, @intCast(i)).?;
+            const name = ph.attr(f, "name") orelse return error.Python;
+            defer py.Py_DecRef(name);
+            slot.* = try gpa.dupe(u8, ph.utf8(name, "field") orelse return error.Python);
+        }
+        const qual = ph.attr(cls, "__name__") orelse return error.Python;
+        defer py.Py_DecRef(qual);
+        const t = try gpa.create(value.RecordType);
+        t.* = .{ .name = try gpa.dupe(u8, ph.utf8(qual, "name") orelse return error.Python), .fields = names, .py_class = cls };
+        _ = try self.objectIndex(cls);
+        try self.record_types.put(self.a, cls, t);
+        try self.record_list.append(self.a, t);
+        return t;
+    }
+
     /// A Python object the code refers to: its index (a new reference kept).
     fn objectIndex(self: *Compiler, o: *PyObject) !usize {
         for (self.objects.items, 0..) |x, i| if (x == o) return i;
@@ -313,6 +388,9 @@ const Inst = struct {
     loops: std.ArrayListUnmanaged(struct { brk: []const u8, cont: []const u8 }) = .empty,
     /// It returned (outside run-time control flow): the rest is dead
     done: bool = false,
+    /// Slots of values it holds for a while (a run-time loop's items):
+    /// None but while held, released with its locals
+    temps: std.ArrayListUnmanaged([]const u8) = .empty,
 };
 
 const Local = union(enum) {
@@ -451,8 +529,50 @@ const Gen = struct {
                 try f.emit("call void @zr_object(ptr %ctx, i64 {d}, ptr {s})", .{ idx, self.out });
                 break :blk try self.loadOut(.any);
             },
+            .list => |l| self.buildSequence("zr_list", l.items.items, at, .list),
+            .tuple => |t| self.buildSequence("zr_tuple", t, at, .tuple),
+            .dict => |d| self.buildDict(d, at),
             else => self.c.unsupported("a {s} can't be kept in a variable or passed as a value (node {d})", .{ @tagName(v), at }),
         };
+    }
+
+    /// A stack array of values (each materialized: owned references).
+    fn valueArray(self: *Gen, items: []const SVal, at: u32) Error![]const u8 {
+        const f = &self.f;
+        const arr = try f.alloca(try std.fmt.allocPrint(self.a(), "[{d} x {{ i64, i64 }}]", .{@max(items.len, 1)}));
+        for (items, 0..) |item, i| {
+            const d = try self.materialize(item, at);
+            const p = try f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i64 {d}", .{ arr, i });
+            try self.storeSlot(p, d);
+        }
+        return arr;
+    }
+
+    /// A run-time list or tuple of known items (they're taken).
+    fn buildSequence(self: *Gen, helper: []const u8, items: []const SVal, at: u32, shape: Shape) Error!Dyn {
+        const arr = try self.valueArray(items, at);
+        const ok = try self.f.value("call i1 @{s}(ptr %ctx, i32 {d}, ptr {s}, i64 {d}, ptr {s})", .{ helper, at, arr, items.len, self.out });
+        try self.check(ok);
+        return self.loadOut(shape);
+    }
+
+    fn buildDict(self: *Gen, d: *SDict, at: u32) Error!Dyn {
+        const keys = try self.valueArray(d.keys.items, at);
+        const vals = try self.valueArray(d.values.items, at);
+        const ok = try self.f.value("call i1 @zr_dict(ptr %ctx, i32 {d}, ptr {s}, ptr {s}, i64 {d}, ptr {s})", .{ at, keys, vals, d.keys.items.len, self.out });
+        // (zr_dict borrowed them)
+        try self.dropArray(keys, d.keys.items.len);
+        try self.dropArray(vals, d.values.items.len);
+        try self.check(ok);
+        return self.loadOut(.dict);
+    }
+
+    fn dropArray(self: *Gen, arr: []const u8, n: usize) Error!void {
+        for (0..n) |i| {
+            const p = try self.f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i64 {d}", .{ arr, i });
+            const v = try self.loadSlot(p, .any);
+            try self.f.emit("call void @zr_decref(i64 {s}, i64 {s})", .{ v.tag, v.bits });
+        }
     }
 
     /// The helpers' result slot, read (an owned reference).
@@ -507,6 +627,7 @@ const Gen = struct {
             .str => |s| return .{ .known = s.len != 0 },
             .list => |l| return .{ .known = l.items.items.len != 0 },
             .tuple => |t| return .{ .known = t.len != 0 },
+            .dict => |d| return .{ .known = d.keys.items.len != 0 },
             .node, .rt, .rt_method, .method, .control => return .{ .known = true },
             .py => |o| {
                 const r = py.c.PyObject_IsTrue(o);
@@ -591,7 +712,7 @@ const Gen = struct {
     }
 
     /// rt.store(name, value), taking the value.
-    fn storeVar(self: *Gen, name_node: u32, value: SVal) Error!void {
+    fn storeVar(self: *Gen, name_node: u32, value_: SVal) Error!void {
         const c = self.c;
         const d = c.data;
         const si = d.symbolIndex(name_node) orelse {
@@ -602,7 +723,7 @@ const Gen = struct {
             try self.failAt(name_node, try std.fmt.allocPrint(self.a(), "can't assign to the builtin '{s}'", .{d.syms[si].name}));
             return;
         }
-        const v = try self.materialize(value, name_node);
+        const v = try self.materialize(value_, name_node);
         const slot = try self.varSlot(si);
         const old = try self.loadSlot(slot, .any);
         try self.storeSlot(slot, v);
@@ -933,13 +1054,33 @@ const Gen = struct {
     /// Drop the semantic's locals that hold run-time values.
     fn releaseLocals(self: *Gen, inst: *Inst) Error!void {
         for (inst.locals) |l| switch (l) {
-            .slot => |s| {
-                const v = try self.loadSlot(s.ptr, s.shape);
-                try self.drop(.{ .dyn = v });
-            },
+            // (None again: the semantic may run again, along another path)
+            .slot => |s| try self.dropTemp(s.ptr),
             .static => |sv| try self.drop(sv),
             .unset => {},
         };
+        for (inst.temps.items) |slot| try self.dropTemp(slot);
+    }
+
+    /// A slot holding None from the function's start (whichever path
+    /// reaches a release of it, it holds a value).
+    fn noneSlot(self: *Gen) Error![]const u8 {
+        const slot = try self.f.alloca("{ i64, i64 }");
+        try self.f.entry.print(self.a(), "  store {{ i64, i64 }} {{ i64 0, i64 0 }}, ptr {s}, align 8\n", .{slot});
+        return slot;
+    }
+
+    /// A temporary slot of a semantic (None until used).
+    fn tempSlot(self: *Gen, inst: *Inst) Error![]const u8 {
+        const slot = try self.noneSlot();
+        try inst.temps.append(self.a(), slot);
+        return slot;
+    }
+
+    /// Give up a temporary slot's value (None again).
+    fn dropTemp(self: *Gen, slot: []const u8) Error!void {
+        try self.drop(.{ .dyn = try self.loadSlot(slot, .any) });
+        try self.storeSlot(slot, .{ .tag = "0", .bits = "0", .shape = .none });
     }
 
     /// Release the locals of the semantics above `depth` (leaving them by a
@@ -975,12 +1116,7 @@ const Gen = struct {
                     try self.assign(inst, t, v, s.pos);
                 }
             },
-            .aug => |a_| {
-                const cur = try self.targetValue(inst, a_.target, s.pos);
-                const rhs = try self.expr(inst, a_.value);
-                const r = try self.binary(inst, a_.op, cur, rhs);
-                try self.assign(inst, a_.target, r, s.pos);
-            },
+            .aug => |a_| try self.augAssign(inst, a_.target, a_.op, a_.value, s.pos),
             .if_ => |i| {
                 const t = try self.truth(try self.expr(inst, i.test_), inst.node);
                 switch (t) {
@@ -1079,13 +1215,12 @@ const Gen = struct {
         switch (inst.locals[slot]) {
             .slot => return,
             .unset => {
-                const p = try self.f.alloca("{ i64, i64 }");
-                try self.storeSlot(p, .{ .tag = "0", .bits = "0", .shape = .none });
+                const p = try self.noneSlot();
                 inst.locals[slot] = .{ .slot = .{ .ptr = p, .shape = .any } };
             },
             .static => |v| {
                 const d = try self.materialize(v, inst.node);
-                const p = try self.f.alloca("{ i64, i64 }");
+                const p = try self.noneSlot();
                 try self.storeSlot(p, d);
                 inst.locals[slot] = .{ .slot = .{ .ptr = p, .shape = .any } };
             },
@@ -1119,23 +1254,104 @@ const Gen = struct {
                 },
             },
             .tuple => |ts| {
-                const items: []const SVal = switch (v) {
+                const known: ?[]const SVal = switch (v) {
                     .tuple => |x| x,
                     .list => |l| l.items.items,
-                    else => return self.c.unsupportedAt(inst.func, pos, "unpacking a value only known at run time can't be compiled yet", .{}),
+                    else => null,
                 };
-                if (items.len != ts.len) return self.c.unsupportedAt(inst.func, pos, "unpacking {d} values into {d} names", .{ items.len, ts.len });
-                for (ts, items) |x, item| try self.assign(inst, x, item, pos);
+                if (known) |items| if (items.len == ts.len) {
+                    // (a known container keeps its items)
+                    for (ts, items) |x, item| try self.assign(inst, x, try self.copyOf(item), pos);
+                    return;
+                };
+                // At run time (and the errors, as Python words them)
+                const d = try self.materialize(v, inst.node);
+                const arr = try self.f.alloca(try std.fmt.allocPrint(self.a(), "[{d} x {{ i64, i64 }}]", .{@max(ts.len, 1)}));
+                const ok = try self.f.value("call i1 @zr_unpack(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, i64 {d}, ptr {s})", .{ inst.node, d.tag, d.bits, ts.len, arr });
+                try self.drop(.{ .dyn = d });
+                try self.check(ok);
+                for (ts, 0..) |x, i| {
+                    const p = try self.f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i64 {d}", .{ arr, i });
+                    try self.assign(inst, x, .{ .dyn = try self.loadSlot(p, .any) }, pos);
+                }
             },
-            .attr, .index => return self.c.unsupportedAt(inst.func, pos, "assigning to an attribute or an item isn't compiled yet", .{}),
+            .attr => |x| try self.setAttr(inst, try self.expr(inst, x.obj), x.name, v, pos),
+            .index => |x| {
+                const obj = try self.expr(inst, x.obj);
+                const key = try self.expr(inst, x.index);
+                try self.setItem(inst, obj, key, v, pos);
+            },
         }
     }
 
-    /// The current value of an assignment target (for `x += 1`).
-    fn targetValue(self: *Gen, inst: *Inst, t: front.Target, pos: front.Pos) Error!SVal {
+    /// obj.name = v (both taken)
+    fn setAttr(self: *Gen, inst: *Inst, obj: SVal, name: []const u8, v: SVal, pos: front.Pos) Error!void {
+        if (obj != .dyn) {
+            try self.drop(v);
+            return self.c.unsupportedAt(inst.func, pos, "assigning to an attribute of a {s} isn't compiled", .{@tagName(obj)});
+        }
+        const vd = try self.materialize(v, inst.node);
+        const s = try self.c.m.string(name);
+        const ok = try self.f.value("call i1 @zr_setattr(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, ptr {s}, i64 {s}, i64 {s})", .{ inst.node, obj.dyn.tag, obj.dyn.bits, s, vd.tag, vd.bits });
+        try self.drop(.{ .dyn = vd });
+        try self.drop(obj);
+        try self.check(ok);
+    }
+
+    /// obj[key] = v (all taken): a known container changed now (outside
+    /// run-time control flow), else zr_setitem.
+    fn setItem(self: *Gen, inst: *Inst, obj: SVal, key: SVal, v: SVal, pos: front.Pos) Error!void {
+        switch (obj) {
+            .list, .dict => {
+                if (inst.dyn_depth > 0 or !key.isStatic() or !isScalar(key))
+                    return self.c.unsupportedAt(inst.func, pos, "changing a list or dict known when compiling inside run-time control flow (or at a run-time key) isn't compiled yet", .{});
+                if (obj == .dict) return self.sdictSet(obj.dict, key, v);
+                const items = obj.list.items.items;
+                if (key == .int) {
+                    const n: i64 = @intCast(items.len);
+                    const i = if (key.int < 0) key.int + n else key.int;
+                    if (i >= 0 and i < n) {
+                        try self.drop(items[@intCast(i)]);
+                        items[@intCast(i)] = v;
+                        return;
+                    }
+                }
+                // (the error, at run time as Python raises it)
+            },
+            else => {},
+        }
+        const od = try self.materialize(obj, inst.node);
+        const kd = try self.materialize(key, inst.node);
+        const vd = try self.materialize(v, inst.node);
+        const ok = try self.f.value("call i1 @zr_setitem(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, i64 {s}, i64 {s}, i64 {s}, i64 {s})", .{ inst.node, od.tag, od.bits, kd.tag, kd.bits, vd.tag, vd.bits });
+        try self.drop(.{ .dyn = vd });
+        try self.drop(.{ .dyn = kd });
+        try self.drop(.{ .dyn = od });
+        try self.check(ok);
+    }
+
+    /// target op= value: the target's object (and key) evaluated once.
+    fn augAssign(self: *Gen, inst: *Inst, t: front.Target, op: front.BinOp, value_e: *const front.Expr, pos: front.Pos) Error!void {
         switch (t) {
-            .local => |slot| return self.readLocal(inst, slot, pos),
-            else => return self.c.unsupportedAt(inst.func, pos, "augmented assignment to an attribute or an item isn't compiled yet", .{}),
+            .local => |slot| {
+                const cur = try self.readLocal(inst, slot, pos);
+                const rhs = try self.expr(inst, value_e);
+                try self.assign(inst, t, try self.binary(inst, op, cur, rhs), pos);
+            },
+            .attr => |x| {
+                const obj = try self.expr(inst, x.obj);
+                const cur = try self.attr(inst, try self.copyOf(obj), x.name, pos);
+                const rhs = try self.expr(inst, value_e);
+                try self.setAttr(inst, obj, x.name, try self.binary(inst, op, cur, rhs), pos);
+            },
+            .index => |x| {
+                const obj = try self.expr(inst, x.obj);
+                const key = try self.expr(inst, x.index);
+                const cur = try self.getItem(inst, try self.copyOf(obj), try self.copyOf(key));
+                const rhs = try self.expr(inst, value_e);
+                try self.setItem(inst, obj, key, try self.binary(inst, op, cur, rhs), pos);
+            },
+            .tuple => return self.c.unsupportedAt(inst.func, pos, "augmented assignment to a tuple", .{}),
         }
     }
 
@@ -1199,7 +1415,7 @@ const Gen = struct {
         const items: []const SVal = switch (it) {
             .list => |l| l.items.items,
             .tuple => |t| t,
-            else => return self.c.unsupportedAt(inst.func, pos, "a for loop over a value only known at run time isn't compiled yet", .{}),
+            else => return self.runtimeFor(inst, target, it, body, else_, pos),
         };
         // Known items: unrolled (break / continue jump within it)
         const exit = try self.f.label("endfor");
@@ -1219,6 +1435,54 @@ const Gen = struct {
         }
         if (!broke) try self.stmts(inst, else_);
         try self.f.block(exit);
+    }
+
+    /// A for loop over the items of a run-time value (a list of them made
+    /// first, as Python iterates a copy... of a list that may change: the
+    /// items when the loop starts).
+    fn runtimeFor(self: *Gen, inst: *Inst, target: front.Target, it: SVal, body: []const front.Stmt, else_: []const front.Stmt, pos: front.Pos) Error!void {
+        const f = &self.f;
+        var set = std.AutoHashMapUnmanaged(u32, void).empty;
+        collectTarget(target, &set, self.a()) catch return error.OutOfMemory;
+        var sit = set.keyIterator();
+        while (sit.next()) |slot| try self.toSlot(inst, slot.*);
+        try self.prepareDynamic(inst, &.{ body, else_ });
+        const items = try self.itemsOf(inst, it);
+        const list_slot = try self.tempSlot(inst);
+        try self.storeSlot(list_slot, items);
+        const n = try f.value("call i64 @zr_list_len(i64 {s}, i64 {s})", .{ items.tag, items.bits });
+        const i_slot = try f.alloca("i64");
+        try f.emit("store i64 0, ptr {s}", .{i_slot});
+        const head = try f.label("for");
+        const step = try f.label("for_next");
+        const loop_body = try f.label("for_body");
+        const els = try f.label("for_else");
+        const exit = try f.label("endfor");
+        try f.br(head);
+        try f.block(head);
+        const i = try f.value("load i64, ptr {s}", .{i_slot});
+        const more = try f.value("icmp slt i64 {s}, {s}", .{ i, n });
+        try f.condBr(more, loop_body, els);
+        try f.block(loop_body);
+        inst.dyn_depth += 1;
+        const l = try self.loadSlot(list_slot, .list);
+        try f.emit("call void @zr_list_at(i64 {s}, i64 {s}, i64 {s}, ptr {s})", .{ l.tag, l.bits, i, self.out });
+        try self.assign(inst, target, .{ .dyn = try self.loadOut(.any) }, pos);
+        try inst.loops.append(self.a(), .{ .brk = exit, .cont = step });
+        try self.stmts(inst, body);
+        _ = inst.loops.pop();
+        try f.br(step);
+        try f.block(step);
+        const i_now = try f.value("load i64, ptr {s}", .{i_slot});
+        const next = try f.value("add i64 {s}, 1", .{i_now});
+        try f.emit("store i64 {s}, ptr {s}", .{ next, i_slot });
+        try f.br(head);
+        try f.block(els);
+        try self.stmts(inst, else_);
+        inst.dyn_depth -= 1;
+        try f.br(exit);
+        try f.block(exit);
+        try self.dropTemp(list_slot);
     }
 
     // ------------------------------------------------------------------
@@ -1282,8 +1546,207 @@ const Gen = struct {
                 return .{ .list = l };
             },
             .list_comp => |comp| return self.listComp(inst, comp, e.pos),
-            else => return c.unsupportedAt(inst.func, e.pos, "this expression ({s}) isn't compiled yet", .{@tagName(e.kind)}),
+            .dict => |x| {
+                const d = try self.a().create(SDict);
+                d.* = .{};
+                var dynamic = false;
+                const keys = try self.a().alloc(SVal, x.keys.len);
+                const vals = try self.a().alloc(SVal, x.keys.len);
+                for (x.keys, x.values, 0..) |ke, ve, i| {
+                    keys[i] = try self.expr(inst, ke);
+                    vals[i] = try self.expr(inst, ve);
+                    if (!keys[i].isStatic() or !isScalar(keys[i])) dynamic = true;
+                }
+                if (!dynamic) {
+                    for (keys, vals) |k, v| try self.sdictSet(d, k, v);
+                    return .{ .dict = d };
+                }
+                // Keys only known at run time: a run-time dict
+                const ka = try self.valueArray(keys, inst.node);
+                const va = try self.valueArray(vals, inst.node);
+                const ok = try self.f.value("call i1 @zr_dict(ptr %ctx, i32 {d}, ptr {s}, ptr {s}, i64 {d}, ptr {s})", .{ inst.node, ka, va, keys.len, self.out });
+                try self.dropArray(ka, keys.len);
+                try self.dropArray(va, vals.len);
+                try self.check(ok);
+                return .{ .dyn = try self.loadOut(.dict) };
+            },
+            .dict_comp => |comp| return self.dictComp(inst, comp.key, comp.value, comp.generators, e.pos),
+            .index => |x| {
+                const obj = try self.expr(inst, x.obj);
+                const key = try self.expr(inst, x.index);
+                return self.getItem(inst, obj, key);
+            },
+            .slice => |x| {
+                const obj = try self.expr(inst, x.obj);
+                const lo = if (x.lo) |v| try self.expr(inst, v) else SVal.none;
+                const hi = if (x.hi) |v| try self.expr(inst, v) else SVal.none;
+                const step = if (x.step) |v| try self.expr(inst, v) else SVal.none;
+                // Known: Python's slice now (strings, known lists of scalars)
+                if (isScalar(obj) and isScalar(lo) and isScalar(hi) and isScalar(step)) {
+                    const o = try self.pyOf(obj);
+                    defer py.Py_DecRef(o);
+                    const sl = try self.sliceObject(lo, hi, step);
+                    defer py.Py_DecRef(sl);
+                    if (py.c.PyObject_GetItem(o, sl)) |r| {
+                        defer py.Py_DecRef(r);
+                        return self.constant(r, inst.node);
+                    }
+                    py.c.PyErr_Clear();
+                }
+                if (obj == .list and lo.isStatic() and hi.isStatic() and step.isStatic() and isScalar(lo) and isScalar(hi) and isScalar(step)) {
+                    // A known list: the slice of its items
+                    const n: isize = @intCast(obj.list.items.items.len);
+                    const sl = try self.sliceObject(lo, hi, step);
+                    defer py.Py_DecRef(sl);
+                    var start: py.Py_ssize_t = 0;
+                    var stop: py.Py_ssize_t = 0;
+                    var stride: py.Py_ssize_t = 0;
+                    if (py.c.PySlice_Unpack(sl, &start, &stop, &stride) == 0) {
+                        const count = py.c.PySlice_AdjustIndices(n, &start, &stop, stride);
+                        const out = try self.a().create(SList);
+                        out.* = .{};
+                        var i: isize = start;
+                        for (0..@intCast(count)) |_| {
+                            try out.items.append(self.a(), try self.copyOf(obj.list.items.items[@intCast(i)]));
+                            i += stride;
+                        }
+                        return .{ .list = out };
+                    }
+                    py.c.PyErr_Clear();
+                }
+                // At run time: Python's slice of the value
+                const sl = try self.sliceObject(lo, hi, step);
+                defer py.Py_DecRef(sl);
+                _ = try c.objectIndex(sl);
+                return self.getItem(inst, obj, .{ .py = sl });
+            },
+            .fstring => |parts| return self.fstring(inst, parts, e.pos),
         }
+    }
+
+    fn sdictSet(self: *Gen, d: *SDict, k: SVal, v: SVal) Error!void {
+        if (d.find(k)) |i| {
+            try self.drop(d.values.items[i]);
+            d.values.items[i] = v;
+            return;
+        }
+        try d.keys.append(self.a(), k);
+        try d.values.append(self.a(), v);
+    }
+
+    /// slice(lo, hi, step) of known bounds (a new reference).
+    fn sliceObject(self: *Gen, lo: SVal, hi: SVal, step: SVal) Error!*PyObject {
+        const a_ = try self.pyOf(lo);
+        defer py.Py_DecRef(a_);
+        const b = try self.pyOf(hi);
+        defer py.Py_DecRef(b);
+        const s = try self.pyOf(step);
+        defer py.Py_DecRef(s);
+        return py.c.PySlice_New(a_, b, s) orelse error.Python;
+    }
+
+    /// obj[key]: known for known containers and keys; zr_getitem else.
+    fn getItem(self: *Gen, inst: *Inst, obj: SVal, key: SVal) Error!SVal {
+        if (key.isStatic() and isScalar(key)) {
+            switch (obj) {
+                .list => |l| if (key == .int) {
+                    const n: i64 = @intCast(l.items.items.len);
+                    const i = if (key.int < 0) key.int + n else key.int;
+                    if (i >= 0 and i < n) return self.copyOf(l.items.items[@intCast(i)]);
+                },
+                .tuple => |t| if (key == .int) {
+                    const n: i64 = @intCast(t.len);
+                    const i = if (key.int < 0) key.int + n else key.int;
+                    if (i >= 0 and i < n) return self.copyOf(t[@intCast(i)]);
+                },
+                .dict => |d| if (d.find(key)) |i| return self.copyOf(d.values.items[i]),
+                .str => {
+                    const o = try self.pyOf(obj);
+                    defer py.Py_DecRef(o);
+                    const k = try self.pyOf(key);
+                    defer py.Py_DecRef(k);
+                    if (py.c.PyObject_GetItem(o, k)) |r| {
+                        defer py.Py_DecRef(r);
+                        return self.constant(r, inst.node);
+                    }
+                    py.c.PyErr_Clear();
+                },
+                else => {},
+            }
+        }
+        const od = try self.materialize(obj, inst.node);
+        const kd = try self.materialize(key, inst.node);
+        const ok = try self.f.value("call i1 @zr_getitem(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, i64 {s}, i64 {s}, ptr {s})", .{ inst.node, od.tag, od.bits, kd.tag, kd.bits, self.out });
+        try self.drop(.{ .dyn = od });
+        try self.drop(.{ .dyn = kd });
+        try self.check(ok);
+        return .{ .dyn = try self.loadOut(.any) };
+    }
+
+    /// An f-string: known pieces joined now; else each piece formatted at
+    /// run time (Python's format()) and joined.
+    fn fstring(self: *Gen, inst: *Inst, parts: []const front.FPart, pos: front.Pos) Error!SVal {
+        const f = &self.f;
+        const pieces = try self.a().alloc(SVal, parts.len);
+        var all_known = true;
+        for (parts, 0..) |p, i| switch (p) {
+            .text => |t| pieces[i] = .{ .str = t },
+            .value => |v| {
+                const x = try self.expr(inst, v.expr);
+                const spec = try self.fstring(inst, v.spec, pos);
+                if (x.isStatic() and isScalar(x) and spec == .str) {
+                    const o = try self.pyOf(x);
+                    defer py.Py_DecRef(o);
+                    var conv = o;
+                    py.Py_IncRef(conv);
+                    defer py.Py_DecRef(conv);
+                    if (v.conversion != 0) {
+                        py.Py_DecRef(conv);
+                        conv = switch (v.conversion) {
+                            'r' => py.c.PyObject_Repr(o),
+                            'a' => py.c.PyObject_ASCII(o),
+                            else => py.c.PyObject_Str(o),
+                        } orelse return error.Python;
+                    }
+                    const s = ph.newString(spec.str) orelse return error.Python;
+                    defer py.Py_DecRef(s);
+                    const r = py.c.PyObject_Format(conv, s) orelse return error.Python;
+                    defer py.Py_DecRef(r);
+                    pieces[i] = try self.constant(r, inst.node);
+                } else {
+                    all_known = false;
+                    const d = try self.materialize(x, inst.node);
+                    const spec_s = try self.c.m.string(if (spec == .str) spec.str else return self.c.unsupportedAt(inst.func, pos, "a format spec only known at run time isn't compiled yet", .{}));
+                    const ok = try f.value("call i1 @zr_format(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, i32 {d}, ptr {s}, ptr {s})", .{ inst.node, d.tag, d.bits, v.conversion, spec_s, self.out });
+                    try self.drop(.{ .dyn = d });
+                    try self.check(ok);
+                    pieces[i] = .{ .dyn = try self.loadOut(.str) };
+                }
+            },
+        };
+        if (all_known) {
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            for (pieces) |p| try buf.appendSlice(self.a(), p.str);
+            return .{ .str = buf.items };
+        }
+        const arr = try self.valueArray(pieces, inst.node);
+        const ok = try f.value("call i1 @zr_concat(ptr %ctx, i32 {d}, ptr {s}, i64 {d}, ptr {s})", .{ inst.node, arr, pieces.len, self.out });
+        try self.dropArray(arr, pieces.len);
+        try self.check(ok);
+        return .{ .dyn = try self.loadOut(.str) };
+    }
+
+    fn dictComp(self: *Gen, inst: *Inst, key_e: *const front.Expr, val_e: *const front.Expr, gens: []const front.Generator, pos: front.Pos) Error!SVal {
+        // A run-time dict filled by the comprehension's loops (known
+        // iterables unroll; run-time ones loop)
+        const empty = try self.a().create(SDict);
+        empty.* = .{};
+        const d = try self.buildDict(empty, inst.node);
+        const slot = try self.f.alloca("{ i64, i64 }");
+        try self.storeSlot(slot, d);
+        var sink = Sink{ .kind = .dict_into, .list = undefined, .slot = slot, .key = key_e, .value = val_e };
+        try self.compLoops(inst, gens, 0, pos, &sink);
+        return .{ .dyn = try self.loadSlot(slot, .dict) };
     }
 
     /// A module-level name of the semantic: its value when compiling.
@@ -1394,9 +1857,95 @@ const Gen = struct {
                 py.Py_DecRef(v);
                 return sv;
             },
-            .str, .list, .dyn => return .{ .method = .{ .recv = try self.boxed(obj), .name = name } },
-            else => return c.unsupportedAt(inst.func, pos, "'{s}' of a {s} isn't compiled yet", .{ name, @tagName(obj) }),
+            .dyn => |d| {
+                // A field of a record (or an attribute of a Python object)
+                const s = try c.m.string(name);
+                const ok = try self.f.value("call i1 @zr_getattr(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, ptr {s}, ptr {s})", .{ inst.node, d.tag, d.bits, s, self.out });
+                try self.drop(obj);
+                try self.check(ok);
+                return .{ .dyn = try self.loadOut(.any) };
+            },
+            else => return c.unsupportedAt(inst.func, pos, "'{s}' of a {s} isn't compiled yet (only called, as a method)", .{ name, @tagName(obj) }),
         }
+    }
+
+    /// `obj.name(args)` on a value (not rt, a node or a module).
+    fn methodCall(self: *Gen, inst: *Inst, obj: SVal, name: []const u8, args: []const SVal, pos: front.Pos) Error!SVal {
+        const c = self.c;
+        const eq = std.mem.eql;
+        // A known list or dict changed while nothing runs at run time: now
+        if (inst.dyn_depth == 0) {
+            switch (obj) {
+                .list => |l| if (eq(u8, name, "append") and args.len == 1) {
+                    try l.items.append(self.a(), args[0]);
+                    return .none;
+                },
+                .dict => |d| if (eq(u8, name, "get") and args.len >= 1 and args.len <= 2 and args[0].isStatic()) {
+                    if (d.find(args[0])) |i| return self.copyOf(d.values.items[i]);
+                    return if (args.len == 2) args[1] else SVal.none;
+                },
+                else => {},
+            }
+        }
+        // Known str methods on known arguments: Python's result now
+        if (obj == .str and allScalar(args)) {
+            const o = try self.pyOf(obj);
+            defer py.Py_DecRef(o);
+            const key = ph.newString(name) orelse return error.Python;
+            defer py.Py_DecRef(key);
+            const method = py.c.PyObject_GetAttr(o, key) orelse {
+                py.c.PyErr_Clear();
+                return c.unsupportedAt(inst.func, pos, "str has no method '{s}'", .{name});
+            };
+            defer py.Py_DecRef(method);
+            const tuple = py.c.PyTuple_New(@intCast(args.len)) orelse return error.Python;
+            defer py.Py_DecRef(tuple);
+            for (args, 0..) |x, i| _ = py.c.PyTuple_SetItem(tuple, @intCast(i), try self.pyOf(x));
+            if (py.c.PyObject_CallObject(method, tuple)) |r| {
+                defer py.Py_DecRef(r);
+                return self.constant(r, inst.node);
+            }
+            py.c.PyErr_Clear();
+        }
+        // (a known container changed at run time would be a copy changed)
+        if ((obj == .list or obj == .dict) and (eq(u8, name, "append") or isMutating(name)))
+            return c.unsupportedAt(inst.func, pos, "changing a list or dict known when compiling inside run-time control flow isn't compiled yet (keep it in a variable of the semantic)", .{});
+        // At run time: append natively; the rest as Python does it
+        const d = try self.materialize(obj, inst.node);
+        if (eq(u8, name, "append") and args.len == 1) {
+            const x = try self.materialize(args[0], inst.node);
+            const ok = try self.f.value("call i1 @zr_append(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, i64 {s}, i64 {s})", .{ inst.node, d.tag, d.bits, x.tag, x.bits });
+            try self.drop(.{ .dyn = x });
+            try self.drop(.{ .dyn = d });
+            try self.check(ok);
+            return .none;
+        }
+        if (isMutating(name)) return c.unsupportedAt(inst.func, pos, "the method {s}() isn't compiled yet", .{name});
+        const arr = try self.valueArray(args, inst.node);
+        const s = try c.m.string(name);
+        const ok = try self.f.value("call i1 @zr_call_method(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, ptr {s}, ptr {s}, i64 {d}, ptr {s})", .{ inst.node, d.tag, d.bits, s, arr, args.len, self.out });
+        try self.dropArray(arr, args.len);
+        try self.drop(.{ .dyn = d });
+        try self.check(ok);
+        return .{ .dyn = try self.loadOut(.any) };
+    }
+
+    fn isMutating(name: []const u8) bool {
+        const mutating = [_][]const u8{ "extend", "insert", "pop", "remove", "clear", "update", "setdefault", "sort", "reverse", "popitem" };
+        for (mutating) |m| if (std.mem.eql(u8, name, m)) return true;
+        return false;
+    }
+
+    fn allScalar(items: []const SVal) bool {
+        for (items) |x| if (!isScalar(x)) return false;
+        return true;
+    }
+
+    /// A copy of a value read out of a known container (a reference of its
+    /// own for a run-time one).
+    fn copyOf(self: *Gen, v: SVal) Error!SVal {
+        if (v == .dyn) try self.increfDyn(v.dyn);
+        return v;
     }
 
     fn boxed(self: *Gen, v: SVal) Error!*const SVal {
@@ -1411,7 +1960,21 @@ const Gen = struct {
 
     fn call(self: *Gen, inst: *Inst, func_e: *const front.Expr, args_e: []const *const front.Expr, kws: []const front.Keyword, pos: front.Pos) Error!SVal {
         const c = self.c;
-        const callee = try self.expr(inst, func_e);
+        // obj.name(...): a method of a value, or an attribute of rt, a node,
+        // a module
+        var callee: SVal = undefined;
+        if (func_e.kind == .attr) {
+            const obj = try self.expr(inst, func_e.kind.attr.obj);
+            switch (obj) {
+                .rt, .node, .py => callee = try self.attr(inst, obj, func_e.kind.attr.name, func_e.pos),
+                else => {
+                    if (kws.len != 0) return c.unsupportedAt(inst.func, pos, "keyword arguments to a method aren't compiled yet", .{});
+                    const margs = try self.a().alloc(SVal, args_e.len);
+                    for (margs, args_e) |*slot, ae| slot.* = try self.expr(inst, ae);
+                    return self.methodCall(inst, obj, func_e.kind.attr.name, margs, pos);
+                },
+            }
+        } else callee = try self.expr(inst, func_e);
         // (arguments in order, as Python evaluates them)
         const args = try self.a().alloc(SVal, args_e.len);
         for (args, args_e) |*slot, ae| slot.* = try self.expr(inst, ae);
@@ -1588,7 +2151,283 @@ const Gen = struct {
             const func = try self.helperFunction(o);
             return self.runFunction(func, inst.node, args);
         }
-        return c.unsupportedAt(inst.func, pos, "calling this (a builtin or a class) isn't compiled yet", .{});
+        // A dataclass: a record
+        if (py.c.PyObject_HasAttrString(o, "__dataclass_fields__") == 1 and py.c.PyObject_IsInstance(o, @ptrCast(@alignCast(py.types.typeObject("PyType_Type")))) == 1) {
+            const rtype = try c.recordType(o);
+            if (args.len != rtype.fields.len) return c.unsupportedAt(inst.func, pos, "{s}() takes {d} fields, given {d} (keywords and defaults aren't compiled yet)", .{ rtype.name, rtype.fields.len, args.len });
+            const arr = try self.valueArray(args, inst.node);
+            const ok = try self.f.value("call i1 @zr_record(ptr %ctx, i32 {d}, ptr {s}, ptr {s}, ptr {s})", .{ inst.node, try self.ptrConst(rtype), arr, self.out });
+            try self.check(ok);
+            return .{ .dyn = try self.loadOut(.record) };
+        }
+        if (try self.builtinCall(inst, o, args, pos)) |v| return v;
+        // Anything else: called as Python does (its arguments as Python
+        // objects)
+        return self.callPython(inst, o, args);
+    }
+
+    /// A pointer known when compiling, as an IR constant.
+    fn ptrConst(self: *Gen, p: anytype) Error![]const u8 {
+        return std.fmt.allocPrint(self.a(), "inttoptr (i64 {d} to ptr)", .{@intFromPtr(p)});
+    }
+
+    /// Call a Python object at run time with the arguments.
+    fn callPython(self: *Gen, inst: *Inst, o: *PyObject, args: []const SVal) Error!SVal {
+        const idx = try self.c.objectIndex(o);
+        const arr = try self.valueArray(args, inst.node);
+        const ok = try self.f.value("call i1 @zr_call_python(ptr %ctx, i32 {d}, i64 {d}, ptr {s}, i64 {d}, ptr {s})", .{ inst.node, idx, arr, args.len, self.out });
+        try self.dropArray(arr, args.len);
+        try self.check(ok);
+        return .{ .dyn = try self.loadOut(.any) };
+    }
+
+    fn isBuiltin(o: *PyObject, name: [*:0]const u8) bool {
+        const builtins = py.c.PyImport_ImportModule("builtins") orelse {
+            py.c.PyErr_Clear();
+            return false;
+        };
+        defer py.Py_DecRef(builtins);
+        const b = py.c.PyObject_GetAttrString(builtins, name) orelse {
+            py.c.PyErr_Clear();
+            return false;
+        };
+        defer py.Py_DecRef(b);
+        return b == o;
+    }
+
+    /// The builtins compiled code knows; null for another callable.
+    fn builtinCall(self: *Gen, inst: *Inst, o: *PyObject, args: []const SVal, pos: front.Pos) Error!?SVal {
+        const c = self.c;
+        // Known arguments: Python's result now (int("12"), len("ab"), ...)
+        if (allScalar(args) and !isBuiltin(o, "print") and !isBuiltin(o, "input")) {
+            const pure = [_][*:0]const u8{ "int", "float", "str", "bool", "len", "abs", "min", "max", "round", "repr", "ord", "chr", "hex", "oct", "bin", "divmod", "pow", "hash" };
+            for (pure) |name| if (isBuiltin(o, name)) {
+                const tuple = py.c.PyTuple_New(@intCast(args.len)) orelse return error.Python;
+                defer py.Py_DecRef(tuple);
+                for (args, 0..) |x, i| _ = py.c.PyTuple_SetItem(tuple, @intCast(i), try self.pyOf(x));
+                if (py.c.PyObject_CallObject(o, tuple)) |r| {
+                    defer py.Py_DecRef(r);
+                    return try self.constant(r, inst.node);
+                }
+                py.c.PyErr_Clear();
+                // (it fails when run: at run time, as Python)
+                break;
+            };
+        }
+        if (isBuiltin(o, "isinstance")) {
+            if (args.len != 2) return c.unsupportedAt(inst.func, pos, "isinstance() takes 2 arguments", .{});
+            return try self.isInstance(inst, args[0], args[1], pos);
+        }
+        if (isBuiltin(o, "len")) {
+            if (args.len == 1) switch (args[0]) {
+                .list => |l| return SVal{ .int = @intCast(l.items.items.len) },
+                .tuple => |t| return SVal{ .int = @intCast(t.len) },
+                .dict => |d| return SVal{ .int = @intCast(d.keys.items.len) },
+                else => {},
+            };
+            return try self.callPython(inst, o, args);
+        }
+        if (isBuiltin(o, "zip") or isBuiltin(o, "enumerate")) {
+            // Known sequences: the pairs now
+            const is_zip = isBuiltin(o, "zip");
+            var seqs: [8][]const SVal = undefined;
+            var known = args.len <= seqs.len;
+            if (known) for (args, 0..) |x, i| {
+                seqs[i] = switch (x) {
+                    .list => |l| l.items.items,
+                    .tuple => |t| t,
+                    else => blk: {
+                        known = false;
+                        break :blk &.{};
+                    },
+                };
+            };
+            if (known and (is_zip or args.len == 1)) {
+                const out = try self.a().create(SList);
+                out.* = .{};
+                var n: usize = std.math.maxInt(usize);
+                for (seqs[0..args.len]) |s| n = @min(n, s.len);
+                if (args.len == 0) n = 0;
+                for (0..n) |i| {
+                    const items = try self.a().alloc(SVal, if (is_zip) args.len else 2);
+                    if (is_zip) {
+                        for (seqs[0..args.len], 0..) |s, k| items[k] = try self.copyOf(s[i]);
+                    } else {
+                        items[0] = .{ .int = @intCast(i) };
+                        items[1] = try self.copyOf(seqs[0][i]);
+                    }
+                    try out.items.append(self.a(), .{ .tuple = items });
+                }
+                return SVal{ .list = out };
+            }
+            // At run time: the items of each, paired here as a loop would
+            return try self.zipRuntime(inst, is_zip, args, pos);
+        }
+        if (isBuiltin(o, "range")) {
+            if (allScalar(args) and args.len >= 1 and args.len <= 3) {
+                var lo: i64 = 0;
+                var hi: i64 = 0;
+                var step: i64 = 1;
+                for (args) |x| if (x != .int) return null;
+                if (args.len == 1) hi = args[0].int else {
+                    lo = args[0].int;
+                    hi = args[1].int;
+                    if (args.len == 3) step = args[2].int;
+                }
+                if (step == 0) return null;
+                const count: i64 = if (step > 0) @max(0, @divFloor(hi - lo + step - 1, step)) else @max(0, @divFloor(lo - hi - step - 1, -step));
+                if (count <= 4096) {
+                    const out = try self.a().create(SList);
+                    out.* = .{};
+                    var i: i64 = 0;
+                    while (i < count) : (i += 1) try out.items.append(self.a(), .{ .int = lo + i * step });
+                    return SVal{ .list = out };
+                }
+            }
+            return try self.callPython(inst, o, args);
+        }
+        return null;
+    }
+
+    /// isinstance(v, T): known for known values; a tag check at run time.
+    fn isInstance(self: *Gen, inst: *Inst, v: SVal, t: SVal, pos: front.Pos) Error!SVal {
+        const c = self.c;
+        const types_: []const SVal = switch (t) {
+            .tuple => |x| x,
+            else => &.{t},
+        };
+        var result: SVal = .{ .bool = false };
+        for (types_, 0..) |ty, i| {
+            const o = switch (ty) {
+                .py => |x| x,
+                else => return c.unsupportedAt(inst.func, pos, "isinstance()'s type must be known when compiling", .{}),
+            };
+            if (i + 1 < types_.len and v == .dyn) try self.increfDyn(v.dyn);
+            const one = try self.isOne(inst, v, o, pos);
+            result = if (i == 0) one else try self.orValues(inst, result, one);
+        }
+        return result;
+    }
+
+    fn isOne(self: *Gen, inst: *Inst, v: SVal, o: *PyObject, pos: front.Pos) Error!SVal {
+        const c = self.c;
+        // A dataclass: a record of its type
+        if (py.c.PyObject_HasAttrString(o, "__dataclass_fields__") == 1) {
+            if (v.isStatic()) return .{ .bool = false };
+            const rtype = try c.recordType(o);
+            const r = try self.f.value("call i1 @zr_is_record(i64 {s}, i64 {s}, ptr {s})", .{ v.dyn.tag, v.dyn.bits, try self.ptrConst(rtype) });
+            try self.drop(v);
+            return dyn("1", try self.f.value("zext i1 {s} to i64", .{r}), .bool);
+        }
+        const codes = [_]struct { [*:0]const u8, u32 }{ .{ "int", 0 }, .{ "float", 1 }, .{ "str", 2 }, .{ "bool", 3 }, .{ "list", 4 }, .{ "tuple", 5 }, .{ "dict", 6 } };
+        for (codes) |entry| if (isBuiltin(o, entry[0])) {
+            if (v.isStatic()) return .{ .bool = switch (entry[1]) {
+                0 => v == .int or v == .bool,
+                1 => v == .float,
+                2 => v == .str,
+                3 => v == .bool,
+                4 => v == .list,
+                5 => v == .tuple,
+                6 => v == .dict,
+                else => false,
+            } };
+            const r = try self.f.value("call i1 @zr_is_type(i64 {s}, i64 {s}, i32 {d})", .{ v.dyn.tag, v.dyn.bits, entry[1] });
+            try self.drop(v);
+            return dyn("1", try self.f.value("zext i1 {s} to i64", .{r}), .bool);
+        };
+        return c.unsupportedAt(inst.func, pos, "isinstance() with this type isn't compiled yet", .{});
+    }
+
+    fn orValues(self: *Gen, inst: *Inst, a_: SVal, b: SVal) Error!SVal {
+        if (a_ == .bool and !a_.bool) return b;
+        if (a_ == .bool and a_.bool) {
+            try self.drop(b);
+            return a_;
+        }
+        const x = try self.truth(a_, inst.node);
+        const y = try self.truth(b, inst.node);
+        const xa = switch (x) {
+            .known => |k| if (k) "true" else "false",
+            .dyn => |d| d,
+        };
+        const yb = switch (y) {
+            .known => |k| if (k) "true" else "false",
+            .dyn => |d| d,
+        };
+        const r = try self.f.value("or i1 {s}, {s}", .{ xa, yb });
+        return dyn("1", try self.f.value("zext i1 {s} to i64", .{r}), .bool);
+    }
+
+    /// zip() / enumerate() of run-time values: a list of tuples built by a
+    /// loop at run time.
+    fn zipRuntime(self: *Gen, inst: *Inst, is_zip: bool, args: []const SVal, pos: front.Pos) Error!SVal {
+        const c = self.c;
+        const f = &self.f;
+        if (!is_zip and args.len != 1) return c.unsupportedAt(inst.func, pos, "enumerate() with a start isn't compiled yet", .{});
+        // Each argument's items as a list
+        const lists = try self.a().alloc(Dyn, args.len);
+        for (args, 0..) |x, i| lists[i] = try self.itemsOf(inst, x);
+        // n = min of the lengths
+        var n: []const u8 = "-1";
+        for (lists, 0..) |l, i| {
+            const len = try f.value("call i64 @zr_list_len(i64 {s}, i64 {s})", .{ l.tag, l.bits });
+            if (i == 0) n = len else {
+                const less = try f.value("icmp slt i64 {s}, {s}", .{ len, n });
+                n = try f.value("select i1 {s}, i64 {s}, i64 {s}", .{ less, len, n });
+            }
+        }
+        if (lists.len == 0) n = "0";
+        // An empty list, then a tuple appended per index
+        const empty = try self.buildSequence("zr_list", &.{}, inst.node, .list);
+        const result = try f.alloca("{ i64, i64 }");
+        try self.storeSlot(result, empty);
+        const i_slot = try f.alloca("i64");
+        try f.emit("store i64 0, ptr {s}", .{i_slot});
+        const head = try f.label("zip");
+        const body = try f.label("zip_body");
+        const done = try f.label("zip_done");
+        try f.br(head);
+        try f.block(head);
+        const i = try f.value("load i64, ptr {s}", .{i_slot});
+        const more = try f.value("icmp slt i64 {s}, {s}", .{ i, n });
+        try f.condBr(more, body, done);
+        try f.block(body);
+        const width = if (is_zip) lists.len else 2;
+        const arr = try f.alloca(try std.fmt.allocPrint(self.a(), "[{d} x {{ i64, i64 }}]", .{@max(width, 1)}));
+        if (is_zip) {
+            for (lists, 0..) |l, k| {
+                const p = try f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i64 {d}", .{ arr, k });
+                try f.emit("call void @zr_list_at(i64 {s}, i64 {s}, i64 {s}, ptr {s})", .{ l.tag, l.bits, i, p });
+            }
+        } else {
+            const p0 = try f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i64 0", .{arr});
+            try self.storeSlot(p0, .{ .tag = "2", .bits = i, .shape = .int });
+            const p1 = try f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i64 1", .{arr});
+            try f.emit("call void @zr_list_at(i64 {s}, i64 {s}, i64 {s}, ptr {s})", .{ lists[0].tag, lists[0].bits, i, p1 });
+        }
+        const ok = try f.value("call i1 @zr_tuple(ptr %ctx, i32 {d}, ptr {s}, i64 {d}, ptr {s})", .{ inst.node, arr, width, self.out });
+        try self.check(ok);
+        const tup = try self.loadOut(.tuple);
+        const acc = try self.loadSlot(result, .list);
+        const ok2 = try f.value("call i1 @zr_append(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, i64 {s}, i64 {s})", .{ inst.node, acc.tag, acc.bits, tup.tag, tup.bits });
+        try self.drop(.{ .dyn = tup });
+        try self.check(ok2);
+        const next = try f.value("add i64 {s}, 1", .{i});
+        try f.emit("store i64 {s}, ptr {s}", .{ next, i_slot });
+        try f.br(head);
+        try f.block(done);
+        for (lists) |l| try self.drop(.{ .dyn = l });
+        return .{ .dyn = try self.loadSlot(result, .list) };
+    }
+
+    /// The items of a value as a run-time list (an owned reference).
+    fn itemsOf(self: *Gen, inst: *Inst, v: SVal) Error!Dyn {
+        const d = try self.materialize(v, inst.node);
+        if (d.shape == .list) return d;
+        const ok = try self.f.value("call i1 @zr_items(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, ptr {s})", .{ inst.node, d.tag, d.bits, self.out });
+        try self.drop(.{ .dyn = d });
+        try self.check(ok);
+        return self.loadOut(.list);
     }
 
     fn helperFunction(self: *Gen, o: *PyObject) Error!*const front.Function {
@@ -1892,39 +2731,129 @@ const Gen = struct {
     }
 
     fn listComp(self: *Gen, inst: *Inst, comp: front.Comp, pos: front.Pos) Error!SVal {
-        // Known iterables: the list built now (its items may be run-time)
+        // Known iterables: the list built now (its items may be run-time);
+        // a run-time one: a run-time list filled by a loop
         const out = try self.a().create(SList);
         out.* = .{};
-        try self.compLevel(inst, comp, 0, out, pos);
-        return .{ .list = out };
+        var sink = Sink{ .list = out, .elt = comp.elt };
+        try self.compLoops(inst, comp.generators, 0, pos, &sink);
+        if (sink.kind == .static_list) return .{ .list = out };
+        return .{ .dyn = try self.loadSlot(sink.slot, .list) };
     }
 
-    fn compLevel(self: *Gen, inst: *Inst, comp: front.Comp, level: usize, out: *SList, pos: front.Pos) Error!void {
-        if (level == comp.generators.len) {
-            try out.items.append(self.a(), try self.expr(inst, comp.elt));
-            return;
-        }
-        const g = comp.generators[level];
+    /// Where a comprehension's elements go
+    const Sink = struct {
+        kind: enum { static_list, list_into, dict_into } = .static_list,
+        list: *SList,
+        /// The run-time list or dict (a stack slot)
+        slot: []const u8 = "",
+        elt: ?*const front.Expr = null,
+        key: ?*const front.Expr = null,
+        value: ?*const front.Expr = null,
+    };
+
+    /// From here the elements go to a run-time list (the known ones first).
+    fn sinkToRuntime(self: *Gen, inst: *Inst, sink: *Sink) Error!void {
+        if (sink.kind != .static_list) return;
+        const items = sink.list.items.items;
+        const d = try self.buildSequence("zr_list", items, inst.node, .list);
+        const slot = try self.f.alloca("{ i64, i64 }");
+        try self.storeSlot(slot, d);
+        sink.kind = .list_into;
+        sink.slot = slot;
+    }
+
+    fn compLoops(self: *Gen, inst: *Inst, gens: []const front.Generator, level: usize, pos: front.Pos, sink: *Sink) Error!void {
+        if (level == gens.len) return self.compEmit(inst, sink);
+        const g = gens[level];
         const it = try self.expr(inst, g.iter);
-        const items: []const SVal = switch (it) {
+        const known: ?[]const SVal = switch (it) {
             .list => |l| l.items.items,
             .tuple => |t| t,
-            else => return self.c.unsupportedAt(inst.func, pos, "a comprehension over a value only known at run time isn't compiled yet", .{}),
+            else => null,
         };
-        for (items) |item| {
-            if (item == .dyn) try self.increfDyn(item.dyn);
-            try self.assign(inst, g.target, item, pos);
-            var keep = true;
-            for (g.ifs) |cond_e| {
-                switch (try self.truth(try self.expr(inst, cond_e), inst.node)) {
-                    .known => |b| if (!b) {
-                        keep = false;
-                        break;
-                    },
-                    .dyn => return self.c.unsupportedAt(inst.func, pos, "a comprehension filtering on a run-time value isn't compiled yet", .{}),
-                }
+        if (known) |items| {
+            for (items) |item| {
+                if (item == .dyn) try self.increfDyn(item.dyn);
+                try self.assign(inst, g.target, item, pos);
+                try self.compFiltered(inst, gens, level, g.ifs, pos, sink);
             }
-            if (keep) try self.compLevel(inst, comp, level + 1, out, pos);
+            return;
+        }
+        // At run time: a loop over the items (its variables in slots, set
+        // before it so none is left unset when it doesn't run)
+        try self.sinkToRuntime(inst, sink);
+        var assigned = std.AutoHashMapUnmanaged(u32, void).empty;
+        for (gens[level..]) |g2| collectTarget(g2.target, &assigned, self.a()) catch return error.OutOfMemory;
+        var ait = assigned.keyIterator();
+        while (ait.next()) |slot| try self.toSlot(inst, slot.*);
+        const f = &self.f;
+        const items = try self.itemsOf(inst, it);
+        const n = try f.value("call i64 @zr_list_len(i64 {s}, i64 {s})", .{ items.tag, items.bits });
+        const i_slot = try f.alloca("i64");
+        try f.emit("store i64 0, ptr {s}", .{i_slot});
+        const head = try f.label("comp");
+        const body = try f.label("comp_body");
+        const done = try f.label("comp_done");
+        try f.br(head);
+        try f.block(head);
+        const i = try f.value("load i64, ptr {s}", .{i_slot});
+        const more = try f.value("icmp slt i64 {s}, {s}", .{ i, n });
+        try f.condBr(more, body, done);
+        try f.block(body);
+        inst.dyn_depth += 1;
+        try f.emit("call void @zr_list_at(i64 {s}, i64 {s}, i64 {s}, ptr {s})", .{ items.tag, items.bits, i, self.out });
+        const item = try self.loadOut(.any);
+        try self.assign(inst, g.target, .{ .dyn = item }, pos);
+        try self.compFiltered(inst, gens, level, g.ifs, pos, sink);
+        inst.dyn_depth -= 1;
+        const next = try f.value("add i64 {s}, 1", .{i});
+        try f.emit("store i64 {s}, ptr {s}", .{ next, i_slot });
+        try f.br(head);
+        try f.block(done);
+        try self.drop(.{ .dyn = items });
+    }
+
+    /// The comprehension's filters, then its next level.
+    fn compFiltered(self: *Gen, inst: *Inst, gens: []const front.Generator, level: usize, ifs: []const *const front.Expr, pos: front.Pos, sink: *Sink) Error!void {
+        if (ifs.len == 0) return self.compLoops(inst, gens, level + 1, pos, sink);
+        switch (try self.truth(try self.expr(inst, ifs[0]), inst.node)) {
+            .known => |b| if (b) try self.compFiltered(inst, gens, level, ifs[1..], pos, sink),
+            .dyn => |cond| {
+                try self.sinkToRuntime(inst, sink);
+                const yes = try self.f.label("comp_keep");
+                const skip = try self.f.label("comp_skip");
+                try self.f.condBr(cond, yes, skip);
+                inst.dyn_depth += 1;
+                try self.f.block(yes);
+                try self.compFiltered(inst, gens, level, ifs[1..], pos, sink);
+                inst.dyn_depth -= 1;
+                try self.f.br(skip);
+                try self.f.block(skip);
+            },
+        }
+    }
+
+    fn compEmit(self: *Gen, inst: *Inst, sink: *Sink) Error!void {
+        const f = &self.f;
+        switch (sink.kind) {
+            .static_list => try sink.list.items.append(self.a(), try self.expr(inst, sink.elt.?)),
+            .list_into => {
+                const x = try self.materialize(try self.expr(inst, sink.elt.?), inst.node);
+                const l = try self.loadSlot(sink.slot, .list);
+                const ok = try f.value("call i1 @zr_append(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, i64 {s}, i64 {s})", .{ inst.node, l.tag, l.bits, x.tag, x.bits });
+                try self.drop(.{ .dyn = x });
+                try self.check(ok);
+            },
+            .dict_into => {
+                const k = try self.materialize(try self.expr(inst, sink.key.?), inst.node);
+                const v = try self.materialize(try self.expr(inst, sink.value.?), inst.node);
+                const d = try self.loadSlot(sink.slot, .dict);
+                const ok = try f.value("call i1 @zr_setitem(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, i64 {s}, i64 {s}, i64 {s}, i64 {s})", .{ inst.node, d.tag, d.bits, k.tag, k.bits, v.tag, v.bits });
+                try self.drop(.{ .dyn = k });
+                try self.drop(.{ .dyn = v });
+                try self.check(ok);
+            },
         }
     }
 };

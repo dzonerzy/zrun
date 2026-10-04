@@ -26,9 +26,18 @@ pub const Compiled = struct {
     globals: usize,
     /// The IR, for debugging (Program.compiled_ir())
     ir_text: []u8,
+    /// The record types its values use
+    record_types: []*value.RecordType,
 
     pub fn destroy(self: *Compiled) void {
         self.module.release();
+        for (self.record_types) |t| {
+            for (t.fields) |f| allocator.free(f);
+            allocator.free(t.fields);
+            allocator.free(t.name);
+            allocator.destroy(t);
+        }
+        allocator.free(self.record_types);
         for (self.objects) |o| py.Py_DecRef(o);
         allocator.free(self.objects);
         allocator.free(self.ir_text);
@@ -42,7 +51,7 @@ var next_id: u64 = 0;
 /// Give zgram's JIT the runtime helpers (once per process).
 fn defineHelpers(view: *const llvm.LlvmView) bool {
     if (helpers_defined) return true;
-    const syms = helpers.symbols();
+    const syms = helpers.symbols() ++ helpers.moreSymbols() ++ helpers.formatSymbols();
     var names: [syms.len][*:0]const u8 = undefined;
     var addrs: [syms.len]u64 = undefined;
     var name_bufs: [syms.len][64:0]u8 = undefined;
@@ -105,7 +114,8 @@ pub fn compileProgram(data: *program_mod.Data, lang: compile_mod.LangView, compi
     const out = allocator.create(Compiled) catch return oom();
     const objs = allocator.dupe(*PyObject, c.objects.items) catch return oom();
     const globals = if (c.layouts.get(program_mod.NONE)) |l| l.syms.items.len else 0;
-    out.* = .{ .module = module, .main = @ptrFromInt(addr), .objects = objs, .globals = globals, .ir_text = ir_text };
+    const records = allocator.dupe(*value.RecordType, c.record_list.items) catch return oom();
+    out.* = .{ .module = module, .main = @ptrFromInt(addr), .objects = objs, .globals = globals, .ir_text = ir_text, .record_types = records };
     return out;
 }
 

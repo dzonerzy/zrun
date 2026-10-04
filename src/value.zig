@@ -17,6 +17,7 @@ const ph = @import("pyhelp.zig");
 const py = ph.py;
 const PyObject = ph.PyObject;
 const types = @import("types.zig");
+const objects = @import("objects.zig");
 
 const allocator = std.heap.c_allocator;
 
@@ -651,10 +652,8 @@ pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
             return o;
         },
         .node => return nodeObject.make(@intCast(v.bits)),
-        .function => {
-            ph.raise(py.PyExc_TypeError(), "a function of the program can't be given to Python", .{});
-            return null;
-        },
+        // (a zrun.Function, as the reference mode gives them)
+        .function => return objects.newNativeFunction(@ptrCast(@alignCast(v.ptr()))),
         _ => {
             ph.raise(py.PyExc_TypeError(), "an unknown value", .{});
             return null;
@@ -726,6 +725,11 @@ pub fn fromPython(o: *PyObject) ?Value {
         }
         return Value.obj(.list, &l.head);
     }
+    // A compiled function given to Python, back: itself
+    if (objects.asFunction(o)) |f| if (f.native) |n| {
+        increfObj(&n.head);
+        return Value.obj(.function, &n.head);
+    };
     py.Py_IncRef(o);
     return .{ .tag = @intFromEnum(Tag.host), .bits = @intFromPtr(o) };
 }
