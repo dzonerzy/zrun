@@ -44,6 +44,20 @@ pub const LangView = struct {
     /// The State object of the program (its tree, for scalar field values)
     tree: *PyObject,
     analysis: ?*PyObject,
+    /// The name the program was loaded under (rt.path), if any
+    path: ?[]const u8 = null,
+    /// Semantics run as Python (they couldn't be compiled): called from
+    /// the compiled code with an rt over its frames (bridge.zig)
+    python: *const std.AutoHashMapUnmanaged(*PyObject, void),
+};
+
+pub const Which = enum(u32) { eval = 0, exec = 1 };
+
+/// A node's semantic
+pub const Semantic = union(enum) {
+    none,
+    compiled: *const front.Function,
+    python: *PyObject,
 };
 
 /// A compile failure: what and where (a source line of a semantic, or a
@@ -171,6 +185,28 @@ pub const Compiler = struct {
     sadd: ir.Fn = undefined,
     ssub: ir.Fn = undefined,
     smul: ir.Fn = undefined,
+    /// The innermost semantic that couldn't be compiled (the driver runs it
+    /// as Python and compiles again)
+    failed_semantic: ?*PyObject = null,
+    /// The code calls semantics run as Python (zr_py_semantic)
+    uses_python: bool = false,
+    /// Thunks made so far (their names' numbers)
+    thunks: u32 = 0,
+    /// The language functions this module compiles (forgotten if it fails:
+    /// they aren't in the JIT then)
+    new_fns: std.ArrayListUnmanaged(u32) = .empty,
+    /// Every frame on the heap (code run through the bridge sees the
+    /// variables through the frames): set by the driver when `need_frames`
+    /// was found
+    force_heap: bool = false,
+    need_frames: bool = false,
+
+    /// Whether every function's (and block's) variables are in frames.
+    pub fn allHeap(self: *const Compiler) bool {
+        var it = self.layouts.valueIterator();
+        while (it.next()) |l| if (!l.*.heap) return false;
+        return true;
+    }
 
     pub fn init(a: Allocator, data: *program_mod.Data, lang: LangView, prefix: []const u8, failure: *Failure) Compiler {
         return .{ .a = a, .data = data, .lang = lang, .m = ir.Module.init(a, prefix), .failure = failure };
@@ -180,6 +216,64 @@ pub const Compiler = struct {
     pub fn deinit(self: *Compiler, gpa: Allocator) void {
         var it = self.helpers_read.valueIterator();
         while (it.next()) |f| f.*.destroy(gpa);
+    }
+
+    /// A new module for more code of the program (the compiler's state,
+    /// its layouts and functions, stays: what it compiled before is in
+    /// the JIT, called by name).
+    pub fn newModule(self: *Compiler) !void {
+        self.m.deinit();
+        self.m = ir.Module.init(self.a, self.m.prefix);
+        self.new_fns.clearRetainingCapacity();
+        try self.declareRuntime();
+    }
+
+    /// The module being made failed: the functions it was to compile are
+    /// still to compile.
+    pub fn forgetModule(self: *Compiler) void {
+        for (self.new_fns.items) |f| _ = self.compiled_fns.remove(f);
+        self.new_fns.clearRetainingCapacity();
+        self.queue.clearRetainingCapacity();
+    }
+
+    /// Whether any of the language's semantics run as Python.
+    fn anyPython(self: *const Compiler) bool {
+        for ([_][]const ?*PyObject{ self.lang.eval_of, self.lang.exec_of }) |table| {
+            for (table) |fo| {
+                const o = fo orelse continue;
+                if (self.lang.python.contains(o) or !self.lang.read.contains(o)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// A thunk: a function running one node's eval or exec in the frames
+    /// of a semantic run as Python (`owner`: the node whose frame it is),
+    /// `i32 <name>(ctx, frame, out)` returning a status (0 error, 1 done,
+    /// 2 Return, 3 Break, 4 Continue; a value in out). Its name.
+    pub fn compileThunk(self: *Compiler, idx: u32, which: Which, owner: u32) Error![:0]const u8 {
+        try self.newModule();
+        self.thunks += 1;
+        const name = try std.fmt.allocPrintSentinel(self.a, "{s}_t{d}", .{ self.m.prefix, self.thunks }, 0);
+        const t = self.m.t;
+        const fun = try self.m.function(name, t.i32, &.{ t.ptr, t.ptr, t.ptr }, true);
+        // (the function around the code: the owner's, through the scopes)
+        var fnode = owner;
+        while (fnode != NONE and !self.isFunctionNode(fnode)) fnode = self.ownerOf(fnode);
+        var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = fnode, .layout = try self.layoutOf(fnode), .thunk = true };
+        g.ctx = g.f.param(0);
+        g.out_param = g.f.param(2);
+        try g.thunkPrologue(owner, g.f.param(1));
+        if (which == .eval) {
+            const v = try g.materialize(try g.evalNode(idx), idx);
+            try g.storeSlot(g.out_param, v);
+        } else try g.execNode(idx);
+        try g.f.ret(self.m.k32(1));
+        try g.f.block(g.err_label);
+        try g.f.ret(self.m.k32(0));
+        g.f.finish();
+        while (self.queue.pop()) |f| try self.genFunction(f);
+        return name;
     }
 
     fn unsupported(self: *Compiler, comptime fmt: []const u8, args: anytype) Error {
@@ -243,6 +337,9 @@ pub const Compiler = struct {
         .{ "zr_format", "bpillipp" },
         .{ "zr_concat", "bpiplp" },
         .{ "zr_unpack", "bpilllp" },
+        .{ "zr_varargs", "bpipllp" },
+        .{ "zr_py_semantic", "ipiipip" },
+        .{ "zr_run_value", "ipiillpip" },
     };
 
     fn letterType(self: *Compiler, l: u8) ir.Type {
@@ -340,6 +437,15 @@ pub const Compiler = struct {
         // them)
         var it = d.frame_scopes.keyIterator();
         while (it.next()) |scope| (try self.layoutOf(scope.*)).heap = true;
+        // Semantics run as Python (and nodes run through the bridge) see the
+        // variables through the frames: every function's on the heap
+        if (self.force_heap or self.anyPython()) {
+            for (d.nodes, 0..) |_, i| {
+                if (self.isFunctionNode(@intCast(i))) (try self.layoutOf(@intCast(i))).heap = true;
+            }
+            var lit = self.layouts.valueIterator();
+            while (lit.next()) |l| l.*.heap = true;
+        }
     }
 
     /// The node whose frame the code of a node runs in: the innermost
@@ -385,14 +491,16 @@ pub const Compiler = struct {
             const name = try std.fmt.allocPrint(self.a, "{s}_main", .{self.m.prefix});
             return self.m.function(name, t.i1, &.{ t.ptr, t.ptr }, true);
         }
+        // (external: modules compiled later, thunks, call them by name)
         const name = try std.fmt.allocPrint(self.a, "{s}_f{d}", .{ self.m.prefix, fnode });
-        return self.m.function(name, t.i1, &.{ t.ptr, t.ptr, t.ptr, t.i64, t.ptr, t.ptr }, false);
+        return self.m.function(name, t.i1, &.{ t.ptr, t.ptr, t.ptr, t.i64, t.ptr, t.ptr }, true);
     }
 
     /// The code of a language function, compiled (queued if it isn't yet).
-    fn functionCode(self: *Compiler, fnode: u32) !ir.Value {
+    pub fn functionCode(self: *Compiler, fnode: u32) !ir.Value {
         if (!self.compiled_fns.contains(fnode)) {
             try self.compiled_fns.put(self.a, fnode, {});
+            try self.new_fns.append(self.a, fnode);
             try self.queue.append(self.a, fnode);
         }
         return (try self.llvmFunction(fnode)).v;
@@ -433,7 +541,7 @@ pub const Compiler = struct {
     }
 
     /// Generate one function: the top level (NONE) or a language function.
-    fn genFunction(self: *Compiler, fnode: u32) Error!void {
+    pub fn genFunction(self: *Compiler, fnode: u32) Error!void {
         const fun = try self.llvmFunction(fnode);
         var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = fnode, .layout = try self.layoutOf(fnode) };
         g.ctx = g.f.param(0);
@@ -442,6 +550,7 @@ pub const Compiler = struct {
         } else {
             g.env = g.f.param(1);
             g.args = g.f.param(2);
+            g.nargs = g.f.param(3);
             g.recv = g.f.param(4);
             g.result = g.f.param(5);
         }
@@ -464,6 +573,18 @@ pub const Compiler = struct {
         }
         try g.epilogue();
         g.f.finish();
+    }
+
+    /// The semantic a node runs (its eval or exec): compiled, run as Python
+    /// (native=False, or one that couldn't be compiled), or none.
+    pub fn semanticOf(self: *const Compiler, idx: u32, which: Which) Semantic {
+        const rid = self.data.rule(idx);
+        const table = if (which == .eval) self.lang.eval_of else self.lang.exec_of;
+        if (rid >= table.len) return .none;
+        const fobj = table[rid] orelse return .none;
+        if (self.lang.python.contains(fobj)) return .{ .python = fobj };
+        if (self.lang.read.get(fobj)) |f| return .{ .compiled = f };
+        return .{ .python = fobj };
     }
 
     pub fn specOf(self: *const Compiler, idx: u32) ?FunctionSpec {
@@ -527,6 +648,13 @@ const Gen = struct {
     frame: ?ir.Value = null,
     /// Stack slots of the variables, by layout slot (stack layouts)
     var_slots: std.ArrayListUnmanaged(ir.Value) = .empty,
+    /// The argument count (a language function)
+    nargs: ir.Value = null,
+    /// The receiver and the extra arguments of the function being run
+    /// (rt.receiver, rt.varargs): two hidden slots of its frame, or stack
+    /// slots
+    recv_slot: ir.Value = null,
+    varargs_slot: ir.Value = null,
     /// Scratch space for helpers' results
     out: ir.Value = null,
     /// Where errors go (return false), and returns (rt.Return)
@@ -542,6 +670,12 @@ const Gen = struct {
     /// Block scopes with frames being run here, innermost last: their
     /// frame pointers' slots
     scopes: std.ArrayListUnmanaged(struct { scope: u32, slot: ir.Value }) = .empty,
+    /// A thunk (one node's eval or exec, called by the bridge for a
+    /// semantic run as Python): it returns a status, its value in
+    /// `out_param`; the first `base_scopes` scopes are the caller's
+    thunk: bool = false,
+    out_param: ir.Value = null,
+    base_scopes: usize = 0,
 
     /// Code that runs many times (a function's, a loop's): reference
     /// counts inline; else calls (less code for LLVM to compile).
@@ -592,6 +726,44 @@ const Gen = struct {
         return self.f.at(self.c.m.t.val, arr, self.k(@intCast(i)));
     }
 
+    /// A thunk's start: the frames of the code it's called from (`base`, the
+    /// frame of `owner`), the scopes' and the function's, worked out.
+    fn thunkPrologue(self: *Gen, owner: u32, base: ir.Value) Error!void {
+        const c = self.c;
+        const f = &self.f;
+        const t = c.m.t;
+        self.out = try f.alloca(t.val);
+        self.err_label = try f.label("error");
+        self.ret_label = try f.label("return");
+        // The block scopes between the owner and the function, innermost
+        // first, their frames up through the parents
+        var chain: std.ArrayListUnmanaged(u32) = .empty;
+        var at = owner;
+        while (at != self.fnode) : (at = c.ownerOf(at)) try chain.append(self.a(), at);
+        var frame = base;
+        const slots = try self.a().alloc(ir.Value, chain.items.len);
+        for (chain.items, 0..) |_, i| {
+            slots[i] = try f.alloca(t.ptr);
+            f.store(frame, slots[i]);
+            frame = f.load(t.ptr, f.offset(frame, 16));
+        }
+        var i = chain.items.len;
+        while (i > 0) {
+            i -= 1;
+            try self.scopes.append(self.a(), .{ .scope = chain.items[i], .slot = slots[i] });
+        }
+        self.base_scopes = chain.items.len;
+        self.frame = frame;
+        if (self.fnode == NONE) {
+            self.globals = frame;
+        } else {
+            self.env = f.load(t.ptr, f.offset(frame, 16));
+            const n = self.layout.syms.items.len;
+            self.recv_slot = f.offset(frame, 32 + 16 * @as(i64, @intCast(n)));
+            self.varargs_slot = f.offset(frame, 32 + 16 * @as(i64, @intCast(n + 1)));
+        }
+    }
+
     fn prologue(self: *Gen) Error!void {
         const f = &self.f;
         const t = self.c.m.t;
@@ -602,16 +774,66 @@ const Gen = struct {
         if (self.fnode == NONE) {
             self.frame = self.globals;
         } else if (self.layout.heap) {
-            self.frame = self.call("zr_frame_new", &.{ self.env, self.k(@intCast(n)) });
+            // (and two hidden slots: the receiver, the extra arguments)
+            self.frame = self.call("zr_frame_new", &.{ self.env, self.k(@intCast(n + 2)) });
+            self.recv_slot = f.offset(self.frame.?, 32 + 16 * @as(i64, @intCast(n)));
+            self.varargs_slot = f.offset(self.frame.?, 32 + 16 * @as(i64, @intCast(n + 1)));
         } else {
             for (0..n) |_| try self.var_slots.append(self.a(), try f.alloca(t.val));
             // (unset until assigned; the entry block runs once)
             for (self.var_slots.items) |slot| f.entryStore(self.k(@bitCast(helpers.UNSET)), slot);
+            self.recv_slot = try self.noneSlot();
+            self.varargs_slot = try self.noneSlot();
+            try self.var_slots.append(self.a(), self.recv_slot);
+            try self.var_slots.append(self.a(), self.varargs_slot);
         }
         if (self.fnode != NONE) {
             // (None until a Return says otherwise)
             try self.storeSlot(self.result, .{ .tag = self.k(0), .bits = self.k(0), .shape = .none });
+            try self.storeReceiver();
+            const spec = self.c.specOf(self.fnode).?;
+            if (spec.extra == .keep) {
+                const nparams = self.paramNodes(self.fnode, spec).len;
+                try self.callCheck("zr_varargs", &.{ self.ctx, self.k32(self.fnode), self.args, self.nargs, self.k(@intCast(nparams)), self.out });
+                try self.storeSlot(self.varargs_slot, try self.loadOut(.tuple));
+            }
         }
+    }
+
+    /// The function's receiver (rt.receiver), in its slot: the call's, or
+    /// (a call without one) the receiver of the function it was made in,
+    /// as the frames around it are searched in the reference mode.
+    fn storeReceiver(self: *Gen) Error!void {
+        const f = &self.f;
+        const c = self.c;
+        const has = f.icmp(jit_c.LLVMIntNE, self.recv, c.m.nullPtr());
+        const given = try f.label("recv_given");
+        const outer = try f.label("recv_outer");
+        const join = try f.label("recv_set");
+        try f.condBr(has, given, outer);
+        try f.block(given);
+        const v = try self.loadSlot(self.recv, .any);
+        try self.increfDyn(v);
+        try self.storeSlot(self.recv_slot, v);
+        try f.br(join);
+        try f.block(outer);
+        // (the nearest function around, through the frames)
+        var at = c.ownerOf(self.fnode);
+        while (at != NONE and !c.isFunctionNode(at)) at = c.ownerOf(at);
+        if (at != NONE) {
+            const frame = try self.frameOf(at, "the receiver of the function around isn't reachable");
+            const n = (try c.layoutOf(at)).syms.items.len;
+            const ov = try self.loadSlot(f.offset(frame, 32 + 16 * @as(i64, @intCast(n))), .any);
+            // (an unset slot holds None here: the hidden slots start unset)
+            const unset = f.icmp(jit_c.LLVMIntEQ, ov.tag, self.k(@bitCast(helpers.UNSET)));
+            const tag = f.select(unset, self.k(0), ov.tag);
+            const bits = f.select(unset, self.k(0), ov.bits);
+            const d = Dyn{ .tag = tag, .bits = bits, .shape = .any };
+            try self.increfDyn(d);
+            try self.storeSlot(self.recv_slot, d);
+        } else try self.storeSlot(self.recv_slot, self.noneDyn());
+        try f.br(join);
+        try f.block(join);
     }
 
     fn epilogue(self: *Gen) Error!void {
@@ -987,8 +1209,16 @@ const Gen = struct {
         const env = try self.envFor(fnode);
         const name_text = if (spec.name != 0) if (program_mod.labelled(c.data, fnode, spec.name)) |nn| c.data.text(nn) else "<anonymous>" else "<anonymous>";
         const name = try c.m.string(name_text);
-        const nparams = self.paramNodes(fnode, spec).len;
-        try self.callCheck("zr_function", &.{ self.ctx, code, env, self.k32(fnode), name, self.k(@intCast(nparams)), self.out });
+        const flags = helpers.FunctionFlags{
+            .nparams = @intCast(self.paramNodes(fnode, spec).len),
+            .missing_none = spec.missing == .none,
+            .extra = switch (spec.extra) {
+                .@"error" => .@"error",
+                .drop => .drop,
+                .keep => .keep,
+            },
+        };
+        try self.callCheck("zr_function", &.{ self.ctx, code, env, self.k32(fnode), name, self.k(flags.word()), self.out });
         return .{ .dyn = try self.loadOut(.function) };
     }
 
@@ -1147,13 +1377,8 @@ const Gen = struct {
     }
 
     /// The semantic of a node, read by the front (null: none registered).
-    fn semanticOf(self: *Gen, idx: u32, which: enum { eval, exec }) Error!?*const front.Function {
-        const c = self.c;
-        const rid = c.data.rule(idx);
-        const table = if (which == .eval) c.lang.eval_of else c.lang.exec_of;
-        if (rid >= table.len) return null;
-        const fobj = table[rid] orelse return null;
-        return c.lang.read.get(fobj) orelse return c.unsupported("the semantic of {s} is native=False: compiled code can't run it yet", .{c.data.grammar.kind_names[rid]});
+    fn semanticOf(self: *Gen, idx: u32, which: Which) Error!Semantic {
+        return self.c.semanticOf(idx, which);
     }
 
     /// rt.eval of a node (a block scope with frames: in a new one).
@@ -1166,7 +1391,11 @@ const Gen = struct {
     }
 
     fn evalHere(self: *Gen, idx: u32) Error!SVal {
-        if (try self.semanticOf(idx, .eval)) |func| return self.runSemantic(func, idx);
+        switch (try self.semanticOf(idx, .eval)) {
+            .compiled => |func| return self.runSemantic(func, idx),
+            .python => return self.pySemantic(idx, .eval),
+            .none => {},
+        }
         // Defaults: a name's variable; an only child's value
         const d = self.c.data;
         if (d.symbolIndex(idx) != null) return self.loadVar(idx);
@@ -1185,8 +1414,40 @@ const Gen = struct {
                 for (l.items.items) |item| try out.items.append(self.a(), try self.evalValue(item));
                 return .{ .list = out };
             },
+            .dyn => return self.runValue(0, v, self.atNode()),
             else => return v,
         }
+    }
+
+    /// The node errors are reported at here (the innermost semantic's).
+    fn atNode(self: *const Gen) u32 {
+        if (self.insts.items.len > 0) return self.insts.items[self.insts.items.len - 1].node;
+        return if (self.fnode == NONE) 0 else self.fnode;
+    }
+
+    /// rt.eval / rt.exec / rt.loop (which: 0, 1, 2) of a value only known
+    /// at run time (a node picked at run time...): dispatched then, to the
+    /// node's compiled code (a thunk) or its Python semantic.
+    fn runValue(self: *Gen, which: u32, v: SVal, at: u32) Error!SVal {
+        const c = self.c;
+        const f = &self.f;
+        // (the code it runs sees this code's variables through the frames)
+        if (!c.allHeap()) {
+            c.need_frames = true;
+            return c.unsupported("a node only known at run time is run here: the program needs its variables in frames", .{});
+        }
+        c.uses_python = true;
+        const d = try self.materialize(v, at);
+        const owner = self.currentOwner();
+        const slot = if (self.scopes.items.len > 0) self.scopes.items[self.scopes.items.len - 1].slot else blk: {
+            const s = try f.alloca(c.m.t.ptr);
+            f.store(try self.currentFrame(), s);
+            break :blk s;
+        };
+        const status = self.call("zr_run_value", &.{ self.ctx, self.k32(which), self.k32(at), d.tag, d.bits, slot, self.k32(owner), self.out });
+        try self.drop(.{ .dyn = d });
+        try self.statusJumps(status, at);
+        return .{ .dyn = try self.loadOut(if (which == 2) .bool else .any) };
     }
 
     /// rt.exec of a node (a block scope with frames: in a new one).
@@ -1199,9 +1460,16 @@ const Gen = struct {
 
     fn execHere(self: *Gen, idx: u32) Error!void {
         const c = self.c;
-        if (try self.semanticOf(idx, .exec)) |func| {
-            try self.drop(try self.runSemantic(func, idx));
-            return;
+        switch (try self.semanticOf(idx, .exec)) {
+            .compiled => |func| {
+                try self.drop(try self.runSemantic(func, idx));
+                return;
+            },
+            .python => {
+                try self.drop(try self.pySemantic(idx, .exec));
+                return;
+            },
+            .none => {},
         }
         // Defaults: a function definition (unless hoisted), an expression
         // for its effect, the children in order
@@ -1211,9 +1479,16 @@ const Gen = struct {
             try self.storeVar(name_node, try self.makeFunction(idx));
             return;
         }
-        if (try self.semanticOf(idx, .eval)) |func| {
-            try self.drop(try self.runSemantic(func, idx));
-            return;
+        switch (try self.semanticOf(idx, .eval)) {
+            .compiled => |func| {
+                try self.drop(try self.runSemantic(func, idx));
+                return;
+            },
+            .python => {
+                try self.drop(try self.pySemantic(idx, .eval));
+                return;
+            },
+            .none => {},
         }
         try self.execValue(try self.childValues(idx));
     }
@@ -1223,6 +1498,7 @@ const Gen = struct {
             .node => |n| try self.execNode(n),
             .list => |l| for (l.items.items) |item| try self.execValue(item),
             .tuple => |t| for (t) |item| try self.execValue(item),
+            .dyn => try self.drop(try self.runValue(1, v, self.atNode())),
             else => {},
         }
     }
@@ -1231,9 +1507,110 @@ const Gen = struct {
     // Running a semantic inline
     // ------------------------------------------------------------------
 
-    /// Run a semantic for a node (its params: the node, rt); its result.
+    /// Run a semantic for a node (its params: the node, rt); its result. If
+    /// it can't be compiled, the compiler learns which semantic (the
+    /// innermost) to run as Python instead.
     fn runSemantic(self: *Gen, func: *const front.Function, idx: u32) Error!SVal {
-        return self.runFunction(func, idx, &.{ .{ .node = idx }, .rt });
+        return self.runFunction(func, idx, &.{ .{ .node = idx }, .rt }) catch |e| {
+            if (e == error.Unsupported and self.c.failed_semantic == null) self.c.failed_semantic = func.py_function;
+            return e;
+        };
+    }
+
+    /// A semantic run as Python, for a node: called through the bridge
+    /// with an rt over this code's frames; what it did (zr_py_semantic's
+    /// status) handled as the compiled code would: a value, an error, a
+    /// Return, a Break, a Continue.
+    fn pySemantic(self: *Gen, idx: u32, which: Which) Error!SVal {
+        const c = self.c;
+        const f = &self.f;
+        c.uses_python = true;
+        // (the frame the code here runs in, in a slot rt.fresh can replace)
+        const owner = self.currentOwner();
+        const slot = if (self.scopes.items.len > 0) self.scopes.items[self.scopes.items.len - 1].slot else blk: {
+            const s = try f.alloca(c.m.t.ptr);
+            f.store(try self.currentFrame(), s);
+            break :blk s;
+        };
+        const status = self.call("zr_py_semantic", &.{ self.ctx, self.k32(@intFromEnum(which)), self.k32(idx), slot, self.k32(owner), self.out });
+        try self.statusJumps(status, idx);
+        return .{ .dyn = try self.loadOut(.any) };
+    }
+
+    /// The node whose frame the code here runs in: the innermost block
+    /// scope being run, or the function (NONE: the program).
+    fn currentOwner(self: *const Gen) u32 {
+        if (self.scopes.items.len > 0) return self.scopes.items[self.scopes.items.len - 1].scope;
+        return self.fnode;
+    }
+
+    /// After a call reporting a status (0 error, 1 done, 2 Return with the
+    /// value in `out`, 3 Break, 4 Continue): each to where it goes.
+    fn statusJumps(self: *Gen, status: ir.Value, at: u32) Error!void {
+        const f = &self.f;
+        const done = try f.label("done");
+        const not_done = try f.label("not_done");
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, status, self.c.m.k32(1)), done, not_done);
+        try f.block(not_done);
+        const err = try f.label("raised_error");
+        const control = try f.label("control");
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, status, self.c.m.k32(0)), err, control);
+        try f.block(err);
+        try f.br(self.err_label);
+        try f.block(control);
+        const is_return = try f.label("raised_return");
+        const loop_ctl = try f.label("raised_loop");
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, status, self.c.m.k32(2)), is_return, loop_ctl);
+        try f.block(is_return);
+        try self.returnWith(try self.loadOut(.any), at);
+        try f.block(loop_ctl);
+        const is_break = try f.label("raised_break");
+        const is_cont = try f.label("raised_continue");
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, status, self.c.m.k32(3)), is_break, is_cont);
+        try f.block(is_break);
+        try self.loopJump(.Break, at);
+        try f.block(is_cont);
+        try self.loopJump(.Continue, at);
+        try f.block(done);
+    }
+
+    /// Leave by a Return with a value (an owned reference): the function's
+    /// result; out of a thunk, its status.
+    fn returnWith(self: *Gen, d: Dyn, at: u32) Error!void {
+        if (self.thunk) {
+            try self.releaseAbove(0);
+            self.releaseScopesAbove(self.base_scopes);
+            try self.storeSlot(self.out_param, d);
+            try self.f.ret(self.c.m.k32(2));
+            return;
+        }
+        if (self.fnode == NONE) {
+            try self.drop(.{ .dyn = d });
+            try self.failAt(at, "return outside a function");
+            return;
+        }
+        try self.releaseAbove(0);
+        self.releaseScopesAbove(0);
+        try self.storeSlot(self.result, d);
+        try self.f.br(self.ret_label);
+    }
+
+    /// Leave by a Break or a Continue: to the rt.loop running here; out of a
+    /// thunk, its status; else an error.
+    fn loopJump(self: *Gen, kind: RtMethod, at: u32) Error!void {
+        if (self.loops.items.len == 0) {
+            if (self.thunk) {
+                try self.releaseAbove(0);
+                self.releaseScopesAbove(self.base_scopes);
+                try self.f.ret(self.c.m.k32(if (kind == .Break) 3 else 4));
+                return;
+            }
+            try self.failAt(at, "break or continue outside a loop");
+            return;
+        }
+        const target = self.loops.items[self.loops.items.len - 1];
+        try self.releaseAboveLoop(target);
+        try self.f.br(if (kind == .Break) target.brk else target.cont);
     }
 
     /// Run a front function inline with arguments.
@@ -1613,25 +1990,13 @@ const Gen = struct {
         };
         switch (ctl.kind) {
             .Return => {
-                if (self.fnode == NONE) {
+                if (self.fnode == NONE and !self.thunk) {
                     try self.failAt(inst.node, "return outside a function");
                     return;
                 }
-                const d = try self.materialize(if (ctl.value) |x| x.* else .none, inst.node);
-                try self.releaseAbove(0);
-                self.releaseScopesAbove(0);
-                try self.storeSlot(self.result, d);
-                try self.f.br(self.ret_label);
+                try self.returnWith(try self.materialize(if (ctl.value) |x| x.* else .none, inst.node), inst.node);
             },
-            .Break, .Continue => {
-                if (self.loops.items.len == 0) {
-                    try self.failAt(inst.node, "break or continue outside a loop");
-                    return;
-                }
-                const target = self.loops.items[self.loops.items.len - 1];
-                try self.releaseAboveLoop(target);
-                try self.f.br(if (ctl.kind == .Break) target.brk else target.cont);
-            },
+            .Break, .Continue => try self.loopJump(ctl.kind, inst.node),
             else => unreachable,
         }
         if (inst.dyn_depth == 0) {
@@ -2145,6 +2510,8 @@ const Gen = struct {
                 if (eq(u8, name, "rule")) return .{ .str = d.grammar.rule_names[rid] };
                 if (eq(u8, name, "text")) return .{ .str = d.text(idx) };
                 if (eq(u8, name, "start")) return .{ .int = n.text_start };
+                if (eq(u8, name, "line")) return .{ .int = d.lineCol(n.text_start).line };
+                if (eq(u8, name, "column")) return .{ .int = d.lineCol(n.text_start).col };
                 if (eq(u8, name, "end")) return .{ .int = n.text_end };
                 if (eq(u8, name, "index")) return .{ .int = idx };
                 if (eq(u8, name, "span")) {
@@ -2166,20 +2533,20 @@ const Gen = struct {
                 }
                 if (eq(u8, name, "receiver")) {
                     if (self.fnode == NONE) return .none;
-                    // (the receiver of the function being run)
-                    const f = &self.f;
-                    const has = f.icmp(jit_c.LLVMIntNE, self.recv, self.c.m.nullPtr());
-                    const slot = try self.valSlot();
-                    try self.storeSlot(slot, self.noneDyn());
-                    const yes = try f.label("recv");
-                    const join = try f.label("recv_end");
-                    try f.condBr(has, yes, join);
-                    try f.block(yes);
-                    const v = try self.loadSlot(self.recv, .any);
+                    // (the function's: its call's, or the one around's)
+                    const v = try self.loadSlot(self.recv_slot, .any);
                     try self.increfDyn(v);
-                    try self.storeSlot(slot, v);
-                    try f.block(join);
-                    return .{ .dyn = try self.loadSlot(slot, .any) };
+                    return .{ .dyn = v };
+                }
+                if (eq(u8, name, "varargs")) {
+                    if (self.fnode == NONE or c.specOf(self.fnode).?.extra != .keep) return .{ .tuple = &.{} };
+                    const v = try self.loadSlot(self.varargs_slot, .tuple);
+                    try self.increfDyn(v);
+                    return .{ .dyn = v };
+                }
+                if (eq(u8, name, "path")) {
+                    const p = self.c.lang.path orelse return .none;
+                    return .{ .str = p };
                 }
                 return c.unsupportedAt(inst.func, pos, "rt has no '{s}' in compiled code", .{name});
             },
@@ -2895,7 +3262,7 @@ const Gen = struct {
                 for (t, 0..) |x, i| _ = py.c.PyTuple_SetItem(out, @intCast(i), try self.pyOf(x));
                 break :blk out;
             },
-            else => error.Python,
+            else => self.c.unsupported("a {s} where a value known when compiling is needed (a slice's bounds...)", .{@tagName(v)}),
         };
     }
 

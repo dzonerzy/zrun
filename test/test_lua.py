@@ -16,15 +16,25 @@ import lua  # noqa: E402
 PROGRAMS = sorted(os.path.basename(p)[:-4] for p in glob.glob(os.path.join(LUA_DIR, "tests", "*.lua")))
 
 
+@pytest.mark.parametrize("mode", ["python", "compiled"])
 @pytest.mark.parametrize("name", PROGRAMS)
-def test_like_real_lua(name, capsys):
+def test_like_real_lua(name, mode, capsys):
+    # (compiled: the semantics the compiler can't compile run as Python,
+    # through the bridge, with everything else native)
     path = os.path.join(LUA_DIR, "tests", name + ".lua")
     with open(path) as f:
         source = f.read()
     with open(path[:-4] + ".expected") as f:
         expected = f.read()
-    lua.run(source, name + ".lua")
+    lua.run(source, name + ".lua", mode=mode)
     assert capsys.readouterr().out == expected
+
+
+def test_python_semantics():
+    # the ones compiled programs run as Python, learned while compiling
+    lua.run("print(1)\n", "x.lua", mode="compiled")
+    names = lua.lang.python_semantics()
+    assert "chunk" in names and names == sorted(names)
 
 
 def test_uncaught_error():

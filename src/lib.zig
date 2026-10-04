@@ -24,6 +24,7 @@ const zabi = @import("zrules_abi.zig");
 const front = @import("front.zig");
 const driver = @import("driver.zig");
 const compile_mod = @import("compile.zig");
+const bridge = @import("bridge.zig");
 const helpers = @import("helpers.zig");
 const value_mod = @import("value.zig");
 
@@ -69,6 +70,9 @@ const Language = struct {
     /// (each holds a reference to its function); those marked
     /// native=False aren't here
     _read: std.AutoHashMapUnmanaged(*PyObject, *front.Function) = .empty,
+    /// Semantics the compiler couldn't compile: compiled programs run them
+    /// as Python (bridge.zig); learned as programs are compiled
+    _python: driver.PythonSet = .empty,
 
     pub fn __new__(args: pyoz.Args(struct { parser: *PyObject, rules: ?*PyObject = null, max_depth: i64 = 1000 })) ?Language {
         const v = args.value;
@@ -124,6 +128,32 @@ const Language = struct {
         while (it.next()) |f| f.*.destroy(allocator);
         self._read.deinit(allocator);
         self._read = .empty;
+        self._python.deinit(allocator);
+        self._python = .empty;
+    }
+
+    /// `lang.python_semantics()`: the semantics compiled programs run as
+    /// Python (native=False ones, and those the compiler couldn't compile,
+    /// learned as programs are compiled), by name, sorted: what to rewrite
+    /// for speed.
+    pub fn python_semantics(self: *Language) ?*PyObject {
+        self.resolve();
+        const out = py.c.PyList_New(0) orelse return null;
+        var seen = std.AutoHashMapUnmanaged(*PyObject, void).empty;
+        defer seen.deinit(allocator);
+        for ([_][]?*PyObject{ self._eval_of, self._exec_of }) |table| {
+            for (table) |fo| {
+                const f = fo orelse continue;
+                if (seen.contains(f)) continue;
+                seen.put(allocator, f, {}) catch return null;
+                if (!self._python.contains(f) and self._read.contains(f)) continue;
+                const name = py.c.PyObject_GetAttrString(f, "__name__") orelse return null;
+                defer py.Py_DecRef(name);
+                if (py.c.PyList_Append(out, name) != 0) return null;
+            }
+        }
+        if (py.c.PyList_Sort(out) != 0) return null;
+        return out;
     }
 
     /// `lang.ir(fn)`: a semantic (or any function) as the compiler's front
@@ -657,12 +687,12 @@ const Program = struct {
         return null;
     }
 
-    /// Compile the program (once).
     /// What the compiler needs of the language (and of this program's tree).
     fn langView(self: *Program) compile_mod.LangView {
         const lang = self.language();
         lang.resolve();
         const st = self.state();
+        const path: ?[]const u8 = if (self._path) |p| (if (p == py.Py_None()) null else ph.utf8(p, "path")) else null;
         return .{
             .grammar = lang._grammar.?,
             .eval_of = lang._eval_of,
@@ -672,19 +702,39 @@ const Program = struct {
             .hosts = lang._hosts.?,
             .tree = st.ctx.?.tree,
             .analysis = st.analysis,
+            .path = path,
+            .python = &lang._python,
         };
     }
 
     fn ensureCompiled(self: *Program) bool {
         if (self._compiled != null) return true;
-        self._compiled = driver.compileProgram(self.ctx().data, self.langView(), types.CompileError) orelse return false;
+        self._compiled = driver.compileProgram(self.ctx().data, self.langView(), &self.language()._python, types.CompileError) orelse return false;
         return true;
     }
 
     /// `program.compiled_ir()`: the LLVM IR the program compiles to (before
     /// LLVM optimizes it), as text.
     pub fn compiled_ir(self: *Program) ?*PyObject {
-        return driver.irText(self.ctx().data, self.langView(), types.CompileError);
+        return driver.irText(self.ctx().data, self.langView(), &self.language()._python, types.CompileError);
+    }
+
+    /// bridge.Link: a node's semantic (borrowed).
+    fn linkSemantic(raw: *anyopaque, idx: u32, which: compile_mod.Which) ?*PyObject {
+        const self: *Program = @ptrCast(@alignCast(raw));
+        const lang = self.language();
+        const rid = self.ctx().data.rule(idx);
+        const table = if (which == .eval) lang._eval_of else lang._exec_of;
+        return if (rid < table.len) table[rid] else null;
+    }
+
+    /// bridge.Link: a zrun.Error at a node, with a stack.
+    fn linkErrorObject(raw: *anyopaque, idx: u32, message: []const u8, stack: []const helpers.CallEntry) ?*PyObject {
+        const self: *Program = @ptrCast(@alignCast(raw));
+        var entries: std.ArrayListUnmanaged(Runtime.StackEntry) = .empty;
+        defer entries.deinit(allocator);
+        for (stack) |e| entries.append(allocator, .{ .name = e.name.bytes(), .call = e.node }) catch return null;
+        return Runtime.errorObject(self, idx, message, "runtime", entries.items);
     }
 
     fn makeNodeObject(raw: *anyopaque, idx: u32) ?*PyObject {
@@ -694,18 +744,46 @@ const Program = struct {
 
     fn runCompiled(self: *Program) ?*PyObject {
         const c = self._compiled.?;
+        const st = self.state();
+        const link = bridge.Link{
+            .program = self,
+            .compiled = c,
+            .data = self.ctx().data,
+            .hosts = self.language()._hosts.?,
+            .analysis = st.analysis,
+            .path = self._path,
+            .context = null,
+            .semantic = &linkSemantic,
+            .error_object = &linkErrorObject,
+        };
         var ectx = helpers.Ctx{
-            .node_maker = .{ .ctx = self, .make_fn = &makeNodeObject },
-            .objects = c.objects,
+            .node_maker = .{ .ctx = self, .make_fn = &makeNodeObject, .owner = Module.selfObject(Program, self) },
+            .objects = c.objects(),
             .max_depth = self.language()._max_depth,
+            .link = @constCast(&link),
         };
         defer ectx.deinit();
+        // (semantics run as Python recurse through Python: room for
+        // max_depth calls, as in the reference mode)
+        const saved_limit = py.c.Py_GetRecursionLimit();
+        const want: c_int = @intCast(@min(@as(u64, ectx.max_depth) * 40 + 1000, std.math.maxInt(c_int)));
+        if (want > saved_limit) py.c.Py_SetRecursionLimit(want);
+        defer py.c.Py_SetRecursionLimit(saved_limit);
         const globals = helpers.zr_frame_new(null, c.globals) orelse {
             _ = py.c.PyErr_NoMemory();
             return null;
         };
         defer value_mod.decrefFrame(globals);
         if (c.main(&ectx, globals)) return none();
+        // An exception from Python going out of the run: itself (a Throw
+        // nothing caught: the zrun.Error it is)
+        if (ectx.pending) |p| {
+            ectx.pending = null;
+            const t: *PyObject = @ptrCast(@alignCast(p.ob_type));
+            py.c.PyErr_SetObject(t, p);
+            py.Py_DecRef(p);
+            return uncaught();
+        }
         if (py.c.PyErr_Occurred() != null) py.c.PyErr_Clear();
         // The error, as the reference mode makes it
         var entries: std.ArrayListUnmanaged(Runtime.StackEntry) = .empty;
@@ -1832,6 +1910,7 @@ fn version() []const u8 {
 fn moduleInit(module: *PyObject) callconv(.c) c_int {
     if (types.init(module) != 0) return -1;
     objects.init(module) catch return -1;
+    bridge.init(module) catch return -1;
     name_program = ph.newString("<program>") orelse return -1;
     CallerType = py.c.PyType_FromSpec(&caller_spec) orelse return -1;
     // (compiled code words Python's errors as the reference mode does)

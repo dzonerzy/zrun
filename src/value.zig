@@ -675,7 +675,7 @@ pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
         },
         .node => return nodeObject.make(@intCast(v.bits)),
         // (a zrun.Function, as the reference mode gives them)
-        .function => return objects.newNativeFunction(@ptrCast(@alignCast(v.ptr()))),
+        .function => return objects.newNativeFunction(@ptrCast(@alignCast(v.ptr())), nodeObject.owner),
         _ => {
             ph.raise(py.PyExc_TypeError(), "an unknown value", .{});
             return null;

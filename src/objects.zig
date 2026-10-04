@@ -650,15 +650,17 @@ pub const FunctionObject = extern struct {
     native: ?*value.Function = null,
 };
 
-/// A compiled function as Python sees it (as the reference mode's).
-pub fn newNativeFunction(f: *value.Function) ?*PyObject {
+/// A compiled function as Python sees it (as the reference mode's),
+/// keeping its program (`owner`, whose code it runs) alive.
+pub fn newNativeFunction(f: *value.Function, owner: ?*PyObject) ?*PyObject {
     const name = ph.newString(f.name.bytes()) orelse return null;
     defer py.Py_DecRef(name);
     const obj = allocObject(FunctionType) orelse return null;
     const fo: *FunctionObject = @ptrCast(@alignCast(obj));
     value.increfObj(&f.head);
     py.Py_IncRef(name);
-    fo.* = .{ .ob_base = fo.ob_base, .state = null, .node = @intCast(f.node), .env = null, .name = name, .native = f };
+    if (owner) |o| py.Py_IncRef(o);
+    fo.* = .{ .ob_base = fo.ob_base, .state = owner, .node = @intCast(f.node), .env = null, .name = name, .native = f };
     return obj;
 }
 
@@ -682,6 +684,12 @@ pub fn asFunction(obj: *PyObject) ?*FunctionObject {
 
 fn functionClear(obj: ?*PyObject) callconv(.c) c_int {
     const f: *FunctionObject = @ptrCast(@alignCast(obj.?));
+    // (a compiled one's native value first: its program, which the state
+    // keeps, is still there)
+    if (f.native) |n| {
+        f.native = null;
+        value.decref(value.Value.obj(.function, &n.head));
+    }
     inline for (.{ "env", "state" }) |field| {
         if (@field(f, field)) |o| {
             @field(f, field) = null;

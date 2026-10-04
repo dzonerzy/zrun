@@ -38,18 +38,38 @@ pub const Ctx = struct {
     err_msg: std.ArrayListUnmanaged(u8) = .empty,
     /// The call stack when it happened (innermost first)
     err_stack: std.ArrayListUnmanaged(CallEntry) = .empty,
+    /// The program running, for semantics run as Python (bridge.zig's
+    /// Link; set by lib.zig)
+    link: ?*anyopaque = null,
+    /// A Python exception going up through the compiled code (a rt.Throw,
+    /// a zrun.Error raised by Python), the error then: raised again where
+    /// Python code is back in charge (owned)
+    pending: ?*PyObject = null,
 
     pub fn deinit(self: *Ctx) void {
         self.calls.deinit(allocator);
+        self.clearError();
         self.err_msg.deinit(allocator);
-        for (self.err_stack.items) |e| value.decref(Value.obj(.str, &e.name.head));
         self.err_stack.deinit(allocator);
+    }
+
+    /// Forget the error (one caught by Python code).
+    pub fn clearError(self: *Ctx) void {
+        self.failed = false;
+        self.err_msg.clearRetainingCapacity();
+        for (self.err_stack.items) |e| value.decref(Value.obj(.str, &e.name.head));
+        self.err_stack.clearRetainingCapacity();
+        if (self.pending) |p| py.Py_DecRef(p);
+        self.pending = null;
     }
 };
 
 pub const NodeMaker = struct {
     ctx: *anyopaque,
     make_fn: *const fn (ctx: *anyopaque, idx: u32) ?*PyObject,
+    /// The program object (borrowed): what a compiled function given to
+    /// Python keeps alive (its code is the program's)
+    owner: ?*PyObject = null,
 
     pub fn make(self: NodeMaker, idx: u32) ?*PyObject {
         return self.make_fn(self.ctx, idx);
@@ -478,13 +498,45 @@ export fn zr_truthy(t: u64, bits: u64) callconv(.c) bool {
 /// result) -> ok
 pub const Code = *const fn (ctx: *Ctx, env: ?*value.Frame, args: [*]const Value, nargs: u64, receiver: ?*const Value, result: *Value) callconv(.c) bool;
 
+/// A function value's flags (its Obj header): its parameter count, and
+/// what a call with fewer or more arguments does (Language.function's
+/// missing= and extra=)
+pub const FunctionFlags = struct {
+    nparams: u16,
+    missing_none: bool,
+    extra: enum(u2) { @"error", drop, keep },
+
+    pub fn of(flags: u32) FunctionFlags {
+        return .{ .nparams = @truncate(flags), .missing_none = flags & 0x10000 != 0, .extra = @enumFromInt(@as(u2, @truncate(flags >> 17))) };
+    }
+
+    pub fn word(self: FunctionFlags) u32 {
+        return @as(u32, self.nparams) | (@as(u32, @intFromBool(self.missing_none)) << 16) | (@as(u32, @intFromEnum(self.extra)) << 17);
+    }
+};
+
+/// The arguments beyond a function's parameters, as a tuple (their own
+/// references), in `out` (extra="keep": rt.varargs).
+export fn zr_varargs(ctx: *Ctx, node: u32, args: [*]const Value, nargs: u64, nparams: u64, out: *Value) callconv(.c) bool {
+    const n = if (nargs > nparams) nargs - nparams else 0;
+    const t = value.newTuple(n) orelse return oomFail(ctx, node);
+    for (t.slice(), 0..) |*slot, i| {
+        const v = args[nparams + i];
+        value.incref(v);
+        slot.* = v;
+    }
+    out.* = Value.obj(.tuple, &t.head);
+    return true;
+}
+
 /// A function value: its code, the frame it's made in, its node, its name
 /// and parameter count, in `out`.
-export fn zr_function(ctx: *Ctx, code: Code, env: ?*value.Frame, node: u32, name: *value.Str, nparams: u64, out: *Value) callconv(.c) bool {
+pub export fn zr_function(ctx: *Ctx, code: Code, env: ?*value.Frame, node: u32, name: *value.Str, flags: u64, out: *Value) callconv(.c) bool {
     const f = allocator.create(value.Function) catch return fail(ctx, node, "out of memory", .{});
     if (env) |e| value.increfObj(&e.head);
     value.increfObj(&name.head);
-    f.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.function), .flags = @intCast(nparams) }, .code = @ptrCast(code), .env = env, .node = node, .name = name };
+    // (flags: FunctionFlags.word())
+    f.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.function), .flags = @intCast(flags) }, .code = @ptrCast(code), .env = env, .node = node, .name = name };
     out.* = Value.obj(.function, &f.head);
     return true;
 }
@@ -492,20 +544,29 @@ export fn zr_function(ctx: *Ctx, code: Code, env: ?*value.Frame, node: u32, name
 /// Call a function value (the program's, or a host one) with arguments
 /// (borrowed); the result in `out`. `node`: the node calling (errors, the
 /// stack).
-export fn zr_call(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Value, nargs: u64, receiver: ?*const Value, out: *Value) callconv(.c) bool {
+pub export fn zr_call(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Value, nargs: u64, receiver: ?*const Value, out: *Value) callconv(.c) bool {
     const f = Value{ .tag = ft, .bits = fb };
     switch (f.kind()) {
         .function => {
             const fo: *value.Function = @ptrCast(@alignCast(f.ptr()));
-            const nparams: u64 = fo.head.flags;
-            if (nparams != nargs) {
+            const policy = FunctionFlags.of(fo.head.flags);
+            const nparams: u64 = policy.nparams;
+            if ((nargs < nparams and !policy.missing_none) or (nargs > nparams and policy.extra == .@"error")) {
                 return fail(ctx, node, "{s}() takes {d} argument{s}, {d} given", .{ fo.name.bytes(), nparams, if (nparams == 1) "" else "s", nargs });
             }
             if (ctx.calls.items.len >= ctx.max_depth) return fail(ctx, node, "call stack too deep (more than {d} calls)", .{ctx.max_depth});
             ctx.calls.append(allocator, .{ .name = fo.name, .node = node }) catch return fail(ctx, node, "out of memory", .{});
             defer _ = ctx.calls.pop();
             const code: Code = @ptrCast(@alignCast(fo.code.?));
-            return code(ctx, fo.env, args, nargs, receiver, out);
+            if (nargs >= nparams) return code(ctx, fo.env, args, nargs, receiver, out);
+            // Fewer than its parameters: the rest None (the code reads one
+            // argument per parameter)
+            var buf: [16]Value = undefined;
+            const padded = if (nparams <= buf.len) buf[0..nparams] else allocator.alloc(Value, nparams) catch return fail(ctx, node, "out of memory", .{});
+            defer if (nparams > buf.len) allocator.free(padded);
+            @memcpy(padded[0..nargs], args[0..nargs]);
+            @memset(padded[nargs..], Value.none_v);
+            return code(ctx, fo.env, padded.ptr, nparams, receiver, out);
         },
         .host => {
             const callee: *PyObject = @ptrFromInt(f.bits);
@@ -985,11 +1046,12 @@ pub fn moreSymbols() [16]struct { []const u8, usize } {
     };
 }
 
-pub fn formatSymbols() [3]struct { []const u8, usize } {
+pub fn formatSymbols() [4]struct { []const u8, usize } {
     return .{
         .{ "zr_format", @intFromPtr(&zr_format) },
         .{ "zr_concat", @intFromPtr(&zr_concat) },
         .{ "zr_unpack", @intFromPtr(&zr_unpack) },
+        .{ "zr_varargs", @intFromPtr(&zr_varargs) },
     };
 }
 
