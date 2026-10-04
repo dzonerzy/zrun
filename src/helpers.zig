@@ -767,7 +767,8 @@ export fn zr_varargs(ctx: *Ctx, node: u32, args: [*]const Value, nargs: u64, npa
 /// A function value: its code, the frame it's made in, its node, its name
 /// and parameter count, in `out`.
 pub export fn zr_function(ctx: *Ctx, code: Code, env: ?*value.Frame, node: u32, name: *value.Str, flags: u64, out: *Value) callconv(.c) bool {
-    const f = allocator.create(value.Function) catch return fail(ctx, node, "out of memory", .{});
+    // (value.zig frees it: its allocator)
+    const f = value.allocator.create(value.Function) catch return fail(ctx, node, "out of memory", .{});
     if (env) |e| value.increfObj(&e.head);
     value.increfObj(&name.head);
     // (flags: FunctionFlags.word())
@@ -1831,6 +1832,23 @@ export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64,
     return zr_call_python(ctx, node, callee_index, @ptrCast(&v), 1, out);
 }
 
+/// A closure's captured variable: its cell `idx` (of the function called,
+/// a host value), what it holds now; Python's NameError for an empty one.
+export fn zr_cell(ctx: *Ctx, node: u32, ft: u64, fb: u64, idx: u64, out: *Value) callconv(.c) bool {
+    _ = ft;
+    const f: *PyObject = @ptrFromInt(fb);
+    const closure = py.c.PyObject_GetAttrString(f, "__closure__") orelse return failPython(ctx, node);
+    defer py.Py_DecRef(closure);
+    const cell = py.c.PyTuple_GetItem(closure, @intCast(idx)) orelse return failPython(ctx, node);
+    const v = py.c.PyObject_GetAttrString(cell, "cell_contents") orelse {
+        py.c.PyErr_Clear();
+        return failAs(ctx, node, py.PyExc_NameError(), null, "free variable referenced before assignment in enclosing scope", .{});
+    };
+    defer py.Py_DecRef(v);
+    out.* = value.fromPython(v) orelse return failPython(ctx, node);
+    return true;
+}
+
 /// type(v): its class, as the reference mode has it (an I64's zrun.I64, a
 /// plain int's int, a record's its class...), without Python.
 export fn zr_type(t: u64, bits: u64, out: *Value) callconv(.c) void {
@@ -1958,7 +1976,7 @@ const helper_names = [_][]const u8{
     "zr_list_len", "zr_list_at",    "zr_append",     "zr_call_method",   "zr_call_python",
     "zr_is_type",  "zr_global",     "zr_format",     "zr_concat",        "zr_unpack",
     "zr_varargs",  "zr_record_new", "zr_isinstance", "zr_call_seq",      "zr_slice",
-    "zr_type",     "zr_builtin",    "zr_range",
+    "zr_type",     "zr_builtin",    "zr_range",      "zr_cell",
 };
 
 /// The names compiled code calls them by, and their addresses

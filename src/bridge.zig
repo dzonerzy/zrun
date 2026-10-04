@@ -483,9 +483,16 @@ pub export fn zr_exc_catch(ctx: *Ctx, at: u32, out: *Value) callconv(.c) bool {
 pub fn compiledCall(ctx: *Ctx, node: u32, callee: *PyObject, args: []const Value, checked: bool, out: *Value) ?bool {
     const link = ctx.link orelse return null;
     const lk: *const Link = @ptrCast(@alignCast(link));
-    if (args.len > 64) return null;
+    if (args.len > 63) return null;
     const pt = compile_mod.pyFunctionType() orelse return null;
     if (ph.typeOf(callee) != @as(*py.c.PyTypeObject, @ptrCast(@alignCast(pt)))) return null;
+    // (a closure: one code for all of them, the function given last)
+    const closure_obj = py.c.PyObject_GetAttrString(callee, "__closure__") orelse {
+        py.c.PyErr_Clear();
+        return null;
+    };
+    py.Py_DecRef(closure_obj);
+    const closure = closure_obj != py.Py_None();
     var mask: u64 = 0;
     var frame: ?*value.Frame = null;
     var owner: u32 = 0;
@@ -501,7 +508,11 @@ pub fn compiledCall(ctx: *Ctx, node: u32, callee: *PyObject, args: []const Value
         given[n] = if (checked) a.checked() else a;
         n += 1;
     }
-    const code = lk.compiled.calledCode(callee, args.len, mask) orelse return null;
+    const code = lk.compiled.calledCode(callee, args.len, mask, closure) orelse return null;
+    if (closure) {
+        given[n] = .{ .tag = @intFromEnum(value.Tag.host), .bits = @intFromPtr(callee) };
+        n += 1;
+    }
     const status = code(ctx, frame, &given, node, owner, null, null, out);
     switch (status) {
         1 => {

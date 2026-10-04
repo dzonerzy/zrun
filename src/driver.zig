@@ -146,15 +146,22 @@ pub const Compiled = struct {
     /// The compiled code of a Python function compiled code calls (for
     /// `nargs` arguments, those of rt_mask rt values): its address, made the
     /// first time; null if it can't be compiled (Python runs it, then).
-    pub fn calledCode(self: *Compiled, o: *PyObject, nargs: usize, rt_mask: u64) ?Helper {
-        const key = CalledKey{ .func = o, .nargs = nargs, .rt_mask = rt_mask };
+    pub fn calledCode(self: *Compiled, o: *PyObject, nargs: usize, rt_mask: u64, closure: bool) ?Helper {
+        // (a closure's code serves all its closures: its variables are read
+        // from the one called)
+        const code_obj = py.c.PyObject_GetAttrString(o, "__code__") orelse {
+            py.c.PyErr_Clear();
+            return null;
+        };
+        py.Py_DecRef(code_obj);
+        const key = CalledKey{ .func = if (closure) code_obj else o, .nargs = nargs, .rt_mask = rt_mask };
         if (self.called.get(key)) |code| return code;
         const c = &self.compiler;
         var code: ?Helper = null;
         while (true) {
             c.failed_semantic = null;
             c.need_retry = false;
-            const name = c.compileCalled(o, nargs, rt_mask) catch |e| {
+            const name = c.compileCalled(o, nargs, rt_mask, closure) catch |e| {
                 c.forgetModule();
                 // (a literal made at run time: again; anything else: Python)
                 if (e == error.Unsupported and c.need_retry) continue;
@@ -168,6 +175,8 @@ pub const Compiled = struct {
             code = @ptrFromInt(addr);
             break;
         }
+        // (the key kept alive: a code object compiled for)
+        if (closure) _ = c.objectIndex(code_obj) catch {};
         self.called.put(allocator, key, code) catch {};
         return code;
     }

@@ -40,6 +40,8 @@ BUILTINS = (
     "trying",
     "strs",
     "wide",
+    "tables",
+    "untables",
 )
 
 
@@ -82,6 +84,9 @@ def returns_in_try(log):
     finally:
         log.append("rf")
 
+
+FROZEN_TABLE = {"a": 1, "b": 2}
+LIVE_TABLE = {"a": 1}
 
 COUNTER = 0
 HOLDER = Holder(1)
@@ -249,6 +254,12 @@ def make_lang():
             return (a, b, m, d, m - 0x10000000000000000, a // 3, a % 7, -a // 3, -a % 7, a >> 3, b & 0xFF, 1 << 100, big, big // a,
                     a > 2**63, a == 2**64, a == float(2**64), 2**53 + 1 == float(2**53), 2**53 + 1 > float(2**53), {a: "k"}.get(2**64),
                     str(a), int(a), abs(-a), float(a), -a, ~a, a == d * 2, isinstance(a, int), type(a) is int)
+        if name == "tables":
+            # a table only read (known when compiling) and one a host
+            # function changes (read when the code runs)
+            before = LIVE_TABLE["a"]
+            rt.call(rt.load(node.name), [])
+            return ("a" in FROZEN_TABLE, FROZEN_TABLE.get("b"), [k for k in FROZEN_TABLE], before, LIVE_TABLE["a"], "z" in LIVE_TABLE)
         if name == "bigmath":
             # A semantic's own ints are Python's (beyond 64 bits on the way)
             m = -1 & 0xFFFFFFFFFFFFFFFF
@@ -417,6 +428,18 @@ def make_lang():
         raise KeyError("k")
 
     @lang.host
+    def untables():
+        LIVE_TABLE.clear()
+        LIVE_TABLE["a"] = 1
+        return 0
+
+    @lang.host
+    def tables():
+        LIVE_TABLE["a"] = LIVE_TABLE["a"] + 1
+        LIVE_TABLE["z"] = 0
+        return 0
+
+    @lang.host
     def wide():
         return [2**62, -(2**63)]
 
@@ -478,6 +501,7 @@ PROGRAMS = {
     "trying": "print(trying());\n",
     "strs": "print(strs());\n",
     "wide": "print(wide());\n",
+    "tables": "print(untables(), tables());\n",
 }
 
 

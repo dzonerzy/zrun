@@ -287,11 +287,60 @@ fn isInstanceOf(o: *PyObject, t: *PyObject) error{Python}!bool {
 /// (`global x`): read when the code runs, not when compiling. Learned
 /// once per module (again if names were added since).
 fn reboundGlobals(globals: *PyObject) error{Python}!*PyObject {
+    return (try moduleScan(globals)).names;
+}
+
+/// The module-level tables (dicts, lists, tuples) of a module its code
+/// only reads (subscripts, `in`, iteration, get/items/keys/values...): as
+/// good as constants, known when compiling.
+fn frozenGlobals(globals: *PyObject) error{Python}!*PyObject {
+    return (try moduleScan(globals)).frozen;
+}
+
+fn moduleScan(globals: *PyObject) error{Python}!ScanEntry {
     const n = py.c.PyDict_Size(globals);
-    if (rebound_cache.get(globals)) |e| if (e.len == n) return e.names;
+    if (rebound_cache.get(globals)) |e| if (e.len == n) return e;
     if (rebound_scanner == null) {
         const src =
-            \\import dis, types
+            \\import ast, dis, inspect, sys, types
+            \\SAFE_METHODS = {"get", "items", "keys", "values", "count", "index", "copy"}
+            \\SAFE_CALLS = {"len", "sorted", "list", "tuple", "set", "frozenset", "min", "max", "sum", "any",
+            \\              "all", "enumerate", "zip", "iter", "reversed", "dict", "str", "repr", "bool"}
+            \\def frozen(g):
+            \\    mod = sys.modules.get(g.get("__name__"))
+            \\    if mod is None or getattr(mod, "__dict__", None) is not g:
+            \\        return frozenset()
+            \\    try:
+            \\        tree = ast.parse(inspect.getsource(mod))
+            \\    except Exception:
+            \\        return frozenset()
+            \\    cands = {k for k, v in g.items() if type(v) in (dict, list, tuple, frozenset)}
+            \\    parents = {}
+            \\    for node in ast.walk(tree):
+            \\        for ch in ast.iter_child_nodes(node):
+            \\            parents[ch] = node
+            \\    bad = set()
+            \\    for node in ast.walk(tree):
+            \\        if not isinstance(node, ast.Name) or node.id not in cands:
+            \\            continue
+            \\        p = parents.get(node)
+            \\        if isinstance(node.ctx, ast.Store):
+            \\            # (its definition, at the module's top level)
+            \\            if not (isinstance(p, (ast.Assign, ast.AnnAssign)) and parents.get(p) is tree):
+            \\                bad.add(node.id)
+            \\            continue
+            \\        if isinstance(node.ctx, ast.Del):
+            \\            bad.add(node.id)
+            \\            continue
+            \\        ok = (isinstance(p, ast.Subscript) and p.value is node and isinstance(p.ctx, ast.Load)) \
+            \\            or (isinstance(p, ast.Compare) and node in p.comparators and all(isinstance(o, (ast.In, ast.NotIn)) for o in p.ops)) \
+            \\            or (isinstance(p, (ast.For, ast.comprehension)) and p.iter is node) \
+            \\            or (isinstance(p, ast.Attribute) and p.value is node and p.attr in SAFE_METHODS
+            \\                and isinstance(parents.get(p), ast.Call) and parents[p].func is p) \
+            \\            or (isinstance(p, ast.Call) and node in p.args and isinstance(p.func, ast.Name) and p.func.id in SAFE_CALLS)
+            \\        if not ok:
+            \\            bad.add(node.id)
+            \\    return frozenset(n for n in cands if n not in bad)
             \\def scan(g):
             \\    out = set()
             \\    seen = set()
@@ -320,7 +369,7 @@ fn reboundGlobals(globals: *PyObject) error{Python}!*PyObject {
             \\                visit(x, depth + 1)
             \\    for v in list(g.values()):
             \\        visit(v, 0)
-            \\    return frozenset(out)
+            \\    return (frozenset(out), frozen(g) - out)
         ;
         const ns = runPython(src) orelse return error.Python;
         defer py.Py_DecRef(ns);
@@ -328,18 +377,26 @@ fn reboundGlobals(globals: *PyObject) error{Python}!*PyObject {
         py.Py_IncRef(f);
         rebound_scanner = f;
     }
-    const names = py.c.PyObject_CallFunctionObjArgs(rebound_scanner.?, globals, @as(?*PyObject, null)) orelse return error.Python;
+    const pair = py.c.PyObject_CallFunctionObjArgs(rebound_scanner.?, globals, @as(?*PyObject, null)) orelse return error.Python;
+    defer py.Py_DecRef(pair);
+    const entry = ScanEntry{ .len = n, .names = py.c.PyTuple_GetItem(pair, 0).?, .frozen = py.c.PyTuple_GetItem(pair, 1).? };
+    py.Py_IncRef(entry.names);
+    py.Py_IncRef(entry.frozen);
     if (rebound_cache.fetchRemove(globals)) |old| {
         py.Py_DecRef(old.value.names);
+        py.Py_DecRef(old.value.frozen);
     } else py.Py_IncRef(globals);
-    rebound_cache.put(std.heap.c_allocator, globals, .{ .len = n, .names = names }) catch {
-        py.Py_DecRef(names);
+    rebound_cache.put(std.heap.c_allocator, globals, entry) catch {
+        py.Py_DecRef(entry.names);
+        py.Py_DecRef(entry.frozen);
         py.Py_DecRef(globals);
         _ = py.c.PyErr_NoMemory();
         return error.Python;
     };
-    return names;
+    return entry;
 }
+
+const ScanEntry = struct { len: isize, names: *PyObject, frozen: *PyObject };
 
 /// The record type of a class whose objects compiled code makes natively
 /// (records): a dataclass, or a plain class with __slots__ (all the way
@@ -430,7 +487,7 @@ var not_records: std.AutoHashMapUnmanaged(*PyObject, void) = .empty;
 
 var rebound_scanner: ?*PyObject = null;
 /// (the module dicts are kept: modules live as long)
-var rebound_cache: std.AutoHashMapUnmanaged(*PyObject, struct { len: isize, names: *PyObject }) = .empty;
+var rebound_cache: std.AutoHashMapUnmanaged(*PyObject, ScanEntry) = .empty;
 
 // ======================================================================
 // The compiler
@@ -454,6 +511,9 @@ const HelperSpec = struct {
     /// The semantic it runs for (run as Python if the helper can't be
     /// compiled)
     semantic: ?*PyObject,
+    /// A closure's code: the function called is the last argument, its
+    /// variables (cells) read from it when the code runs
+    closure: bool = false,
 
     fn matches(self: *const HelperSpec, func: *const front.Function, args: []const SVal) bool {
         if (self.func != func or self.args.len != args.len) return false;
@@ -535,7 +595,7 @@ pub const Compiler = struct {
 
     /// Free the constants' Bigs.
     pub fn freeBigs(self: *Compiler) void {
-        for (self.bigs.items) |b| std.heap.c_allocator.destroy(b);
+        for (self.bigs.items) |b| value.allocator.destroy(b);
         self.bigs.deinit(std.heap.c_allocator);
         self.bigs = .empty;
     }
@@ -623,11 +683,18 @@ pub const Compiler = struct {
                 continue;
             }
             const d = try g.loadSlot(g.elem(g.f.param(2), j), .any);
+            j += 1;
+            // (a closure's function, last: borrowed, its cells read)
+            if (h.closure and i == h.args.len - 1) {
+                g.closure_fn = d;
+                g.closure_root = h.func;
+                continue;
+            }
             try g.increfDyn(d);
             args[i] = .{ .dyn = d };
-            j += 1;
         }
-        const v = try g.materialize(try g.runFunction(h.func, AT_PARAM, args), AT_PARAM);
+        const params = if (h.closure) args[0 .. args.len - 1] else args;
+        const v = try g.materialize(try g.runFunction(h.func, AT_PARAM, params), AT_PARAM);
         try g.storeSlot(g.out_param, v);
         try g.f.ret(self.m.k32(1));
         try g.f.block(g.err_label);
@@ -640,7 +707,7 @@ pub const Compiler = struct {
         const b = value.newBig(v) orelse return error.OutOfMemory;
         b.head.rc = value.IMMORTAL;
         self.bigs.append(std.heap.c_allocator, b) catch {
-            std.heap.c_allocator.destroy(b);
+            value.allocator.destroy(b);
             return error.OutOfMemory;
         };
         return b;
@@ -666,15 +733,17 @@ pub const Compiler = struct {
     /// (a library function of the language...), for `nargs` arguments
     /// (those in `rt_mask`: rt values, the call's frames): a helper's code
     /// out of line, in a module of its own. Its name.
-    pub fn compileCalled(self: *Compiler, o: *PyObject, nargs: usize, rt_mask: u64) Error![:0]const u8 {
+    pub fn compileCalled(self: *Compiler, o: *PyObject, nargs: usize, rt_mask: u64, closure: bool) Error![:0]const u8 {
         try self.newModule();
         const func = try self.readFunction(o);
         if (func.param_count != nargs) return self.unsupported("{s}() takes {d} arguments, called with {d}", .{ func.name, func.param_count, nargs });
-        const key = try self.a.alloc(SVal, nargs);
-        for (key, 0..) |*slot, i| slot.* = if (rt_mask & (@as(u64, 1) << @intCast(i)) != 0) .rt else .{ .dyn = undefined };
+        // (a closure: the function called given last, its variables read
+        // from it)
+        const key = try self.a.alloc(SVal, nargs + @intFromBool(closure));
+        for (key, 0..) |*slot, i| slot.* = if (i < nargs and rt_mask & (@as(u64, 1) << @intCast(i)) != 0) .rt else .{ .dyn = undefined };
         _ = try self.objectIndex(o);
         const h = try self.a.create(HelperSpec);
-        h.* = .{ .func = func, .args = key, .name = try std.fmt.allocPrintSentinel(self.a, "{s}_c{d}", .{ self.m.prefix, self.helper_fns.items.len }, 0), .semantic = null };
+        h.* = .{ .func = func, .args = key, .name = try std.fmt.allocPrintSentinel(self.a, "{s}_c{d}", .{ self.m.prefix, self.helper_fns.items.len }, 0), .semantic = null, .closure = closure };
         try self.helper_fns.append(self.a, h);
         try self.helper_queue.append(self.a, h);
         try self.drainQueues();
@@ -794,6 +863,7 @@ pub const Compiler = struct {
         .{ "zr_exc_matches", "bpl" },
         .{ "zr_exc_catch", "bpip" },
         .{ "zr_type", "vllp" },
+        .{ "zr_cell", "bpilllp" },
         .{ "zr_builtin", "bpiilllp" },
         .{ "zr_range", "bpiplp" },
         .{ "zr_is_type", "blli" },
@@ -1001,7 +1071,7 @@ pub const Compiler = struct {
     }
 
     /// A Python object the code refers to: its index (a new reference kept).
-    fn objectIndex(self: *Compiler, o: *PyObject) !usize {
+    pub fn objectIndex(self: *Compiler, o: *PyObject) !usize {
         for (self.objects.items, 0..) |x, i| if (x == o) return i;
         py.Py_IncRef(o);
         try self.objects.append(self.a, o);
@@ -1197,6 +1267,10 @@ const Gen = struct {
     /// (pointers, null for none)
     detached: bool = false,
     owner_param: ir.Value = null,
+    /// A closure's code: the function called (its cells), and the function
+    /// it's the code of
+    closure_fn: ?Dyn = null,
+    closure_root: ?*const front.Function = null,
     out_param: ir.Value = null,
     base_scopes: usize = 0,
 
@@ -2008,6 +2082,33 @@ const Gen = struct {
             else => {},
         }
         return v;
+    }
+
+    /// A module-level table the module only reads (frozenGlobals), known:
+    /// a dict or list of its items as constants (a tuple: as constant()
+    /// makes it).
+    fn frozenTable(self: *Gen, o: *PyObject, at: u32) Error!SVal {
+        const t = ph.typeOf(o);
+        if (t == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyDict_Type"))))) {
+            const d = try self.a().create(SDict);
+            d.* = .{};
+            var pos: py.Py_ssize_t = 0;
+            var key: ?*PyObject = null;
+            var v: ?*PyObject = null;
+            while (py.c.PyDict_Next(o, &pos, @ptrCast(&key), @ptrCast(&v)) != 0) {
+                try d.keys.append(self.a(), try self.constant(key.?, at));
+                try d.values.append(self.a(), try self.constant(v.?, at));
+            }
+            return .{ .dict = d };
+        }
+        if (t == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyList_Type"))))) {
+            const l = try self.a().create(SList);
+            l.* = .{};
+            const n: usize = @intCast(py.c.PyList_Size(o));
+            for (0..n) |i| try l.items.append(self.a(), try self.constant(py.c.PyList_GetItem(o, @intCast(i)).?, at));
+            return .{ .list = l };
+        }
+        return self.constant(o, at);
     }
 
     /// A run-time value as rt hands it over (a plain int made an I64: its
@@ -3553,7 +3654,12 @@ const Gen = struct {
         defer py.Py_DecRef(globals);
         const key = ph.newString(name) orelse return error.Python;
         defer py.Py_DecRef(key);
-        // A captured variable first, then the module, then builtins
+        // A captured variable first (a closure's code: read from the
+        // function called), then the module, then builtins
+        if (self.closure_fn) |cf| if (inst.func == self.closure_root.?) if (try freeVarIndex(fobj, name)) |idx| {
+            try self.callCheck("zr_cell", &.{ self.ctx, self.k32(inst.node), cf.tag, cf.bits, self.k(@intCast(idx)), self.out });
+            return .{ .dyn = try self.loadOut(.any) };
+        };
         if (try closureValue(fobj, name)) |cell_value| return self.constant(cell_value, inst.node);
         // (one a function assigns: its value when the code runs)
         const rebound = try reboundGlobals(globals);
@@ -3563,7 +3669,11 @@ const Gen = struct {
             try self.callCheck("zr_global", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), s, self.out });
             return .{ .dyn = try self.loadOut(.any) };
         }
-        if (py.c.PyDict_GetItem(globals, key)) |v| return self.constant(v, inst.node);
+        if (py.c.PyDict_GetItem(globals, key)) |v| {
+            // (a table only read: known, as a constant)
+            if (py.c.PySequence_Contains(try frozenGlobals(globals), key) == 1) return self.frozenTable(v, inst.node);
+            return self.constant(v, inst.node);
+        }
         const builtins = py.c.PyImport_ImportModule("builtins") orelse return error.Python;
         defer py.Py_DecRef(builtins);
         if (py.c.PyObject_HasAttr(builtins, key) == 1) {
@@ -3573,6 +3683,20 @@ const Gen = struct {
             return .{ .py = v };
         }
         return self.c.unsupportedAt(inst.func, pos, "name '{s}' is not defined", .{name});
+    }
+
+    /// The index of a function's free variable (its cell's), or null.
+    fn freeVarIndex(fobj: *PyObject, name: []const u8) Error!?usize {
+        const code = ph.attr(fobj, "__code__") orelse return error.Python;
+        defer py.Py_DecRef(code);
+        const freevars = ph.attr(code, "co_freevars") orelse return error.Python;
+        defer py.Py_DecRef(freevars);
+        const n: usize = @intCast(py.c.PyTuple_Size(freevars));
+        for (0..n) |i| {
+            const fv = ph.utf8(py.c.PyTuple_GetItem(freevars, @intCast(i)).?, "name") orelse return error.Python;
+            if (std.mem.eql(u8, fv, name)) return i;
+        }
+        return null;
     }
 
     fn closureValue(fobj: *PyObject, name: []const u8) Error!?*PyObject {

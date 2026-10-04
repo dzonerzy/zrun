@@ -20,7 +20,9 @@ const types = @import("types.zig");
 const objects = @import("objects.zig");
 const proxies = @import("proxies.zig");
 
-const allocator = std.heap.c_allocator;
+/// What values are made with (and freed with: anything making one
+/// elsewhere uses it too)
+pub const allocator = @import("pool.zig").allocator;
 
 pub const Tag = enum(u64) {
     none = 0,
