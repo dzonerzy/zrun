@@ -592,6 +592,8 @@ pub const Compiler = struct {
     /// The Bigs of the code's constants (c_allocator's: the program frees
     /// them)
     bigs: std.ArrayListUnmanaged(*value.Big) = .empty,
+    /// Record fields by module and name (Gen.fieldCandidates)
+    field_cands: std.StringHashMapUnmanaged([]const Gen.FieldCandidate) = .empty,
 
     /// Free the constants' Bigs.
     pub fn freeBigs(self: *Compiler) void {
@@ -2399,15 +2401,25 @@ const Gen = struct {
     /// semantic's): each one's finally on the way, innermost first; or a
     /// handler catching it (as Python's `except` catches those): to it,
     /// true.
-    fn leaveTries(self: *Gen, stop: usize, ctl: ?RtMethod) Error!bool {
+    fn leaveTries(self: *Gen, stop: usize, ctl: ?RtMethod, ret: ?Dyn) Error!bool {
         var i = self.tries.items.len;
         while (i > stop) {
             i -= 1;
             const fr = self.tries.items[i];
             if (ctl) |kind| if (fr.catches(kind)) |h| {
+                // (the exception Python would have raised, for `as e`:
+                // rt.Return(value), rt.Break(), rt.Continue(); borrowing
+                // the value)
+                const cls = controlClass(kind).?;
+                const n: usize = if (kind == .Return) 1 else 0;
+                const arr = try self.valueSlots(1);
+                if (n == 1) try self.storeSlot(self.elem(arr, 0), ret orelse self.noneDyn());
+                try self.callCheck("zr_call_python", &.{ self.ctx, self.k32(self.atNode()), self.k(@intCast(try self.c.objectIndex(cls))), arr, self.k(@intCast(n)), self.out });
+                const exc = try self.loadOut(.any);
                 try self.releaseAbove(fr.depth);
                 self.releaseScopesAbove(fr.scope_depth);
                 try self.dropTemp(fr.caught[h]);
+                try self.storeSlot(fr.caught[h], exc);
                 try self.f.br(fr.handler_blocks[h]);
                 try self.f.block(try self.f.label("after_jump"));
                 return true;
@@ -2433,7 +2445,7 @@ const Gen = struct {
 
     fn returnWith(self: *Gen, d: Dyn, at: u32) Error!void {
         // (through the try statements here: caught, or their finally run)
-        if (try self.leaveTries(0, .Return)) {
+        if (try self.leaveTries(0, .Return, d)) {
             try self.drop(.{ .dyn = d });
             return;
         }
@@ -2461,7 +2473,7 @@ const Gen = struct {
         // (through the try statements inside the loop: caught, or their
         // finally run)
         const stop = if (self.loops.items.len > 0) self.loops.items[self.loops.items.len - 1].tries else 0;
-        if (try self.leaveTries(stop, kind)) return;
+        if (try self.leaveTries(stop, kind, null)) return;
         if (self.loops.items.len == 0) {
             if (self.thunk) {
                 try self.releaseAbove(0);
@@ -2643,7 +2655,7 @@ const Gen = struct {
         // (the finally of the try statements it's in, first)
         var stop = self.tries.items.len;
         while (stop > 0 and self.tries.items[stop - 1].inst == inst) stop -= 1;
-        _ = try self.leaveTries(stop, null);
+        _ = try self.leaveTries(stop, null, null);
         // (the locals as they are on this path: a value assigned after
         // a return inside run-time control flow isn't there on the others)
         try self.releaseLocals(inst);
@@ -2811,7 +2823,7 @@ const Gen = struct {
             .break_, .continue_ => {
                 if (inst.loops.items.len == 0) return self.c.unsupportedAt(inst.func, s.pos, "this break or continue can't be compiled", .{});
                 const target = inst.loops.items[inst.loops.items.len - 1];
-                _ = try self.leaveTries(target.tries, null);
+                _ = try self.leaveTries(target.tries, null, null);
                 try self.f.br(if (s.kind == .break_) target.brk else target.cont);
                 try self.f.block(try self.f.label("after_jump"));
             },
@@ -2894,8 +2906,6 @@ const Gen = struct {
             if (fr.catch_break == null and py.c.PyObject_IsSubclass(types_.Break, cls) == 1) fr.catch_break = i;
             if (fr.catch_continue == null and py.c.PyObject_IsSubclass(types_.Continue, cls) == 1) fr.catch_continue = i;
             if (py.c.PyErr_Occurred() != null) return error.Python;
-            if (h.name != null and (fr.catch_return == i or fr.catch_break == i or fr.catch_continue == i))
-                return c.unsupportedAt(inst.func, h.pos, "`except ... as` catching rt.Return, rt.Break or rt.Continue can't be compiled", .{});
         }
         const catcher = try f.label("except");
         const handled = try f.label("handled");
@@ -3065,11 +3075,43 @@ const Gen = struct {
             return self.c.unsupportedAt(inst.func, pos, "assigning to an attribute of a {s} isn't compiled", .{@tagName(obj)});
         }
         const vd = try self.materialize(v, inst.node);
+        const d = obj.dyn;
+        const f = &self.f;
+        const t = self.c.m.t;
+        // A field of a record of the module's classes: stored where it is
+        // (its type checked); anything else by zr_setattr
+        const cands = try self.fieldCandidates(inst, name, true);
+        const join = try f.label("setfield_done");
+        const generic = try f.label("setfield_generic");
+        if (cands.len > 0) {
+            const typed = try f.label("setfield_typed");
+            try f.condBr(f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.record))), typed, generic);
+            try f.block(typed);
+            const rt = self.recordTypeOf(d);
+            for (cands) |cand| {
+                const yes = try f.label("setfield_of");
+                const no = try f.label("setfield_next");
+                try f.condBr(f.icmp(jit_c.LLVMIntEQ, rt, self.k(@intCast(@intFromPtr(cand.rtype)))), yes, no);
+                try f.block(yes);
+                const p = self.fieldPtr(d, cand.index);
+                const old = Dyn{ .tag = f.load(t.i64, p), .bits = f.load(t.i64, f.offset(p, 8)), .shape = .any };
+                try self.increfDyn(vd);
+                try self.storeSlot(p, vd);
+                // (an unset slot's old "value" isn't counted: the tag)
+                _ = self.call(self.decName(), &.{ old.tag, old.bits });
+                try f.br(join);
+                try f.block(no);
+            }
+            try f.br(generic);
+        } else try f.br(generic);
+        try f.block(generic);
         const s = try self.c.m.string(name);
-        const ok = self.call("zr_setattr", &.{ self.ctx, self.k32(inst.node), obj.dyn.tag, obj.dyn.bits, s, vd.tag, vd.bits });
+        const ok = self.call("zr_setattr", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, s, vd.tag, vd.bits });
+        try self.check(ok);
+        try f.br(join);
+        try f.block(join);
         try self.drop(.{ .dyn = vd });
         try self.drop(obj);
-        try self.check(ok);
     }
 
     /// obj[key] = v (all taken): a known container changed now (outside
@@ -3831,15 +3873,101 @@ const Gen = struct {
                 return sv;
             },
             .dyn => |d| {
-                // A field of a record (or an attribute of a Python object)
-                const s = try c.m.string(name);
-                const ok = self.call("zr_getattr", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, s, self.out });
-                try self.drop(obj);
-                try self.check(ok);
-                return .{ .dyn = try self.loadOut(.any) };
+                // A field of a record of the module's classes: read where
+                // it is (its type checked); anything else (a Python
+                // object's attribute...) by zr_getattr
+                const cands = try self.fieldCandidates(inst, name, false);
+                if (cands.len > 0) return self.recordField(inst, d, name, cands);
+                return .{ .dyn = try self.genericGetattr(inst, d, name) };
             },
             else => return c.unsupportedAt(inst.func, pos, "'{s}' of a {s} isn't compiled yet (only called, as a method)", .{ name, @tagName(obj) }),
         }
+    }
+
+    fn genericGetattr(self: *Gen, inst: *Inst, d: Dyn, name: []const u8) Error!Dyn {
+        const s = try self.c.m.string(name);
+        const ok = self.call("zr_getattr", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, s, self.out });
+        try self.drop(.{ .dyn = d });
+        try self.check(ok);
+        return self.loadOut(.any);
+    }
+
+    const FieldCandidate = struct { rtype: *value.RecordType, index: usize };
+
+    /// The record classes of the semantic's module with a field `name`
+    /// (not frozen ones, `for_store`), and where it is in them (made once
+    /// per module and name).
+    fn fieldCandidates(self: *Gen, inst: *Inst, name: []const u8, for_store: bool) Error![]const FieldCandidate {
+        const c = self.c;
+        const globals = ph.attr(inst.func.py_function, "__globals__") orelse return error.Python;
+        defer py.Py_DecRef(globals);
+        const key = try std.fmt.allocPrint(c.a, "{x}:{s}:{}", .{ @intFromPtr(globals), name, for_store });
+        if (c.field_cands.get(key)) |cands| return cands;
+        var out: std.ArrayListUnmanaged(FieldCandidate) = .empty;
+        var pos: py.Py_ssize_t = 0;
+        var gk: ?*PyObject = null;
+        var v: ?*PyObject = null;
+        while (py.c.PyDict_Next(globals, &pos, @ptrCast(&gk), @ptrCast(&v)) != 0) {
+            if (!try isInstanceOf(v.?, @ptrCast(@alignCast(py.types.typeObject("PyType_Type"))))) continue;
+            const rtype = try recordOf(v.?) orelse continue;
+            if (for_store and rtype.frozen) continue;
+            for (rtype.fields, 0..) |f, i| if (std.mem.eql(u8, f, name)) {
+                try out.append(c.a, .{ .rtype = rtype, .index = i });
+                break;
+            };
+        }
+        try c.field_cands.put(c.a, key, out.items);
+        return out.items;
+    }
+
+    /// Where field `index` of a record is (its tag word).
+    fn fieldPtr(self: *Gen, d: Dyn, index: usize) ir.Value {
+        return self.f.offset(self.f.intToPtr(d.bits), @intCast(@sizeOf(value.Record) + index * @sizeOf(value.Value)));
+    }
+
+    /// A record's type (the word after its header).
+    fn recordTypeOf(self: *Gen, d: Dyn) ir.Value {
+        return self.f.load(self.c.m.t.i64, self.f.offset(self.f.intToPtr(d.bits), @offsetOf(value.Record, "rtype")));
+    }
+
+    /// obj.name read where it is in a record of one of the candidates'
+    /// types; anything else (or a slot never assigned: its error) by
+    /// zr_getattr.
+    fn recordField(self: *Gen, inst: *Inst, d: Dyn, name: []const u8, cands: []const FieldCandidate) Error!SVal {
+        const f = &self.f;
+        const t = self.c.m.t;
+        const result = try self.valSlot();
+        const join = try f.label("field_done");
+        const generic = try f.label("field_generic");
+        const is_record = f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.record)));
+        const typed = try f.label("field_typed");
+        try f.condBr(is_record, typed, generic);
+        try f.block(typed);
+        const rt = self.recordTypeOf(d);
+        for (cands) |cand| {
+            const yes = try f.label("field_of");
+            const no = try f.label("field_next");
+            try f.condBr(f.icmp(jit_c.LLVMIntEQ, rt, self.k(@intCast(@intFromPtr(cand.rtype)))), yes, no);
+            try f.block(yes);
+            const p = self.fieldPtr(d, cand.index);
+            const ftag = f.load(t.i64, p);
+            const set = try f.label("field_set");
+            try f.condBr(f.icmp(jit_c.LLVMIntEQ, ftag, self.k(@bitCast(value.UNSET_TAG))), generic, set);
+            try f.block(set);
+            const v = Dyn{ .tag = ftag, .bits = f.load(t.i64, f.offset(p, 8)), .shape = .any };
+            try self.increfDyn(v);
+            try self.storeSlot(result, v);
+            // (the record: dropped, the field's taken)
+            _ = self.call(self.decName(), &.{ d.tag, d.bits });
+            try f.br(join);
+            try f.block(no);
+        }
+        try f.br(generic);
+        try f.block(generic);
+        try self.storeSlot(result, try self.genericGetattr(inst, d, name));
+        try f.br(join);
+        try f.block(join);
+        return .{ .dyn = try self.loadSlot(result, .any) };
     }
 
     /// `obj.name(args)` on a value (not rt, a node or a module).

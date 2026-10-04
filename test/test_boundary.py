@@ -43,6 +43,7 @@ BUILTINS = (
     "tables",
     "untables",
     "defaults",
+    "fields",
 )
 
 
@@ -77,6 +78,26 @@ class Holder:
 
     def get(self, k):
         return self.v + k
+
+
+class Slot2:
+    __slots__ = ("x", "y")
+
+    def __init__(self, x):
+        self.x = x
+
+
+class Slot3(Slot2):
+    __slots__ = ("z",)
+
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+
+@dataclass(frozen=True)
+class Frozen:
+    v: int
 
 
 def scaled(x, factor=2, offset=0):
@@ -269,6 +290,24 @@ def make_lang():
             # helpers' defaults and keyword arguments
             n = rt.call(rt.load(node.name), [])
             return (scaled(n), scaled(n, 3), scaled(n, offset=1), scaled(x=n, factor=4, offset=1), scaled(n, offset=2, factor=0))
+        if name == "fields":
+            # record fields: a class's, a subclass's, unset, frozen
+            n = rt.call(rt.load(node.name), [])
+            b = Slot2(n)
+            s = Slot3(n, n + 1)
+            s.x = s.x + 10
+            out = [b.x, s.x, s.y]
+            try:
+                out.append(b.y)
+            except AttributeError as e:
+                out.append(str(e))
+            fz = Frozen(n)
+            try:
+                fz.v = 2
+            except Exception as e:
+                out.append(type(e).__name__)
+            out.append(fz.v)
+            return out
         if name == "bigmath":
             # A semantic's own ints are Python's (beyond 64 bits on the way)
             m = -1 & 0xFFFFFFFFFFFFFFFF
@@ -441,6 +480,10 @@ def make_lang():
         return 3
 
     @lang.host
+    def fields():
+        return 5
+
+    @lang.host
     def untables():
         LIVE_TABLE.clear()
         LIVE_TABLE["a"] = 1
@@ -516,6 +559,7 @@ PROGRAMS = {
     "wide": "print(wide());\n",
     "tables": "print(untables(), tables());\n",
     "defaults": "print(defaults());\n",
+    "fields": "print(fields());\n",
 }
 
 

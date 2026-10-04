@@ -199,6 +199,18 @@ pub fn printStats() void {
     stats.clearRetainingCapacity();
 }
 
+/// dataclasses.FrozenInstanceError (had once; null with an exception).
+fn frozenError() ?*PyObject {
+    const S = struct {
+        var cls: ?*PyObject = null;
+    };
+    if (S.cls) |c| return c;
+    const m = py.c.PyImport_ImportModule("dataclasses") orelse return null;
+    defer py.Py_DecRef(m);
+    S.cls = py.c.PyObject_GetAttrString(m, "FrozenInstanceError");
+    return S.cls;
+}
+
 /// The Python exception being raised as the run's error (as the reference
 /// mode words it); false.
 fn failPython(ctx: *Ctx, node: u32) bool {
@@ -1000,7 +1012,10 @@ export fn zr_setattr(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value
         const r: *value.Record = @ptrCast(@alignCast(v.ptr()));
         for (r.rtype.fields, 0..) |f, i| {
             if (std.mem.eql(u8, f, name.bytes())) {
-                if (r.rtype.frozen) return fail(ctx, node, "cannot assign to field '{s}'", .{f});
+                if (r.rtype.frozen) {
+                    const cls = frozenError() orelse return failPython(ctx, node);
+                    return failAs(ctx, node, cls, null, "cannot assign to field '{s}'", .{f});
+                }
                 value.incref(x);
                 value.decref(r.fields()[i]);
                 r.fields()[i] = x;
