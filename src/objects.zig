@@ -518,6 +518,9 @@ pub const FrameObject = extern struct {
     name: ?*PyObject,
     /// The variables, by symbol (owned values)
     slots: ?*Slots,
+    /// What the function was called on (rt.call(f, args, receiver=...)),
+    /// owned; null: none
+    receiver: ?*PyObject,
 };
 
 pub fn newFrame(scope: u32, call: u32, parent: ?*PyObject, name: *PyObject) ?*PyObject {
@@ -525,6 +528,7 @@ pub fn newFrame(scope: u32, call: u32, parent: ?*PyObject, name: *PyObject) ?*Py
     const f: *FrameObject = @ptrCast(@alignCast(obj));
     f.scope = scope;
     f.call = call;
+    f.receiver = null;
     if (parent) |p| py.Py_IncRef(p);
     f.parent = parent;
     py.Py_IncRef(name);
@@ -562,18 +566,22 @@ fn frameClear(obj: ?*PyObject) callconv(.c) c_int {
         while (it.next()) |v| py.Py_DecRef(v.*);
         slots.clearRetainingCapacity();
     }
-    if (f.parent) |p| {
-        f.parent = null;
-        py.Py_DecRef(p);
+    inline for (.{ "parent", "receiver" }) |field| {
+        if (@field(f, field)) |o| {
+            @field(f, field) = null;
+            py.Py_DecRef(o);
+        }
     }
     return 0;
 }
 
 fn frameTraverse(obj: ?*PyObject, visit: py.c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
     const f: *FrameObject = @ptrCast(@alignCast(obj.?));
-    if (f.parent) |p| {
-        const r = visit.?(p, arg);
-        if (r != 0) return r;
+    inline for (.{ f.parent, f.receiver }) |o| {
+        if (o) |x| {
+            const r = visit.?(x, arg);
+            if (r != 0) return r;
+        }
     }
     if (f.slots) |slots| {
         var it = slots.valueIterator();

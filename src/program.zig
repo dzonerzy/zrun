@@ -29,10 +29,25 @@ pub const Sym = struct {
 /// How functions are made from nodes of a kind (Language.function)
 pub const FunctionSpec = struct {
     params: u8 = 0,
+    /// The body: the child with this label, else the first child of the
+    /// rule `body_rule`
     body: u8 = 0,
+    body_rule: u16 = NO_RULE,
     name: u8 = 0,
     hoist: bool = true,
 };
+
+pub const NO_RULE: u16 = std.math.maxInt(u16);
+
+/// The first child of `node` matched by a rule.
+pub fn childOfRule(data: *const Data, node: u32, rule_id: u16) ?u32 {
+    var c = node + 1;
+    const stop = data.end(node);
+    while (c < stop) : (c = data.end(c)) {
+        if (data.nodes[c].ruleId() == rule_id) return c;
+    }
+    return null;
+}
 
 pub const Data = struct {
     arena: std.heap.ArenaAllocator,

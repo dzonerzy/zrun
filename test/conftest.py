@@ -20,6 +20,10 @@ def _load_tiny():
 
 tiny = _load_tiny()
 
+# The typed language (examples/typed): typed.py imports typedlang.py from its folder
+sys.path.insert(0, os.path.join(HERE, "..", "examples", "typed"))
+import typed  # noqa: E402
+
 
 @pytest.fixture
 def run(capsys):

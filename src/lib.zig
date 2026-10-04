@@ -203,7 +203,23 @@ const Language = struct {
         }
         var spec = FunctionSpec{ .hoist = v.hoist };
         spec.params = self.labelId(v.params, "params", true) orelse return null;
-        spec.body = self.labelId(v.body, "body", false) orelse return null;
+        // The body: a label, or a rule (an unlabelled block)
+        if (optional(v.body)) |b| {
+            const given = ph.utf8(b, "body") orelse return null;
+            if (g.field_ids.get(given)) |id| {
+                spec.body = id;
+            } else for (g.rule_names, 0..) |r, i| {
+                if (std.mem.eql(u8, r, given)) {
+                    spec.body_rule = @intCast(i);
+                    break;
+                }
+            } else {
+                ph.raise(py.PyExc_ValueError(), "the grammar has no label or rule '{s}' (the function's body)", .{given});
+                return null;
+            }
+        } else {
+            spec.body = self.labelId(null, "body", false) orelse return null;
+        }
         spec.name = self.labelId(v.name, "name", true) orelse return null;
         for (g.rule_names, g.kind_names, 0..) |r, k, i| {
             if (std.mem.eql(u8, r, kind) or std.mem.eql(u8, k, kind)) self._functions[i] = spec;
@@ -543,7 +559,7 @@ const Program = struct {
             var rt = Runtime.begin(self) orelse return null;
             defer rt.end();
             rt.self()._frame = ref(st.globals.?);
-            return rt.self().callValue(f, args);
+            return rt.self().callValue(f, args, null);
         }
         ph.raise(py.PyExc_KeyError(), "the program defines no function '{s}'", .{wanted});
         return null;
@@ -1010,26 +1026,31 @@ const Runtime = struct {
     }
 
     /// Define the hoisted functions of the scope just entered.
-    fn hoist(self: *Runtime, scope: u32) bool {
-        const list = self.data().hoisted.get(scope) orelse return true;
+    fn hoist(self: *Runtime, scope_node: u32) bool {
+        const list = self.data().hoisted.get(scope_node) orelse return true;
         for (list.items) |fnode| {
             if (!self.defineFunction(fnode, self.specOf(fnode).?)) return false;
         }
         return true;
     }
 
-    /// `rt.call(f, args)`: call a function of the program, or a host
-    /// function, with a list of arguments.
-    pub fn call(self: *Runtime, f: *PyObject, args: *PyObject) ?*PyObject {
-        const tuple = py.c.PySequence_Tuple(args) orelse return null;
+    /// `rt.call(f, args, receiver=None)`: call a function of the program, or
+    /// a host function, with a list of arguments; `receiver` is what a
+    /// method is called on (`rt.receiver` in its body; a host function gets
+    /// it as its first argument).
+    pub fn call(self: *Runtime, a: pyoz.Args(struct { f: *PyObject, args: *PyObject, receiver: ?*PyObject = null })) ?*PyObject {
+        const v = a.value;
+        const tuple = py.c.PySequence_Tuple(v.args) orelse return null;
         defer py.Py_DecRef(tuple);
-        return self.callValue(f, tuple);
+        return self.callValue(v.f, tuple, optional(v.receiver));
     }
 
-    fn callValue(self: *Runtime, f: *PyObject, args: *PyObject) ?*PyObject {
-        if (objects.asFunction(f)) |fo| return self.callFunction(fo, args);
+    fn callValue(self: *Runtime, f: *PyObject, args: *PyObject, receiver: ?*PyObject) ?*PyObject {
+        if (objects.asFunction(f)) |fo| return self.callFunction(fo, args, receiver);
         if (py.PyCallable_Check(f)) {
-            const wrapped = wrapAll(args) orelse return null;
+            const all = if (receiver) |r| prepend(r, args) orelse return null else ref(args);
+            defer py.Py_DecRef(all);
+            const wrapped = wrapAll(all) orelse return null;
             defer py.Py_DecRef(wrapped);
             const r = py.c.PyObject_CallObject(f, wrapped) orelse return self.hostFailed(f);
             return types.wrapOwned(r) orelse self.raised(self._at);
@@ -1060,7 +1081,7 @@ const Runtime = struct {
         return self.fail(self._at, "{s}: {s}", .{ name, message });
     }
 
-    fn callFunction(self: *Runtime, fo: *objects.FunctionObject, args: *PyObject) ?*PyObject {
+    fn callFunction(self: *Runtime, fo: *objects.FunctionObject, args: *PyObject, receiver: ?*PyObject) ?*PyObject {
         if (fo.state != self.stateObj()) return self.fail(self._at, "a function of another program can't be called here", .{});
         const fnode = fo.node;
         const spec = self.specOf(fnode).?;
@@ -1081,6 +1102,7 @@ const Runtime = struct {
         if (self._depth >= max) return self.fail(self._at, "call stack too deep (more than {d} calls)", .{max});
 
         const frame = objects.newFrame(fnode, self._at, fo.env, fo.name.?) orelse return null;
+        if (receiver) |r| objects.asFrame(frame).receiver = ref(r);
         const saved = self._frame;
         self._frame = frame;
         self._depth += 1;
@@ -1104,7 +1126,12 @@ const Runtime = struct {
             const target = self.paramName(p) orelse return null;
             if (!self.storeNode(target, py.c.PyTuple_GetItem(args, @intCast(i)).?)) return null;
         }
-        const body = objects.fieldOf(program, self.ctx(), fnode, spec.body) orelse return null;
+        const body = if (spec.body != 0)
+            objects.fieldOf(program, self.ctx(), fnode, spec.body) orelse return null
+        else if (program_mod.childOfRule(self.data(), fnode, spec.body_rule)) |b|
+            objects.valueOf(program, self.ctx(), b) orelse return null
+        else
+            none();
         defer py.Py_DecRef(body);
         if (self.execObj(body)) return none();
         if (types.pendingControl() == .ret) return types.takeReturn();
@@ -1162,6 +1189,57 @@ const Runtime = struct {
         const idx = self.nodeIndex(n, "node") orelse return null;
         const nd = self.data().nodes[idx];
         return py.c.Py_BuildValue("(II)", @as(c_uint, nd.text_start), @as(c_uint, nd.text_end));
+    }
+
+    /// What the method being run was called on (rt.call(..., receiver=)):
+    /// the innermost one through the frames functions were made in; None
+    /// outside a method
+    pub fn get_receiver(self: *const Runtime) ?*PyObject {
+        var fo = self._frame;
+        while (fo) |o| {
+            const f = objects.asFrame(o);
+            if (f.receiver) |r| return ref(r);
+            fo = f.parent;
+        }
+        return none();
+    }
+
+    /// `rt.scope(node)`: the scope node the name `node` refers to is
+    /// defined in (a function, a struct, the program if the rules make it a
+    /// scope), or None for builtins and the global scope.
+    pub fn scope(self: *Runtime, n: *PyObject) ?*PyObject {
+        const idx = self.nodeIndex(n, "node") orelse return null;
+        const d = self.data();
+        const si = d.symbolIndex(idx) orelse return none();
+        const s = d.syms[si].scope;
+        if (s == NONE or s >= d.nodes.len) return none();
+        return self.node(s);
+    }
+
+    /// `rt.symbol(node)`: zrules' Symbol for the name `node` defines or
+    /// uses (its name, type, defining node, scope...), or None.
+    pub fn symbol(self: *Runtime, n: *PyObject) ?*PyObject {
+        const idx = self.nodeIndex(n, "node") orelse return null;
+        const analysis = self._p.?.state().analysis orelse return none();
+        return py.c.PyObject_CallMethod(analysis, "resolve", "I", @as(c_uint, idx));
+    }
+
+    /// `rt.type_of(node)`: the type zrules' types() rule gave a node, as
+    /// text (`int`, `list[float]`, `Point?`), or None.
+    pub fn type_of(self: *Runtime, n: *PyObject) ?*PyObject {
+        const idx = self.nodeIndex(n, "node") orelse return null;
+        const analysis = self._p.?.state().analysis orelse return none();
+        return py.c.PyObject_CallMethod(analysis, "type_of", "I", @as(c_uint, idx));
+    }
+
+    /// `rt.node(index)`: the node at an index of the tree (symbols refer to
+    /// nodes by index).
+    pub fn node_at(self: *Runtime, index: i64) ?*PyObject {
+        if (index < 0 or index >= self.data().nodes.len) {
+            ph.raise(py.PyExc_IndexError(), "no node {d}", .{index});
+            return null;
+        }
+        return self.node(@intCast(index));
     }
 
     /// What the host passed to the run (None without)
@@ -1361,6 +1439,15 @@ fn typeName(o: *PyObject) []const u8 {
 }
 
 /// A tuple with each item wrapped (ints made I64).
+/// (first, *rest) as a new tuple.
+fn prepend(first: *PyObject, rest: *PyObject) ?*PyObject {
+    const n = py.c.PyTuple_Size(rest);
+    const out = py.c.PyTuple_New(n + 1) orelse return null;
+    _ = py.c.PyTuple_SetItem(out, 0, ref(first));
+    for (0..@intCast(n)) |i| _ = py.c.PyTuple_SetItem(out, @intCast(i + 1), ref(py.c.PyTuple_GetItem(rest, @intCast(i)).?));
+    return out;
+}
+
 fn wrapAll(args: *PyObject) ?*PyObject {
     const n = py.c.PyTuple_Size(args);
     const out = py.c.PyTuple_New(n) orelse return null;
