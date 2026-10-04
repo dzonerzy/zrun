@@ -33,8 +33,8 @@ def test_like_real_lua(name, mode, capsys):
 def test_python_semantics():
     # the ones compiled programs run as Python, learned while compiling
     lua.run("print(1)\n", "x.lua", mode="compiled")
-    names = lua.lang.python_semantics()
-    assert "chunk" in names and names == sorted(names)
+    why = lua.lang.python_semantics()
+    assert why["chunk"] == "native=False"
 
 
 def test_uncaught_error():

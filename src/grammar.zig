@@ -133,10 +133,10 @@ fn call(obj: *PyObject, comptime method: [*:0]const u8) !*PyObject {
 fn actionOf(name: ?[]const u8) Action {
     const n = name orelse return .none;
     const table = .{
-        .{ "str", Action.str },     .{ "int", Action.int },       .{ "float", Action.float },
-        .{ "unquote", Action.unquote }, .{ "True", Action.true_ }, .{ "False", Action.false_ },
-        .{ "None", Action.none_ },  .{ "list", Action.list },     .{ "tuple", Action.tuple },
-        .{ "dict", Action.dict },   .{ "first", Action.first },   .{ "drop", Action.drop },
+        .{ "str", Action.str },         .{ "int", Action.int },     .{ "float", Action.float },
+        .{ "unquote", Action.unquote }, .{ "True", Action.true_ },  .{ "False", Action.false_ },
+        .{ "None", Action.none_ },      .{ "list", Action.list },   .{ "tuple", Action.tuple },
+        .{ "dict", Action.dict },       .{ "first", Action.first }, .{ "drop", Action.drop },
     };
     inline for (table) |entry| {
         if (std.mem.eql(u8, n, entry[0])) return entry[1];

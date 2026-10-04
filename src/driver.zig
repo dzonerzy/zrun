@@ -25,8 +25,18 @@ pub const Main = *const fn (ctx: *helpers.Ctx, globals: *value.Frame) callconv(.
 /// A thunk's code: a node's eval or exec in the frames of `frame`
 pub const Thunk = *const fn (ctx: *helpers.Ctx, frame: *value.Frame, out: *value.Value) callconv(.c) i32;
 
-/// The semantics run as Python, by their function (a language's set)
-pub const PythonSet = std.AutoHashMapUnmanaged(*PyObject, void);
+/// The semantics run as Python, by their function (a language's set): why
+pub const PythonSet = compile_mod.PythonSet;
+
+/// Mark a semantic run as Python, with the compiler's reason.
+fn markPython(set: *PythonSet, s: *PyObject, reason: []const u8) bool {
+    const r = allocator.dupe(u8, reason) catch return false;
+    set.put(allocator, s, r) catch {
+        allocator.free(r);
+        return false;
+    };
+    return true;
+}
 
 pub const Compiled = struct {
     /// The compiler's memory, and the compiler (kept: thunks are compiled
@@ -70,15 +80,18 @@ pub const Compiled = struct {
         const c = &self.compiler;
         while (true) {
             c.failed_semantic = null;
+            c.need_retry = false;
             const name = c.compileThunk(node, which, owner) catch |e| switch (blk: {
                 c.forgetModule();
                 break :blk e;
             }) {
                 error.Unsupported => {
+                    // (a literal now made at run time: compiled again)
+                    if (c.need_retry) continue;
                     // (a semantic it reaches can't be compiled: as Python)
                     if (c.failed_semantic) |s| {
                         if (!self.python.contains(s)) {
-                            self.python.put(allocator, s, {}) catch return oomT();
+                            if (!markPython(self.python, s, self.failure.message.items)) return oomT();
                             continue;
                         }
                     }
@@ -188,6 +201,7 @@ fn build(out: *Compiled, data: *program_mod.Data, lang: compile_mod.LangView, pr
         out.compiler.compileProgram() catch |e| {
             const failed = out.compiler.failed_semantic;
             const need_frames = out.compiler.need_frames;
+            const need_retry = out.compiler.need_retry;
             // (what this attempt kept)
             for (out.compiler.objects.items) |o| py.Py_DecRef(o);
             for (out.compiler.record_list.items) |t| freeRecordType(t);
@@ -200,12 +214,14 @@ fn build(out: *Compiled, data: *program_mod.Data, lang: compile_mod.LangView, pr
                         force_heap = true;
                         continue;
                     }
+                    // (compiled again with a literal made at run time)
+                    if (need_retry) continue;
                     if (failed) |s| {
                         if (!out.python.contains(s)) {
-                            out.python.put(allocator, s, {}) catch {
+                            if (!markPython(out.python, s, out.failure.message.items)) {
                                 _ = py.c.PyErr_NoMemory();
                                 return false;
-                            };
+                            }
                             continue;
                         }
                     }

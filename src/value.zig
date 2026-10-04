@@ -18,6 +18,7 @@ const py = ph.py;
 const PyObject = ph.PyObject;
 const types = @import("types.zig");
 const objects = @import("objects.zig");
+const proxies = @import("proxies.zig");
 
 const allocator = std.heap.c_allocator;
 
@@ -153,8 +154,12 @@ pub const Dict = extern struct {
 pub const RecordType = struct {
     name: []const u8,
     fields: []const []const u8,
-    /// The Python class it was made from (a dataclass), for converting
+    /// The Python class it was made from (a dataclass, or a plain class),
+    /// for converting
     py_class: ?*PyObject,
+    /// Records equal when their fields are (a dataclass's eq; then not
+    /// hashable): else, as plain objects, by identity
+    value_eq: bool = true,
 };
 
 pub const Record = extern struct {
@@ -437,7 +442,8 @@ pub fn equal(a: Value, b: Value) bool {
         .record => blk: {
             const x: *Record = @ptrCast(@alignCast(a.ptr()));
             const y: *Record = @ptrCast(@alignCast(b.ptr()));
-            if (x.rtype != y.rtype) break :blk false;
+            if (a.bits == b.bits) break :blk true;
+            if (x.rtype != y.rtype or !x.rtype.value_eq) break :blk false;
             for (x.fields(), y.fields()) |p, q| if (!equal(p, q)) break :blk false;
             break :blk true;
         },
@@ -491,6 +497,8 @@ fn hashOf(tag: u64, bits: u64) u64 {
 pub fn hashable(v: Value) bool {
     return switch (v.kind()) {
         .list, .dict => false,
+        // (a dataclass compared by value isn't; a plain object is, by identity)
+        .record => !@as(*Record, @ptrCast(@alignCast(v.ptr()))).rtype.value_eq,
         .tuple => for (@as(*Tuple, @ptrCast(@alignCast(v.ptr()))).slice()) |item| {
             if (!hashable(item)) break false;
         } else true,
@@ -569,6 +577,22 @@ pub fn dictSet(d: *Dict, key: Value, value: Value) bool {
     return true;
 }
 
+/// del d[key]: whether it was there (its key and value dropped).
+pub fn dictDelete(d: *Dict, key: Value) bool {
+    const i = dictFind(d, key, hash(key)) orelse return false;
+    const e = &d.entries.?[i];
+    const k = e.key;
+    const v = e.value;
+    // (the entry stays, marked deleted, until a resize: the index's probe
+    // chains go through it)
+    e.key = .{ .tag = DELETED, .bits = 0 };
+    e.value = Value.none_v;
+    d.len -= 1;
+    decref(k);
+    decref(v);
+    return true;
+}
+
 /// d[key] (borrowed), or null.
 pub fn dictGet(d: *Dict, key: Value) ?Value {
     const i = dictFind(d, key, hash(key)) orelse return null;
@@ -606,18 +630,9 @@ pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
             const s: *Str = @ptrCast(v.ptr());
             return ph.newString(s.bytes());
         },
-        .list => {
-            const l: *List = @ptrCast(@alignCast(v.ptr()));
-            const out = py.c.PyList_New(@intCast(l.len)) orelse return null;
-            for (l.slice(), 0..) |item, i| {
-                const o = toPython(item, nodeObject) orelse {
-                    py.Py_DecRef(out);
-                    return null;
-                };
-                _ = py.c.PyList_SetItem(out, @intCast(i), o);
-            }
-            return out;
-        },
+        // Lists, dicts, records: proxies over the same objects (shared, as
+        // in the reference mode), not copies
+        .list, .dict, .record => return proxies.make(v, nodeObject),
         .tuple => {
             const t: *Tuple = @ptrCast(@alignCast(v.ptr()));
             const items = t.slice();
@@ -630,43 +645,6 @@ pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
                 _ = py.c.PyTuple_SetItem(out, @intCast(i), o);
             }
             return out;
-        },
-        .dict => {
-            const d: *Dict = @ptrCast(@alignCast(v.ptr()));
-            const out = py.c.PyDict_New() orelse return null;
-            for (dictEntries(d)) |e| {
-                if (isDeleted(e)) continue;
-                const k = toPython(e.key, nodeObject) orelse {
-                    py.Py_DecRef(out);
-                    return null;
-                };
-                defer py.Py_DecRef(k);
-                const val = toPython(e.value, nodeObject) orelse {
-                    py.Py_DecRef(out);
-                    return null;
-                };
-                defer py.Py_DecRef(val);
-                if (py.c.PyDict_SetItem(out, k, val) != 0) {
-                    py.Py_DecRef(out);
-                    return null;
-                }
-            }
-            return out;
-        },
-        .record => {
-            const r: *Record = @ptrCast(@alignCast(v.ptr()));
-            const cls = r.rtype.py_class orelse {
-                ph.raise(py.PyExc_TypeError(), "a {s} can't be given to Python", .{r.rtype.name});
-                return null;
-            };
-            const fields = r.fields();
-            const args = py.c.PyTuple_New(@intCast(fields.len)) orelse return null;
-            defer py.Py_DecRef(args);
-            for (fields, 0..) |f, i| {
-                const o = toPython(f, nodeObject) orelse return null;
-                _ = py.c.PyTuple_SetItem(args, @intCast(i), o);
-            }
-            return py.c.PyObject_CallObject(cls, args);
         },
         .host => {
             const o: *PyObject = @ptrFromInt(v.bits);
@@ -688,6 +666,8 @@ pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
 /// tuples and dicts are copied; other objects are host values.
 pub fn fromPython(o: *PyObject) ?Value {
     if (o == py.Py_None()) return Value.none_v;
+    // (a proxy: the compiled object itself)
+    if (proxies.unwrap(o)) |v| return v;
     if (py.PyBool_Check(o)) return Value.boolean(o == py.Py_True());
     if (py.PyLong_Check(o)) {
         var overflow: c_int = 0;

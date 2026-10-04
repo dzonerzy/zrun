@@ -655,10 +655,10 @@ const Reader = struct {
     fn binOp(self: *Reader, op: *PyObject, pos: Pos) ReadError!BinOp {
         const k = try kindOf(op);
         const table = .{
-            .{ "Add", BinOp.add },       .{ "Sub", BinOp.sub },       .{ "Mult", BinOp.mul },
-            .{ "Div", BinOp.div },       .{ "FloorDiv", BinOp.floordiv }, .{ "Mod", BinOp.mod },
-            .{ "Pow", BinOp.pow },       .{ "LShift", BinOp.lshift }, .{ "RShift", BinOp.rshift },
-            .{ "BitOr", BinOp.bitor },   .{ "BitXor", BinOp.bitxor }, .{ "BitAnd", BinOp.bitand },
+            .{ "Add", BinOp.add },     .{ "Sub", BinOp.sub },           .{ "Mult", BinOp.mul },
+            .{ "Div", BinOp.div },     .{ "FloorDiv", BinOp.floordiv }, .{ "Mod", BinOp.mod },
+            .{ "Pow", BinOp.pow },     .{ "LShift", BinOp.lshift },     .{ "RShift", BinOp.rshift },
+            .{ "BitOr", BinOp.bitor }, .{ "BitXor", BinOp.bitxor },     .{ "BitAnd", BinOp.bitand },
         };
         inline for (table) |entry| {
             if (eq(k, entry[0])) return entry[1];
@@ -670,9 +670,9 @@ const Reader = struct {
         _ = self;
         const k = try kindOf(op);
         const table = .{
-            .{ "Eq", CmpOp.eq },   .{ "NotEq", CmpOp.ne }, .{ "Lt", CmpOp.lt },     .{ "LtE", CmpOp.le },
-            .{ "Gt", CmpOp.gt },   .{ "GtE", CmpOp.ge },   .{ "Is", CmpOp.is },     .{ "IsNot", CmpOp.is_not },
-            .{ "In", CmpOp.in },   .{ "NotIn", CmpOp.not_in },
+            .{ "Eq", CmpOp.eq }, .{ "NotEq", CmpOp.ne },     .{ "Lt", CmpOp.lt }, .{ "LtE", CmpOp.le },
+            .{ "Gt", CmpOp.gt }, .{ "GtE", CmpOp.ge },       .{ "Is", CmpOp.is }, .{ "IsNot", CmpOp.is_not },
+            .{ "In", CmpOp.in }, .{ "NotIn", CmpOp.not_in },
         };
         inline for (table) |entry| {
             if (eq(k, entry[0])) return entry[1];
@@ -1018,11 +1018,11 @@ fn intAttrOr(obj: *PyObject, name: [*:0]const u8, default: i64) error{Python}!i6
 
 fn stmtName(k: []const u8) []const u8 {
     const table = .{
-        .{ "Try", "`try`" },                  .{ "TryStar", "`try`" },             .{ "With", "`with`" },
-        .{ "AsyncWith", "`async with`" },     .{ "FunctionDef", "a nested `def`" }, .{ "AsyncFunctionDef", "`async def`" },
-        .{ "ClassDef", "a nested `class`" },  .{ "Global", "`global`" },           .{ "Nonlocal", "`nonlocal`" },
-        .{ "Delete", "`del`" },               .{ "Import", "`import`" },           .{ "ImportFrom", "`import`" },
-        .{ "AsyncFor", "`async for`" },       .{ "Match", "`match`" },
+        .{ "Try", "`try`" },                 .{ "TryStar", "`try`" },              .{ "With", "`with`" },
+        .{ "AsyncWith", "`async with`" },    .{ "FunctionDef", "a nested `def`" }, .{ "AsyncFunctionDef", "`async def`" },
+        .{ "ClassDef", "a nested `class`" }, .{ "Global", "`global`" },            .{ "Nonlocal", "`nonlocal`" },
+        .{ "Delete", "`del`" },              .{ "Import", "`import`" },            .{ "ImportFrom", "`import`" },
+        .{ "AsyncFor", "`async for`" },      .{ "Match", "`match`" },
     };
     inline for (table) |entry| {
         if (eq(k, entry[0])) return entry[1];
@@ -1032,9 +1032,9 @@ fn stmtName(k: []const u8) []const u8 {
 
 fn exprName(k: []const u8) []const u8 {
     const table = .{
-        .{ "Lambda", "`lambda`" },          .{ "Yield", "`yield`" },              .{ "YieldFrom", "`yield from`" },
-        .{ "Await", "`await`" },            .{ "NamedExpr", "`:=`" },             .{ "GeneratorExp", "a generator expression" },
-        .{ "SetComp", "a set comprehension" }, .{ "Set", "a set" },             .{ "Starred", "*unpacking" },
+        .{ "Lambda", "`lambda`" },             .{ "Yield", "`yield`" },  .{ "YieldFrom", "`yield from`" },
+        .{ "Await", "`await`" },               .{ "NamedExpr", "`:=`" }, .{ "GeneratorExp", "a generator expression" },
+        .{ "SetComp", "a set comprehension" }, .{ "Set", "a set" },      .{ "Starred", "*unpacking" },
     };
     inline for (table) |entry| {
         if (eq(k, entry[0])) return entry[1];

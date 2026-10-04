@@ -238,7 +238,7 @@ pub fn valueOf(state: *PyObject, ctx: *Context, idx: u32) ?*PyObject {
     const rid = data.rule(idx);
     const action: grammar_mod.Action = if (rid < g.actions.len) g.actions[rid] else .none;
     const v: *PyObject = switch (action) {
-        .none, .class => return newNode(state, ctx,idx),
+        .none, .class => return newNode(state, ctx, idx),
         .str, .int, .float, .unquote => blk: {
             // zgram's own conversion, so values are exactly parse_ast's
             const zn = py.c.PyObject_CallMethod(ctx.tree, "node", "I", @as(c_uint, idx)) orelse return null;
@@ -251,13 +251,13 @@ pub fn valueOf(state: *PyObject, ctx: *Context, idx: u32) ?*PyObject {
         .none_ => ref(py.Py_None()),
         .drop => ref(DROP()),
         .list, .tuple => blk: {
-            const list = childValues(state, ctx,idx) orelse return null;
+            const list = childValues(state, ctx, idx) orelse return null;
             if (action == .list) break :blk list;
             defer py.Py_DecRef(list);
             break :blk py.c.PyList_AsTuple(list) orelse return null;
         },
         .dict => blk: {
-            const list = childValues(state, ctx,idx) orelse return null;
+            const list = childValues(state, ctx, idx) orelse return null;
             defer py.Py_DecRef(list);
             const dict = py.c.PyDict_New() orelse return null;
             const n: usize = @intCast(py.c.PyList_Size(list));
@@ -275,7 +275,7 @@ pub fn valueOf(state: *PyObject, ctx: *Context, idx: u32) ?*PyObject {
             var c = idx + 1;
             const stop = data.end(idx);
             while (c < stop) : (c = data.end(c)) {
-                const cv = valueOf(state, ctx,c) orelse return null;
+                const cv = valueOf(state, ctx, c) orelse return null;
                 if (cv == DROP()) {
                     py.Py_DecRef(cv);
                     continue;
@@ -304,7 +304,7 @@ pub fn childValues(state: *PyObject, ctx: *Context, idx: u32) ?*PyObject {
     var c = idx + 1;
     const stop = data.end(idx);
     while (c < stop) : (c = data.end(c)) {
-        const v = valueOf(state, ctx,c) orelse {
+        const v = valueOf(state, ctx, c) orelse {
             py.Py_DecRef(list);
             return null;
         };
@@ -333,7 +333,7 @@ pub fn fieldOf(state: *PyObject, ctx: *Context, idx: u32, field: u8) ?*PyObject 
     const stop = data.end(idx);
     while (c < stop) : (c = data.end(c)) {
         if (data.nodes[c].fieldId() != field) continue;
-        const v = valueOf(state, ctx,c) orelse {
+        const v = valueOf(state, ctx, c) orelse {
             if (list) |l| py.Py_DecRef(l);
             return null;
         };

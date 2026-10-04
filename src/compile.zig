@@ -39,7 +39,9 @@ pub const LangView = struct {
     eval_of: []const ?*PyObject,
     exec_of: []const ?*PyObject,
     functions: []const ?FunctionSpec,
-    read: *const std.AutoHashMapUnmanaged(*PyObject, *front.Function),
+    /// The semantics, and the helpers they call, as the front read them
+    /// (the language's: helpers are added as they're read)
+    read: *std.AutoHashMapUnmanaged(*PyObject, *front.Function),
     hosts: *PyObject,
     /// The State object of the program (its tree, for scalar field values)
     tree: *PyObject,
@@ -48,8 +50,15 @@ pub const LangView = struct {
     path: ?[]const u8 = null,
     /// Semantics run as Python (they couldn't be compiled): called from
     /// the compiled code with an rt over its frames (bridge.zig)
-    python: *const std.AutoHashMapUnmanaged(*PyObject, void),
+    python: *const PythonSet,
+    /// List and dict literals built at run time (they escape where a known
+    /// one can't follow: learned while compiling)
+    escaping: *std.AutoHashMapUnmanaged(*const front.Expr, void),
 };
+
+/// Semantics run as Python, by their function: why (the compiler's
+/// message, owned by c_allocator)
+pub const PythonSet = std.AutoHashMapUnmanaged(*PyObject, []const u8);
 
 pub const Which = enum(u32) { eval = 0, exec = 1 };
 
@@ -95,12 +104,17 @@ pub const RtMethod = enum { eval, exec, loop, load, store, function, call, @"err
 /// identity (aliases see changes)
 pub const SList = struct {
     items: std.ArrayListUnmanaged(SVal) = .empty,
+    /// The literal (or comprehension) that made it, if one did: built at
+    /// run time instead once it's known to escape where a known one can't
+    /// follow (Compiler.escaping)
+    origin: ?*const front.Expr = null,
 };
 
 /// A dict known at compile time: keys known (scalars), values maybe not
 pub const SDict = struct {
     keys: std.ArrayListUnmanaged(SVal) = .empty,
     values: std.ArrayListUnmanaged(SVal) = .empty,
+    origin: ?*const front.Expr = null,
 
     fn find(self: *const SDict, key: SVal) ?usize {
         for (self.keys.items, 0..) |k, i| if (sameKey(k, key)) return i;
@@ -174,9 +188,6 @@ pub const Compiler = struct {
     /// Language functions compiled or to compile
     compiled_fns: std.AutoHashMapUnmanaged(u32, void) = .empty,
     queue: std.ArrayListUnmanaged(u32) = .empty,
-    /// Helper functions (module-level Python functions semantics call),
-    /// read once
-    helpers_read: std.AutoHashMapUnmanaged(*PyObject, *front.Function) = .empty,
     /// Record types, by the dataclass they come from (allocated outside
     /// the arena: the compiled program keeps them)
     record_types: std.AutoHashMapUnmanaged(*PyObject, *value.RecordType) = .empty,
@@ -200,6 +211,8 @@ pub const Compiler = struct {
     /// was found
     force_heap: bool = false,
     need_frames: bool = false,
+    /// A literal was marked to be built at run time: compile again
+    need_retry: bool = false,
 
     /// Whether every function's (and block's) variables are in frames.
     pub fn allHeap(self: *const Compiler) bool {
@@ -212,10 +225,11 @@ pub const Compiler = struct {
         return .{ .a = a, .data = data, .lang = lang, .m = ir.Module.init(a, prefix), .failure = failure };
     }
 
-    /// Release what isn't in the arena (the helpers read here).
+    /// Release what isn't in the arena (nothing now: the helpers read are
+    /// the language's).
     pub fn deinit(self: *Compiler, gpa: Allocator) void {
-        var it = self.helpers_read.valueIterator();
-        while (it.next()) |f| f.*.destroy(gpa);
+        _ = self;
+        _ = gpa;
     }
 
     /// A new module for more code of the program (the compiler's state,
@@ -915,11 +929,113 @@ const Gen = struct {
                 _ = self.call("zr_object", &.{ self.ctx, self.k(@intCast(idx)), self.out });
                 break :blk try self.loadOut(.any);
             },
-            .list => |l| self.buildSequence("zr_list", l.items.items, at, .list),
+            .list => |l| blk: {
+                const d = try self.buildSequence("zr_list", l.items.items, at, .list);
+                try self.promote(v, d);
+                break :blk d;
+            },
             .tuple => |t| self.buildSequence("zr_tuple", t, at, .tuple),
-            .dict => |d| self.buildDict(d, at),
+            .dict => |x| blk: {
+                const d = try self.buildDict(x, at);
+                try self.promote(v, d);
+                break :blk d;
+            },
             else => self.c.unsupported("a {s} can't be kept in a variable or passed as a value (node {d})", .{ @tagName(v), at }),
         };
+    }
+
+    /// A list or dict a literal (or a comprehension) made: known when
+    /// compiling, unless it's one that escapes where a known one can't
+    /// follow (then built at run time).
+    fn literal(self: *Gen, v: SVal, e: *const front.Expr, at: u32) Error!SVal {
+        switch (v) {
+            .list => |l| l.origin = e,
+            .dict => |d| d.origin = e,
+            else => return v,
+        }
+        if (!self.c.lang.escaping.contains(e)) return v;
+        return .{ .dyn = try self.materialize(v, at) };
+    }
+
+    /// A known list or dict made a run-time one (it escapes: given to code
+    /// that sees it as an object, which may change it): the variables
+    /// referring to it refer to the run-time one from here (each with a
+    /// reference of its own), so both see the same object. Inside run-time
+    /// control flow that can't follow every path: its literal is marked to
+    /// be built at run time, and the program compiled again.
+    fn promote(self: *Gen, old: SVal, d: Dyn) Error!void {
+        const ptr: *const anyopaque = switch (old) {
+            .list => |l| l,
+            .dict => |x| x,
+            else => return,
+        };
+        var aliased = false;
+        for (self.insts.items) |inst| {
+            for (inst.locals) |l| switch (l) {
+                .static => |sv| if (refersTo(sv, ptr, 4)) {
+                    aliased = true;
+                },
+                else => {},
+            };
+        }
+        if (!aliased) return;
+        var in_flow = self.loop_level > 0;
+        // (after a return from inside it, the rest runs on some paths only)
+        for (self.insts.items) |inst| in_flow = in_flow or inst.dyn_depth > 0 or inst.result_slot != null;
+        if (in_flow) {
+            const origin = switch (old) {
+                .list => |l| l.origin,
+                .dict => |x| x.origin,
+                else => null,
+            } orelse return;
+            try self.c.lang.escaping.put(std.heap.c_allocator, origin, {});
+            self.c.need_retry = true;
+            return self.c.unsupported("a list or dict escapes inside run-time control flow: compiled again, made at run time", .{});
+        }
+        for (self.insts.items) |inst| {
+            for (inst.locals) |*l| switch (l.*) {
+                .static => |*sv| try self.replaceRefs(sv, ptr, d, 4),
+                else => {},
+            };
+        }
+    }
+
+    fn refersTo(v: SVal, ptr: *const anyopaque, depth: u32) bool {
+        if (depth == 0) return false;
+        return switch (v) {
+            .list => |l| @as(*const anyopaque, l) == ptr or for (l.items.items) |x| {
+                if (refersTo(x, ptr, depth - 1)) break true;
+            } else false,
+            .dict => |x| @as(*const anyopaque, x) == ptr or for (x.values.items) |y| {
+                if (refersTo(y, ptr, depth - 1)) break true;
+            } else false,
+            .tuple => |t| for (t) |x| {
+                if (refersTo(x, ptr, depth - 1)) break true;
+            } else false,
+            else => false,
+        };
+    }
+
+    /// The references to a known container in `v` (and the known
+    /// containers in it) replaced by the run-time one.
+    fn replaceRefs(self: *Gen, v: *SVal, ptr: *const anyopaque, d: Dyn, depth: u32) Error!void {
+        if (depth == 0) return;
+        const is_it = switch (v.*) {
+            .list => |l| @as(*const anyopaque, l) == ptr,
+            .dict => |x| @as(*const anyopaque, x) == ptr,
+            else => false,
+        };
+        if (is_it) {
+            try self.increfDyn(d);
+            v.* = .{ .dyn = d };
+            return;
+        }
+        switch (v.*) {
+            .list => |l| for (l.items.items) |*x| try self.replaceRefs(x, ptr, d, depth - 1),
+            .dict => |x| for (x.values.items) |*y| try self.replaceRefs(y, ptr, d, depth - 1),
+            .tuple => |t| for (@constCast(t)) |*x| try self.replaceRefs(x, ptr, d, depth - 1),
+            else => {},
+        }
     }
 
     /// A stack array of values (each materialized: owned references).
@@ -1628,14 +1744,14 @@ const Gen = struct {
         try self.stmts(inst, func.body);
         // Falling off the end: None
         if (!inst.done) try self.setResult(inst, .none);
-        // The exit: where returns from run-time control flow meet
-        var result: SVal = inst.result orelse .none;
+        // The exit: where returns from run-time control flow meet (each
+        // released the locals it had)
         if (inst.result_slot) |slot| {
             try self.f.block(inst.exit_label);
-            result = .{ .dyn = try self.loadSlot(slot, .any) };
+            return .{ .dyn = try self.loadSlot(slot, .any) };
         }
         try self.releaseLocals(inst);
-        return result;
+        return inst.result orelse .none;
     }
 
     /// The semantic's result: kept, or in its slot (and to its exit).
@@ -1651,6 +1767,9 @@ const Gen = struct {
             break :blk s;
         };
         try self.storeSlot(slot, try self.materialize(v, inst.node));
+        // (the locals as they are on this path: a value assigned after
+        // a return inside run-time control flow isn't there on the others)
+        try self.releaseLocals(inst);
         try self.f.br(inst.exit_label);
         if (inst.dyn_depth == 0) {
             inst.done = true;
@@ -2243,15 +2362,15 @@ const Gen = struct {
             },
             .list, .tuple => |items| {
                 const l = try self.a().create(SList);
-                l.* = .{};
+                l.* = .{ .origin = e };
                 for (items) |item| try l.items.append(self.a(), try self.expr(inst, item));
                 if (e.kind == .tuple) return .{ .tuple = l.items.items };
-                return .{ .list = l };
+                return self.literal(.{ .list = l }, e, inst.node);
             },
-            .list_comp => |comp| return self.listComp(inst, comp, e.pos),
+            .list_comp => |comp| return self.literal(try self.listComp(inst, comp, e.pos), e, inst.node),
             .dict => |x| {
                 const d = try self.a().create(SDict);
-                d.* = .{};
+                d.* = .{ .origin = e };
                 var dynamic = false;
                 const keys = try self.a().alloc(SVal, x.keys.len);
                 const vals = try self.a().alloc(SVal, x.keys.len);
@@ -2262,7 +2381,7 @@ const Gen = struct {
                 }
                 if (!dynamic) {
                     for (keys, vals) |key, v| try self.sdictSet(d, key, v);
-                    return .{ .dict = d };
+                    return self.literal(.{ .dict = d }, e, inst.node);
                 }
                 // Keys only known at run time: a run-time dict
                 const ka = try self.valueArray(keys, inst.node);
@@ -3133,15 +3252,21 @@ const Gen = struct {
         return self.loadOut(.list);
     }
 
+    /// A helper function (one a semantic calls), read once for the
+    /// language (with the semantics read: the same front functions, so
+    /// what's learned about their code, like literals that escape, holds).
     fn helperFunction(self: *Gen, o: *PyObject) Error!*const front.Function {
         const c = self.c;
-        if (c.helpers_read.get(o)) |f| return f;
+        if (c.lang.read.get(o)) |f| return f;
         var failure = front.Failure{};
         const f = front.read(std.heap.c_allocator, o, &failure) catch |e| switch (e) {
             error.Unsupported => return c.unsupported("{s}", .{failure.text()}),
             else => |x| return x,
         };
-        try c.helpers_read.put(c.a, o, f);
+        c.lang.read.put(std.heap.c_allocator, o, f) catch {
+            f.destroy(std.heap.c_allocator);
+            return error.OutOfMemory;
+        };
         return f;
     }
 

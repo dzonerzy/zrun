@@ -1,6 +1,7 @@
 """The semantics compiler's front: semantics read from their Python source,
-checked against the compilable subset (errors at the line, when the
-semantic is registered), and what it makes of them (lang.ir())."""
+checked against the compilable subset (errors at the line; a registered
+semantic outside it runs as Python, lang.python_semantics() says why), and
+what it makes of them (lang.ir())."""
 
 import inspect
 
@@ -57,10 +58,14 @@ class TestSubset:
         text = "def semantic(node, rt):\n" + source
         linecache.cache["semantics.py"] = (len(text), None, text.splitlines(True), "semantics.py")
         with pytest.raises(zrun.CompileError) as e:
-            lang().eval("Call")(ns["semantic"])
+            lang().ir(ns["semantic"])
         assert e.value.reason == reason
         assert e.value.file == "semantics.py" and e.value.line == 2
         assert str(e.value).startswith(f"semantics.py:2:{e.value.column}: in semantic(): {reason}")
+        # registered, it runs as Python in compiled programs, saying why
+        l = lang()
+        l.eval("Call")(ns["semantic"])
+        assert l.python_semantics() == {"semantic": str(e.value)}
 
     def test_the_line_in_a_real_file(self):
         def semantic(node, rt):
@@ -72,7 +77,7 @@ class TestSubset:
             return x
 
         with pytest.raises(zrun.CompileError) as e:
-            lang().eval("Call")(semantic)
+            lang().ir(semantic)
         assert e.value.line == line_of(semantic, "try:") and e.value.column == 13
 
     def test_parameters(self):
@@ -83,9 +88,9 @@ class TestSubset:
             return 1
 
         with pytest.raises(zrun.CompileError, match="only plain parameters"):
-            lang().eval("Call")(defaults)
+            lang().ir(defaults)
         with pytest.raises(zrun.CompileError, match=r"\*args and \*\*kwargs"):
-            lang().eval("Call")(star)
+            lang().ir(star)
 
     def test_native_false_isnt_read(self, capsys):
         l = lang()

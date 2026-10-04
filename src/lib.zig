@@ -73,6 +73,9 @@ const Language = struct {
     /// Semantics the compiler couldn't compile: compiled programs run them
     /// as Python (bridge.zig); learned as programs are compiled
     _python: driver.PythonSet = .empty,
+    /// List and dict literals of the semantics compiled programs build at
+    /// run time (they escape where known ones can't follow)
+    _escaping: std.AutoHashMapUnmanaged(*const front.Expr, void) = .empty,
 
     pub fn __new__(args: pyoz.Args(struct { parser: *PyObject, rules: ?*PyObject = null, max_depth: i64 = 1000 })) ?Language {
         const v = args.value;
@@ -128,31 +131,32 @@ const Language = struct {
         while (it.next()) |f| f.*.destroy(allocator);
         self._read.deinit(allocator);
         self._read = .empty;
+        var pit = self._python.valueIterator();
+        while (pit.next()) |r| allocator.free(r.*);
         self._python.deinit(allocator);
         self._python = .empty;
+        self._escaping.deinit(allocator);
+        self._escaping = .empty;
     }
 
     /// `lang.python_semantics()`: the semantics compiled programs run as
-    /// Python (native=False ones, and those the compiler couldn't compile,
-    /// learned as programs are compiled), by name, sorted: what to rewrite
-    /// for speed.
+    /// Python, {name: why}: native=False ones, and those the compiler
+    /// couldn't compile (learned as programs are compiled; why: where in
+    /// the semantic, and what): what to rewrite for speed.
     pub fn python_semantics(self: *Language) ?*PyObject {
         self.resolve();
-        const out = py.c.PyList_New(0) orelse return null;
-        var seen = std.AutoHashMapUnmanaged(*PyObject, void).empty;
-        defer seen.deinit(allocator);
+        const out = py.c.PyDict_New() orelse return null;
         for ([_][]?*PyObject{ self._eval_of, self._exec_of }) |table| {
             for (table) |fo| {
                 const f = fo orelse continue;
-                if (seen.contains(f)) continue;
-                seen.put(allocator, f, {}) catch return null;
-                if (!self._python.contains(f) and self._read.contains(f)) continue;
+                const reason = self._python.get(f) orelse continue;
                 const name = py.c.PyObject_GetAttrString(f, "__name__") orelse return null;
                 defer py.Py_DecRef(name);
-                if (py.c.PyList_Append(out, name) != 0) return null;
+                const r = ph.newString(reason) orelse return null;
+                defer py.Py_DecRef(r);
+                if (py.c.PyDict_SetItem(out, name, r) != 0) return null;
             }
         }
-        if (py.c.PyList_Sort(out) != 0) return null;
         return out;
     }
 
@@ -165,6 +169,21 @@ const Language = struct {
         defer out.deinit(allocator);
         front.dump(f, &out, allocator) catch return oom(*PyObject);
         return ph.newString(out.items);
+    }
+
+    /// A semantic compiled programs run as Python, and why.
+    fn markPython(self: *Language, func: *PyObject, reason: []const u8) bool {
+        if (self._python.contains(func)) return true;
+        const r = allocator.dupe(u8, reason) catch {
+            _ = py.c.PyErr_NoMemory();
+            return false;
+        };
+        self._python.put(allocator, func, r) catch {
+            allocator.free(r);
+            _ = py.c.PyErr_NoMemory();
+            return false;
+        };
+        return true;
     }
 
     /// Read a semantic with the compiler's front (once per function);
@@ -243,15 +262,33 @@ const Language = struct {
         return true;
     }
 
-    /// Register `fn` for each name in `kind` (str or sequence); a native
-    /// one is read by the compiler's front first (CompileError if it can't
-    /// be compiled).
+    /// Register `fn` for each name in `kind` (str or sequence). A native one
+    /// is read by the compiler's front first; one it can't read, and a
+    /// native=False one, compiled programs run as Python (the reason kept:
+    /// lang.python_semantics()).
     fn register(self: *Language, which: u8, kind: *PyObject, func: *PyObject, native: bool) bool {
         if (!py.PyCallable_Check(func)) {
             ph.raise(py.PyExc_TypeError(), "semantics must be callable: fn(node, rt)", .{});
             return false;
         }
-        if (native and !self.readSemantic(func)) return false;
+        if (!native) {
+            if (!self.markPython(func, "native=False")) return false;
+        } else if (!self.readSemantic(func)) {
+            if (py.c.PyErr_ExceptionMatches(types.CompileError) == 0) return false;
+            // (outside the compilable subset: run as Python, saying why)
+            var t: ?*PyObject = null;
+            var v: ?*PyObject = null;
+            var tb: ?*PyObject = null;
+            py.c.PyErr_Fetch(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
+            py.c.PyErr_NormalizeException(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
+            defer inline for (.{ t, v, tb }) |o| {
+                if (o) |x| py.Py_DecRef(x);
+            };
+            const msg = py.c.PyObject_Str(v.?) orelse return false;
+            defer py.Py_DecRef(msg);
+            const text = ph.utf8(msg, "message") orelse return false;
+            if (!self.markPython(func, text)) return false;
+        }
         const dict = if (which == 0) self._evals.? else self._execs.?;
         if (py.PyUnicode_Check(kind)) {
             if (py.c.PyDict_SetItem(dict, kind, func) != 0) return false;
@@ -704,6 +741,7 @@ const Program = struct {
             .analysis = st.analysis,
             .path = path,
             .python = &lang._python,
+            .escaping = &lang._escaping,
         };
     }
 
@@ -1911,6 +1949,7 @@ fn moduleInit(module: *PyObject) callconv(.c) c_int {
     if (types.init(module) != 0) return -1;
     objects.init(module) catch return -1;
     bridge.init(module) catch return -1;
+    @import("proxies.zig").init(module) catch return -1;
     name_program = ph.newString("<program>") orelse return -1;
     CallerType = py.c.PyType_FromSpec(&caller_spec) orelse return -1;
     // (compiled code words Python's errors as the reference mode does)
