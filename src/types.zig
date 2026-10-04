@@ -34,7 +34,7 @@ pub fn init(module: *PyObject) callconv(.c) c_int {
 }
 
 fn initTypes(module: *PyObject) !void {
-    const int_type: *PyObject = @ptrCast(py.types.typeObject("PyLong_Type"));
+    const int_type: *PyObject = @ptrCast(@alignCast(py.types.typeObject("PyLong_Type")));
     int_new = @ptrCast(py.c.PyType_GetSlot(@ptrCast(int_type), py.c.Py_tp_new) orelse return error.Python);
 
     const bases = py.c.PyTuple_Pack(1, int_type) orelse return error.Python;
@@ -164,7 +164,7 @@ fn checked(result: ?*PyObject) ?*PyObject {
 
 /// I64(x): int(x), checked.
 fn i64New(_: ?*PyObject, args: ?*PyObject, kwargs: ?*PyObject) callconv(.c) ?*PyObject {
-    const int_type: *PyObject = @ptrCast(py.types.typeObject("PyLong_Type"));
+    const int_type: *PyObject = @ptrCast(@alignCast(py.types.typeObject("PyLong_Type")));
     return wrapOwned(py.c.PyObject_Call(int_type, args, kwargs));
 }
 

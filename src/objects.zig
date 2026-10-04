@@ -1,9 +1,16 @@
 //! The objects semantics handle, as raw C-API types (made when the module
 //! loads): `Node` (a node of the program, with its fields), `Function` (a
 //! function of the program: its node and the frame it was made in) and
-//! `Frame` (the variables of one run of a function). Functions and frames
-//! can refer to each other in cycles (a function stored in the frame it was
-//! made in): both take part in Python's cycle collector.
+//! `Frame` (the variables of one run of a function); and `State`, a loaded
+//! program's data, which they refer to.
+//!
+//! Everything that can be part of a reference cycle is here, and takes part
+//! in Python's cycle collector: a function stored in the frame it was made
+//! in; a node stored in a variable (the program's frame, in its state,
+//! refers to the node, which refers to the state). The PyOZ classes
+//! (Language, Program, Runtime) only refer to these, never the other way,
+//! so they need no collector support. (They can't have it in the stable ABI:
+//! PyOZ 0.13.7 frees a collected class's objects with PyObject_Del there.)
 
 const std = @import("std");
 const ph = @import("pyhelp.zig");
@@ -19,20 +26,23 @@ const allocator = std.heap.c_allocator;
 pub var NodeType: *PyObject = undefined;
 pub var FunctionType: *PyObject = undefined;
 pub var FrameType: *PyObject = undefined;
+pub var StateType: *PyObject = undefined;
 /// zgram.Diagnostic
 pub var Diagnostic: *PyObject = undefined;
 
 pub fn init(module: *PyObject) !void {
+    StateType = py.c.PyType_FromSpec(&state_spec) orelse return error.Python;
     NodeType = py.c.PyType_FromSpec(&node_spec) orelse return error.Python;
     FunctionType = py.c.PyType_FromSpec(&function_spec) orelse return error.Python;
     FrameType = py.c.PyType_FromSpec(&frame_spec) orelse return error.Python;
     if (py.c.PyModule_AddObjectRef(module, "Node", NodeType) != 0) return error.Python;
     if (py.c.PyModule_AddObjectRef(module, "Function", FunctionType) != 0) return error.Python;
     if (py.c.PyModule_AddObjectRef(module, "Frame", FrameType) != 0) return error.Python;
+    if (py.c.PyModule_AddObjectRef(module, "State", StateType) != 0) return error.Python;
     const zgram = py.c.PyImport_ImportModule("zgram") orelse return error.Python;
     defer py.Py_DecRef(zgram);
     Diagnostic = py.c.PyObject_GetAttrString(zgram, "Diagnostic") orelse return error.Python;
-    const object_type: *PyObject = @ptrCast(py.types.typeObject("PyBaseObject_Type"));
+    const object_type: *PyObject = @ptrCast(@alignCast(py.types.typeObject("PyBaseObject_Type")));
     drop_sentinel = py.c.PyObject_CallObject(object_type, null) orelse return error.Python;
 }
 
@@ -45,26 +55,119 @@ fn freeObject(obj: *PyObject) void {
     const t = obj.ob_type;
     const free: py.c.freefunc = @ptrCast(py.c.PyType_GetSlot(t, py.c.Py_tp_free));
     free.?(obj);
-    py.Py_DecRef(@ptrCast(t));
+    py.Py_DecRef(@ptrCast(@alignCast(t)));
 }
 
 // ======================================================================
-// Program context: what a node reads its tree and values from
+// State: a loaded program's data
 // ======================================================================
 
-/// The part of a Program nodes need (owned by the Program object, which
-/// every node references)
+/// What nodes read their tree and values from (owned by the State)
 pub const Context = struct {
     data: *program_mod.Data,
-    /// The zgram Tree, for the values of scalar actions (tree.node(i).to_ast())
+    /// The zgram Tree (owned), for the values of scalar actions
+    /// (tree.node(i).to_ast()); its capsule's memory is what data reads
     tree: *PyObject,
     /// Per node: its value, once worked out (owned references)
     values: []?*PyObject,
 
-    pub fn deinit(self: *Context) void {
+    fn destroy(self: *Context) void {
         for (self.values) |v| if (v) |o| py.Py_DecRef(o);
         allocator.free(self.values);
+        self.data.deinit();
+        allocator.destroy(self.data);
+        py.Py_DecRef(self.tree);
+        allocator.destroy(self);
     }
+};
+
+pub const StateObject = extern struct {
+    ob_base: py.c.PyObject,
+    ctx: ?*Context,
+    /// The Language (keeps the grammar and the semantics alive)
+    lang: ?*PyObject,
+    /// The zrules Analysis (keeps the symbols' memory alive), or null
+    analysis: ?*PyObject,
+    diagnostics: ?*PyObject,
+    /// The program's frame once it ran (for calls into it)
+    globals: ?*PyObject,
+};
+
+/// A state owning `ctx` and taking references to the rest.
+pub fn newState(ctx: *Context, lang: *PyObject, analysis: ?*PyObject, diagnostics: *PyObject) ?*PyObject {
+    const obj = allocObject(StateType) orelse return null;
+    const s: *StateObject = @ptrCast(@alignCast(obj));
+    s.ctx = ctx;
+    py.Py_IncRef(lang);
+    s.lang = lang;
+    if (analysis) |a| py.Py_IncRef(a);
+    s.analysis = analysis;
+    py.Py_IncRef(diagnostics);
+    s.diagnostics = diagnostics;
+    s.globals = null;
+    return obj;
+}
+
+pub fn asState(obj: *PyObject) *StateObject {
+    return @ptrCast(@alignCast(obj));
+}
+
+/// The context of a state object.
+pub fn contextOf(state: *PyObject) *Context {
+    return asState(state).ctx.?;
+}
+
+fn stateClear(obj: ?*PyObject) callconv(.c) c_int {
+    const s: *StateObject = @ptrCast(@alignCast(obj.?));
+    if (s.globals) |g| {
+        s.globals = null;
+        py.Py_DecRef(g);
+    }
+    return 0;
+}
+
+fn stateTraverse(obj: ?*PyObject, visit: py.c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
+    const s: *StateObject = @ptrCast(@alignCast(obj.?));
+    inline for (.{ s.globals, s.lang, s.analysis, s.diagnostics }) |o| {
+        if (o) |x| {
+            const r = visit.?(x, arg);
+            if (r != 0) return r;
+        }
+    }
+    if (s.ctx) |c| {
+        const r = visit.?(c.tree, arg);
+        if (r != 0) return r;
+    }
+    return visit.?(@ptrCast(@alignCast(obj.?.ob_type)), arg);
+}
+
+fn stateDealloc(obj: ?*PyObject) callconv(.c) void {
+    py.c.PyObject_GC_UnTrack(obj);
+    _ = stateClear(obj);
+    const s: *StateObject = @ptrCast(@alignCast(obj.?));
+    if (s.ctx) |c| c.destroy();
+    s.ctx = null;
+    inline for (.{ "lang", "analysis", "diagnostics" }) |f| {
+        if (@field(s, f)) |o| py.Py_DecRef(o);
+        @field(s, f) = null;
+    }
+    freeObject(obj.?);
+}
+
+var state_slots = [_]py.c.PyType_Slot{
+    .{ .slot = py.c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&stateDealloc)) },
+    .{ .slot = py.c.Py_tp_traverse, .pfunc = @ptrCast(@constCast(&stateTraverse)) },
+    .{ .slot = py.c.Py_tp_clear, .pfunc = @ptrCast(@constCast(&stateClear)) },
+    .{ .slot = py.c.Py_tp_doc, .pfunc = @ptrCast(@constCast("A loaded program's data: its tree, symbols, and frame.")) },
+    .{ .slot = 0, .pfunc = null },
+};
+
+var state_spec = py.c.PyType_Spec{
+    .name = "zrun.State",
+    .basicsize = @sizeOf(StateObject),
+    .itemsize = 0,
+    .flags = py.c.Py_TPFLAGS_DEFAULT | py.c.Py_TPFLAGS_HAVE_GC,
+    .slots = &state_slots,
 };
 
 // ======================================================================
@@ -73,36 +176,58 @@ pub const Context = struct {
 
 pub const NodeObject = extern struct {
     ob_base: py.c.PyObject,
-    /// The Program object (owned): keeps the context alive
-    program: ?*PyObject,
+    /// The program's State (owned): keeps the context alive
+    state: ?*PyObject,
     ctx: ?*Context,
     idx: u32,
 };
 
-pub fn newNode(program: *PyObject, ctx: *Context, idx: u32) ?*PyObject {
+pub fn newNode(state: *PyObject, ctx: *Context, idx: u32) ?*PyObject {
     const obj = allocObject(NodeType) orelse return null;
     const n: *NodeObject = @ptrCast(@alignCast(obj));
-    py.Py_IncRef(program);
-    n.program = program;
+    py.Py_IncRef(state);
+    n.state = state;
     n.ctx = ctx;
     n.idx = idx;
     return obj;
 }
 
 pub fn asNode(obj: *PyObject) ?*NodeObject {
-    if (obj.ob_type != @as(*py.c.PyTypeObject, @ptrCast(NodeType))) return null;
-    return @ptrCast(@alignCast(obj));
+    if (obj.ob_type != @as(*py.c.PyTypeObject, @ptrCast(@alignCast(NodeType)))) return null;
+    const n: *NodeObject = @ptrCast(@alignCast(obj));
+    // (a node whose state the collector cleared has nothing to read)
+    if (n.state == null) return null;
+    return n;
+}
+
+fn nodeClear(obj: ?*PyObject) callconv(.c) c_int {
+    const n: *NodeObject = @ptrCast(@alignCast(obj.?));
+    if (n.state) |s| {
+        n.state = null;
+        n.ctx = null;
+        py.Py_DecRef(s);
+    }
+    return 0;
+}
+
+fn nodeTraverse(obj: ?*PyObject, visit: py.c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
+    const n: *NodeObject = @ptrCast(@alignCast(obj.?));
+    if (n.state) |s| {
+        const r = visit.?(s, arg);
+        if (r != 0) return r;
+    }
+    return visit.?(@ptrCast(@alignCast(obj.?.ob_type)), arg);
 }
 
 fn nodeDealloc(obj: ?*PyObject) callconv(.c) void {
-    const n: *NodeObject = @ptrCast(@alignCast(obj.?));
-    if (n.program) |p| py.Py_DecRef(p);
+    py.c.PyObject_GC_UnTrack(obj);
+    _ = nodeClear(obj);
     freeObject(obj.?);
 }
 
 /// A child's value as a field: what its action makes, or a Node; null
 /// with an exception; DROP for `-> drop`.
-pub fn valueOf(program: *PyObject, ctx: *Context, idx: u32) ?*PyObject {
+pub fn valueOf(state: *PyObject, ctx: *Context, idx: u32) ?*PyObject {
     if (ctx.values[idx]) |v| {
         py.Py_IncRef(v);
         return v;
@@ -112,7 +237,7 @@ pub fn valueOf(program: *PyObject, ctx: *Context, idx: u32) ?*PyObject {
     const rid = data.rule(idx);
     const action: grammar_mod.Action = if (rid < g.actions.len) g.actions[rid] else .none;
     const v: *PyObject = switch (action) {
-        .none, .class => return newNode(program, ctx, idx),
+        .none, .class => return newNode(state, ctx,idx),
         .str, .int, .float, .unquote => blk: {
             // zgram's own conversion, so values are exactly parse_ast's
             const zn = py.c.PyObject_CallMethod(ctx.tree, "node", "I", @as(c_uint, idx)) orelse return null;
@@ -125,13 +250,13 @@ pub fn valueOf(program: *PyObject, ctx: *Context, idx: u32) ?*PyObject {
         .none_ => ref(py.Py_None()),
         .drop => ref(DROP()),
         .list, .tuple => blk: {
-            const list = childValues(program, ctx, idx) orelse return null;
+            const list = childValues(state, ctx,idx) orelse return null;
             if (action == .list) break :blk list;
             defer py.Py_DecRef(list);
             break :blk py.c.PyList_AsTuple(list) orelse return null;
         },
         .dict => blk: {
-            const list = childValues(program, ctx, idx) orelse return null;
+            const list = childValues(state, ctx,idx) orelse return null;
             defer py.Py_DecRef(list);
             const dict = py.c.PyDict_New() orelse return null;
             const n: usize = @intCast(py.c.PyList_Size(list));
@@ -149,7 +274,7 @@ pub fn valueOf(program: *PyObject, ctx: *Context, idx: u32) ?*PyObject {
             var c = idx + 1;
             const stop = data.end(idx);
             while (c < stop) : (c = data.end(c)) {
-                const cv = valueOf(program, ctx, c) orelse return null;
+                const cv = valueOf(state, ctx,c) orelse return null;
                 if (cv == DROP()) {
                     py.Py_DecRef(cv);
                     continue;
@@ -159,20 +284,26 @@ pub fn valueOf(program: *PyObject, ctx: *Context, idx: u32) ?*PyObject {
             break :blk ref(py.Py_None());
         },
     };
-    // (nodes aren't cached: they are cheap and identity doesn't matter)
-    py.Py_IncRef(v);
-    ctx.values[idx] = v;
+    // Only values without nodes are kept: a node holds its program, which
+    // holds this cache (a cycle the collector doesn't see)
+    switch (action) {
+        .str, .int, .float, .unquote, .true_, .false_, .none_, .drop => {
+            py.Py_IncRef(v);
+            ctx.values[idx] = v;
+        },
+        else => {},
+    }
     return v;
 }
 
 /// The values of a node's children, `-> drop` ones left out (a new list).
-pub fn childValues(program: *PyObject, ctx: *Context, idx: u32) ?*PyObject {
+pub fn childValues(state: *PyObject, ctx: *Context, idx: u32) ?*PyObject {
     const data = ctx.data;
     const list = py.c.PyList_New(0) orelse return null;
     var c = idx + 1;
     const stop = data.end(idx);
     while (c < stop) : (c = data.end(c)) {
-        const v = valueOf(program, ctx, c) orelse {
+        const v = valueOf(state, ctx,c) orelse {
             py.Py_DecRef(list);
             return null;
         };
@@ -189,7 +320,7 @@ pub fn childValues(program: *PyObject, ctx: *Context, idx: u32) ?*PyObject {
 /// A field of a node: the labelled child's value (None if absent), or the
 /// list of them for a label that repeats. Null with an exception; or null
 /// without one if `field` isn't a label of the grammar.
-pub fn fieldOf(program: *PyObject, ctx: *Context, idx: u32, field: u8) ?*PyObject {
+pub fn fieldOf(state: *PyObject, ctx: *Context, idx: u32, field: u8) ?*PyObject {
     const data = ctx.data;
     const rid = data.rule(idx);
     const label = data.grammar.labelOf(rid, field);
@@ -201,7 +332,7 @@ pub fn fieldOf(program: *PyObject, ctx: *Context, idx: u32, field: u8) ?*PyObjec
     const stop = data.end(idx);
     while (c < stop) : (c = data.end(c)) {
         if (data.nodes[c].fieldId() != field) continue;
-        const v = valueOf(program, ctx, c) orelse {
+        const v = valueOf(state, ctx,c) orelse {
             if (list) |l| py.Py_DecRef(l);
             return null;
         };
@@ -248,17 +379,18 @@ fn DROP() *PyObject {
     return drop_sentinel;
 }
 
-const meta_names = [_][]const u8{ "kind", "rule", "text", "span", "start", "end", "index", "children", "parent", "fields" };
-
 fn nodeGetattro(obj: ?*PyObject, name_obj: ?*PyObject) callconv(.c) ?*PyObject {
     const n: *NodeObject = @ptrCast(@alignCast(obj.?));
-    const ctx = n.ctx.?;
-    const program = n.program.?;
     const name = ph.utf8(name_obj.?, "an attribute name") orelse return null;
-    // Labels first: a field named like an attribute (`index`) is the field
-    if (ctx.data.grammar.field_ids.get(name)) |field| return fieldOf(program, ctx, n.idx, field);
-    if (meta(n, name)) |result| return result;
     if (name.len > 1 and name[0] == '_' and name[1] == '_') return py.c.PyObject_GenericGetAttr(obj, name_obj);
+    const state = n.state orelse {
+        ph.raise(py.PyExc_RuntimeError(), "this node's program is gone", .{});
+        return null;
+    };
+    const ctx = n.ctx.?;
+    // Labels first: a field named like an attribute (`index`) is the field
+    if (ctx.data.grammar.field_ids.get(name)) |field| return fieldOf(state, ctx, n.idx, field);
+    if (meta(n, name)) |result| return result;
     if (py.c.PyErr_Occurred() != null) return null;
     // No such field: say which it has
     const data = ctx.data;
@@ -298,11 +430,11 @@ fn meta(n: *NodeObject, name: []const u8) ?*PyObject {
     if (eq(u8, name, "start")) return py.c.PyLong_FromUnsignedLong(node.text_start);
     if (eq(u8, name, "end")) return py.c.PyLong_FromUnsignedLong(node.text_end);
     if (eq(u8, name, "index")) return py.c.PyLong_FromUnsignedLong(n.idx);
-    if (eq(u8, name, "children")) return childValues(n.program.?, ctx, n.idx);
+    if (eq(u8, name, "children")) return childValues(n.state.?, ctx, n.idx);
     if (eq(u8, name, "parent")) {
         const p = data.parents[n.idx];
         if (p == NONE) return ref(py.Py_None());
-        return newNode(n.program.?, ctx, p);
+        return newNode(n.state.?, ctx, p);
     }
     if (eq(u8, name, "fields")) {
         const labels = data.grammar.labels[rid];
@@ -332,7 +464,8 @@ fn nodeHash(obj: ?*PyObject) callconv(.c) py.c.Py_hash_t {
 
 fn nodeRepr(obj: ?*PyObject) callconv(.c) ?*PyObject {
     const n: *NodeObject = @ptrCast(@alignCast(obj.?));
-    const data = n.ctx.?.data;
+    const ctx = n.ctx orelse return ph.newString("<node of a program that is gone>");
+    const data = ctx.data;
     const rid = data.rule(n.idx);
     var t = data.text(n.idx);
     var dots: []const u8 = "";
@@ -342,12 +475,15 @@ fn nodeRepr(obj: ?*PyObject) callconv(.c) ?*PyObject {
     }
     const text = ph.newString(t) orelse return null;
     defer py.Py_DecRef(text);
-    const kind = data.grammar.kind_names[rid];
-    return py.c.PyUnicode_FromFormat("<%.*s %R%s>", @as(c_int, @intCast(kind.len)), kind.ptr, text, dots.ptr);
+    const kind = ph.newString(data.grammar.kind_names[rid]) orelse return null;
+    defer py.Py_DecRef(kind);
+    return py.c.PyUnicode_FromFormat("<%U %R%s>", kind, text, dots.ptr);
 }
 
 var node_slots = [_]py.c.PyType_Slot{
     .{ .slot = py.c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&nodeDealloc)) },
+    .{ .slot = py.c.Py_tp_traverse, .pfunc = @ptrCast(@constCast(&nodeTraverse)) },
+    .{ .slot = py.c.Py_tp_clear, .pfunc = @ptrCast(@constCast(&nodeClear)) },
     .{ .slot = py.c.Py_tp_getattro, .pfunc = @ptrCast(@constCast(&nodeGetattro)) },
     .{ .slot = py.c.Py_tp_richcompare, .pfunc = @ptrCast(@constCast(&nodeRichcompare)) },
     .{ .slot = py.c.Py_tp_hash, .pfunc = @ptrCast(@constCast(&nodeHash)) },
@@ -360,7 +496,7 @@ var node_spec = py.c.PyType_Spec{
     .name = "zrun.Node",
     .basicsize = @sizeOf(NodeObject),
     .itemsize = 0,
-    .flags = py.c.Py_TPFLAGS_DEFAULT,
+    .flags = py.c.Py_TPFLAGS_DEFAULT | py.c.Py_TPFLAGS_HAVE_GC,
     .slots = &node_slots,
 };
 
@@ -447,7 +583,7 @@ fn frameTraverse(obj: ?*PyObject, visit: py.c.visitproc, arg: ?*anyopaque) callc
         }
     }
     // (heap types visit their type)
-    return visit.?(@ptrCast(obj.?.ob_type), arg);
+    return visit.?(@ptrCast(@alignCast(obj.?.ob_type)), arg);
 }
 
 fn frameDealloc(obj: ?*PyObject) callconv(.c) void {
@@ -485,8 +621,9 @@ var frame_spec = py.c.PyType_Spec{
 
 pub const FunctionObject = extern struct {
     ob_base: py.c.PyObject,
-    /// The Program object (owned)
-    program: ?*PyObject,
+    /// The program's State (owned): a function is called only by its own
+    /// program
+    state: ?*PyObject,
     node: u32,
     /// The frame it was made in, owned
     env: ?*PyObject,
@@ -494,11 +631,11 @@ pub const FunctionObject = extern struct {
     name: ?*PyObject,
 };
 
-pub fn newFunction(program: *PyObject, node: u32, env: ?*PyObject, name: *PyObject) ?*PyObject {
+pub fn newFunction(state: *PyObject, node: u32, env: ?*PyObject, name: *PyObject) ?*PyObject {
     const obj = allocObject(FunctionType) orelse return null;
     const f: *FunctionObject = @ptrCast(@alignCast(obj));
-    py.Py_IncRef(program);
-    f.program = program;
+    py.Py_IncRef(state);
+    f.state = state;
     f.node = node;
     if (env) |e| py.Py_IncRef(e);
     f.env = env;
@@ -508,13 +645,13 @@ pub fn newFunction(program: *PyObject, node: u32, env: ?*PyObject, name: *PyObje
 }
 
 pub fn asFunction(obj: *PyObject) ?*FunctionObject {
-    if (obj.ob_type != @as(*py.c.PyTypeObject, @ptrCast(FunctionType))) return null;
+    if (obj.ob_type != @as(*py.c.PyTypeObject, @ptrCast(@alignCast(FunctionType)))) return null;
     return @ptrCast(@alignCast(obj));
 }
 
 fn functionClear(obj: ?*PyObject) callconv(.c) c_int {
     const f: *FunctionObject = @ptrCast(@alignCast(obj.?));
-    inline for (.{ "env", "program" }) |field| {
+    inline for (.{ "env", "state" }) |field| {
         if (@field(f, field)) |o| {
             @field(f, field) = null;
             py.Py_DecRef(o);
@@ -525,13 +662,13 @@ fn functionClear(obj: ?*PyObject) callconv(.c) c_int {
 
 fn functionTraverse(obj: ?*PyObject, visit: py.c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
     const f: *FunctionObject = @ptrCast(@alignCast(obj.?));
-    inline for (.{ f.env, f.program }) |o| {
+    inline for (.{ f.env, f.state }) |o| {
         if (o) |x| {
             const r = visit.?(x, arg);
             if (r != 0) return r;
         }
     }
-    return visit.?(@ptrCast(obj.?.ob_type), arg);
+    return visit.?(@ptrCast(@alignCast(obj.?.ob_type)), arg);
 }
 
 fn functionDealloc(obj: ?*PyObject) callconv(.c) void {

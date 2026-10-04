@@ -113,23 +113,11 @@ const Language = struct {
         self._exec_of = &.{};
     }
 
+    // (No __traverse__: PyOZ 0.13.7 frees a collected class's objects with
+    // PyObject_Del in the stable ABI, which crashes. A language is in a
+    // cycle only through its semantics' module, which lives as long anyway.)
     pub fn __del__(self: *Language) void {
         self.release();
-    }
-
-    pub fn __traverse__(self: *Language, visit: pyoz.GCVisitor) c_int {
-        inline for (.{ "_evals", "_execs", "_hosts", "_parser", "_rules" }) |f| {
-            const r = visit.call(@field(self, f));
-            if (r != 0) return r;
-        }
-        return 0;
-    }
-
-    pub fn __clear__(self: *Language) void {
-        inline for (.{ "_evals", "_execs", "_hosts" }) |f| {
-            if (@field(self, f)) |o| _ = py.c.PyDict_Clear(o);
-        }
-        self._resolved = false;
     }
 
     /// `@lang.eval(kind)`: the semantics of an expression kind (a kind or
@@ -305,11 +293,10 @@ const Language = struct {
         // (recover: every syntax error is reported, not only the first)
         const tree = parseTree(self._parser.?, v.source) orelse return null;
         var prog = Program{};
-        prog._tree = tree;
         prog._lang = ref(Module.selfObject(Language, self));
         prog._source = ref(v.source);
         if (optional(v.path)) |p| prog._path = ref(p);
-        if (!prog.setup(self)) {
+        if (!prog.setup(self, tree)) {
             prog.release();
             return null;
         }
@@ -378,25 +365,17 @@ const Registrar = struct {
 // ============================================================================
 
 const Program = struct {
+    /// The Language (never refers to its programs)
     _lang: ?*PyObject = null,
     _source: ?*PyObject = null,
     _path: ?*PyObject = null,
-    _tree: ?*PyObject = null,
-    _analysis: ?*PyObject = null,
-    _diagnostics: ?*PyObject = null,
-    _ctx: ?*objects.Context = null,
-    /// The program's frame once it ran (for calls into it)
-    _globals: ?*PyObject = null,
+    /// Everything else, in a State (objects.zig): the tree, the analysis,
+    /// the native data, the program's frame. Nodes and functions refer to
+    /// it; this class refers to nothing that refers back to it
+    _state: ?*PyObject = null,
 
     fn release(self: *Program) void {
-        if (self._ctx) |c| {
-            c.deinit();
-            c.data.deinit();
-            allocator.destroy(c.data);
-            allocator.destroy(c);
-            self._ctx = null;
-        }
-        inline for (.{ "_globals", "_lang", "_source", "_path", "_tree", "_analysis", "_diagnostics" }) |f| {
+        inline for (.{ "_state", "_lang", "_source", "_path" }) |f| {
             if (@field(self, f)) |o| py.Py_DecRef(o);
             @field(self, f) = null;
         }
@@ -406,34 +385,30 @@ const Program = struct {
         self.release();
     }
 
-    pub fn __traverse__(self: *Program, visit: pyoz.GCVisitor) c_int {
-        inline for (.{ "_globals", "_lang", "_tree", "_analysis", "_diagnostics" }) |f| {
-            const r = visit.call(@field(self, f));
-            if (r != 0) return r;
-        }
-        return 0;
+    fn state(self: *const Program) *objects.StateObject {
+        return objects.asState(self._state.?);
     }
 
-    pub fn __clear__(self: *Program) void {
-        if (self._globals) |g| {
-            self._globals = null;
-            py.Py_DecRef(g);
-        }
+    fn ctx(self: *const Program) *objects.Context {
+        return self.state().ctx.?;
     }
 
     /// Check the tree (syntax errors, the rules) and build the native data.
-    fn setup(self: *Program, lang: *Language) bool {
-        const tree_obj = self._tree.?;
+    fn setup(self: *Program, lang: *Language, tree_obj: *PyObject) bool {
+        defer py.Py_DecRef(tree_obj);
         // The diagnostics: the rules' (syntax errors included), or the
         // tree's syntax errors
+        var analysis: ?*PyObject = null;
+        defer if (analysis) |a| py.Py_DecRef(a);
+        var diagnostics: *PyObject = undefined;
         if (lang._rules) |rules| {
-            const checked = py.c.PyObject_CallMethod(rules, "analyze", "(O)", tree_obj) orelse return false;
-            self._analysis = checked;
-            self._diagnostics = py.c.PyObject_GetAttrString(checked, "diagnostics") orelse return false;
+            analysis = py.c.PyObject_CallMethod(rules, "analyze", "(O)", tree_obj) orelse return false;
+            diagnostics = py.c.PyObject_GetAttrString(analysis.?, "diagnostics") orelse return false;
         } else {
-            self._diagnostics = py.c.PyObject_GetAttrString(tree_obj, "errors") orelse return false;
+            diagnostics = py.c.PyObject_GetAttrString(tree_obj, "errors") orelse return false;
         }
-        if (!self.raiseIfErrors()) return false;
+        defer py.Py_DecRef(diagnostics);
+        if (!self.raiseIfErrors(diagnostics)) return false;
 
         const capsule = py.c.PyObject_GetAttrString(tree_obj, "capsule") orelse return false;
         defer py.Py_DecRef(capsule);
@@ -443,7 +418,7 @@ const Program = struct {
             return false;
         }
         var av: ?*const zabi.AnalysisView = null;
-        if (self._analysis) |checked| {
+        if (analysis) |checked| {
             const ac = py.c.PyObject_GetAttrString(checked, "capsule") orelse {
                 py.c.PyErr_Clear();
                 ph.raise(py.PyExc_ImportError(), "zrun needs zrules 0.1.5 or later (Analysis.capsule)", .{});
@@ -461,28 +436,34 @@ const Program = struct {
             if (e == error.OutOfMemory) _ = py.c.PyErr_NoMemory();
             return false;
         };
-        const ctx = allocator.create(objects.Context) catch {
+        const context = allocator.create(objects.Context) catch {
             data.deinit();
             allocator.destroy(data);
             _ = py.c.PyErr_NoMemory();
             return false;
         };
         const values = allocator.alloc(?*PyObject, data.nodes.len) catch {
-            allocator.destroy(ctx);
+            allocator.destroy(context);
             data.deinit();
             allocator.destroy(data);
             _ = py.c.PyErr_NoMemory();
             return false;
         };
         @memset(values, null);
-        ctx.* = .{ .data = data, .tree = tree_obj, .values = values };
-        self._ctx = ctx;
+        context.* = .{ .data = data, .tree = ref(tree_obj), .values = values };
+        self._state = objects.newState(context, self._lang.?, analysis, diagnostics) orelse {
+            py.Py_DecRef(tree_obj);
+            allocator.free(values);
+            allocator.destroy(context);
+            data.deinit();
+            allocator.destroy(data);
+            return false;
+        };
         return true;
     }
 
     /// Raise LoadError if the diagnostics have an error.
-    fn raiseIfErrors(self: *Program) bool {
-        const diags = self._diagnostics.?;
+    fn raiseIfErrors(self: *Program, diags: *PyObject) bool {
         const n: usize = @intCast(py.c.PyList_Size(diags));
         var errors: usize = 0;
         for (0..n) |i| {
@@ -523,12 +504,17 @@ const Program = struct {
 
     /// Run the program from its start. Raises zrun.Error on a runtime error.
     pub fn run(self: *Program) ?*PyObject {
+        return onBigStack(runHere, .{self}, self.language()._max_depth);
+    }
+
+    fn runHere(self: *Program) ?*PyObject {
         var rt = Runtime.begin(self) orelse return null;
         defer rt.end();
         const frame = objects.newFrame(NONE, NONE, null, name_program orelse return null) orelse return null;
         rt.self()._frame = frame;
-        if (self._globals) |g| py.Py_DecRef(g);
-        self._globals = ref(frame);
+        const st = self.state();
+        if (st.globals) |g| py.Py_DecRef(g);
+        st.globals = ref(frame);
         const r = rt.self();
         if (!r.hoist(NONE)) return null;
         if (!r.execNode(0)) return null;
@@ -538,20 +524,25 @@ const Program = struct {
     /// `program.call(name, *args)`: call a function the program defines at
     /// its top level (running the program first if it hasn't run).
     fn callEntry(self: *Program, name: *PyObject, args: *PyObject) ?*PyObject {
-        if (self._globals == null) {
-            const r = self.run() orelse return null;
+        return onBigStack(callHere, .{ self, name, args }, self.language()._max_depth);
+    }
+
+    fn callHere(self: *Program, name: *PyObject, args: *PyObject) ?*PyObject {
+        const st = self.state();
+        if (st.globals == null) {
+            const r = self.runHere() orelse return null;
             py.Py_DecRef(r);
         }
         const wanted = ph.utf8(name, "name") orelse return null;
-        const data = self._ctx.?.data;
+        const data = self.ctx().data;
         for (data.syms, 0..) |s, i| {
             if (s.builtin or !std.mem.eql(u8, s.name, wanted)) continue;
             if (data.homeOf(@intCast(i)) != NONE) continue;
-            const g = objects.asFrame(self._globals.?);
+            const g = objects.asFrame(st.globals.?);
             const f = g.slots.?.get(@intCast(i)) orelse continue;
             var rt = Runtime.begin(self) orelse return null;
             defer rt.end();
-            rt.self()._frame = ref(self._globals.?);
+            rt.self()._frame = ref(st.globals.?);
             return rt.self().callValue(f, args);
         }
         ph.raise(py.PyExc_KeyError(), "the program defines no function '{s}'", .{wanted});
@@ -575,22 +566,22 @@ const Program = struct {
 
     /// The zgram Tree
     pub fn get_tree(self: *const Program) ?*PyObject {
-        return ref(self._tree.?);
+        return ref(self.ctx().tree);
     }
 
     /// The zrules Analysis (None without rules)
     pub fn get_analysis(self: *const Program) ?*PyObject {
-        return ref(self._analysis orelse py.Py_None());
+        return ref(self.state().analysis orelse py.Py_None());
     }
 
     /// The warnings found loading it
     pub fn get_diagnostics(self: *const Program) ?*PyObject {
-        return ref(self._diagnostics.?);
+        return ref(self.state().diagnostics.?);
     }
 
     /// The root node
     pub fn get_root(self: *const Program) ?*PyObject {
-        return objects.newNode(Module.selfObject(Program, self), self._ctx.?, 0);
+        return objects.newNode(self._state.?, self.ctx(), 0);
     }
 
     pub const __doc__: [*:0]const u8 = "A program loaded by Language.load(): run() runs it, call(name, *args) calls one of its functions. Also: source, tree, analysis, diagnostics (its warnings), root.";
@@ -598,6 +589,41 @@ const Program = struct {
 };
 
 var name_program: ?*PyObject = null;
+
+/// Run `f(args)` on a thread of its own with a stack for `max_depth`
+/// calls of the language: semantics recurse through Python and native
+/// frames, more than a default stack holds (8 MB on Linux, 1 MB on
+/// Windows). The calling thread waits without the GIL; the result and any
+/// exception come back to it.
+fn onBigStack(comptime f: anytype, args: anytype, max_depth: u32) ?*PyObject {
+    const Ctx = struct {
+        args: @TypeOf(args),
+        result: ?*PyObject = null,
+        t: ?*PyObject = null,
+        v: ?*PyObject = null,
+        tb: ?*PyObject = null,
+
+        fn work(c: *@This()) void {
+            const g = py.c.PyGILState_Ensure();
+            c.result = @call(.auto, f, c.args);
+            if (c.result == null) py.c.PyErr_Fetch(@ptrCast(&c.t), @ptrCast(&c.v), @ptrCast(&c.tb));
+            py.c.PyGILState_Release(g);
+        }
+    };
+    var ctx = Ctx{ .args = args };
+    // About 64 KB per call leaves room for deep semantics and debug builds
+    const stack: usize = @min(@as(usize, max_depth) * 64 * 1024 + 16 * 1024 * 1024, 8 * 1024 * 1024 * 1024);
+    const ts = py.c.PyEval_SaveThread();
+    const thread = std.Thread.spawn(.{ .stack_size = stack }, Ctx.work, .{&ctx}) catch {
+        py.c.PyEval_RestoreThread(ts);
+        _ = py.c.PyErr_NoMemory();
+        return null;
+    };
+    thread.join();
+    py.c.PyEval_RestoreThread(ts);
+    if (ctx.result == null) py.c.PyErr_Restore(ctx.t, ctx.v, ctx.tb);
+    return ctx.result;
+}
 
 /// `program.call`: a callable taking `(name, *args)` (PyOZ methods take
 /// fixed arguments, and its types can't get methods added: the property
@@ -632,7 +658,7 @@ fn callerDealloc(obj: ?*PyObject) callconv(.c) void {
     const t = obj.?.ob_type;
     const free: py.c.freefunc = @ptrCast(py.c.PyType_GetSlot(t, py.c.Py_tp_free));
     free.?(obj);
-    py.Py_DecRef(@ptrCast(t));
+    py.Py_DecRef(@ptrCast(@alignCast(t)));
 }
 
 var caller_slots = [_]py.c.PyType_Slot{
@@ -711,15 +737,20 @@ const Runtime = struct {
     }
 
     fn data(self: *Runtime) *program_mod.Data {
-        return self._p.?._ctx.?.data;
+        return self._p.?.ctx().data;
     }
 
     fn ctx(self: *Runtime) *objects.Context {
-        return self._p.?._ctx.?;
+        return self._p.?.ctx();
+    }
+
+    /// The program's State object (borrowed: the program holds it)
+    fn stateObj(self: *Runtime) *PyObject {
+        return self._p.?._state.?;
     }
 
     fn node(self: *Runtime, idx: u32) ?*PyObject {
-        return objects.newNode(self._program.?, self.ctx(), idx);
+        return objects.newNode(self.stateObj(), self.ctx(), idx);
     }
 
     /// The node index of a Node object of this program, or null with
@@ -781,7 +812,7 @@ const Runtime = struct {
 
     fn defaultEval(self: *Runtime, idx: u32) ?*PyObject {
         if (self.data().symbolIndex(idx) != null) return self.loadNode(idx);
-        const values = objects.childValues(self._program.?, self.ctx(), idx) orelse return self.raised(idx);
+        const values = objects.childValues(self.stateObj(), self.ctx(), idx) orelse return self.raised(idx);
         defer py.Py_DecRef(values);
         if (py.c.PyList_Size(values) == 1) return self.evalObj(py.c.PyList_GetItem(values, 0).?);
         const g = self.data().grammar;
@@ -843,7 +874,7 @@ const Runtime = struct {
             py.Py_DecRef(v);
             return true;
         }
-        const values = objects.childValues(self._program.?, self.ctx(), idx) orelse {
+        const values = objects.childValues(self.stateObj(), self.ctx(), idx) orelse {
             _ = self.raised(idx);
             return false;
         };
@@ -925,7 +956,7 @@ const Runtime = struct {
     }
 
     fn notAVariable(self: *Runtime, idx: u32) ?*PyObject {
-        if (self._p.?._analysis == null) return self.fail(idx, "variables need rules with a scopes() rule", .{});
+        if (self._p.?.state().analysis == null) return self.fail(idx, "variables need rules with a scopes() rule", .{});
         return self.fail(idx, "'{s}' is not a variable", .{self.data().text(idx)});
     }
 
@@ -962,7 +993,7 @@ const Runtime = struct {
         const name_text = if (spec.name != 0) if (program_mod.labelled(d, idx, spec.name)) |nn| d.text(nn) else "<anonymous>" else "<anonymous>";
         const name = ph.newString(name_text) orelse return null;
         defer py.Py_DecRef(name);
-        return objects.newFunction(self._program.?, idx, self._frame, name);
+        return objects.newFunction(self.stateObj(), idx, self._frame, name);
     }
 
     fn specOf(self: *Runtime, idx: u32) ?FunctionSpec {
@@ -1030,9 +1061,10 @@ const Runtime = struct {
     }
 
     fn callFunction(self: *Runtime, fo: *objects.FunctionObject, args: *PyObject) ?*PyObject {
+        if (fo.state != self.stateObj()) return self.fail(self._at, "a function of another program can't be called here", .{});
         const fnode = fo.node;
         const spec = self.specOf(fnode).?;
-        const program = self._program.?;
+        const program = self.stateObj();
         // The parameters: a list, one, or none
         const params = if (spec.params != 0) objects.fieldOf(program, self.ctx(), fnode, spec.params) orelse return null else py.c.PyList_New(0) orelse return null;
         defer py.Py_DecRef(params);
