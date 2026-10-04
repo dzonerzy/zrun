@@ -45,6 +45,7 @@ BUILTINS = (
     "defaults",
     "fields",
     "matches",
+    "isinst",
 )
 
 
@@ -306,6 +307,18 @@ def make_lang():
                     r = r + (str(e),)
                 out.append(r)
             return out
+        if name == "isinst":
+            # isinstance() of values of every kind: Python's, natively made
+            # ones (records of a class, of a subclass)
+            vals = rt.call(rt.load(node.name), [])
+            vals = vals + [Slot3(1, 2), Holder(3), 2**70 + len(vals), True, 7, 1.5, "s", None]
+            out = []
+            for v in vals:
+                out.append("".join("1" if x else "0" for x in (
+                    isinstance(v, int), isinstance(v, bool), isinstance(v, float), isinstance(v, str), isinstance(v, list),
+                    isinstance(v, tuple), isinstance(v, dict), isinstance(v, Holder), isinstance(v, Slot2), isinstance(v, Slot3),
+                    isinstance(v, (str, list)), isinstance(v, Point))))
+            return out
         if name == "defaults":
             # helpers' defaults and keyword arguments
             n = rt.call(rt.load(node.name), [])
@@ -500,6 +513,10 @@ def make_lang():
         return 3
 
     @lang.host
+    def isinst():
+        return [1, True, 2**70, 2**200, 2.0, "s", MyStr("x"), [1], (1,), {}, None, Color.RED, Point(1, 2), Holder(1), Slot3(1, 2), Box(1)]
+
+    @lang.host
     def matches():
         return ["+", "..", "//", "", "abcdefgh", "abcdefghi", "abcdefg", "abcdefgx", "é", "/", "++", 1, None, True, 2.0, [1], MyStr("+")]
 
@@ -585,6 +602,7 @@ PROGRAMS = {
     "defaults": "print(defaults());\n",
     "fields": "print(fields());\n",
     "matches": "print(matches());\n",
+    "isinst": "print(isinst());\n",
 }
 
 

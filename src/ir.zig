@@ -416,6 +416,14 @@ pub const Function = struct {
         return p;
     }
 
+    /// A phi of a value from each block (as many as there are).
+    pub fn phiN(self: *Function, ty: Type, vals: []const Value, blocks: []const Block) Value {
+        self.open();
+        const p = L("LLVMBuildPhi")(self.b, ty, "");
+        L("LLVMAddIncoming")(p, @constCast(vals.ptr), @constCast(blocks.ptr), @intCast(vals.len));
+        return p;
+    }
+
     pub fn call(self: *Function, f: Fn, args: []const Value) Value {
         self.open();
         return L("LLVMBuildCall2")(self.b, f.ty, f.v, @constCast(args.ptr), @intCast(args.len), "");

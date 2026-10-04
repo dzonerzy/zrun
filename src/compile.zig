@@ -4642,15 +4642,11 @@ const Gen = struct {
         // subclass), or a Python object of it
         if (try c.recordType(o)) |rtype| {
             if (v.isStatic()) return .{ .bool = false };
-            const r = self.call("zr_is_record", &.{ v.dyn.tag, v.dyn.bits, self.ptrConst(rtype) });
-            try self.drop(v);
-            return self.boolDyn(r);
+            return self.isRecord(v.dyn, rtype);
         }
         if (o == objects_mod.FunctionType) {
             if (v.isStatic()) return .{ .bool = false };
-            const r = self.call("zr_is_type", &.{ v.dyn.tag, v.dyn.bits, self.k32(8) });
-            try self.drop(v);
-            return self.boolDyn(r);
+            return self.isType(v.dyn, 8);
         }
         const codes = [_]struct { [*:0]const u8, u32 }{ .{ "int", 0 }, .{ "float", 1 }, .{ "str", 2 }, .{ "bool", 3 }, .{ "list", 4 }, .{ "tuple", 5 }, .{ "dict", 6 } };
         for (codes) |entry| if (isBuiltin(o, entry[0])) {
@@ -4664,9 +4660,7 @@ const Gen = struct {
                 6 => v == .dict,
                 else => false,
             } };
-            const r = self.call("zr_is_type", &.{ v.dyn.tag, v.dyn.bits, self.k32(entry[1]) });
-            try self.drop(v);
-            return self.boolDyn(r);
+            return self.isType(v.dyn, entry[1]);
         };
         // Any other class: as Python answers it, the value as Python sees it
         const d = try self.materialize(v, inst.node);
@@ -4674,6 +4668,69 @@ const Gen = struct {
         try self.callCheck("zr_isinstance", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, self.k(@intCast(idx)), self.out });
         try self.drop(.{ .dyn = d });
         return .{ .dyn = try self.loadOut(.bool) };
+    }
+
+    /// isinstance() of a run-time value and a builtin type (`code`: as
+    /// zr_is_type's): its tag, inline; a Python object's type by
+    /// zr_is_type (subclasses...). The value dropped.
+    fn isType(self: *Gen, d: Dyn, code: u32) Error!SVal {
+        const f = &self.f;
+        const T = value.Tag;
+        const tags: []const u64 = switch (code) {
+            // (int: an I64, a plain int, a bool, a Big)
+            0 => &.{ @intFromEnum(T.int), value.PINT_TAG, @intFromEnum(T.bool), @intFromEnum(T.big) },
+            1 => &.{@intFromEnum(T.float)},
+            2 => &.{@intFromEnum(T.str)},
+            3 => &.{@intFromEnum(T.bool)},
+            4 => &.{@intFromEnum(T.list)},
+            5 => &.{@intFromEnum(T.tuple)},
+            6 => &.{@intFromEnum(T.dict)},
+            8 => &.{@intFromEnum(T.function)},
+            else => unreachable,
+        };
+        var native = f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intCast(tags[0])));
+        for (tags[1..]) |t| native = f.or_(native, f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intCast(t))));
+        const native64 = f.zext64(native);
+        const host = try f.label("is_host");
+        const join = try f.label("is_joined");
+        const start = f.current;
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(T.host))), host, join);
+        try f.block(host);
+        const r = f.zext64(self.call("zr_is_type", &.{ d.tag, d.bits, self.k32(code) }));
+        const host_end = f.current;
+        try f.br(join);
+        try f.block(join);
+        const res = f.phi(self.c.m.t.i64, native64, start, r, host_end);
+        try self.drop(.{ .dyn = d });
+        return dyn(self.k(1), res, .bool);
+    }
+
+    /// isinstance() of a run-time value and a record class: a record of
+    /// exactly it, inline; one of another type (a subclass?) or a Python
+    /// object by zr_is_record; anything else isn't. The value dropped.
+    fn isRecord(self: *Gen, d: Dyn, rtype: *const value.RecordType) Error!SVal {
+        const f = &self.f;
+        const t = self.c.m.t;
+        const T = value.Tag;
+        const maybe = try f.label("isrec_maybe");
+        const rec = try f.label("isrec_record");
+        const slow = try f.label("isrec_slow");
+        const join = try f.label("isrec_joined");
+        const is_rec = f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(T.record)));
+        const start = f.current;
+        try f.condBr(f.or_(is_rec, f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(T.host)))), maybe, join);
+        try f.block(maybe);
+        try f.condBr(is_rec, rec, slow);
+        try f.block(rec);
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, self.recordTypeOf(d), self.k(@intCast(@intFromPtr(rtype)))), join, slow);
+        try f.block(slow);
+        const r = f.zext64(self.call("zr_is_record", &.{ d.tag, d.bits, self.ptrConst(rtype) }));
+        const slow_end = f.current;
+        try f.br(join);
+        try f.block(join);
+        const res = f.phiN(t.i64, &.{ self.k(0), self.k(1), r }, &.{ start, rec, slow_end });
+        try self.drop(.{ .dyn = d });
+        return dyn(self.k(1), res, .bool);
     }
 
     fn orValues(self: *Gen, inst: *Inst, a_: SVal, b: SVal) Error!SVal {
