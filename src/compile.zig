@@ -691,6 +691,61 @@ pub const Compiler = struct {
     inlined: usize = 0,
     /// Record fields by module and name (Gen.fieldCandidates)
     field_cands: std.StringHashMapUnmanaged([]const Gen.FieldCandidate) = .empty,
+    /// By node: its kind's str (kindTable); by label, its child (fieldTable)
+    kind_table: ?[]u64 = null,
+    field_tables: std.AutoHashMapUnmanaged(u8, []u64) = .empty,
+
+    /// In a field table: a node whose label isn't one child or none (a
+    /// list of them, a value an action makes): zr_getattr's
+    pub const field_other: i64 = @as(i64, NONE) - 1;
+
+    /// Each node's kind as a str (immortal: value.literal), by node: what
+    /// node.kind of a node only known at run time reads.
+    pub fn kindTable(self: *Compiler) Error![]u64 {
+        if (self.kind_table) |t| return t;
+        const d = self.data;
+        const t = try self.a.alloc(u64, d.nodes.len);
+        for (t, 0..) |*slot, i| {
+            const s = value.literal(d.grammar.kind_names[d.rule(@intCast(i))]) orelse return error.OutOfMemory;
+            slot.* = @intFromPtr(s);
+        }
+        self.kind_table = t;
+        return t;
+    }
+
+    /// Each node's child of a label, by node (NONE: none, field_other:
+    /// several or a value an action makes): what node.<label> of a node
+    /// only known at run time reads (as bridge.nodeAttr gives it).
+    pub fn fieldTable(self: *Compiler, field: u8) Error![]u64 {
+        if (self.field_tables.get(field)) |t| return t;
+        const d = self.data;
+        const t = try self.a.alloc(u64, d.nodes.len);
+        for (t, 0..) |*slot, i| {
+            const idx: u32 = @intCast(i);
+            const label = d.grammar.labelOf(d.rule(idx), field);
+            var found: u64 = NONE;
+            var count: usize = 0;
+            var other = label != null and label.?.many;
+            var ch = idx + 1;
+            const stop = d.end(idx);
+            while (ch < stop and !other) : (ch = d.end(ch)) {
+                if (d.nodes[ch].fieldId() != field) continue;
+                const crid = d.rule(ch);
+                const action: grammar_mod.Action = if (crid < d.grammar.actions.len) d.grammar.actions[crid] else .none;
+                switch (action) {
+                    .none, .class => {
+                        count += 1;
+                        found = ch;
+                    },
+                    .drop => {},
+                    else => other = true,
+                }
+            }
+            slot.* = if (other or count > 1) @bitCast(field_other) else found;
+        }
+        try self.field_tables.put(self.a, field, t);
+        return t;
+    }
 
     /// Whether every function's (and block's) variables are in frames.
     pub fn allHeap(self: *const Compiler) bool {
@@ -4038,11 +4093,79 @@ const Gen = struct {
     }
 
     fn genericGetattr(self: *Gen, inst: *Inst, d: Dyn, name: []const u8) Error!Dyn {
+        if (d.shape == .any or d.shape == .node) {
+            const g = self.c.data.grammar;
+            if (std.mem.eql(u8, name, "kind") and g.field_ids.get(name) == null) return self.nodeKind(inst, d, name);
+            if (g.field_ids.get(name)) |field| return self.nodeField(inst, d, name, field);
+        }
+        return self.getattrCall(inst, d, name);
+    }
+
+    fn getattrCall(self: *Gen, inst: *Inst, d: Dyn, name: []const u8) Error!Dyn {
         const s = try self.c.m.string(name);
         const ok = self.call("zr_getattr", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, s, self.out });
         try self.drop(.{ .dyn = d });
         try self.check(ok);
         return self.loadOut(.any);
+    }
+
+    /// node.kind of a value that may be a node: the program's table of
+    /// kinds (by node), inline; anything else by zr_getattr.
+    fn nodeKind(self: *Gen, inst: *Inst, d: Dyn, name: []const u8) Error!Dyn {
+        const f = &self.f;
+        const t = self.c.m.t;
+        const table = try self.c.kindTable();
+        const is_node = try f.label("kind_node");
+        const slow = try f.label("kind_other");
+        const join = try f.label("kind_got");
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.node))), is_node, slow);
+        try f.block(is_node);
+        // (an immortal str: no reference to take)
+        const s = f.load(t.i64, f.at(t.i64, self.c.m.ptrConst(@intFromPtr(table.ptr)), d.bits));
+        try f.br(join);
+        try f.block(slow);
+        const g = try self.getattrCall(inst, d, name);
+        const slow_end = f.current;
+        try f.br(join);
+        try f.block(join);
+        return .{
+            .tag = f.phi(t.i64, self.k(@intFromEnum(value.Tag.str)), is_node, g.tag, slow_end),
+            .bits = f.phi(t.i64, s, is_node, g.bits, slow_end),
+            .shape = .any,
+        };
+    }
+
+    /// node.<label> of a value that may be a node: the program's table of
+    /// that label's child (by node: one, or None), inline; a node whose
+    /// label repeats (a list), or whose child an action makes a value of,
+    /// and anything else by zr_getattr.
+    fn nodeField(self: *Gen, inst: *Inst, d: Dyn, name: []const u8, field: u8) Error!Dyn {
+        const f = &self.f;
+        const t = self.c.m.t;
+        const table = try self.c.fieldTable(field);
+        const is_node = try f.label("field_node");
+        const known = try f.label("field_known");
+        const slow = try f.label("field_other");
+        const join = try f.label("field_got");
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.node))), is_node, slow);
+        try f.block(is_node);
+        const ch = f.load(t.i64, f.at(t.i64, self.c.m.ptrConst(@intFromPtr(table.ptr)), d.bits));
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, ch, self.k(Compiler.field_other)), slow, known);
+        try f.block(known);
+        const none = f.icmp(jit_c.LLVMIntEQ, ch, self.k(NONE));
+        const tag = f.select(none, self.k(@intFromEnum(value.Tag.none)), self.k(@intFromEnum(value.Tag.node)));
+        const bits = f.select(none, self.k(0), ch);
+        try f.br(join);
+        try f.block(slow);
+        const g = try self.getattrCall(inst, d, name);
+        const slow_end = f.current;
+        try f.br(join);
+        try f.block(join);
+        return .{
+            .tag = f.phi(t.i64, tag, known, g.tag, slow_end),
+            .bits = f.phi(t.i64, bits, known, g.bits, slow_end),
+            .shape = .any,
+        };
     }
 
     const FieldCandidate = struct { rtype: *value.RecordType, index: usize };
