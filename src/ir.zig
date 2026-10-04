@@ -172,31 +172,13 @@ pub const Module = struct {
         return L("LLVMConstIntToPtr")(L("LLVMConstInt")(self.t.i64, addr, 0), self.t.ptr);
     }
 
-    /// An immortal string object for a literal: a constant global laid out
-    /// as the runtime's Str (header, lengths, its hash, the bytes).
+    /// The immortal string object of a literal (value.literal: the
+    /// process's, not the module's memory: values made of it may outlive
+    /// the program), as a pointer constant.
     pub fn string(self: *Module, bytes: []const u8) !Value {
         if (self.strings.get(bytes)) |g| return g;
-        const t = self.t;
-        const chars = std.unicode.utf8CountCodepoints(bytes) catch bytes.len;
-        const arr = L("LLVMConstStringInContext2")(self.ctx, bytes.ptr, bytes.len, 1);
-        var fields = [_]Value{
-            self.k64(@bitCast(value.IMMORTAL)),
-            self.k32(4),
-            self.k32(0),
-            self.k64(@intCast(bytes.len)),
-            self.k64(@intCast(chars)),
-            self.k64(@bitCast(value.strHash(bytes))),
-            arr,
-        };
-        const init_v = L("LLVMConstStructInContext")(self.ctx, &fields, fields.len, 0);
-        const name = try std.fmt.allocPrintSentinel(self.gpa, "{s}_s{d}", .{ self.prefix, self.strings.count() }, 0);
-        _ = t;
-        const g = L("LLVMAddGlobal")(self.mod, L("LLVMTypeOf")(init_v), name);
-        L("LLVMSetInitializer")(g, init_v);
-        L("LLVMSetGlobalConstant")(g, 1);
-        L("LLVMSetLinkage")(g, c.LLVMPrivateLinkage);
-        L("LLVMSetUnnamedAddress")(g, c.LLVMGlobalUnnamedAddr);
-        L("LLVMSetAlignment")(g, 8);
+        const s = value.literal(bytes) orelse return error.OutOfMemory;
+        const g = self.ptrConst(@intFromPtr(s));
         try self.strings.put(self.gpa, try self.gpa.dupe(u8, bytes), g);
         return g;
     }

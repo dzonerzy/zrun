@@ -123,6 +123,13 @@ pub fn unwrap(o: *PyObject) ?Value {
     return v;
 }
 
+/// The native value a proxy stands for (borrowed, nothing changed), or
+/// null if `o` isn't one.
+pub fn objectOf(o: *PyObject) ?Value {
+    const kind: value.Tag = if (typeIs(o, ListType)) .list else if (typeIs(o, DictType)) .dict else if (typeIs(o, RecordType)) .record else return null;
+    return Value.obj(kind, asProxy(o).obj);
+}
+
 /// Compiled code let go of an object that has a proxy: true if it's to be
 /// freed now (Python doesn't have the proxy either), else the proxy owns
 /// it from now on.

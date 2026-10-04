@@ -31,6 +31,9 @@ pub const Ctx = struct {
     /// (the compiler's list itself: compiling more while the program runs
     /// adds to it, and may move it)
     objects: *const std.ArrayListUnmanaged(*PyObject),
+    /// The compiled program running (driver.Compiled.id): its functions'
+    /// code is the only code that runs here
+    program: u64 = 0,
     /// The language's calls being run, outermost first
     calls: std.ArrayListUnmanaged(CallEntry) = .empty,
     max_depth: u32,
@@ -789,7 +792,7 @@ pub export fn zr_function(ctx: *Ctx, code: Code, env: ?*value.Frame, node: u32, 
     if (env) |e| value.increfObj(&e.head);
     value.increfObj(&name.head);
     // (flags: FunctionFlags.word())
-    f.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.function), .flags = @intCast(flags) }, .code = @ptrCast(code), .env = env, .node = node, .name = name };
+    f.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.function), .flags = @intCast(flags) }, .code = @ptrCast(code), .env = env, .node = node, .name = name, .program = ctx.program };
     out.* = Value.obj(.function, &f.head);
     return true;
 }
@@ -802,6 +805,8 @@ pub export fn zr_call(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Val
     switch (f.kind()) {
         .function => {
             const fo: *value.Function = @ptrCast(@alignCast(f.ptr()));
+            // (one a table both programs see has: as the reference mode)
+            if (fo.program != ctx.program) return fail(ctx, node, "a function of another program can't be called here", .{});
             const policy = FunctionFlags.of(fo.head.flags);
             const nparams: u64 = policy.nparams;
             if ((nargs < nparams and !policy.missing_none) or (nargs > nparams and policy.extra == .@"error")) {
@@ -1300,6 +1305,16 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
             value.incref(x);
             out.* = x;
             return true;
+        }
+    }
+    // A record's field holding a function (`b.fn(args)`): the function
+    // called, as Python finds the attribute (no self)
+    if (v.kind() == .record) {
+        const r: *value.Record = @ptrCast(@alignCast(v.ptr()));
+        for (r.rtype.fields, r.fields()) |f, x| {
+            if (!std.mem.eql(u8, f, name.bytes())) continue;
+            if (x.tag == value.UNSET_TAG) break;
+            return zr_call(ctx, node, x.tag, x.bits, args, n, null, out);
         }
     }
     // A str's common methods, natively (an ASCII one: Unicode's case

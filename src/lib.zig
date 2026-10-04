@@ -797,6 +797,7 @@ const Program = struct {
         var ectx = helpers.Ctx{
             .node_maker = .{ .ctx = self, .make_fn = &makeNodeObject, .owner = Module.selfObject(Program, self) },
             .objects = &c.compiler.objects,
+            .program = c.id,
             .max_depth = self.language()._max_depth,
             .link = @constCast(&link),
         };

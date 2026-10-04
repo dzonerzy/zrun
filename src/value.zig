@@ -282,6 +282,9 @@ pub const Function = extern struct {
     env: ?*Frame,
     node: u64,
     name: *Str,
+    /// The compiled program it's of (driver.Compiled.id, never reused): its
+    /// code runs only in that program's runs
+    program: u64,
 };
 
 /// The variables of a run of a function that functions made in it see (a
@@ -410,6 +413,32 @@ pub fn newStr(bytes: []const u8) ?*Str {
     @memcpy((mem.ptr + @sizeOf(Str))[0..bytes.len], bytes);
     return s;
 }
+
+/// The str of a literal (the compiled code's constants, kind names...):
+/// one per content, immortal, for the process. (Not the program's memory:
+/// a str stored in module state outlives the program that made it.)
+pub fn literal(bytes: []const u8) ?*Str {
+    if (literals.get(bytes)) |s| return s;
+    const s = newStr(bytes) orelse return null;
+    s.head.rc = IMMORTAL;
+    s.hash = strHash(bytes);
+    literals.put(allocator, s.bytes(), s) catch return null;
+    return s;
+}
+
+var literals: std.StringHashMapUnmanaged(*Str) = .empty;
+
+/// The Big of a literal beyond 64 bits (as literal()'s strs: one per
+/// value, immortal, for the process).
+pub fn bigLiteral(v: i128) ?*Big {
+    if (big_literals.get(v)) |b| return b;
+    const b = newBig(v) orelse return null;
+    b.head.rc = IMMORTAL;
+    big_literals.put(allocator, v, b) catch return null;
+    return b;
+}
+
+var big_literals: std.AutoHashMapUnmanaged(i128, *Big) = .empty;
 
 pub fn newList(cap: usize) ?*List {
     const l = allocator.create(List) catch return null;

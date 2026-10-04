@@ -30,6 +30,7 @@ const helpers = @import("helpers.zig");
 const value = @import("value.zig");
 const objects_mod = @import("objects.zig");
 const types_mod = @import("types.zig");
+const adopt_mod = @import("adopt.zig");
 
 const Allocator = std.mem.Allocator;
 const NONE = program_mod.NONE;
@@ -589,18 +590,8 @@ pub const Compiler = struct {
     helpers_kept: usize = 0,
     /// Semantic and helper bodies run inline so far (ZRUN_STATS)
     inlined: usize = 0,
-    /// The Bigs of the code's constants (c_allocator's: the program frees
-    /// them)
-    bigs: std.ArrayListUnmanaged(*value.Big) = .empty,
     /// Record fields by module and name (Gen.fieldCandidates)
     field_cands: std.StringHashMapUnmanaged([]const Gen.FieldCandidate) = .empty,
-
-    /// Free the constants' Bigs.
-    pub fn freeBigs(self: *Compiler) void {
-        for (self.bigs.items) |b| value.allocator.destroy(b);
-        self.bigs.deinit(std.heap.c_allocator);
-        self.bigs = .empty;
-    }
 
     /// Whether every function's (and block's) variables are in frames.
     pub fn allHeap(self: *const Compiler) bool {
@@ -705,14 +696,9 @@ pub const Compiler = struct {
     }
 
     /// A Big for a constant (immortal: freed with the program).
-    pub fn bigConst(self: *Compiler, v: i128) !*value.Big {
-        const b = value.newBig(v) orelse return error.OutOfMemory;
-        b.head.rc = value.IMMORTAL;
-        self.bigs.append(std.heap.c_allocator, b) catch {
-            value.allocator.destroy(b);
-            return error.OutOfMemory;
-        };
-        return b;
+    pub fn bigConst(_: *Compiler, v: i128) !*value.Big {
+        // (the process's: values made of it may outlive the program)
+        return value.bigLiteral(v) orelse error.OutOfMemory;
     }
 
     /// A Python function as the front reads it (once: the language keeps
@@ -3756,6 +3742,17 @@ const Gen = struct {
         if (py.c.PyDict_GetItem(globals, key)) |v| {
             // (a table only read: known, as a constant)
             if (py.c.PySequence_Contains(try frozenGlobals(globals), key) == 1) return self.frozenTable(v, inst.node);
+            // (a table or record kept there that semantics change: native,
+            // shared with Python (adopt.zig), its address a constant)
+            if (try adopt_mod.adopt(v, globals)) |nv| return .{ .dyn = .{
+                .tag = self.k(@intCast(nv.tag)),
+                .bits = self.k(@bitCast(nv.bits)),
+                .shape = switch (nv.kind()) {
+                    .list => .list,
+                    .dict => .dict,
+                    else => .record,
+                },
+            } };
             return self.constant(v, inst.node);
         }
         const builtins = py.c.PyImport_ImportModule("builtins") orelse return error.Python;

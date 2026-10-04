@@ -54,10 +54,13 @@ pub const Compiled = struct {
     main: Main,
     /// The number of the top level's variables
     globals: usize,
+    /// The program's number (its functions' Function.program), never used
+    /// again by another
+    id: u64 = 0,
     /// Thunks compiled, by node, eval or exec, and the frame's owner
     thunks: std.AutoHashMapUnmanaged(ThunkKey, Thunk) = .empty,
     /// Kind and rule names as values (node.kind of a node known only at
-    /// run time), made once (immortal: freed with the program)
+    /// run time), looked up once (value.literal: immortal)
     names: std.AutoHashMapUnmanaged(u32, *value.Str) = .empty,
     /// The compiled code of Python functions the code calls (null: Python
     /// runs it)
@@ -70,13 +73,9 @@ pub const Compiled = struct {
     pub fn nameStr(self: *Compiled, text: []const u8, rid: u32, is_kind: bool) ?*value.Str {
         const key = rid | (@as(u32, @intFromBool(is_kind)) << 31);
         if (self.names.get(key)) |s| return s;
-        const s = value.newStr(text) orelse return null;
-        s.head.rc = value.IMMORTAL;
-        self.names.put(allocator, key, s) catch {
-            s.head.rc = 1;
-            value.decref(value.Value.obj(.str, &s.head));
-            return null;
-        };
+        // (the process's: a kind kept in module state outlives the program)
+        const s = value.literal(text) orelse return null;
+        self.names.put(allocator, key, s) catch return null;
         return s;
     }
 
@@ -90,13 +89,7 @@ pub const Compiled = struct {
         self.modules.deinit(allocator);
         self.thunks.deinit(allocator);
         self.called.deinit(allocator);
-        var it = self.names.valueIterator();
-        while (it.next()) |s| {
-            s.*.head.rc = 1;
-            value.decref(value.Value.obj(.str, &s.*.head));
-        }
         self.names.deinit(allocator);
-        self.compiler.freeBigs();
         for (self.compiler.objects.items) |o| py.Py_DecRef(o);
         self.compiler.m.deinit();
         self.compiler.deinit(allocator);
@@ -310,7 +303,6 @@ fn build(out: *Compiled, data: *program_mod.Data, lang: compile_mod.LangView, pr
             if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("build attempt: frames={} retry={} heap={} python={}: {s}\n", .{ need_frames, need_retry, force_heap, failed != null, out.failure.message.items });
             // (what this attempt kept)
             for (out.compiler.objects.items) |o| py.Py_DecRef(o);
-            out.compiler.freeBigs();
             out.compiler.m.deinit();
             out.compiler.deinit(allocator);
             switch (e) {
@@ -351,6 +343,7 @@ pub fn compileProgram(data: *program_mod.Data, lang: compile_mod.LangView, pytho
     const out = allocator.create(Compiled) catch return oom();
     out.* = .{ .arena = std.heap.ArenaAllocator.init(allocator), .compiler = undefined, .python = python, .view = view, .main = undefined, .globals = 0 };
     next_id += 1;
+    out.id = next_id;
     const prefix = std.fmt.allocPrint(out.arena.allocator(), "zr{d}", .{next_id}) catch return oom();
     if (!build(out, data, lang, prefix, compile_error)) {
         out.arena.deinit();
