@@ -710,6 +710,8 @@ pub export fn zr_call(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Val
         },
         .host => {
             const callee: *PyObject = @ptrFromInt(f.bits);
+            // (a Python function: by its compiled code, if it can have one)
+            if (receiver == null) if (@import("bridge.zig").compiledCall(ctx, node, callee, args[0..nargs], true, out)) |ok| return ok;
             if (stats_on == true) {
                 var b: [64]u8 = undefined;
                 stat("call host {s}", .{statType(f, &b)});
@@ -1185,6 +1187,8 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
     defer py.Py_DecRef(key);
     const method = py.c.PyObject_GetAttr(objs[0], key) orelse return failPython(ctx, node);
     defer py.Py_DecRef(method);
+    // (a Python function, or one bound to its object: its compiled code)
+    if (@import("bridge.zig").compiledMethod(ctx, node, method, args[0..n], out)) |ok| return ok;
     const tuple = py.c.PyTuple_New(@intCast(n)) orelse return failPython(ctx, node);
     defer py.Py_DecRef(tuple);
     for (args[0..n], 0..) |a, i| {

@@ -327,6 +327,16 @@ pub const Function = struct {
         return L("LLVMBuildOr")(self.b, a, b, "");
     }
 
+    pub fn shl(self: *Function, a: Value, b: Value) Value {
+        self.open();
+        return L("LLVMBuildShl")(self.b, a, b, "");
+    }
+
+    pub fn lshr(self: *Function, a: Value, b: Value) Value {
+        self.open();
+        return L("LLVMBuildLShr")(self.b, a, b, "");
+    }
+
     pub fn xor(self: *Function, a: Value, b: Value) Value {
         self.open();
         return L("LLVMBuildXor")(self.b, a, b, "");

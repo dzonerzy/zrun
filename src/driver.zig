@@ -25,6 +25,10 @@ pub const Main = *const fn (ctx: *helpers.Ctx, globals: *value.Frame) callconv(.
 /// A thunk's code: a node's eval or exec in the frames of `frame`
 pub const Thunk = *const fn (ctx: *helpers.Ctx, frame: *value.Frame, out: *value.Value) callconv(.c) i32;
 
+/// A helper's code out of line (compile.zig's genHelper): a status as a
+/// thunk's
+pub const Helper = *const fn (ctx: *helpers.Ctx, frame: ?*value.Frame, args: [*]const value.Value, at: u32, owner: u32, receiver: ?*const value.Value, varargs: ?*const value.Value, out: *value.Value) callconv(.c) i32;
+
 /// The semantics run as Python, by their function (a language's set): why
 pub const PythonSet = compile_mod.PythonSet;
 
@@ -55,8 +59,12 @@ pub const Compiled = struct {
     /// Kind and rule names as values (node.kind of a node known only at
     /// run time), made once (immortal: freed with the program)
     names: std.AutoHashMapUnmanaged(u32, *value.Str) = .empty,
+    /// The compiled code of Python functions the code calls (null: Python
+    /// runs it)
+    called: std.AutoHashMapUnmanaged(CalledKey, ?Helper) = .empty,
 
     const ThunkKey = struct { node: u32, which: compile_mod.Which, owner: u32 };
+    const CalledKey = struct { func: *PyObject, nargs: usize, rt_mask: u64 };
 
     /// A kind's (or rule's) name as a str value (borrowed: immortal).
     pub fn nameStr(self: *Compiled, text: []const u8, rid: u32, is_kind: bool) ?*value.Str {
@@ -81,6 +89,7 @@ pub const Compiled = struct {
         for (self.modules.items) |*m| m.release();
         self.modules.deinit(allocator);
         self.thunks.deinit(allocator);
+        self.called.deinit(allocator);
         var it = self.names.valueIterator();
         while (it.next()) |s| {
             s.*.head.rc = 1;
@@ -131,6 +140,35 @@ pub const Compiled = struct {
             self.thunks.put(allocator, key, t) catch return oomT();
             return t;
         }
+    }
+
+    /// The compiled code of a Python function compiled code calls (for
+    /// `nargs` arguments, those of rt_mask rt values): its address, made the
+    /// first time; null if it can't be compiled (Python runs it, then).
+    pub fn calledCode(self: *Compiled, o: *PyObject, nargs: usize, rt_mask: u64) ?Helper {
+        const key = CalledKey{ .func = o, .nargs = nargs, .rt_mask = rt_mask };
+        if (self.called.get(key)) |code| return code;
+        const c = &self.compiler;
+        var code: ?Helper = null;
+        while (true) {
+            c.failed_semantic = null;
+            c.need_retry = false;
+            const name = c.compileCalled(o, nargs, rt_mask) catch |e| {
+                c.forgetModule();
+                // (a literal made at run time: again; anything else: Python)
+                if (e == error.Unsupported and c.need_retry) continue;
+                py.c.PyErr_Clear();
+                break;
+            };
+            const addr = self.add(name) orelse {
+                py.c.PyErr_Clear();
+                break;
+            };
+            code = @ptrFromInt(addr);
+            break;
+        }
+        self.called.put(allocator, key, code) catch {};
+        return code;
     }
 
     /// The code of a language function (compiled now if it wasn't): its

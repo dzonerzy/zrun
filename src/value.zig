@@ -37,6 +37,11 @@ pub const Tag = enum(u64) {
     host = 10,
     /// A node of the program (its index)
     node = 11,
+    /// rt handed over as a value (to a function compiled code calls): the
+    /// frames it runs in (bits: the frame, borrowed; the tag's upper word:
+    /// the scope they're of). Valid while the call that got it runs, as an
+    /// rt of the reference mode is.
+    rt = 12,
     _,
 };
 
@@ -88,7 +93,18 @@ pub const Value = extern struct {
 
     pub fn kind(self: Value) Tag {
         if (self.tag == PINT_TAG) return .int;
+        if (self.tag & 0xFFFF_FFFF == @intFromEnum(Tag.rt)) return .rt;
         return @enumFromInt(self.tag);
+    }
+
+    /// rt as a value: the frame (borrowed) and the scope it's of.
+    pub fn rt(frame: *Frame, owner: u32) Value {
+        return .{ .tag = @intFromEnum(Tag.rt) | (@as(u64, owner) << 32), .bits = @intFromPtr(frame) };
+    }
+
+    /// An rt value's scope.
+    pub fn rtOwner(self: Value) u32 {
+        return @intCast(self.tag >> 32);
     }
 
     pub fn asInt(self: Value) i64 {
@@ -435,6 +451,7 @@ pub fn typeName(v: Value) []const u8 {
         .function => "function",
         .node => "Node",
         .host => "object",
+        .rt => "CompiledRuntime",
         _ => "object",
     };
 }
@@ -846,6 +863,8 @@ pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
         .node => return nodeObject.make(@intCast(v.bits)),
         // (a zrun.Function, as the reference mode gives them)
         .function => return objects.newNativeFunction(@ptrCast(@alignCast(v.ptr())), nodeObject.owner),
+        // (rt reaching Python code: an rt object over its frames)
+        .rt => return @import("bridge.zig").runtimeObject(v),
         _ => {
             ph.raise(py.PyExc_TypeError(), "an unknown value", .{});
             return null;
@@ -967,6 +986,8 @@ fn convert(o: *PyObject, unique: bool) ?Value {
         }
         return Value.obj(.dict, &d.head);
     }
+    // An rt of the compiled code, back: the rt value
+    if (@import("bridge.zig").runtimeValue(o)) |v| return v;
     // A node (of the program running: nodes don't go from one program to
     // another), back: the node itself
     if (objects.asNode(o)) |n| return .{ .tag = @intFromEnum(Tag.node), .bits = n.idx };

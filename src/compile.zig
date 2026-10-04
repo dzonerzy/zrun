@@ -227,6 +227,24 @@ fn pyTypes() error{Python}!PyTypes {
     return t;
 }
 
+/// types.FunctionType (null if it couldn't be had).
+pub fn pyFunctionType() ?*PyObject {
+    const t = pyTypes() catch {
+        py.c.PyErr_Clear();
+        return null;
+    };
+    return t.function;
+}
+
+/// types.MethodType (null if it couldn't be had).
+pub fn pyMethodType() ?*PyObject {
+    const t = pyTypes() catch {
+        py.c.PyErr_Clear();
+        return null;
+    };
+    return t.method;
+}
+
 /// Python source run in a fresh namespace: the namespace (a new reference),
 /// or null with the exception.
 fn runPython(src: [:0]const u8) ?*PyObject {
@@ -605,6 +623,41 @@ pub const Compiler = struct {
         try g.f.block(g.err_label);
         try g.f.ret(self.m.k32(0));
         g.f.finish();
+    }
+
+    /// A Python function as the front reads it (once: the language keeps
+    /// it).
+    pub fn readFunction(self: *Compiler, o: *PyObject) Error!*const front.Function {
+        if (self.lang.read.get(o)) |f| return f;
+        var failure = front.Failure{};
+        const f = front.read(std.heap.c_allocator, o, &failure) catch |e| switch (e) {
+            error.Unsupported => return self.unsupported("{s}", .{failure.text()}),
+            else => |x| return x,
+        };
+        self.lang.read.put(std.heap.c_allocator, o, f) catch {
+            f.destroy(std.heap.c_allocator);
+            return error.OutOfMemory;
+        };
+        return f;
+    }
+
+    /// The code of a Python function compiled code calls at run time
+    /// (a library function of the language...), for `nargs` arguments
+    /// (those in `rt_mask`: rt values, the call's frames): a helper's code
+    /// out of line, in a module of its own. Its name.
+    pub fn compileCalled(self: *Compiler, o: *PyObject, nargs: usize, rt_mask: u64) Error![:0]const u8 {
+        try self.newModule();
+        const func = try self.readFunction(o);
+        if (func.param_count != nargs) return self.unsupported("{s}() takes {d} arguments, called with {d}", .{ func.name, func.param_count, nargs });
+        const key = try self.a.alloc(SVal, nargs);
+        for (key, 0..) |*slot, i| slot.* = if (rt_mask & (@as(u64, 1) << @intCast(i)) != 0) .rt else .{ .dyn = undefined };
+        _ = try self.objectIndex(o);
+        const h = try self.a.create(HelperSpec);
+        h.* = .{ .func = func, .args = key, .name = try std.fmt.allocPrintSentinel(self.a, "{s}_c{d}", .{ self.m.prefix, self.helper_fns.items.len }, 0), .semantic = null };
+        try self.helper_fns.append(self.a, h);
+        try self.helper_queue.append(self.a, h);
+        try self.drainQueues();
+        return h.name;
     }
 
     /// A helper's code out of line, declared in this module.
@@ -1379,16 +1432,18 @@ const Gen = struct {
                 try self.promote(v, d);
                 break :blk d;
             },
-            // (given to Python: an rt over the frames here)
+            // (handed over: an rt value of the frames here, their scope in
+            // the tag's upper word)
             .rt => blk: {
                 const c = self.c;
                 if (!c.allHeap()) {
                     c.need_frames = true;
-                    return c.unsupported("rt is given to Python here: the program needs its variables in frames", .{});
+                    return c.unsupported("rt is handed over here: the program needs its variables in frames", .{});
                 }
-                c.uses_python = true;
-                try self.callCheck("zr_runtime", &.{ self.ctx, self.k32(at), try self.currentFrame(), self.k32(self.currentOwner()), self.out });
-                break :blk try self.loadOut(.any);
+                const f = &self.f;
+                const owner = f.zext64(self.k32(self.currentOwner()));
+                const tag = f.or_(self.k(@intFromEnum(value.Tag.rt)), f.shl(owner, self.k(32)));
+                break :blk Dyn{ .tag = tag, .bits = f.ptrToInt(try self.currentFrame()), .shape = .any };
             },
             else => self.c.unsupported("a {s} can't be kept in a variable or passed as a value (node {d})", .{ @tagName(v), at }),
         };
@@ -4377,18 +4432,7 @@ const Gen = struct {
     /// language (with the semantics read: the same front functions, so
     /// what's learned about their code, like literals that escape, holds).
     fn helperFunction(self: *Gen, o: *PyObject) Error!*const front.Function {
-        const c = self.c;
-        if (c.lang.read.get(o)) |f| return f;
-        var failure = front.Failure{};
-        const f = front.read(std.heap.c_allocator, o, &failure) catch |e| switch (e) {
-            error.Unsupported => return c.unsupported("{s}", .{failure.text()}),
-            else => |x| return x,
-        };
-        c.lang.read.put(std.heap.c_allocator, o, f) catch {
-            f.destroy(std.heap.c_allocator);
-            return error.OutOfMemory;
-        };
-        return f;
+        return self.c.readFunction(o);
     }
 
     // ------------------------------------------------------------------

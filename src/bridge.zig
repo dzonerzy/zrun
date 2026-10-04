@@ -475,6 +475,105 @@ pub export fn zr_exc_catch(ctx: *Ctx, at: u32, out: *Value) callconv(.c) bool {
     return true;
 }
 
+/// A Python function compiled code calls (`f(args)`, a library function
+/// of the language...): by its compiled code (made the first time), the
+/// rt values among the arguments giving it the frames to run in.
+/// `checked`: through rt.call (ints handed over as I64s, as it does). True
+/// / false (an error); null if it can't be compiled (Python runs it).
+pub fn compiledCall(ctx: *Ctx, node: u32, callee: *PyObject, args: []const Value, checked: bool, out: *Value) ?bool {
+    const link = ctx.link orelse return null;
+    const lk: *const Link = @ptrCast(@alignCast(link));
+    if (args.len > 64) return null;
+    const pt = compile_mod.pyFunctionType() orelse return null;
+    if (ph.typeOf(callee) != @as(*py.c.PyTypeObject, @ptrCast(@alignCast(pt)))) return null;
+    var mask: u64 = 0;
+    var frame: ?*value.Frame = null;
+    var owner: u32 = 0;
+    var given: [64]Value = undefined;
+    var n: usize = 0;
+    for (args, 0..) |a, i| {
+        if (a.kind() == .rt) {
+            mask |= @as(u64, 1) << @intCast(i);
+            frame = @ptrFromInt(a.bits);
+            owner = a.rtOwner();
+            continue;
+        }
+        given[n] = if (checked) a.checked() else a;
+        n += 1;
+    }
+    const code = lk.compiled.calledCode(callee, args.len, mask) orelse return null;
+    const status = code(ctx, frame, &given, node, owner, null, null, out);
+    switch (status) {
+        1 => {
+            if (checked) out.* = out.*.checked();
+            return true;
+        },
+        0 => return false,
+        else => {
+            // (rt.Return, Break, Continue out of it: as the reference mode
+            // raises them out of a call, an error here)
+            return helpers.fail(ctx, node, "rt.Return, rt.Break or rt.Continue raised out of a function called with rt.call", .{});
+        },
+    }
+}
+
+/// obj.name(args) where obj.name is a Python function, or a bound method
+/// of one (its object first): by its compiled code (compiledCall).
+pub fn compiledMethod(ctx: *Ctx, node: u32, m: *PyObject, args: []const Value, out: *Value) ?bool {
+    if (args.len >= 64) return null;
+    const pt = compile_mod.pyMethodType() orelse return null;
+    if (ph.typeOf(m) != @as(*py.c.PyTypeObject, @ptrCast(@alignCast(pt)))) return compiledCall(ctx, node, m, args, false, out);
+    const func = py.c.PyObject_GetAttrString(m, "__func__") orelse {
+        py.c.PyErr_Clear();
+        return null;
+    };
+    defer py.Py_DecRef(func);
+    const self_obj = py.c.PyObject_GetAttrString(m, "__self__") orelse {
+        py.c.PyErr_Clear();
+        return null;
+    };
+    defer py.Py_DecRef(self_obj);
+    var all: [64]Value = undefined;
+    all[0] = value.fromPython(self_obj) orelse {
+        py.c.PyErr_Clear();
+        return null;
+    };
+    defer value.decref(all[0]);
+    @memcpy(all[1 .. args.len + 1], args);
+    return compiledCall(ctx, node, func, all[0 .. args.len + 1], false, out);
+}
+
+/// The compiled run going on (the innermost): what an rt value reaching
+/// Python runs in
+pub var current: ?*Ctx = null;
+
+/// An rt value as Python sees it: an rt object over its frames (a new
+/// reference; null with an exception).
+pub fn runtimeObject(v: Value) ?*PyObject {
+    const ctx = current orelse {
+        ph.raise(py.PyExc_RuntimeError(), "an rt outside the run it belongs to", .{});
+        return null;
+    };
+    const frame: *value.Frame = @ptrFromInt(v.bits);
+    var slot: *value.Frame = frame;
+    const obj = newRuntime(ctx, &slot, v.rtOwner(), 0) orelse return null;
+    const r = asRuntime(obj);
+    value.increfObj(&frame.head);
+    r.own_frame = frame;
+    r.frame_slot = &r.own_frame.?;
+    return obj;
+}
+
+/// An rt object of the run going on, back: the rt value of its frames;
+/// null for anything else.
+pub fn runtimeValue(o: *PyObject) ?Value {
+    if (o.ob_type != @as(*py.c.PyTypeObject, @ptrCast(@alignCast(RuntimeType)))) return null;
+    const r = asRuntime(o);
+    if (r.ctx == null or r.ctx != current) return null;
+    const slot = r.frame_slot orelse return null;
+    return Value.rt(slot.*, r.owner);
+}
+
 /// `rt` as a value compiled code passes (to a Python function: f(rt,
 /// node...)): an rt over the frames of the code there, holding its frame.
 pub export fn zr_runtime(ctx: *Ctx, at: u32, frame: *value.Frame, owner: u32, out: *Value) callconv(.c) bool {
