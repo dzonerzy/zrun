@@ -296,6 +296,67 @@ fn fromResult(ctx: *Ctx, node: u32, r: ?*PyObject, out: *Value) bool {
 
 const Op = enum(u32) { add, sub, mul, div, floordiv, mod, pow, lshift, rshift, bitor, bitxor, bitand };
 
+/// An int against a float (not NaN), exactly.
+fn orderIntFloat(x: i128, f: f64) std.math.Order {
+    if (std.math.isInf(f)) return if (f > 0) .lt else .gt;
+    if (@abs(f) >= 1.7e38) return if (f > 0) .lt else .gt;
+    const whole = @trunc(f);
+    const i: i128 = @intFromFloat(whole);
+    if (x != i) return std.math.order(x, i);
+    // (equal whole parts: the float's fraction decides)
+    return std.math.order(0, f - whole);
+}
+
+/// a op b on ints in 128 bits (Bigs, or a 64-bit result's overflow): an
+/// I64 among them makes it an I64 (beyond 64 bits: the overflow error);
+/// past 128 bits, or division and powers, Python's.
+fn wideBinary(ctx: *Ctx, node: u32, op: Op, a: Value, b: Value, out: *Value) bool {
+    const x = value.wide(a).?;
+    const y = value.wide(b).?;
+    const checked = a.tag == @intFromEnum(Tag.int) or b.tag == @intFromEnum(Tag.int);
+    const r: ?i128 = switch (op) {
+        .add => blk: {
+            const s = @addWithOverflow(x, y);
+            break :blk if (s[1] != 0) null else s[0];
+        },
+        .sub => blk: {
+            const s = @subWithOverflow(x, y);
+            break :blk if (s[1] != 0) null else s[0];
+        },
+        .mul => blk: {
+            const s = @mulWithOverflow(x, y);
+            break :blk if (s[1] != 0) null else s[0];
+        },
+        .floordiv, .mod => blk: {
+            if (y == 0) return failAs(ctx, node, py.PyExc_ZeroDivisionError(), "integer division or modulo by zero", "division by zero", .{});
+            if (x == std.math.minInt(i128) and y == -1) break :blk null;
+            break :blk if (op == .floordiv) @divFloor(x, y) else @mod(x, y);
+        },
+        .bitand => x & y,
+        .bitor => x | y,
+        .bitxor => x ^ y,
+        .rshift => blk: {
+            if (y < 0) break :blk null;
+            break :blk if (y >= 127) (if (x < 0) -1 else 0) else x >> @intCast(y);
+        },
+        .lshift => blk: {
+            if (y < 0 or y >= 127) break :blk null;
+            const s = @shlWithOverflow(x, @as(u7, @intCast(y)));
+            break :blk if (s[1] != 0) null else s[0];
+        },
+        // (true division correctly rounded, powers: Python's)
+        .div, .pow => null,
+    };
+    const v = r orelse return pythonBinary(ctx, node, op, a, b, out);
+    if (checked) {
+        if (v < std.math.minInt(i64) or v > std.math.maxInt(i64)) return zr_overflow(ctx, node);
+        out.* = Value.int(@intCast(v));
+        return true;
+    }
+    out.* = value.intValue(v) orelse return oomFail(ctx, node);
+    return true;
+}
+
 fn pythonBinary(ctx: *Ctx, node: u32, op: Op, a: Value, b: Value, out: *Value) bool {
     if (stats_on == true) {
         var b1: [64]u8 = undefined;
@@ -353,6 +414,8 @@ export fn zr_binary(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u6
     const a = Value{ .tag = ta, .bits = ba };
     const b = Value{ .tag = tb, .bits = bb };
     const op: Op = @enumFromInt(op_code);
+    // (a Big among ints: in 128 bits)
+    if ((a.kind() == .big or b.kind() == .big) and value.wide(a) != null and value.wide(b) != null) return wideBinary(ctx, node, op, a, b, out);
     if (isInt(a) and isInt(b)) {
         const x = a.asInt();
         const y = b.asInt();
@@ -367,7 +430,7 @@ export fn zr_binary(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u6
                     .sub => @subWithOverflow(x, y),
                     else => @mulWithOverflow(x, y),
                 };
-                if (r[1] != 0) return if (checked) zr_overflow(ctx, node) else pythonBinary(ctx, node, op, a, b, out);
+                if (r[1] != 0) return if (checked) zr_overflow(ctx, node) else wideBinary(ctx, node, op, a, b, out);
                 out.* = mk(r[0]);
                 return true;
             },
@@ -378,7 +441,7 @@ export fn zr_binary(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u6
                         out.* = mk(0);
                         return true;
                     }
-                    return if (checked) zr_overflow(ctx, node) else pythonBinary(ctx, node, op, a, b, out);
+                    return if (checked) zr_overflow(ctx, node) else wideBinary(ctx, node, op, a, b, out);
                 }
                 out.* = mk(if (op == .floordiv) floorDiv(x, y) else floorMod(x, y));
                 return true;
@@ -483,6 +546,24 @@ export fn zr_compare(ctx: *Ctx, node: u32, cmp_code: u32, ta: u64, ba: u64, tb: 
         .lt, .le, .gt, .ge => {
             const order: ?std.math.Order = blk: {
                 if (isInt(a) and isInt(b)) break :blk std.math.order(a.asInt(), b.asInt());
+                // (ints of any width, and ints with floats: exactly, as
+                // Python compares them)
+                if (value.wide(a)) |x| {
+                    if (value.wide(b)) |y| break :blk std.math.order(x, y);
+                    if (b.kind() == .float) {
+                        if (std.math.isNan(b.asFloat())) {
+                            out.* = Value.boolean(false);
+                            return true;
+                        }
+                        break :blk orderIntFloat(x, b.asFloat());
+                    }
+                } else if (value.wide(b)) |y| if (a.kind() == .float) {
+                    if (std.math.isNan(a.asFloat())) {
+                        out.* = Value.boolean(false);
+                        return true;
+                    }
+                    break :blk orderIntFloat(y, a.asFloat()).invert();
+                };
                 const fa: ?f64 = switch (a.kind()) {
                     .int, .bool => @floatFromInt(a.asInt()),
                     .float => a.asFloat(),
@@ -583,6 +664,20 @@ export fn zr_unary(ctx: *Ctx, node: u32, op_code: u32, t: u64, bits: u64, out: *
     // (an I64 stays one, checked; a plain int or a bool gives a plain int)
     const checked = a.tag == @intFromEnum(Tag.int);
     const mk = if (checked) &Value.int else &Value.pint;
+    // (a Big: in 128 bits)
+    if (a.kind() == .big and op != .not_) {
+        const x = value.wide(a).?;
+        const r: ?i128 = switch (op) {
+            .neg => if (x == std.math.minInt(i128)) null else -x,
+            .pos => x,
+            .invert => ~x,
+            .not_ => unreachable,
+        };
+        if (r) |v| {
+            out.* = value.intValue(v) orelse return oomFail(ctx, node);
+            return true;
+        }
+    }
     switch (op) {
         .not_ => {
             out.* = Value.boolean(!value.truthy(a));
@@ -591,6 +686,9 @@ export fn zr_unary(ctx: *Ctx, node: u32, op_code: u32, t: u64, bits: u64, out: *
         .neg => if (isInt(a)) {
             if (a.asInt() == std.math.minInt(i64)) {
                 if (checked) return zr_overflow(ctx, node);
+                // (-(-2**63): a Big)
+                out.* = value.intValue(-@as(i128, a.asInt())) orelse return oomFail(ctx, node);
+                return true;
             } else {
                 out.* = mk(-a.asInt());
                 return true;
@@ -1008,6 +1106,24 @@ export fn zr_items(ctx: *Ctx, node: u32, t: u64, bits: u64, out: *Value) callcon
             out.* = v;
             return true;
         },
+        // (a str: its characters)
+        .str => {
+            const s: *value.Str = @ptrCast(v.ptr());
+            const src = s.bytes();
+            const l = value.newList(s.chars) orelse return oomFail(ctx, node);
+            var at: usize = 0;
+            while (at < src.len) {
+                const n = std.unicode.utf8ByteSequenceLength(src[at]) catch 1;
+                const ch = charStr(src[at .. at + n]) orelse {
+                    value.decref(Value.obj(.list, &l.head));
+                    return oomFail(ctx, node);
+                };
+                _ = value.listPush(l, Value.obj(.str, &ch.head));
+                at += n;
+            }
+            out.* = Value.obj(.list, &l.head);
+            return true;
+        },
         .tuple => {
             const items = @as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).slice();
             const l = value.newList(items.len) orelse return oomFail(ctx, node);
@@ -1040,6 +1156,21 @@ export fn zr_items(ctx: *Ctx, node: u32, t: u64, bits: u64, out: *Value) callcon
     defer py.Py_DecRef(objs[0]);
     const seq = py.c.PySequence_List(objs[0]);
     return fromResult(ctx, node, seq, out);
+}
+
+/// The one-character strs of ASCII, made once (immortal)
+var ascii_chars: [128]?*value.Str = .{null} ** 128;
+
+/// A one-character str (a new reference; an ASCII one shared).
+fn charStr(bytes: []const u8) ?*value.Str {
+    if (bytes.len == 1 and bytes[0] < 128) {
+        if (ascii_chars[bytes[0]]) |s| return s;
+        const s = value.newStr(bytes) orelse return null;
+        s.head.rc = value.IMMORTAL;
+        ascii_chars[bytes[0]] = s;
+        return s;
+    }
+    return value.newStr(bytes);
 }
 
 /// Python functions unpacking into n names (`a0, a1 = x`), by n: what
@@ -1150,6 +1281,26 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
             return true;
         }
     }
+    // A str's common methods, natively (an ASCII one: Unicode's case
+    // rules are Python's)
+    if (v.kind() == .str) {
+        if (strMethod(ctx, node, @ptrCast(v.ptr()), name.bytes(), args[0..n], out)) |ok| return ok;
+    }
+    // A dict's pop(): natively
+    if (v.kind() == .dict and std.mem.eql(u8, name.bytes(), "pop") and (n == 1 or n == 2) and value.hashable(args[0])) {
+        const d: *value.Dict = @ptrCast(@alignCast(v.ptr()));
+        if (value.dictGet(d, args[0])) |x| {
+            value.incref(x);
+            _ = value.dictDelete(d, args[0]);
+            out.* = x;
+            return true;
+        }
+        if (n == 2) {
+            value.incref(args[1]);
+            out.* = args[1];
+            return true;
+        }
+    }
     // A list's extend() by a list or tuple, its pop(): natively
     if (v.kind() == .list) {
         const l: *value.List = @ptrCast(@alignCast(v.ptr()));
@@ -1198,6 +1349,176 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
     return fromResult(ctx, node, py.c.PyObject_CallObject(method, tuple), out);
 }
 
+/// A str method natively (true / false: an error), or null for one (or
+/// arguments, or a str) not done here.
+fn strMethod(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []const Value, out: *Value) ?bool {
+    const eq = std.mem.eql;
+    const b = s.bytes();
+    // (ASCII only: one byte one character, Python's case rules plain)
+    if (s.chars != s.len) return null;
+    const strArg = struct {
+        fn f(x: Value) ?[]const u8 {
+            if (x.kind() != .str) return null;
+            return @as(*value.Str, @ptrCast(x.ptr())).bytes();
+        }
+    }.f;
+    const result = struct {
+        fn str(c: *Ctx, at: u32, o: *Value, bytes: []const u8) bool {
+            const r = value.newStr(bytes) orelse return oomFail(c, at);
+            o.* = Value.obj(.str, &r.head);
+            return true;
+        }
+    }.str;
+    if (args.len == 0) {
+        if (eq(u8, name, "lower") or eq(u8, name, "upper")) {
+            const buf = allocator.alloc(u8, b.len) catch return oomFail(ctx, node);
+            defer allocator.free(buf);
+            for (b, buf) |c, *d| d.* = if (eq(u8, name, "lower")) std.ascii.toLower(c) else std.ascii.toUpper(c);
+            return result(ctx, node, out, buf);
+        }
+        if (eq(u8, name, "strip") or eq(u8, name, "lstrip") or eq(u8, name, "rstrip")) {
+            const ws = " \t\n\r\x0b\x0c\x1c\x1d\x1e\x1f";
+            const t = if (eq(u8, name, "strip")) std.mem.trim(u8, b, ws) else if (eq(u8, name, "lstrip")) std.mem.trimStart(u8, b, ws) else std.mem.trimEnd(u8, b, ws);
+            return result(ctx, node, out, t);
+        }
+        const preds = .{ .{ "isdigit", std.ascii.isDigit }, .{ "isalpha", std.ascii.isAlphabetic }, .{ "isalnum", std.ascii.isAlphanumeric }, .{ "isspace", isPySpace } };
+        inline for (preds) |p| if (eq(u8, name, p[0])) {
+            var all = b.len > 0;
+            for (b) |c| all = all and p[1](c);
+            out.* = Value.boolean(all);
+            return true;
+        };
+        if (eq(u8, name, "isupper") or eq(u8, name, "islower")) {
+            // (cased characters all upper (lower), and at least one)
+            var cased = false;
+            var ok = true;
+            for (b) |c| {
+                if (std.ascii.isUpper(c)) {
+                    cased = true;
+                    if (eq(u8, name, "islower")) ok = false;
+                } else if (std.ascii.isLower(c)) {
+                    cased = true;
+                    if (eq(u8, name, "isupper")) ok = false;
+                }
+            }
+            out.* = Value.boolean(cased and ok);
+            return true;
+        }
+        return null;
+    }
+    if (args.len == 1) {
+        if (eq(u8, name, "join") and (args[0].kind() == .list or args[0].kind() == .tuple)) {
+            const items = if (args[0].kind() == .list) @as(*value.List, @ptrCast(@alignCast(args[0].ptr()))).slice() else @as(*value.Tuple, @ptrCast(@alignCast(args[0].ptr()))).slice();
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer buf.deinit(allocator);
+            for (items, 0..) |x, i| {
+                // (anything not a str: Python's TypeError)
+                const t = strArg(x) orelse return null;
+                if (i > 0) buf.appendSlice(allocator, b) catch return oomFail(ctx, node);
+                buf.appendSlice(allocator, t) catch return oomFail(ctx, node);
+            }
+            return result(ctx, node, out, buf.items);
+        }
+        const sub = strArg(args[0]) orelse return null;
+        if (eq(u8, name, "startswith")) {
+            out.* = Value.boolean(std.mem.startsWith(u8, b, sub));
+            return true;
+        }
+        if (eq(u8, name, "endswith")) {
+            out.* = Value.boolean(std.mem.endsWith(u8, b, sub));
+            return true;
+        }
+        if (eq(u8, name, "find") or eq(u8, name, "count")) {
+            // (the other str may be non-ASCII: then never found in ASCII)
+            if (eq(u8, name, "find")) {
+                out.* = Value.pint(if (std.mem.indexOf(u8, b, sub)) |i| @intCast(i) else -1);
+            } else {
+                out.* = Value.pint(@intCast(if (sub.len == 0) b.len + 1 else std.mem.count(u8, b, sub)));
+            }
+            return true;
+        }
+    }
+    return null;
+}
+
+/// int(s) of an ASCII str as Python reads it in base 10 (whitespace
+/// around, a sign, digits with single underscores between them), or null
+/// (not one, or beyond 64 bits).
+fn parseInt(s: []const u8) ?i64 {
+    const t = std.mem.trim(u8, s, int_space);
+    if (!looksLikeInt(s)) return null;
+    var i: usize = 0;
+    var neg = false;
+    if (t[0] == '+' or t[0] == '-') {
+        neg = t[0] == '-';
+        i = 1;
+    }
+    var acc: i128 = 0;
+    while (i < t.len) : (i += 1) {
+        if (t[i] == '_') continue;
+        acc = acc * 10 + (t[i] - '0');
+        if (acc > std.math.maxInt(i64) + 1) return null;
+    }
+    if (neg) acc = -acc;
+    if (acc > std.math.maxInt(i64)) return null;
+    return @intCast(acc);
+}
+
+/// The whitespace int() takes around a number (not all isspace()'s: the
+/// \x1c-\x1f separators aren't)
+const int_space = " \t\n\r\x0b\x0c";
+
+/// Whether int() reads an ASCII str as a base 10 int (of any size).
+fn looksLikeInt(s: []const u8) bool {
+    const t = std.mem.trim(u8, s, int_space);
+    var i: usize = 0;
+    if (t.len > 0 and (t[0] == '+' or t[0] == '-')) i = 1;
+    if (i >= t.len) return false;
+    var prev_digit = false;
+    while (i < t.len) : (i += 1) {
+        if (std.ascii.isDigit(t[i])) {
+            prev_digit = true;
+        } else if (t[i] == '_' and prev_digit and i + 1 < t.len and std.ascii.isDigit(t[i + 1])) {
+            prev_digit = false;
+        } else return false;
+    }
+    return true;
+}
+
+/// repr() of an ASCII str, as Python writes it (quotes, escapes), into
+/// `buf`; null if it doesn't fit.
+fn pyRepr(s: []const u8, buf: []u8) ?[]const u8 {
+    const has_single = std.mem.indexOfScalar(u8, s, '\'') != null;
+    const has_double = std.mem.indexOfScalar(u8, s, '"') != null;
+    const q: u8 = if (has_single and !has_double) '"' else '\'';
+    var w = std.Io.Writer.fixed(buf);
+    w.writeByte(q) catch return null;
+    for (s) |c| {
+        switch (c) {
+            '\\' => w.writeAll("\\\\") catch return null,
+            '\n' => w.writeAll("\\n") catch return null,
+            '\r' => w.writeAll("\\r") catch return null,
+            '\t' => w.writeAll("\\t") catch return null,
+            else => if (c == q) {
+                w.writeByte('\\') catch return null;
+                w.writeByte(c) catch return null;
+            } else if (c < 0x20 or c == 0x7f) {
+                w.print("\\x{x:0>2}", .{c}) catch return null;
+            } else w.writeByte(c) catch return null,
+        }
+    }
+    w.writeByte(q) catch return null;
+    return w.buffered();
+}
+
+/// Python's str.isspace() for an ASCII character.
+fn isPySpace(c: u8) bool {
+    return switch (c) {
+        ' ', '\t', '\n', '\r', 0x0b, 0x0c, 0x1c, 0x1d, 0x1e, 0x1f => true,
+        else => false,
+    };
+}
+
 /// A builtin called with arguments, as Python does it (int(), float(),
 /// len(), zip()... of run-time values): a host object of the program.
 export fn zr_call_python(ctx: *Ctx, node: u32, callee_index: u64, args: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
@@ -1237,11 +1558,7 @@ export fn zr_slice(ctx: *Ctx, node: u32, t: u64, bits: u64, lt: u64, lb: u64, ht
         const len: i64 = switch (v.kind()) {
             .list => @intCast(@as(*value.List, @ptrCast(@alignCast(v.ptr()))).len),
             .tuple => @intCast(@as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).len),
-            .str => blk: {
-                const s: *value.Str = @ptrCast(v.ptr());
-                if (s.chars != s.len) break :native;
-                break :blk @intCast(s.len);
-            },
+            .str => @intCast(@as(*value.Str, @ptrCast(v.ptr())).chars),
             else => break :native,
         };
         // (PySlice_AdjustIndices)
@@ -1254,15 +1571,36 @@ export fn zr_slice(ctx: *Ctx, node: u32, t: u64, bits: u64, lt: u64, lb: u64, ht
         if (step < 0 and stop < start) count = @intCast(@divFloor(start - stop - 1, -step) + 1);
         switch (v.kind()) {
             .str => {
-                const src = @as(*value.Str, @ptrCast(v.ptr())).bytes();
-                const buf = allocator.alloc(u8, count) catch return oomFail(ctx, node);
-                defer allocator.free(buf);
-                var i = start;
-                for (buf) |*c| {
-                    c.* = src[@intCast(i)];
-                    i += step;
+                const str: *value.Str = @ptrCast(v.ptr());
+                const src = str.bytes();
+                var buf: std.ArrayListUnmanaged(u8) = .empty;
+                defer buf.deinit(allocator);
+                if (str.chars == str.len) {
+                    // (ASCII: a byte a character)
+                    buf.ensureTotalCapacity(allocator, count) catch return oomFail(ctx, node);
+                    var i = start;
+                    for (0..count) |_| {
+                        buf.appendAssumeCapacity(src[@intCast(i)]);
+                        i += step;
+                    }
+                } else {
+                    // (UTF-8: each character's bytes, by where they start)
+                    const starts = allocator.alloc(usize, str.chars + 1) catch return oomFail(ctx, node);
+                    defer allocator.free(starts);
+                    var at: usize = 0;
+                    for (starts[0..str.chars]) |*p| {
+                        p.* = at;
+                        at += std.unicode.utf8ByteSequenceLength(src[at]) catch 1;
+                    }
+                    starts[str.chars] = src.len;
+                    var i = start;
+                    for (0..count) |_| {
+                        const k: usize = @intCast(i);
+                        buf.appendSlice(allocator, src[starts[k]..starts[k + 1]]) catch return oomFail(ctx, node);
+                        i += step;
+                    }
                 }
-                const s = value.newStr(buf) orelse return oomFail(ctx, node);
+                const s = value.newStr(buf.items) orelse return oomFail(ctx, node);
                 out.* = Value.obj(.str, &s.head);
             },
             .list => {
@@ -1361,12 +1699,59 @@ pub const Builtin = enum(u32) { int, float, len, abs, str, bool };
 /// (objects[callee_index]).
 export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64, bits: u64, out: *Value) callconv(.c) bool {
     const v = Value{ .tag = t, .bits = bits };
+    // (a Big: int() and abs() in 128 bits, float() rounded, str() its
+    // digits, bool() true)
+    if (v.kind() == .big) {
+        const x = value.wide(v).?;
+        switch (@as(Builtin, @enumFromInt(code))) {
+            .int => {
+                value.incref(v);
+                out.* = v;
+                return true;
+            },
+            .abs => if (x != std.math.minInt(i128)) {
+                out.* = value.intValue(if (x < 0) -x else x) orelse return oomFail(ctx, node);
+                return true;
+            },
+            .float => {
+                out.* = Value.float(@floatFromInt(x));
+                return true;
+            },
+            .str => {
+                var buf: [48]u8 = undefined;
+                const s = value.newStr(std.fmt.bufPrint(&buf, "{d}", .{x}) catch unreachable) orelse return oomFail(ctx, node);
+                out.* = Value.obj(.str, &s.head);
+                return true;
+            },
+            .bool => {
+                out.* = Value.boolean(true);
+                return true;
+            },
+            .len => {},
+        }
+    }
     switch (@as(Builtin, @enumFromInt(code))) {
         // (int() of an int: a plain one, as int(I64) gives)
         .int => switch (v.kind()) {
             .int, .bool => {
                 out.* = Value.pint(v.asInt());
                 return true;
+            },
+            .str => {
+                const s: *value.Str = @ptrCast(v.ptr());
+                if (s.chars == s.len) {
+                    if (parseInt(s.bytes())) |x| {
+                        out.* = Value.pint(x);
+                        return true;
+                    }
+                    // (not a number at all: Python's error; one beyond 64
+                    // bits: Python's big int)
+                    if (!looksLikeInt(s.bytes())) {
+                        var buf: [256]u8 = undefined;
+                        const r = pyRepr(s.bytes(), &buf) orelse "...";
+                        return failAs(ctx, node, py.PyExc_ValueError(), null, "invalid literal for int() with base 10: {s}", .{r});
+                    }
+                }
             },
             .float => {
                 const f = v.asFloat();
@@ -1454,6 +1839,7 @@ export fn zr_type(t: u64, bits: u64, out: *Value) callconv(.c) void {
         .none => @ptrCast(@alignCast(ph.typeOf(py.Py_None()))),
         .bool => @ptrCast(@alignCast(py.types.typeObject("PyBool_Type"))),
         .int => if (v.isPlain()) @ptrCast(@alignCast(py.types.typeObject("PyLong_Type"))) else types.I64,
+        .big => @ptrCast(@alignCast(py.types.typeObject("PyLong_Type"))),
         .float => @ptrCast(@alignCast(py.types.typeObject("PyFloat_Type"))),
         .str => @ptrCast(@alignCast(py.types.typeObject("PyUnicode_Type"))),
         .list => @ptrCast(@alignCast(py.types.typeObject("PyList_Type"))),
@@ -1511,7 +1897,7 @@ export fn zr_is_type(t: u64, bits: u64, code: u32) callconv(.c) bool {
         };
     }
     return switch (code) {
-        0 => v.kind() == .int or v.kind() == .bool, // int (bool is an int)
+        0 => v.kind() == .int or v.kind() == .bool or v.kind() == .big, // int (bool is an int)
         1 => v.kind() == .float,
         2 => v.kind() == .str,
         3 => v.kind() == .bool,

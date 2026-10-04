@@ -38,6 +38,8 @@ BUILTINS = (
     "slices",
     "genexp",
     "trying",
+    "strs",
+    "wide",
 )
 
 
@@ -219,6 +221,34 @@ def make_lang():
             except ZeroDivisionError:
                 out.append("zero")
             return out
+        if name == "strs":
+            # str operations on run-time strs, as Python does them
+            words = rt.call(rt.load(node.name), [])
+            out = []
+            for w in words:
+                out.append((w.lower(), w.upper(), w.strip(), w.isupper(), w.islower(), w.isdigit(), w.isspace(), w.startswith("A"), w.endswith("é"), w.find("b"), w.count(""), w[1:3], w[::-1], [c for c in w]))
+            out.append("-".join(words))
+            nums = []
+            for t in (" -1_000 ", "+42", "007", "\x0b9\x0c"):
+                nums.append(int(t))
+            for bad in ("1__0", "  ", "x'y", "_1", "1_", "\x1c9"):
+                try:
+                    int(bad)
+                except ValueError as e:
+                    nums.append(str(e))
+            out.append(nums)
+            return out
+        if name == "wide":
+            # ints past 64 bits a semantic computes (native up to 128)
+            vals = rt.call(rt.load(node.name), [])
+            a = vals[0] * 4
+            b = a - 1
+            m = vals[1] & 0xFFFFFFFFFFFFFFFF
+            d = -vals[1]
+            big = a * a * a
+            return (a, b, m, d, m - 0x10000000000000000, a // 3, a % 7, -a // 3, -a % 7, a >> 3, b & 0xFF, 1 << 100, big, big // a,
+                    a > 2**63, a == 2**64, a == float(2**64), 2**53 + 1 == float(2**53), 2**53 + 1 > float(2**53), {a: "k"}.get(2**64),
+                    str(a), int(a), abs(-a), float(a), -a, ~a, a == d * 2, isinstance(a, int), type(a) is int)
         if name == "bigmath":
             # A semantic's own ints are Python's (beyond 64 bits on the way)
             m = -1 & 0xFFFFFFFFFFFFFFFF
@@ -387,6 +417,14 @@ def make_lang():
         raise KeyError("k")
 
     @lang.host
+    def wide():
+        return [2**62, -(2**63)]
+
+    @lang.host
+    def strs():
+        return ["Abc", "ÉcolÉ é", " \t\x1c ", "ABC1", "12", "", "a'b\"c"]
+
+    @lang.host
     def genexp():
         return [1, 2, 3]
 
@@ -438,6 +476,8 @@ PROGRAMS = {
     "slices": "print(slices());\n",
     "genexp": "print(genexp());\n",
     "trying": "print(trying());\n",
+    "strs": "print(strs());\n",
+    "wide": "print(wide());\n",
 }
 
 
@@ -445,10 +485,23 @@ PROGRAMS = {
 def test_shared_with_python(name, capsys):
     out, err = same_in_every_mode(lang, PROGRAMS[name], capsys)
     assert err is None, err
-    # (len * 1000 + first * 100 + last, after the host's changes...)
-    assert out.strip() == {"list": "4531", "dict": "231", "record": "53", "from_python": "0 203 5 4 34", "keys": "redfsboxno3", "live": "0 50801161", "identity": "1 32", "bigmath": "-78", "slices": "([2, 3, 4], [5, 3, 1], [], (4, 5), 'ello', 'éllo', [1, 2], [1, 2, 3, 4])", "genexp": "(True, False, 12, 2, True, False, '123')",
+    # (len * 1000 + first * 100 + last, after the host's changes...; none:
+    # the reference mode's output is what's expected)
+    expected = {
+        "list": "4531",
+        "dict": "231",
+        "record": "53",
+        "from_python": "0 203 5 4 34",
+        "keys": "redfsboxno3",
+        "live": "0 50801161",
+        "identity": "1 32",
+        "bigmath": "-78",
+        "slices": "([2, 3, 4], [5, 3, 1], [], (4, 5), 'ello', 'éllo', [1, 2], [1, 2, 3, 4])",
+        "genexp": "(True, False, 12, 2, True, False, '123')",
         "trying": "[\"value:invalid literal for int() with base 10: 'x'\", 'key', 'fin', 'body', 'else', 'loop0', 'f0', 'f1', 'f2', 'g1', 'g2', 'rf', 'ret', 'v', 'again', 'inner', 'zero']",
-    }[name]
+    }.get(name)
+    if expected is not None:
+        assert out.strip() == expected
     if name == "from_python":
         assert SHARED == [2, 7] and SHARED_DICT == {"k": 5}
     # (compiled: none of them ran as Python)

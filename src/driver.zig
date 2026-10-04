@@ -96,6 +96,7 @@ pub const Compiled = struct {
             value.decref(value.Value.obj(.str, &s.*.head));
         }
         self.names.deinit(allocator);
+        self.compiler.freeBigs();
         for (self.compiler.objects.items) |o| py.Py_DecRef(o);
         self.compiler.m.deinit();
         self.compiler.deinit(allocator);
@@ -299,6 +300,7 @@ fn build(out: *Compiled, data: *program_mod.Data, lang: compile_mod.LangView, pr
             if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("build attempt: frames={} retry={} heap={} python={}: {s}\n", .{ need_frames, need_retry, force_heap, failed != null, out.failure.message.items });
             // (what this attempt kept)
             for (out.compiler.objects.items) |o| py.Py_DecRef(o);
+            out.compiler.freeBigs();
             out.compiler.m.deinit();
             out.compiler.deinit(allocator);
             switch (e) {

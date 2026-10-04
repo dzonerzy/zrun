@@ -529,6 +529,16 @@ pub const Compiler = struct {
     helpers_kept: usize = 0,
     /// Semantic and helper bodies run inline so far (ZRUN_STATS)
     inlined: usize = 0,
+    /// The Bigs of the code's constants (c_allocator's: the program frees
+    /// them)
+    bigs: std.ArrayListUnmanaged(*value.Big) = .empty,
+
+    /// Free the constants' Bigs.
+    pub fn freeBigs(self: *Compiler) void {
+        for (self.bigs.items) |b| std.heap.c_allocator.destroy(b);
+        self.bigs.deinit(std.heap.c_allocator);
+        self.bigs = .empty;
+    }
 
     /// Whether every function's (and block's) variables are in frames.
     pub fn allHeap(self: *const Compiler) bool {
@@ -623,6 +633,17 @@ pub const Compiler = struct {
         try g.f.block(g.err_label);
         try g.f.ret(self.m.k32(0));
         g.f.finish();
+    }
+
+    /// A Big for a constant (immortal: freed with the program).
+    pub fn bigConst(self: *Compiler, v: i128) !*value.Big {
+        const b = value.newBig(v) orelse return error.OutOfMemory;
+        b.head.rc = value.IMMORTAL;
+        self.bigs.append(std.heap.c_allocator, b) catch {
+            std.heap.c_allocator.destroy(b);
+            return error.OutOfMemory;
+        };
+        return b;
     }
 
     /// A Python function as the front reads it (once: the language keeps
@@ -827,8 +848,9 @@ pub const Compiler = struct {
         const other = try f.label("other");
         const python = try f.label("python");
         const done = try f.label("done");
+        // (counted: str..function (4-9), a Big (13))
         const k = f.sub(tag, m.k64(4));
-        try f.condBr(f.icmp(jit_c.LLVMIntULT, k, m.k64(6)), counted, other);
+        try f.condBr(f.or_(f.icmp(jit_c.LLVMIntULT, k, m.k64(6)), f.icmp(jit_c.LLVMIntEQ, tag, m.k64(@intFromEnum(value.Tag.big)))), counted, other);
         try f.block(counted);
         const p = f.intToPtr(bits);
         const rc = f.load(t.i64, p);
@@ -1416,7 +1438,11 @@ const Gen = struct {
             .float => |x| self.konst(3, @bitCast(x), .float),
             .str => |s| .{ .tag = self.k(4), .bits = self.f.ptrToInt(try self.c.m.string(s)), .shape = .str },
             .node => |n| self.konst(11, n, .node),
-            .py => |o| blk: {
+            // (a big int within 128 bits: a Big, made once for the program)
+            .py => |o| if (ph.typeOf(o) == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyLong_Type")))) and value.bigOf(o) != null) blk: {
+                const b = try self.c.bigConst(value.bigOf(o).?);
+                break :blk self.konst(@intFromEnum(value.Tag.big), @intCast(@intFromPtr(b)), .any);
+            } else blk: {
                 const idx = try self.c.objectIndex(o);
                 _ = self.call("zr_object", &.{ self.ctx, self.k(@intCast(idx)), self.out });
                 break :blk try self.loadOut(.any);
@@ -3384,14 +3410,8 @@ const Gen = struct {
                     }
                     py.c.PyErr_Clear();
                 }
-                // At run time: Python's slice of the value (known bounds: a
-                // slice object; else zr_slice)
-                if (isScalar(lo) and isScalar(hi) and isScalar(step)) {
-                    const sl = try self.sliceObject(lo, hi, step);
-                    defer py.Py_DecRef(sl);
-                    _ = try c.objectIndex(sl);
-                    return self.getItem(inst, obj, .{ .py = sl });
-                }
+                // At run time: the slice natively (zr_slice), Python's for
+                // other objects
                 const ds = [_]Dyn{ try self.materialize(obj, inst.node), try self.materialize(lo, inst.node), try self.materialize(hi, inst.node), try self.materialize(step, inst.node) };
                 const ok = self.call("zr_slice", &.{ self.ctx, self.k32(inst.node), ds[0].tag, ds[0].bits, ds[1].tag, ds[1].bits, ds[2].tag, ds[2].bits, ds[3].tag, ds[3].bits, self.out });
                 for (ds) |d| try self.drop(.{ .dyn = d });

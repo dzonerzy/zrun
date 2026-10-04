@@ -42,8 +42,40 @@ pub const Tag = enum(u64) {
     /// the scope they're of). Valid while the call that got it runs, as an
     /// rt of the reference mode is.
     rt = 12,
+    /// A plain int beyond 64 bits, within 128 (Big): Python's big ints a
+    /// semantic's arithmetic makes (2**63, masks of 64 bits...), natively
+    big = 13,
     _,
 };
+
+/// A plain int beyond 64 bits (never one within: those are ints)
+pub const Big = extern struct {
+    head: Obj,
+    v: i128 align(8),
+};
+
+pub fn newBig(v: i128) ?*Big {
+    const b = allocator.create(Big) catch return null;
+    b.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.big) }, .v = v };
+    return b;
+}
+
+/// A plain int's value: an int, or a Big (a new reference), or null if
+/// beyond 128 bits.
+pub fn intValue(v: i128) ?Value {
+    if (v >= std.math.minInt(i64) and v <= std.math.maxInt(i64)) return Value.pint(@intCast(v));
+    const b = newBig(v) orelse return null;
+    return Value.obj(.big, &b.head);
+}
+
+/// An int-like value's value as an i128 (an int, a bool, a Big), or null.
+pub fn wide(v: Value) ?i128 {
+    return switch (v.kind()) {
+        .int, .bool => v.asInt(),
+        .big => @as(*Big, @ptrCast(@alignCast(v.ptr()))).v,
+        else => null,
+    };
+}
 
 /// An int is an I64 (tag int: the program's, its arithmetic checked) or a
 /// plain one (this tag: a semantic's own, as Python's: overflowing 64 bits
@@ -121,7 +153,7 @@ pub const Value = extern struct {
 
     pub fn isHeap(self: Value) bool {
         return switch (self.kind()) {
-            .str, .list, .tuple, .dict, .record, .function => true,
+            .str, .list, .tuple, .dict, .record, .function, .big => true,
             else => false,
         };
     }
@@ -351,6 +383,7 @@ pub fn free(tag: Tag, o: *Obj) void {
             decref(Value.obj(.str, &f.name.head));
             allocator.destroy(f);
         },
+        .big => allocator.destroy(@as(*Big, @ptrCast(@alignCast(o)))),
         else => {},
     }
 }
@@ -452,6 +485,7 @@ pub fn typeName(v: Value) []const u8 {
         .node => "Node",
         .host => "object",
         .rt => "CompiledRuntime",
+        .big => "int",
         _ => "object",
     };
 }
@@ -460,6 +494,7 @@ pub fn truthy(v: Value) bool {
     return switch (v.kind()) {
         .none => false,
         .bool, .int => v.bits != 0,
+        .big => true,
         .float => v.asFloat() != 0,
         .str => @as(*Str, @ptrCast(v.ptr())).len != 0,
         .list => @as(*List, @ptrCast(@alignCast(v.ptr()))).len != 0,
@@ -578,6 +613,38 @@ fn hostEqual(a: Value, b: Value) bool {
 
 /// A host value, or a scalar, as a Python object (a new reference); null
 /// for the rest (they're not equal to the Python objects compared).
+/// A Python int of an i128 (a new reference; null with an exception):
+/// from its decimal digits.
+pub fn bigObject(x: i128) ?*PyObject {
+    var buf: [48]u8 = undefined;
+    const s = std.fmt.bufPrintZ(&buf, "{d}", .{x}) catch unreachable;
+    return py.c.PyLong_FromString(s.ptr, null, 10);
+}
+
+/// A Python int as an i128, or null if beyond 128 bits (no exception).
+pub fn bigOf(o: *PyObject) ?i128 {
+    // (its low 64 bits, and what's above them, which must fit an i64)
+    const low = py.c.PyLong_AsUnsignedLongLongMask(o);
+    if (low == std.math.maxInt(c_ulonglong) and py.c.PyErr_Occurred() != null) {
+        py.c.PyErr_Clear();
+        return null;
+    }
+    const sixty_four = py.c.PyLong_FromLong(64) orelse {
+        py.c.PyErr_Clear();
+        return null;
+    };
+    defer py.Py_DecRef(sixty_four);
+    const high_obj = py.c.PyNumber_Rshift(o, sixty_four) orelse {
+        py.c.PyErr_Clear();
+        return null;
+    };
+    defer py.Py_DecRef(high_obj);
+    var overflow: c_int = 0;
+    const high = py.c.PyLong_AsLongLongAndOverflow(high_obj, &overflow);
+    if (overflow != 0) return null;
+    return (@as(i128, high) << 64) | @as(i128, low);
+}
+
 fn scalarObject(v: Value) ?*PyObject {
     const o: ?*PyObject = switch (v.kind()) {
         .host => blk: {
@@ -591,6 +658,7 @@ fn scalarObject(v: Value) ?*PyObject {
         },
         .bool => py.c.PyBool_FromLong(@intFromBool(v.asInt() != 0)),
         .int => py.c.PyLong_FromLongLong(v.asInt()),
+        .big => bigObject(@as(*Big, @ptrCast(@alignCast(v.ptr()))).v),
         .float => py.c.PyFloat_FromDouble(v.asFloat()),
         .str => blk: {
             const b = @as(*Str, @ptrCast(v.ptr())).bytes();
@@ -604,6 +672,18 @@ fn scalarObject(v: Value) ?*PyObject {
 
 pub fn equal(a: Value, b: Value) bool {
     if (isIntLike(a) and isIntLike(b)) return a.asInt() == b.asInt();
+    // (a Big: equal to an int never (ints within 64 bits aren't Bigs), to
+    // a Big of its value, to a float of exactly its value)
+    if (a.kind() == .big or b.kind() == .big) {
+        if (wide(a)) |x| if (wide(b)) |y| return x == y;
+        const x = wide(a) orelse wide(b) orelse unreachable;
+        const other = if (a.kind() == .big) b else a;
+        if (other.kind() == .float) {
+            const f = other.asFloat();
+            return f == @trunc(f) and @abs(f) < 1.7e38 and @as(i128, @intFromFloat(f)) == x;
+        }
+        if (other.kind() != .host) return false;
+    }
     if (a.kind() == .float and isIntLike(b)) return intEqualsFloat(b.asInt(), a.asFloat());
     if (b.kind() == .float and isIntLike(a)) return intEqualsFloat(a.asInt(), b.asFloat());
     if (a.kind() == .host or b.kind() == .host) return hostEqual(a, b);
@@ -665,8 +745,14 @@ fn hashOf(tag: u64, bits: u64) u64 {
                 const i: i64 = @intFromFloat(f);
                 return std.hash.Wyhash.hash(0, std.mem.asBytes(&i));
             }
+            // (one equal to a Big: hashed as it is)
+            if (f == @trunc(f) and @abs(f) < 1.7e38) {
+                const i: i128 = @intFromFloat(f);
+                return std.hash.Wyhash.hash(2, std.mem.asBytes(&i));
+            }
             return std.hash.Wyhash.hash(1, std.mem.asBytes(&bits));
         },
+        .big => return std.hash.Wyhash.hash(2, std.mem.asBytes(&@as(*Big, @ptrCast(@alignCast(v.ptr()))).v)),
         .str => {
             const s: *Str = @ptrCast(v.ptr());
             if (s.hash != 0) return s.hash;
@@ -834,6 +920,7 @@ pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
         },
         // (an I64, or a plain int, as the reference mode has them)
         .int => return if (v.isPlain()) py.c.PyLong_FromLongLong(v.asInt()) else types.fromInt(v.asInt()),
+        .big => return bigObject(@as(*Big, @ptrCast(@alignCast(v.ptr()))).v),
         .float => return py.c.PyFloat_FromDouble(v.asFloat()),
         .str => {
             const s: *Str = @ptrCast(v.ptr());
@@ -908,8 +995,16 @@ fn convert(o: *PyObject, unique: bool) ?Value {
     if (ty == exact.int or is_i64) big: {
         var overflow: c_int = 0;
         const n = py.c.PyLong_AsLongLongAndOverflow(o, &overflow);
-        // (beyond 64 bits: Python's own, a host value; an I64 never is)
-        if (overflow != 0) break :big;
+        // (beyond 64 bits: a Big within 128; beyond, Python's own, a host
+        // value; an I64 never is)
+        if (overflow != 0) {
+            const x = bigOf(o) orelse break :big;
+            const b = newBig(x) orelse {
+                _ = py.c.PyErr_NoMemory();
+                return null;
+            };
+            return Value.obj(.big, &b.head);
+        }
         return if (is_i64) Value.int(n) else Value.pint(n);
     }
     if (ty == exact.float) return Value.float(py.c.PyFloat_AsDouble(o));
