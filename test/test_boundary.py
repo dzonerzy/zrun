@@ -34,6 +34,7 @@ BUILTINS = (
     "live",
     "same",
     "back",
+    "bigmath",
 )
 
 
@@ -143,6 +144,12 @@ def make_lang():
             d[k[1]] = "fs"
             d[k[3]] = "box"
             return d.get(1, "no") + d.get(k[2], "no") + d.get(k[3], "no") + d.get(Box(1), "no") + str(len(d))
+        if name == "bigmath":
+            # A semantic's own ints are Python's (beyond 64 bits on the way)
+            m = -1 & 0xFFFFFFFFFFFFFFFF
+            back = m - 0x10000000000000000 if m >= 0x8000000000000000 else m
+            lim = max(min(2**63 + 5, 2**63 - 1), -(2**63))
+            return back * 100 + (lim - (2**63 - 1)) + len(str(2**70))
         if name == "same":
             # One object, the same each time Python sees it; Python keeping
             # it after compiled code let go, changing it, giving it back
@@ -338,6 +345,7 @@ PROGRAMS = {
     "keys": "print(keys());\n",
     "live": "print(unlive(), live());\n",
     "identity": "print(same(), back());\n",
+    "bigmath": "print(bigmath());\n",
 }
 
 
@@ -346,7 +354,7 @@ def test_shared_with_python(name, capsys):
     out, err = same_in_every_mode(lang, PROGRAMS[name], capsys)
     assert err is None, err
     # (len * 1000 + first * 100 + last, after the host's changes...)
-    assert out.strip() == {"list": "4531", "dict": "231", "record": "53", "from_python": "0 203 5 4 34", "keys": "redfsboxno3", "live": "0 50801161", "identity": "1 32"}[name]
+    assert out.strip() == {"list": "4531", "dict": "231", "record": "53", "from_python": "0 203 5 4 34", "keys": "redfsboxno3", "live": "0 50801161", "identity": "1 32", "bigmath": "-78"}[name]
     if name == "from_python":
         assert SHARED == [2, 7] and SHARED_DICT == {"k": 5}
     # (compiled: none of them ran as Python)

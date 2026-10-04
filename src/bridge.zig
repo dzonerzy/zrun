@@ -281,6 +281,9 @@ const RuntimeObject = extern struct {
     owner: u32,
     /// The node whose semantic it is (errors)
     at: u32,
+    /// The frame, held (an rt compiled code passes to Python: frame_slot
+    /// is this field)
+    own_frame: ?*value.Frame = null,
 };
 
 fn asRuntime(o: *PyObject) *RuntimeObject {
@@ -295,7 +298,44 @@ fn newRuntime(ctx: *Ctx, frame_slot: **value.Frame, owner: u32, at: u32) ?*PyObj
     r.frame_slot = frame_slot;
     r.owner = owner;
     r.at = at;
+    r.own_frame = null;
     return obj;
+}
+
+/// `raise exc` in compiled code (an exception object or class: a rt.Throw,
+/// a ValueError...): raised as a Python semantic's exception is (a Throw
+/// goes up to whoever catches it, anything else is the run's error, worded
+/// as the reference mode does). Always false.
+pub export fn zr_raise(ctx: *Ctx, at: u32, t: u64, bits: u64) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    const o = value.toPython(v, ctx.node_maker) orelse return pythonFailure(ctx, at) != 0;
+    defer py.Py_DecRef(o);
+    const base = py.c.PyExc_BaseException;
+    const is_type = py.c.PyObject_IsInstance(o, @ptrCast(@alignCast(py.types.typeObject("PyType_Type")))) == 1;
+    if (is_type and py.c.PyObject_IsSubclass(o, base) == 1) {
+        py.c.PyErr_SetNone(o);
+    } else if (py.c.PyObject_IsInstance(o, base) == 1) {
+        py.c.PyErr_SetObject(@ptrCast(ph.typeOf(o)), o);
+    } else {
+        ph.raise(py.PyExc_TypeError(), "exceptions must derive from BaseException", .{});
+    }
+    return pythonFailure(ctx, at) != 0;
+}
+
+/// `rt` as a value compiled code passes (to a Python function: f(rt,
+/// node...)): an rt over the frames of the code there, holding its frame.
+pub export fn zr_runtime(ctx: *Ctx, at: u32, frame: *value.Frame, owner: u32, out: *Value) callconv(.c) bool {
+    var slot: *value.Frame = frame;
+    const obj = newRuntime(ctx, &slot, owner, at) orelse {
+        py.c.PyErr_Clear();
+        return helpers.fail(ctx, at, "out of memory", .{});
+    };
+    const r = asRuntime(obj);
+    value.increfObj(&frame.head);
+    r.own_frame = frame;
+    r.frame_slot = &r.own_frame.?;
+    out.* = .{ .tag = @intFromEnum(value.Tag.host), .bits = @intFromPtr(obj) };
+    return true;
 }
 
 fn live(self: ?*PyObject) ?*RuntimeObject {
@@ -750,6 +790,7 @@ var getset = [_]py.c.PyGetSetDef{
 };
 
 fn runtimeDealloc(obj: ?*PyObject) callconv(.c) void {
+    if (asRuntime(obj.?).own_frame) |f| value.decrefFrame(f);
     const t = obj.?.ob_type;
     const free: py.c.freefunc = @ptrCast(py.c.PyType_GetSlot(t, py.c.Py_tp_free));
     free.?(obj);
@@ -778,9 +819,11 @@ pub fn init(module: *PyObject) !void {
 }
 
 /// The bridge's helpers, by name (for the JIT)
-pub fn symbols() [2]struct { []const u8, usize } {
+pub fn symbols() [4]struct { []const u8, usize } {
     return .{
         .{ "zr_py_semantic", @intFromPtr(&zr_py_semantic) },
         .{ "zr_run_value", @intFromPtr(&zr_run_value) },
+        .{ "zr_runtime", @intFromPtr(&zr_runtime) },
+        .{ "zr_raise", @intFromPtr(&zr_raise) },
     };
 }

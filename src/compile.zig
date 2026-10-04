@@ -28,6 +28,8 @@ const program_mod = @import("program.zig");
 const grammar_mod = @import("grammar.zig");
 const helpers = @import("helpers.zig");
 const value = @import("value.zig");
+const objects_mod = @import("objects.zig");
+const types_mod = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
 const NONE = program_mod.NONE;
@@ -124,21 +126,48 @@ pub const SDict = struct {
 
 /// Equal keys known when compiling (Python's equality for scalars).
 fn sameKey(a: SVal, b: SVal) bool {
+    if (intOf(a)) |x| {
+        if (intOf(b)) |y| return x == y;
+        return b == .float and intEqualsFloat(x, b.float);
+    }
     return switch (a) {
         .str => |s| b == .str and std.mem.eql(u8, s, b.str),
-        .int => |n| (b == .int and b.int == n) or (b == .bool and @as(i64, @intFromBool(b.bool)) == n) or (b == .float and b.float == @as(f64, @floatFromInt(n))),
-        .bool => |x| (b == .bool and b.bool == x) or (b == .int and b.int == @intFromBool(x)),
-        .float => |x| (b == .float and b.float == x) or (b == .int and @as(f64, @floatFromInt(b.int)) == x),
+        .float => |x| (b == .float and b.float == x) or (if (intOf(b)) |y| intEqualsFloat(y, x) else false),
         .none => b == .none,
         .node => |n| b == .node and b.node == n,
+        // (big ints)
+        .py => |o| b == .py and (o == b.py or py.c.PyObject_RichCompareBool(o, b.py, py.c.Py_EQ) == 1),
         else => false,
     };
+}
+
+/// An int (or a bool) known when compiling, either kind.
+fn intOf(v: SVal) ?i64 {
+    return switch (v) {
+        .int, .pint => |n| n,
+        .bool => |b| @intFromBool(b),
+        else => null,
+    };
+}
+
+/// An int and a float equal exactly (as Python compares them).
+fn intEqualsFloat(i: i64, f: f64) bool {
+    if (f != @trunc(f) or !(@abs(f) < 9.3e18)) return false;
+    if (f >= 9223372036854775807.0 or f < -9223372036854775808.0) return false;
+    return @as(i64, @intFromFloat(f)) == i;
 }
 
 pub const SVal = union(enum) {
     none,
     bool: bool,
+    /// An int of the program (zrun.I64 in the reference mode: what rt.eval,
+    /// rt.load, fields... give): its arithmetic is checked, an overflow an
+    /// error
     int: i64,
+    /// A plain int a semantic's code makes (a literal, len(), a count...):
+    /// as Python's, its arithmetic overflowing 64 bits makes a big int (a
+    /// .py int); rt makes it an `int` where the reference mode makes an I64
+    pint: i64,
     float: f64,
     str: []const u8,
     node: u32,
@@ -294,6 +323,93 @@ fn reboundGlobals(globals: *PyObject) error{Python}!*PyObject {
     return names;
 }
 
+/// The record type of a class whose objects compiled code makes natively
+/// (records): a dataclass, or a plain class with __slots__ (all the way
+/// up, single inheritance) and no special methods but __init__, __repr__
+/// and __str__ (what native records do is then what Python does). Made
+/// once per class, for the process (records outlive programs); null for
+/// another class (its objects are Python's).
+pub fn recordOf(cls: *PyObject) Error!?*value.RecordType {
+    if (record_types.get(cls)) |t| return t;
+    if (not_records.contains(cls)) return null;
+    if (record_describer == null) {
+        const src =
+            \\import dataclasses
+            \\OK = {"__module__", "__qualname__", "__doc__", "__slots__", "__init__", "__repr__", "__str__",
+            \\      "__annotations__", "__match_args__", "__firstlineno__", "__static_attributes__"}
+            \\def describe(cls):
+            \\    if type(cls) is not type or cls.__mro__[-1] is not object or len(cls.__bases__) != 1:
+            \\        return None
+            \\    base = cls.__bases__[0]
+            \\    if dataclasses.is_dataclass(cls):
+            \\        p = cls.__dataclass_params__
+            \\        if p.order or "__post_init__" in dir(cls):
+            \\            return None
+            \\        names = tuple(f.name for f in dataclasses.fields(cls))
+            \\        return (names, False, bool(p.eq), bool(p.frozen), base if dataclasses.is_dataclass(base) else None)
+            \\    out = []
+            \\    for k in reversed(cls.__mro__[:-1]):
+            \\        d = k.__dict__
+            \\        if "__slots__" not in d:
+            \\            return None
+            \\        s = d["__slots__"]
+            \\        for n in ((s,) if isinstance(s, str) else tuple(s)):
+            \\            if n in ("__dict__", "__weakref__"):
+            \\                return None
+            \\            if n.startswith("__") and not n.endswith("__"):
+            \\                n = "_" + k.__name__.lstrip("_") + n
+            \\            out.append(n)
+            \\        for n in d:
+            \\            if n.startswith("__") and n.endswith("__") and n not in OK:
+            \\                return None
+            \\    return (tuple(out), True, False, False, None if base is object else base)
+        ;
+        const ns = runPython(src) orelse return error.Python;
+        defer py.Py_DecRef(ns);
+        const f = py.c.PyDict_GetItemString(ns, "describe") orelse return error.Python;
+        py.Py_IncRef(f);
+        record_describer = f;
+    }
+    const gpa = std.heap.c_allocator;
+    const d = py.c.PyObject_CallFunctionObjArgs(record_describer.?, cls, @as(?*PyObject, null)) orelse return error.Python;
+    defer py.Py_DecRef(d);
+    if (d == py.Py_None()) {
+        try not_records.put(gpa, cls, {});
+        py.Py_IncRef(cls);
+        return null;
+    }
+    const field_names = py.c.PyTuple_GetItem(d, 0).?;
+    const base_cls = py.c.PyTuple_GetItem(d, 4).?;
+    const base = if (base_cls == py.Py_None()) null else try recordOf(base_cls) orelse {
+        try not_records.put(gpa, cls, {});
+        py.Py_IncRef(cls);
+        return null;
+    };
+    const n: usize = @intCast(py.c.PyTuple_Size(field_names));
+    const names = try gpa.alloc([]const u8, n);
+    for (names, 0..) |*slot, i| slot.* = try gpa.dupe(u8, ph.utf8(py.c.PyTuple_GetItem(field_names, @intCast(i)).?, "field") orelse return error.Python);
+    const qual = ph.attr(cls, "__name__") orelse return error.Python;
+    defer py.Py_DecRef(qual);
+    const t = try gpa.create(value.RecordType);
+    t.* = .{
+        .name = try gpa.dupe(u8, ph.utf8(qual, "name") orelse return error.Python),
+        .fields = names,
+        .py_class = cls,
+        .slots = py.c.PyTuple_GetItem(d, 1).? == py.Py_True(),
+        .value_eq = py.c.PyTuple_GetItem(d, 2).? == py.Py_True(),
+        .frozen = py.c.PyTuple_GetItem(d, 3).? == py.Py_True(),
+        .base = base,
+    };
+    // (the class is kept: its records may live as long as the process)
+    py.Py_IncRef(cls);
+    try record_types.put(gpa, cls, t);
+    return t;
+}
+
+var record_describer: ?*PyObject = null;
+var record_types: std.AutoHashMapUnmanaged(*PyObject, *value.RecordType) = .empty;
+var not_records: std.AutoHashMapUnmanaged(*PyObject, void) = .empty;
+
 var rebound_scanner: ?*PyObject = null;
 /// (the module dicts are kept: modules live as long)
 var rebound_cache: std.AutoHashMapUnmanaged(*PyObject, struct { len: isize, names: *PyObject }) = .empty;
@@ -326,10 +442,6 @@ pub const Compiler = struct {
     /// Language functions compiled or to compile
     compiled_fns: std.AutoHashMapUnmanaged(u32, void) = .empty,
     queue: std.ArrayListUnmanaged(u32) = .empty,
-    /// Record types, by the dataclass they come from (allocated outside
-    /// the arena: the compiled program keeps them)
-    record_types: std.AutoHashMapUnmanaged(*PyObject, *value.RecordType) = .empty,
-    record_list: std.ArrayListUnmanaged(*value.RecordType) = .empty,
     /// Checked i64 arithmetic (LLVM's intrinsics)
     sadd: ir.Fn = undefined,
     ssub: ir.Fn = undefined,
@@ -486,6 +598,11 @@ pub const Compiler = struct {
         .{ "zr_call_method", "bpillpplp" },
         .{ "zr_call_python", "bpilplp" },
         .{ "zr_global", "bpilpp" },
+        .{ "zr_record_new", "bpipp" },
+        .{ "zr_isinstance", "bpilllp" },
+        .{ "zr_runtime", "bpipip" },
+        .{ "zr_call_seq", "bpillllpp" },
+        .{ "zr_raise", "bpill" },
         .{ "zr_is_type", "blli" },
         .{ "zr_format", "bpillipp" },
         .{ "zr_concat", "bpiplp" },
@@ -659,29 +776,10 @@ pub const Compiler = struct {
         return (try self.llvmFunction(fnode)).v;
     }
 
-    /// The record type of a dataclass (made once).
-    fn recordType(self: *Compiler, cls: *PyObject) Error!*value.RecordType {
-        if (self.record_types.get(cls)) |t| return t;
-        const dataclasses = py.c.PyImport_ImportModule("dataclasses") orelse return error.Python;
-        defer py.Py_DecRef(dataclasses);
-        const fields = py.c.PyObject_CallMethod(dataclasses, "fields", "(O)", cls) orelse return error.Python;
-        defer py.Py_DecRef(fields);
-        const n: usize = @intCast(py.c.PyTuple_Size(fields));
-        const gpa = std.heap.c_allocator;
-        const names = try gpa.alloc([]const u8, n);
-        for (names, 0..) |*slot, i| {
-            const f = py.c.PyTuple_GetItem(fields, @intCast(i)).?;
-            const name = ph.attr(f, "name") orelse return error.Python;
-            defer py.Py_DecRef(name);
-            slot.* = try gpa.dupe(u8, ph.utf8(name, "field") orelse return error.Python);
-        }
-        const qual = ph.attr(cls, "__name__") orelse return error.Python;
-        defer py.Py_DecRef(qual);
-        const t = try gpa.create(value.RecordType);
-        t.* = .{ .name = try gpa.dupe(u8, ph.utf8(qual, "name") orelse return error.Python), .fields = names, .py_class = cls };
+    /// The record type of a class, if its objects are records (recordOf).
+    fn recordType(self: *Compiler, cls: *PyObject) Error!?*value.RecordType {
+        const t = try recordOf(cls) orelse return null;
         _ = try self.objectIndex(cls);
-        try self.record_types.put(self.a, cls, t);
-        try self.record_list.append(self.a, t);
         return t;
     }
 
@@ -1059,7 +1157,7 @@ const Gen = struct {
             .dyn => |d| d,
             .none => self.noneDyn(),
             .bool => |b| self.konst(1, @intFromBool(b), .bool),
-            .int => |n| self.konst(2, n, .int),
+            .int, .pint => |n| self.konst(2, n, .int),
             .float => |x| self.konst(3, @bitCast(x), .float),
             .str => |s| .{ .tag = self.k(4), .bits = self.f.ptrToInt(try self.c.m.string(s)), .shape = .str },
             .node => |n| self.konst(11, n, .node),
@@ -1078,6 +1176,17 @@ const Gen = struct {
                 const d = try self.buildDict(x, at);
                 try self.promote(v, d);
                 break :blk d;
+            },
+            // (given to Python: an rt over the frames here)
+            .rt => blk: {
+                const c = self.c;
+                if (!c.allHeap()) {
+                    c.need_frames = true;
+                    return c.unsupported("rt is given to Python here: the program needs its variables in frames", .{});
+                }
+                c.uses_python = true;
+                try self.callCheck("zr_runtime", &.{ self.ctx, self.k32(at), try self.currentFrame(), self.k32(self.currentOwner()), self.out });
+                break :blk try self.loadOut(.any);
             },
             else => self.c.unsupported("a {s} can't be kept in a variable or passed as a value (node {d})", .{ @tagName(v), at }),
         };
@@ -1283,7 +1392,7 @@ const Gen = struct {
         switch (v) {
             .none => return .{ .known = false },
             .bool => |b| return .{ .known = b },
-            .int => |n| return .{ .known = n != 0 },
+            .int, .pint => |n| return .{ .known = n != 0 },
             .float => |x| return .{ .known = x != 0 },
             .str => |s| return .{ .known = s.len != 0 },
             .list => |l| return .{ .known = l.items.items.len != 0 },
@@ -1454,7 +1563,8 @@ const Gen = struct {
             try self.failAt(name_node, try std.fmt.allocPrint(self.a(), "can't assign to the builtin '{s}'", .{d.syms[si].name}));
             return;
         }
-        const v = try self.materialize(value_, name_node);
+        // (stored as rt.store does: an int an I64)
+        const v = try self.materialize(try self.checkedAt(value_, name_node), name_node);
         const slot = try self.varSlot(si);
         const old = try self.loadSlot(slot, .any);
         try self.storeSlot(slot, v);
@@ -1568,7 +1678,8 @@ const Gen = struct {
                 defer py.Py_DecRef(zn);
                 const o = py.c.PyObject_CallMethod(zn, "to_ast", null) orelse return error.Python;
                 defer py.Py_DecRef(o);
-                return self.constant(o, idx);
+                // (an int of the program: an I64)
+                return self.checkedAt(try self.constant(o, idx), idx);
             },
             .true_ => return .{ .bool = true },
             .false_ => return .{ .bool = false },
@@ -1592,21 +1703,40 @@ const Gen = struct {
         }
     }
 
-    /// A Python constant as a value known here.
-    fn constant(self: *Gen, o: *PyObject, at: u32) Error!SVal {
-        if (o == py.Py_None()) return .none;
-        if (py.PyBool_Check(o)) return .{ .bool = o == py.Py_True() };
-        if (py.PyLong_Check(o)) {
-            var overflow: c_int = 0;
-            const n = py.c.PyLong_AsLongLongAndOverflow(o, &overflow);
-            if (overflow != 0) {
-                // (as the reference mode: an error when it's evaluated, at
-                // the node whose semantic reads it)
+    /// A value where the reference mode makes ints I64 (what rt gives and
+    /// takes): a plain int made an `int`; one beyond 64 bits an overflow
+    /// error there, as I64() raises it.
+    fn checkedAt(self: *Gen, v: SVal, at: u32) Error!SVal {
+        switch (v) {
+            .pint => |n| return .{ .int = n },
+            .py => |o| if (ph.typeOf(o) == @as(*py.c.PyTypeObject, @ptrCast(py.types.typeObject("PyLong_Type")))) {
                 const where = if (self.insts.items.len > 0) self.insts.items[self.insts.items.len - 1].node else at;
                 try self.failAt(where, "integer overflow");
                 return .none;
+            },
+            else => {},
+        }
+        return v;
+    }
+
+    /// A Python constant as a value known here.
+    fn constant(self: *Gen, o: *PyObject, at: u32) Error!SVal {
+        if (o == py.Py_None()) return .none;
+        if (o == py.Py_True() or o == py.Py_False()) return .{ .bool = o == py.Py_True() };
+        const t: *PyObject = @ptrCast(ph.typeOf(o));
+        const is_i64 = t == types_mod.I64;
+        // (an int: a plain one, or an I64, an int of the program; a subclass,
+        // an IntEnum..., is itself)
+        if (is_i64 or t == @as(*PyObject, @ptrCast(py.types.typeObject("PyLong_Type")))) {
+            var overflow: c_int = 0;
+            const n = py.c.PyLong_AsLongLongAndOverflow(o, &overflow);
+            // (beyond 64 bits: a big int, a Python object; an I64 never is)
+            if (overflow != 0) {
+                // (kept: it may be one just computed)
+                _ = try self.c.objectIndex(o);
+                return .{ .py = o };
             }
-            return .{ .int = n };
+            return if (is_i64) .{ .int = n } else .{ .pint = n };
         }
         if (py.PyFloat_Check(o)) return .{ .float = py.c.PyFloat_AsDouble(o) };
         if (py.PyUnicode_Check(o)) {
@@ -1674,7 +1804,8 @@ const Gen = struct {
 
     fn evalHere(self: *Gen, idx: u32) Error!SVal {
         switch (try self.semanticOf(idx, .eval)) {
-            .compiled => |func| return self.runSemantic(func, idx),
+            // (its value as rt.eval gives it: an int an I64)
+            .compiled => |func| return self.checkedAt(try self.runSemantic(func, idx), idx),
             .python => return self.pySemantic(idx, .eval),
             .none => {},
         }
@@ -1697,7 +1828,7 @@ const Gen = struct {
                 return .{ .list = out };
             },
             .dyn => return self.runValue(0, v, self.atNode()),
-            else => return v,
+            else => return self.checkedAt(v, self.atNode()),
         }
     }
 
@@ -2204,9 +2335,9 @@ const Gen = struct {
             .list, .dict => if (inst.dyn_depth == 0 and key.isStatic() and isScalar(key)) {
                 if (obj == .dict) return self.sdictSet(obj.dict, key, v);
                 const items = obj.list.items.items;
-                if (key == .int) {
+                if (intOf(key)) |ki| {
                     const n: i64 = @intCast(items.len);
-                    const i = if (key.int < 0) key.int + n else key.int;
+                    const i = if (ki < 0) ki + n else ki;
                     if (i >= 0 and i < n) {
                         try self.drop(items[@intCast(i)]);
                         items[@intCast(i)] = v;
@@ -2267,11 +2398,21 @@ const Gen = struct {
         }
     }
 
-    /// raise rt.Return(v) / rt.Break() / rt.Continue()
+    /// raise rt.Return(v) / rt.Break() / rt.Continue(): jumps; raise of
+    /// anything else (rt.Throw(...), ValueError(...)): at run time.
     fn raise(self: *Gen, inst: *Inst, v: SVal, pos: front.Pos) Error!void {
+        _ = pos;
         const ctl = switch (v) {
             .control => |x| x,
-            else => return self.c.unsupportedAt(inst.func, pos, "only rt.Return, rt.Break and rt.Continue can be raised in compiled code", .{}),
+            else => {
+                const d = try self.materialize(v, inst.node);
+                _ = self.call("zr_raise", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits });
+                try self.drop(.{ .dyn = d });
+                try self.f.br(self.err_label);
+                if (inst.dyn_depth == 0) inst.done = true;
+                try self.f.block(try self.f.label("after_raise"));
+                return;
+            },
         };
         switch (ctl.kind) {
             .Return => {
@@ -2480,7 +2621,12 @@ const Gen = struct {
     fn expr(self: *Gen, inst: *Inst, e: *const front.Expr) Error!SVal {
         const c = self.c;
         switch (e.kind) {
-            .int => |n| return .{ .int = n },
+            // (a literal of the semantic's: a plain int; a big one, Python's)
+            .int => |n| return .{ .pint = n },
+            .big => |o| {
+                _ = try c.objectIndex(o);
+                return .{ .py = o };
+            },
             .float => |x| return .{ .float = x },
             .str => |s| return .{ .str = s },
             .bool => |b| return .{ .bool = b },
@@ -2637,14 +2783,14 @@ const Gen = struct {
     fn getItem(self: *Gen, inst: *Inst, obj: SVal, key: SVal) Error!SVal {
         if (key.isStatic() and isScalar(key)) {
             switch (obj) {
-                .list => |l| if (key == .int) {
+                .list => |l| if (intOf(key)) |ki| {
                     const n: i64 = @intCast(l.items.items.len);
-                    const i = if (key.int < 0) key.int + n else key.int;
+                    const i = if (ki < 0) ki + n else ki;
                     if (i >= 0 and i < n) return self.copyOf(l.items.items[@intCast(i)]);
                 },
-                .tuple => |t| if (key == .int) {
+                .tuple => |t| if (intOf(key)) |ki| {
                     const n: i64 = @intCast(t.len);
-                    const i = if (key.int < 0) key.int + n else key.int;
+                    const i = if (ki < 0) ki + n else ki;
                     if (i >= 0 and i < n) return self.copyOf(t[@intCast(i)]);
                 },
                 .dict => |d| if (d.find(key)) |i| return self.copyOf(d.values.items[i]),
@@ -2802,15 +2948,16 @@ const Gen = struct {
                 if (eq(u8, name, "kind")) return .{ .str = d.grammar.kind_names[rid] };
                 if (eq(u8, name, "rule")) return .{ .str = d.grammar.rule_names[rid] };
                 if (eq(u8, name, "text")) return .{ .str = d.text(idx) };
-                if (eq(u8, name, "start")) return .{ .int = n.text_start };
-                if (eq(u8, name, "line")) return .{ .int = d.lineCol(n.text_start).line };
-                if (eq(u8, name, "column")) return .{ .int = d.lineCol(n.text_start).col };
-                if (eq(u8, name, "end")) return .{ .int = n.text_end };
-                if (eq(u8, name, "index")) return .{ .int = idx };
+                // (plain ints, as the reference mode's Node gives them)
+                if (eq(u8, name, "start")) return .{ .pint = n.text_start };
+                if (eq(u8, name, "line")) return .{ .pint = d.lineCol(n.text_start).line };
+                if (eq(u8, name, "column")) return .{ .pint = d.lineCol(n.text_start).col };
+                if (eq(u8, name, "end")) return .{ .pint = n.text_end };
+                if (eq(u8, name, "index")) return .{ .pint = idx };
                 if (eq(u8, name, "span")) {
                     const items = try self.a().alloc(SVal, 2);
-                    items[0] = .{ .int = n.text_start };
-                    items[1] = .{ .int = n.text_end };
+                    items[0] = .{ .pint = n.text_start };
+                    items[1] = .{ .pint = n.text_end };
                     return .{ .tuple = items };
                 }
                 if (eq(u8, name, "children")) return self.childValues(idx);
@@ -2841,6 +2988,8 @@ const Gen = struct {
                     const p = self.c.lang.path orelse return .none;
                     return .{ .str = p };
                 }
+                // (the class: raised, caught by Python)
+                if (eq(u8, name, "Throw")) return .{ .py = @import("types.zig").Throw };
                 return c.unsupportedAt(inst.func, pos, "rt has no '{s}' in compiled code", .{name});
             },
             .py => |o| {
@@ -3046,8 +3195,8 @@ const Gen = struct {
             .span => {
                 const n = c.data.nodes[try self.nodeArg(inst, args[0], pos)];
                 const items = try self.a().alloc(SVal, 2);
-                items[0] = .{ .int = n.text_start };
-                items[1] = .{ .int = n.text_end };
+                items[0] = .{ .pint = n.text_start };
+                items[1] = .{ .pint = n.text_end };
                 return .{ .tuple = items };
             },
             .scope => {
@@ -3066,7 +3215,7 @@ const Gen = struct {
                 return sv;
             },
             .node_at => switch (args[0]) {
-                .int => |i| return .{ .node = @intCast(i) },
+                .int, .pint => |i| return .{ .node = @intCast(i) },
                 else => return c.unsupportedAt(inst.func, pos, "rt.node_at's index must be known when compiling", .{}),
             },
             .Return => return .{ .control = .{ .kind = .Return, .value = if (args.len == 1) try self.boxed(args[0]) else null } },
@@ -3115,7 +3264,7 @@ const Gen = struct {
         const items: []const SVal = switch (args_v) {
             .list => |l| l.items.items,
             .tuple => |t| t,
-            else => return self.c.unsupported("arguments only known as a list at run time aren't compiled yet (node {d})", .{inst.node}),
+            else => return self.seqCall(inst, fv, args_v, receiver),
         };
         const fd = try self.materialize(fv, inst.node);
         // The arguments, in a stack array
@@ -3138,6 +3287,26 @@ const Gen = struct {
         // (the call borrowed them)
         for (ds) |d| try self.drop(.{ .dyn = d });
         if (recv_d) |r| try self.drop(.{ .dyn = r });
+        try self.drop(.{ .dyn = fd });
+        try self.check(ok);
+        return .{ .dyn = try self.loadOut(.any) };
+    }
+
+    /// rt.call(f, args) with args only known at run time (all taken).
+    fn seqCall(self: *Gen, inst: *Inst, fv: SVal, args_v: SVal, receiver: ?SVal) Error!SVal {
+        const fd = try self.materialize(fv, inst.node);
+        const ad = try self.materialize(args_v, inst.node);
+        var recv_ptr = self.c.m.nullPtr();
+        var recv_d: ?Dyn = null;
+        if (receiver) |r| {
+            recv_d = try self.materialize(r, inst.node);
+            const p = try self.valSlot();
+            try self.storeSlot(p, recv_d.?);
+            recv_ptr = p;
+        }
+        const ok = self.call("zr_call_seq", &.{ self.ctx, self.k32(inst.node), fd.tag, fd.bits, ad.tag, ad.bits, recv_ptr, self.out });
+        if (recv_d) |r| try self.drop(.{ .dyn = r });
+        try self.drop(.{ .dyn = ad });
         try self.drop(.{ .dyn = fd });
         try self.check(ok);
         return .{ .dyn = try self.loadOut(.any) };
@@ -3170,15 +3339,36 @@ const Gen = struct {
             const func = try self.helperFunction(o);
             return self.runFunction(func, inst.node, args);
         }
-        // A dataclass: a record
-        if (py.c.PyObject_HasAttrString(o, "__dataclass_fields__") == 1 and py.c.PyObject_IsInstance(o, @ptrCast(@alignCast(py.types.typeObject("PyType_Type")))) == 1) {
-            const rtype = try c.recordType(o);
-            if (args.len != rtype.fields.len) return c.unsupportedAt(inst.func, pos, "{s}() takes {d} fields, given {d} (keywords and defaults aren't compiled yet)", .{ rtype.name, rtype.fields.len, args.len });
-            const arr = try self.valueArray(args, inst.node);
-            const ok = self.call("zr_record", &.{ self.ctx, self.k32(inst.node), self.ptrConst(rtype), arr, self.out });
-            try self.check(ok);
-            return .{ .dyn = try self.loadOut(.record) };
-        }
+        // A class whose objects are records: made natively
+        if (try isInstanceOf(o, @ptrCast(@alignCast(py.types.typeObject("PyType_Type"))))) if (try c.recordType(o)) |rtype| {
+            if (!rtype.slots) {
+                // (a dataclass: its fields, in order)
+                if (args.len != rtype.fields.len) return c.unsupportedAt(inst.func, pos, "{s}() takes {d} fields, given {d} (keywords and defaults aren't compiled yet)", .{ rtype.name, rtype.fields.len, args.len });
+                const arr = try self.valueArray(args, inst.node);
+                try self.callCheck("zr_record", &.{ self.ctx, self.k32(inst.node), self.ptrConst(rtype), arr, self.out });
+                return .{ .dyn = try self.loadOut(.record) };
+            }
+            // (a class with __slots__: its fields unset, then its __init__
+            // on it, compiled)
+            try self.callCheck("zr_record_new", &.{ self.ctx, self.k32(inst.node), self.ptrConst(rtype), self.out });
+            const rec = try self.loadOut(.record);
+            const init = ph.attr(o, "__init__") orelse return error.Python;
+            defer py.Py_DecRef(init);
+            if (try isInstanceOf(init, pt.function)) {
+                try self.increfDyn(rec);
+                const all = try self.a().alloc(SVal, args.len + 1);
+                all[0] = .{ .dyn = rec };
+                @memcpy(all[1..], args);
+                _ = try c.objectIndex(init);
+                try self.drop(try self.runFunction(try self.helperFunction(init), inst.node, all));
+            } else if (args.len != 0) {
+                for (args) |x| try self.drop(x);
+                try self.drop(.{ .dyn = rec });
+                try self.failAt(inst.node, try std.fmt.allocPrint(self.a(), "{s}() takes no arguments", .{rtype.name}));
+                return .none;
+            }
+            return .{ .dyn = rec };
+        };
         if (try self.builtinCall(inst, o, args, pos)) |v| return v;
         // Anything else: called as Python does (its arguments as Python
         // objects)
@@ -3239,9 +3429,9 @@ const Gen = struct {
         }
         if (isBuiltin(o, "len")) {
             if (args.len == 1) switch (args[0]) {
-                .list => |l| return SVal{ .int = @intCast(l.items.items.len) },
-                .tuple => |t| return SVal{ .int = @intCast(t.len) },
-                .dict => |d| return SVal{ .int = @intCast(d.keys.items.len) },
+                .list => |l| return SVal{ .pint = @intCast(l.items.items.len) },
+                .tuple => |t| return SVal{ .pint = @intCast(t.len) },
+                .dict => |d| return SVal{ .pint = @intCast(d.keys.items.len) },
                 else => {},
             };
             return try self.callPython(inst, o, args);
@@ -3272,7 +3462,7 @@ const Gen = struct {
                     if (is_zip) {
                         for (seqs[0..args.len], 0..) |s, j| items[j] = try self.copyOf(s[i]);
                     } else {
-                        items[0] = .{ .int = @intCast(i) };
+                        items[0] = .{ .pint = @intCast(i) };
                         items[1] = try self.copyOf(seqs[0][i]);
                     }
                     try out.items.append(self.a(), .{ .tuple = items });
@@ -3284,22 +3474,23 @@ const Gen = struct {
         }
         if (isBuiltin(o, "range")) {
             if (allScalar(args) and args.len >= 1 and args.len <= 3) {
-                var lo: i64 = 0;
-                var hi: i64 = 0;
-                var step: i64 = 1;
-                for (args) |x| if (x != .int) return null;
-                if (args.len == 1) hi = args[0].int else {
-                    lo = args[0].int;
-                    hi = args[1].int;
-                    if (args.len == 3) step = args[2].int;
+                var lo: i128 = 0;
+                var hi: i128 = 0;
+                var step: i128 = 1;
+                for (args) |x| if (x == .bool or intOf(x) == null) return null;
+                if (args.len == 1) hi = intOf(args[0]).? else {
+                    lo = intOf(args[0]).?;
+                    hi = intOf(args[1]).?;
+                    if (args.len == 3) step = intOf(args[2]).?;
                 }
                 if (step == 0) return null;
-                const count: i64 = if (step > 0) @max(0, @divFloor(hi - lo + step - 1, step)) else @max(0, @divFloor(lo - hi - step - 1, -step));
+                const count: i128 = if (step > 0) @max(0, @divFloor(hi - lo + step - 1, step)) else @max(0, @divFloor(lo - hi - step - 1, -step));
                 if (count <= 4096) {
                     const out = try self.a().create(SList);
                     out.* = .{};
-                    var i: i64 = 0;
-                    while (i < count) : (i += 1) try out.items.append(self.a(), .{ .int = lo + i * step });
+                    var i: i128 = 0;
+                    // (plain ints, as range gives them)
+                    while (i < count) : (i += 1) try out.items.append(self.a(), .{ .pint = @intCast(lo + i * step) });
                     return SVal{ .list = out };
                 }
             }
@@ -3330,18 +3521,28 @@ const Gen = struct {
 
     fn isOne(self: *Gen, inst: *Inst, v: SVal, o: *PyObject, pos: front.Pos) Error!SVal {
         const c = self.c;
-        // A dataclass: a record of its type
-        if (py.c.PyObject_HasAttrString(o, "__dataclass_fields__") == 1) {
+        if (!try isInstanceOf(o, @ptrCast(@alignCast(py.types.typeObject("PyType_Type")))))
+            return c.unsupportedAt(inst.func, pos, "isinstance()'s second argument must be a class or a tuple of them", .{});
+        // A Python object known when compiling: its class doesn't change
+        if (v == .py) return .{ .bool = try isInstanceOf(v.py, o) };
+        // A class whose objects are records: a record of it (or of a
+        // subclass), or a Python object of it
+        if (try c.recordType(o)) |rtype| {
             if (v.isStatic()) return .{ .bool = false };
-            const rtype = try c.recordType(o);
             const r = self.call("zr_is_record", &.{ v.dyn.tag, v.dyn.bits, self.ptrConst(rtype) });
+            try self.drop(v);
+            return self.boolDyn(r);
+        }
+        if (o == objects_mod.FunctionType) {
+            if (v.isStatic()) return .{ .bool = false };
+            const r = self.call("zr_is_type", &.{ v.dyn.tag, v.dyn.bits, self.k32(8) });
             try self.drop(v);
             return self.boolDyn(r);
         }
         const codes = [_]struct { [*:0]const u8, u32 }{ .{ "int", 0 }, .{ "float", 1 }, .{ "str", 2 }, .{ "bool", 3 }, .{ "list", 4 }, .{ "tuple", 5 }, .{ "dict", 6 } };
         for (codes) |entry| if (isBuiltin(o, entry[0])) {
             if (v.isStatic()) return .{ .bool = switch (entry[1]) {
-                0 => v == .int or v == .bool,
+                0 => v == .int or v == .pint or v == .bool,
                 1 => v == .float,
                 2 => v == .str,
                 3 => v == .bool,
@@ -3354,7 +3555,12 @@ const Gen = struct {
             try self.drop(v);
             return self.boolDyn(r);
         };
-        return c.unsupportedAt(inst.func, pos, "isinstance() with this type isn't compiled yet", .{});
+        // Any other class: as Python answers it, the value as Python sees it
+        const d = try self.materialize(v, inst.node);
+        const idx = try c.objectIndex(o);
+        try self.callCheck("zr_isinstance", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, self.k(@intCast(idx)), self.out });
+        try self.drop(.{ .dyn = d });
+        return .{ .dyn = try self.loadOut(.bool) };
     }
 
     fn orValues(self: *Gen, inst: *Inst, a_: SVal, b: SVal) Error!SVal {
@@ -3545,7 +3751,9 @@ const Gen = struct {
 
     fn isScalar(v: SVal) bool {
         return switch (v) {
-            .none, .bool, .int, .float, .str => true,
+            .none, .bool, .int, .pint, .float, .str => true,
+            // (a big int)
+            .py => |o| ph.typeOf(o) == @as(*py.c.PyTypeObject, @ptrCast(py.types.typeObject("PyLong_Type"))),
             .tuple => |t| for (t) |x| {
                 if (!isScalar(x)) break false;
             } else true,
@@ -3565,7 +3773,14 @@ const Gen = struct {
                 py.Py_IncRef(o);
                 break :blk o;
             },
-            .int => |n| py.c.PyLong_FromLongLong(n) orelse error.Python,
+            // (an int of the program as the reference mode has it: an I64,
+            // whose arithmetic is checked)
+            .int => |n| types_mod.fromInt(n) orelse error.Python,
+            .pint => |n| py.c.PyLong_FromLongLong(n) orelse error.Python,
+            .py => |o| blk: {
+                py.Py_IncRef(o);
+                break :blk o;
+            },
             .float => |x| py.c.PyFloat_FromDouble(x) orelse error.Python,
             .str => |s| ph.newString(s) orelse error.Python,
             .tuple => |t| blk: {

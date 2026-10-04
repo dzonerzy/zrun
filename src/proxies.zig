@@ -983,7 +983,13 @@ fn recordGetattro(o: ?*PyObject, name: ?*PyObject) callconv(.c) ?*PyObject {
     const p = asProxy(o);
     const r = record(p);
     const n = ph.utf8(name.?, "attribute") orelse return null;
-    if (fieldIndex(r, n)) |i| return out(p, r.fields()[i]);
+    if (fieldIndex(r, n)) |i| {
+        if (r.fields()[i].tag == value.UNSET_TAG) {
+            ph.raise(py.PyExc_AttributeError(), "'{s}' object has no attribute '{s}'", .{ r.rtype.name, n });
+            return null;
+        }
+        return out(p, r.fields()[i]);
+    }
     if (std.mem.eql(u8, n, "__class__")) return ref(recordClass(r) orelse return py.c.PyObject_GenericGetAttr(o, name));
     // The class's: methods bound to the proxy, as an instance's would be
     const cls = recordClass(r) orelse return py.c.PyObject_GenericGetAttr(o, name);
@@ -1007,8 +1013,24 @@ fn recordSetattro(o: ?*PyObject, name: ?*PyObject, v: ?*PyObject) callconv(.c) c
         ph.raise(py.PyExc_AttributeError(), "'{s}' object has no attribute '{s}'", .{ r.rtype.name, n });
         return -1;
     };
+    if (r.rtype.frozen) {
+        // (dataclasses.FrozenInstanceError, as the dataclass raises it)
+        const dataclasses = py.c.PyImport_ImportModule("dataclasses") orelse return -1;
+        defer py.Py_DecRef(dataclasses);
+        const exc = py.c.PyObject_GetAttrString(dataclasses, "FrozenInstanceError") orelse return -1;
+        defer py.Py_DecRef(exc);
+        ph.raise(exc, "cannot assign to field '{s}'", .{n});
+        return -1;
+    }
     const x = v orelse {
-        ph.raise(py.PyExc_AttributeError(), "can't delete the field '{s}' of a compiled '{s}'", .{ n, r.rtype.name });
+        // (del obj.field: unset again, as a slot's)
+        if (r.rtype.slots and r.fields()[i].tag != value.UNSET_TAG) {
+            const old = r.fields()[i];
+            r.fields()[i] = value.unset;
+            value.decref(old);
+            return 0;
+        }
+        ph.raise(py.PyExc_AttributeError(), "'{s}' object has no attribute '{s}'", .{ r.rtype.name, n });
         return -1;
     };
     const nv = in(x) orelse return -1;
@@ -1049,9 +1071,26 @@ fn recordRepr(o: ?*PyObject) callconv(.c) ?*PyObject {
         defer py.Py_DecRef(m);
         return py.c.PyObject_CallFunctionObjArgs(m, o.?, @as(?*PyObject, null));
     }
+    // (object's: the class's module and qualified name)
+    if (recordClass(r)) |cls| {
+        const module = py.c.PyObject_GetAttrString(cls, "__module__") orelse return null;
+        defer py.Py_DecRef(module);
+        const qual = py.c.PyObject_GetAttrString(cls, "__qualname__") orelse return null;
+        defer py.Py_DecRef(qual);
+        return py.c.PyUnicode_FromFormat("<%S.%S object at %p>", module, qual, o.?);
+    }
     var buf: [256]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, "<{s} object at 0x{x}>", .{ r.rtype.name, @intFromPtr(o.?) }) catch "<object>";
     return ph.newString(text);
+}
+
+fn recordStr(o: ?*PyObject) callconv(.c) ?*PyObject {
+    const r = record(asProxy(o));
+    if (classMethod(r, "__str__")) |m| {
+        defer py.Py_DecRef(m);
+        return py.c.PyObject_CallFunctionObjArgs(m, o.?, @as(?*PyObject, null));
+    }
+    return recordRepr(o);
 }
 
 fn recordCompare(o: ?*PyObject, other: ?*PyObject, op: c_int) callconv(.c) ?*PyObject {
@@ -1086,6 +1125,7 @@ var record_slots = [_]py.c.PyType_Slot{
     .{ .slot = py.c.Py_tp_getattro, .pfunc = @ptrCast(@constCast(&recordGetattro)) },
     .{ .slot = py.c.Py_tp_setattro, .pfunc = @ptrCast(@constCast(&recordSetattro)) },
     .{ .slot = py.c.Py_tp_repr, .pfunc = @ptrCast(@constCast(&recordRepr)) },
+    .{ .slot = py.c.Py_tp_str, .pfunc = @ptrCast(@constCast(&recordStr)) },
     .{ .slot = py.c.Py_tp_richcompare, .pfunc = @ptrCast(@constCast(&recordCompare)) },
     .{ .slot = py.c.Py_tp_hash, .pfunc = @ptrCast(@constCast(&recordHash)) },
     .{ .slot = py.c.Py_tp_doc, .pfunc = @ptrCast(@constCast("An object of compiled code (a record of a class), shared with it: its fields, its class's methods; isinstance() with its class is true.")) },

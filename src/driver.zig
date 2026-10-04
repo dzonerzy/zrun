@@ -64,7 +64,6 @@ pub const Compiled = struct {
         for (self.modules.items) |*m| m.release();
         self.modules.deinit(allocator);
         self.thunks.deinit(allocator);
-        for (self.compiler.record_list.items) |t| freeRecordType(t);
         for (self.compiler.objects.items) |o| py.Py_DecRef(o);
         self.compiler.m.deinit();
         self.compiler.deinit(allocator);
@@ -122,20 +121,33 @@ pub const Compiled = struct {
             const addr = llvm.lookup(self.view, name);
             if (addr != 0) return addr;
         }
-        c.newModule() catch {
-            _ = py.c.PyErr_NoMemory();
-            return null;
-        };
-        _ = c.functionCode(fnode) catch {
-            _ = py.c.PyErr_NoMemory();
-            return null;
-        };
-        while (c.queue.pop()) |f| c.genFunction(f) catch {
-            c.forgetModule();
-            ph.raise(types().CompileError, "{s}", .{self.failure.message.items});
-            return null;
-        };
-        return self.add(name);
+        attempt: while (true) {
+            c.failed_semantic = null;
+            c.need_retry = false;
+            c.newModule() catch return oomA();
+            _ = c.functionCode(fnode) catch return oomA();
+            while (c.queue.pop()) |f| c.genFunction(f) catch |e| {
+                c.forgetModule();
+                switch (e) {
+                    error.Unsupported => {
+                        // (as a thunk's: a literal made at run time, or a
+                        // semantic run as Python, and compiled again)
+                        if (c.need_retry) continue :attempt;
+                        if (c.failed_semantic) |s| {
+                            if (!self.python.contains(s)) {
+                                if (!markPython(self.python, s, self.failure.message.items)) return oomA();
+                                continue :attempt;
+                            }
+                        }
+                        ph.raise(types().CompileError, "{s}", .{self.failure.message.items});
+                        return null;
+                    },
+                    error.OutOfMemory => return oomA(),
+                    error.Python => return null,
+                }
+            };
+            return self.add(name);
+        }
     }
 
     /// The compiler's module into the JIT: the address of `name` in it.
@@ -212,7 +224,6 @@ fn build(out: *Compiled, data: *program_mod.Data, lang: compile_mod.LangView, pr
             const need_retry = out.compiler.need_retry;
             // (what this attempt kept)
             for (out.compiler.objects.items) |o| py.Py_DecRef(o);
-            for (out.compiler.record_list.items) |t| freeRecordType(t);
             out.compiler.m.deinit();
             out.compiler.deinit(allocator);
             switch (e) {
@@ -288,14 +299,12 @@ pub fn irText(data: *program_mod.Data, lang: compile_mod.LangView, python: *Pyth
     return ph.newString(text);
 }
 
-fn freeRecordType(t: *value.RecordType) void {
-    for (t.fields) |f| allocator.free(f);
-    allocator.free(t.fields);
-    allocator.free(t.name);
-    allocator.destroy(t);
+fn oom() ?*Compiled {
+    _ = py.c.PyErr_NoMemory();
+    return null;
 }
 
-fn oom() ?*Compiled {
+fn oomA() ?usize {
     _ = py.c.PyErr_NoMemory();
     return null;
 }

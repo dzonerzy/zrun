@@ -629,7 +629,7 @@ export fn zr_frame_release(f: *value.Frame) callconv(.c) void {
 }
 
 /// The tag of a variable without a value yet
-pub const UNSET: u64 = 0xFFFF_0000;
+pub const UNSET: u64 = value.UNSET_TAG;
 
 // ======================================================================
 // Containers and records
@@ -677,12 +677,40 @@ export fn zr_record(ctx: *Ctx, node: u32, rtype: *const value.RecordType, fields
     return true;
 }
 
-/// Is `v` a record of `rtype`?
+/// A new record of a class with __slots__, its fields unset (its __init__
+/// sets them).
+export fn zr_record_new(ctx: *Ctx, node: u32, rtype: *const value.RecordType, out: *Value) callconv(.c) bool {
+    const r = value.newRecord(rtype) orelse return oomFail(ctx, node);
+    out.* = Value.obj(.record, &r.head);
+    return true;
+}
+
+/// isinstance(v, <the class of rtype>): a record of it or of a subclass,
+/// or a Python object of the class (one Python made).
 export fn zr_is_record(t: u64, bits: u64, rtype: *const value.RecordType) callconv(.c) bool {
     const v = Value{ .tag = t, .bits = bits };
+    if (v.kind() == .host) {
+        const cls = rtype.py_class orelse return false;
+        const r = py.c.PyObject_IsInstance(@ptrFromInt(v.bits), cls);
+        if (r < 0) py.c.PyErr_Clear();
+        return r == 1;
+    }
     if (v.kind() != .record) return false;
     const r: *value.Record = @ptrCast(@alignCast(v.ptr()));
-    return r.rtype == rtype;
+    return r.rtype.isA(rtype);
+}
+
+/// isinstance(v, cls) for any class (objects[cls_index]), as Python does
+/// it (a compiled value given as Python sees it).
+export fn zr_isinstance(ctx: *Ctx, node: u32, t: u64, bits: u64, cls_index: u64, out: *Value) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    var objs: [1]*PyObject = undefined;
+    if (!objects(ctx, &.{v}, &objs)) return failPython(ctx, node);
+    defer py.Py_DecRef(objs[0]);
+    const r = py.c.PyObject_IsInstance(objs[0], ctx.objects[cls_index]);
+    if (r < 0) return failPython(ctx, node);
+    out.* = Value.boolean(r == 1);
+    return true;
 }
 
 /// v.name
@@ -693,6 +721,8 @@ export fn zr_getattr(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value
         for (r.rtype.fields, 0..) |f, i| {
             if (std.mem.eql(u8, f, name.bytes())) {
                 const x = r.fields()[i];
+                // (a slot never assigned: as Python says it)
+                if (x.tag == UNSET) return fail(ctx, node, "'{s}' object has no attribute '{s}'", .{ r.rtype.name, f });
                 value.incref(x);
                 out.* = x;
                 return true;
@@ -717,6 +747,7 @@ export fn zr_setattr(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value
         const r: *value.Record = @ptrCast(@alignCast(v.ptr()));
         for (r.rtype.fields, 0..) |f, i| {
             if (std.mem.eql(u8, f, name.bytes())) {
+                if (r.rtype.frozen) return fail(ctx, node, "cannot assign to field '{s}'", .{f});
                 value.incref(x);
                 value.decref(r.fields()[i]);
                 r.fields()[i] = x;
@@ -985,6 +1016,29 @@ export fn zr_call_python(ctx: *Ctx, node: u32, callee_index: u64, args: [*]const
     return fromResult(ctx, node, py.c.PyObject_CallObject(callee, tuple), out);
 }
 
+/// rt.call(f, args) with the arguments a sequence only known at run time
+/// (a list, a tuple, anything Python iterates), borrowed.
+export fn zr_call_seq(ctx: *Ctx, node: u32, ft: u64, fb: u64, st: u64, sb: u64, receiver: ?*const Value, out: *Value) callconv(.c) bool {
+    const s = Value{ .tag = st, .bits = sb };
+    switch (s.kind()) {
+        .list => {
+            const items = @as(*value.List, @ptrCast(@alignCast(s.ptr()))).slice();
+            return zr_call(ctx, node, ft, fb, items.ptr, items.len, receiver, out);
+        },
+        .tuple => {
+            const items = @as(*value.Tuple, @ptrCast(@alignCast(s.ptr()))).slice();
+            return zr_call(ctx, node, ft, fb, items.ptr, items.len, receiver, out);
+        },
+        else => {
+            var l: Value = undefined;
+            if (!zr_items(ctx, node, st, sb, &l)) return false;
+            defer value.decref(l);
+            const items = @as(*value.List, @ptrCast(@alignCast(l.ptr()))).slice();
+            return zr_call(ctx, node, ft, fb, items.ptr, items.len, receiver, out);
+        },
+    }
+}
+
 /// A module-level name some function assigns (`global`), read when the
 /// code runs from the module's dict (objects[globals_index]), then the
 /// builtins; Python's NameError if neither has it.
@@ -1022,6 +1076,7 @@ export fn zr_is_type(t: u64, bits: u64, code: u32) callconv(.c) bool {
             4 => py.PyList_Check(o),
             5 => py.PyTuple_Check(o),
             6 => py.PyDict_Check(o),
+            8 => @import("objects.zig").asFunction(o) != null,
             else => false,
         };
     }
@@ -1034,6 +1089,7 @@ export fn zr_is_type(t: u64, bits: u64, code: u32) callconv(.c) bool {
         5 => v.kind() == .tuple,
         6 => v.kind() == .dict,
         7 => v.kind() == .none,
+        8 => v.kind() == .function,
         else => false,
     };
 }
@@ -1078,14 +1134,14 @@ export fn zr_concat(ctx: *Ctx, node: u32, items: [*]const Value, n: u64, out: *V
 
 /// The helpers compiled code calls, by name
 const helper_names = [_][]const u8{
-    "zr_incref",   "zr_decref",  "zr_fail",      "zr_unset",         "zr_overflow",
-    "zr_binary",   "zr_compare", "zr_unary",     "zr_truthy",        "zr_function",
-    "zr_call",     "zr_object",  "zr_frame_new", "zr_frame_release", "zr_free",
-    "zr_list",     "zr_tuple",   "zr_dict",      "zr_record",        "zr_is_record",
-    "zr_getattr",  "zr_setattr", "zr_getitem",   "zr_setitem",       "zr_items",
-    "zr_list_len", "zr_list_at", "zr_append",    "zr_call_method",   "zr_call_python",
-    "zr_is_type",  "zr_global",  "zr_format",    "zr_concat",        "zr_unpack",
-    "zr_varargs",
+    "zr_incref",   "zr_decref",     "zr_fail",       "zr_unset",         "zr_overflow",
+    "zr_binary",   "zr_compare",    "zr_unary",      "zr_truthy",        "zr_function",
+    "zr_call",     "zr_object",     "zr_frame_new",  "zr_frame_release", "zr_free",
+    "zr_list",     "zr_tuple",      "zr_dict",       "zr_record",        "zr_is_record",
+    "zr_getattr",  "zr_setattr",    "zr_getitem",    "zr_setitem",       "zr_items",
+    "zr_list_len", "zr_list_at",    "zr_append",     "zr_call_method",   "zr_call_python",
+    "zr_is_type",  "zr_global",     "zr_format",     "zr_concat",        "zr_unpack",
+    "zr_varargs",  "zr_record_new", "zr_isinstance", "zr_call_seq",
 };
 
 /// The names compiled code calls them by, and their addresses

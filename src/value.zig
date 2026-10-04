@@ -99,6 +99,11 @@ pub const Obj = extern struct {
     flags: u32 = 0,
 };
 
+/// The tag of a slot not assigned yet (a variable, a record's field): not
+/// a value (referenced counts leave it alone)
+pub const UNSET_TAG: u64 = 0xFFFF_0000;
+pub const unset = Value{ .tag = UNSET_TAG, .bits = 0 };
+
 /// A list, dict or record Python has seen: it has a proxy (proxies.zig),
 /// which may outlive compiled code's references
 pub const HAS_PROXY: u32 = 1 << 31;
@@ -164,6 +169,22 @@ pub const RecordType = struct {
     /// Records equal when their fields are (a dataclass's eq; then not
     /// hashable): else, as plain objects, by identity
     value_eq: bool = true,
+    /// The class's base, a record class too (a record of this type is an
+    /// instance of it)
+    base: ?*const RecordType = null,
+    /// A class with __slots__: its fields start unset (reading one before
+    /// it's assigned is an AttributeError), its __init__ sets them
+    slots: bool = false,
+    /// A frozen dataclass: its fields can't be assigned
+    frozen: bool = false,
+
+    /// A record of this type is an instance of `t` (it, or a base).
+    /// (one RecordType per class: compile.recordOf)
+    pub fn isA(self: *const RecordType, t: *const RecordType) bool {
+        var r: ?*const RecordType = self;
+        while (r) |x| : (r = x.base) if (x == t) return true;
+        return false;
+    }
 };
 
 pub const Record = extern struct {
@@ -349,7 +370,7 @@ pub fn newRecord(rtype: *const RecordType) ?*Record {
     const mem = allocator.alignedAlloc(u8, .of(Record), @sizeOf(Record) + n * @sizeOf(Value)) catch return null;
     const r: *Record = @ptrCast(mem.ptr);
     r.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.record) }, .rtype = rtype };
-    @memset(r.fields(), Value.none_v);
+    @memset(r.fields(), if (rtype.slots) unset else Value.none_v);
     return r;
 }
 
@@ -836,7 +857,8 @@ fn convert(o: *PyObject, unique: bool) ?Value {
     // a host value, itself)
     if (o == py.Py_True() or o == py.Py_False()) return Value.boolean(o == py.Py_True());
     const ty = ph.typeOf(o);
-    if (ty == exact.int) {
+    // (zrun.I64 too: the ints rt gives Python)
+    if (ty == exact.int or @as(*PyObject, @ptrCast(ty)) == types.I64) {
         var overflow: c_int = 0;
         const n = py.c.PyLong_AsLongLongAndOverflow(o, &overflow);
         if (overflow != 0) {

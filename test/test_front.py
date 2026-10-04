@@ -44,7 +44,6 @@ class TestSubset:
             ("    return (x for x in node.children)\n", "a generator expression can't be compiled"),
             ("    return {1, 2}\n", "a set can't be compiled"),
             ("    return rt.call(*node.children)\n", "*unpacking can't be compiled"),
-            ("    return 2 ** 70 + 99999999999999999999\n", "the integer is outside the 64-bit range"),
             ("    return node @ rt\n", "the operator MatMult can't be compiled"),
             ("    yield 1\n", "`yield` can't be compiled"),
         ],
@@ -126,6 +125,13 @@ class TestReading:
             "        x#2 add= 1\n"
             "    return (tuple [c#4 for c#4 in node#0.children if c#4], x#2)\n"
         )
+
+    def test_big_ints(self):
+        def f(node, rt):
+            return 2**70 + 99999999999999999999
+
+        # (Python's ints: beyond 64 bits too)
+        assert self.ir(f).splitlines()[1] == "    return (add (pow 2 70) 99999999999999999999)"
 
     def test_a_comprehension_variable_doesnt_leak(self):
         def f(node, rt):

@@ -36,6 +36,9 @@ pub const Expr = struct {
 
     pub const Kind = union(enum) {
         int: i64,
+        /// An int literal beyond 64 bits (a reference kept for as long as
+        /// the language: functions read are)
+        big: *PyObject,
         float: f64,
         str: []const u8,
         bool: bool,
@@ -571,7 +574,11 @@ const Reader = struct {
         if (py.PyLong_Check(v)) {
             var overflow: c_int = 0;
             const n = py.c.PyLong_AsLongLongAndOverflow(v, &overflow);
-            if (overflow != 0) return self.unsupported(pos, "the integer is outside the 64-bit range", .{});
+            if (overflow != 0) {
+                // (the AST's: kept, as the function read is)
+                py.Py_IncRef(v);
+                return self.new(pos, .{ .big = v });
+            }
             return self.new(pos, .{ .int = n });
         }
         if (py.PyFloat_Check(v)) return self.new(pos, .{ .float = py.c.PyFloat_AsDouble(v) });
@@ -835,6 +842,18 @@ const Dumper = struct {
     fn expr(self: *Dumper, e: *const Expr) Allocator.Error!void {
         switch (e.kind) {
             .int => |v| try self.print("{d}", .{v}),
+            .big => |v| {
+                const s = py.c.PyObject_Str(v) orelse {
+                    py.c.PyErr_Clear();
+                    return self.print("<int>", .{});
+                };
+                defer py.Py_DecRef(s);
+                const text = ph.utf8(s, "int") orelse {
+                    py.c.PyErr_Clear();
+                    return self.print("<int>", .{});
+                };
+                try self.print("{s}", .{text});
+            },
             .float => |v| try self.print("{d}", .{v}),
             .str => |v| try self.print("\"{s}\"", .{v}),
             .bool => |v| try self.print("{s}", .{if (v) "True" else "False"}),
