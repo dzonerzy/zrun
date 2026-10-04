@@ -1276,6 +1276,9 @@ const Gen = struct {
 
     /// Code that runs many times (a function's, a loop's): reference
     /// counts inline; else calls (less code for LLVM to compile).
+    /// Code that runs many times (a function's, a loop's): reference
+    /// counts inline. (Elsewhere, calls: each inline one is blocks for
+    /// LLVM to compile.)
     fn hot(self: *const Gen) bool {
         return self.fnode != NONE or self.loop_level > 0;
     }

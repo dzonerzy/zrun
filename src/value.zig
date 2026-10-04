@@ -305,22 +305,28 @@ pub const KIND_FRAME: u32 = 100;
 // Reference counting
 // ----------------------------------------------------------------------
 
+/// A tag of a counted object: str..function (4-9), a Big (13). (By tags,
+/// not kind(): reference counts are most of what code does with values)
+inline fn counted(tag: u64) bool {
+    return tag -% 4 < 6 or tag == @intFromEnum(Tag.big);
+}
+
 pub fn incref(v: Value) void {
-    if (v.isHeap()) {
+    if (counted(v.tag)) {
         const o = v.ptr();
         if (o.rc < IMMORTAL) o.rc += 1;
-    } else if (v.kind() == .host) {
+    } else if (v.tag == @intFromEnum(Tag.host)) {
         py.Py_IncRef(@ptrFromInt(v.bits));
     }
 }
 
 pub fn decref(v: Value) void {
-    if (v.isHeap()) {
+    if (counted(v.tag)) {
         const o = v.ptr();
         if (o.rc >= IMMORTAL) return;
         o.rc -= 1;
-        if (o.rc == 0) free(v.kind(), o);
-    } else if (v.kind() == .host) {
+        if (o.rc == 0) free(@enumFromInt(v.tag), o);
+    } else if (v.tag == @intFromEnum(Tag.host)) {
         py.Py_DecRef(@ptrFromInt(v.bits));
     }
 }
