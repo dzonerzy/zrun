@@ -58,6 +58,7 @@ pub const Api = struct {
     DisposeMessage: *const fn ([*c]u8) callconv(.c) void,
     Int1TypeInContext: *const fn (Context) callconv(.c) Type,
     Int8TypeInContext: *const fn (Context) callconv(.c) Type,
+    IntTypeInContext: *const fn (Context, c_uint) callconv(.c) Type,
     Int32TypeInContext: *const fn (Context) callconv(.c) Type,
     Int64TypeInContext: *const fn (Context) callconv(.c) Type,
     DoubleTypeInContext: *const fn (Context) callconv(.c) Type,

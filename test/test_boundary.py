@@ -44,6 +44,7 @@ BUILTINS = (
     "untables",
     "defaults",
     "fields",
+    "matches",
 )
 
 
@@ -112,6 +113,13 @@ def returns_in_try(log):
 
 
 FROZEN_TABLE = {"a": 1, "b": 2}
+OPS = {"+": 1, "..": 2, "//": 3, "": 4, "abcdefgh": 5}
+
+
+class MyStr(str):
+    pass
+
+
 LIVE_TABLE = {"a": 1}
 
 COUNTER = 0
@@ -286,6 +294,18 @@ def make_lang():
             before = LIVE_TABLE["a"]
             rt.call(rt.load(node.name), [])
             return ("a" in FROZEN_TABLE, FROZEN_TABLE.get("b"), [k for k in FROZEN_TABLE], before, LIVE_TABLE["a"], "z" in LIVE_TABLE)
+        if name == "matches":
+            # run-time values against constant strs (`==`, `in` a constant
+            # table or tuple): strs of every length, anything else
+            out = []
+            for w in rt.call(rt.load(node.name), []):
+                r = (w == "+", w != "..", "//" == w, w == "", w == "abcdefgh", w in ("abcdefghi", "é", "abcdefg"), w not in ["", "x"])
+                try:
+                    r = r + (w in OPS, w not in OPS)
+                except TypeError as e:
+                    r = r + (str(e),)
+                out.append(r)
+            return out
         if name == "defaults":
             # helpers' defaults and keyword arguments
             n = rt.call(rt.load(node.name), [])
@@ -480,6 +500,10 @@ def make_lang():
         return 3
 
     @lang.host
+    def matches():
+        return ["+", "..", "//", "", "abcdefgh", "abcdefghi", "abcdefg", "abcdefgx", "é", "/", "++", 1, None, True, 2.0, [1], MyStr("+")]
+
+    @lang.host
     def fields():
         return 5
 
@@ -560,6 +584,7 @@ PROGRAMS = {
     "tables": "print(untables(), tables());\n",
     "defaults": "print(defaults());\n",
     "fields": "print(fields());\n",
+    "matches": "print(matches());\n",
 }
 
 

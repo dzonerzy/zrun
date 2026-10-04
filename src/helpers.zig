@@ -609,9 +609,14 @@ export fn zr_compare(ctx: *Ctx, node: u32, cmp_code: u32, ta: u64, ba: u64, tb: 
                 return true;
             }
         },
-        .in, .not_in => if (contains(a, b)) |r| {
-            out.* = Value.boolean(if (cmp == .in) r else !r);
-            return true;
+        .in, .not_in => {
+            if (contains(a, b)) |r| {
+                out.* = Value.boolean(if (cmp == .in) r else !r);
+                return true;
+            }
+            // (a list, a dict... looked up in a dict: Python's error)
+            if (b.kind() == .dict and a.kind() != .host and !value.hashable(a))
+                return failAs(ctx, node, py.PyExc_TypeError(), null, "unhashable type: '{s}'", .{value.typeName(a)});
         },
     }
     // Through Python

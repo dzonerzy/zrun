@@ -150,6 +150,15 @@ pub const Module = struct {
         return L("LLVMConstInt")(self.t.i32, n, 0);
     }
 
+    /// An int type of any width (an i24 for 3 bytes...).
+    pub fn intType(self: *Module, bits: u32) Type {
+        return L("LLVMIntTypeInContext")(self.ctx, bits);
+    }
+
+    pub fn kInt(ty: Type, n: u64) Value {
+        return L("LLVMConstInt")(ty, n, 0);
+    }
+
     pub fn k1(self: *Module, b: bool) Value {
         return L("LLVMConstInt")(self.t.i1, @intFromBool(b), 0);
     }

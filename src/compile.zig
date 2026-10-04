@@ -4981,6 +4981,14 @@ const Gen = struct {
             try self.drop(other);
             return self.boolDyn(t);
         }
+        // A run-time str against constant strs (`op == "+"`, `op in OPS`):
+        // its bytes compared inline (no container made, no hashing)
+        if (op == .eq or op == .ne or op == .in or op == .not_in) {
+            const swap = (op == .eq or op == .ne) and l.isStatic() and r == .dyn;
+            const d_side = if (swap) r else l;
+            const k_side = if (swap) l else r;
+            if (d_side == .dyn) if (try self.staticStrs(op, k_side)) |keys| return self.strMatch(inst, op, l, r, d_side.dyn, keys);
+        }
         const f = &self.f;
         const ld = try self.materialize(l, inst.node);
         const rd = try self.materialize(r, inst.node);
@@ -5012,6 +5020,84 @@ const Gen = struct {
             return dyn(self.k(1), f.phi(self.c.m.t.i64, res, fast_end, g.bits, slow_end), .bool);
         }
         return .{ .dyn = try self.compareHelper(inst, op, ld, rd) };
+    }
+
+    /// The constant strs a comparison is against: `== "s"`, `in` a constant
+    /// tuple, list or dict of strs (its keys). (null: not only strs.)
+    fn staticStrs(self: *Gen, op: front.CmpOp, v: SVal) Error!?[]const []const u8 {
+        const items: []const SVal = switch (op) {
+            .eq, .ne => if (v == .str) &.{v} else return null,
+            else => switch (v) {
+                .tuple => |t| t,
+                .list => |l| l.items.items,
+                .dict => |d| d.keys.items,
+                else => return null,
+            },
+        };
+        const keys = try self.a().alloc([]const u8, items.len);
+        for (items, keys) |item, *key| {
+            if (item != .str) return null;
+            key.* = item.str;
+        }
+        return keys;
+    }
+
+    /// `d == s` / `d in (s1, s2...)` for constant strs: d a Str, its length
+    /// then its bytes (8 at a time) checked inline; anything else to
+    /// zr_compare (Python's rules: an unhashable key in a dict raises...).
+    fn strMatch(self: *Gen, inst: *Inst, op: front.CmpOp, l: SVal, r: SVal, d: Dyn, keys: []const []const u8) Error!SVal {
+        const f = &self.f;
+        const m = &self.c.m;
+        const t = m.t;
+        const is_str = try f.label("str_cmp");
+        const slow = try f.label("generic_cmp");
+        const hit = try f.label("str_hit");
+        const miss = try f.label("str_miss");
+        const done = try f.label("str_done");
+        const join = try f.label("cmp_joined");
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.str))), is_str, slow);
+        try f.block(is_str);
+        const p = f.intToPtr(d.bits);
+        const len = f.load(t.i64, f.offset(p, @offsetOf(value.Str, "len")));
+        for (keys) |key| {
+            const bytes = try f.label("str_bytes");
+            const next = try f.label("str_next");
+            try f.condBr(f.icmp(jit_c.LLVMIntEQ, len, self.k(@intCast(key.len))), bytes, next);
+            try f.block(bytes);
+            var same = m.k1(true);
+            var at: usize = 0;
+            while (at < key.len) {
+                // (usize: @min would make it a u4, n * 8 wrapping)
+                const n: usize = @min(8, key.len - at);
+                const ty = m.intType(@intCast(n * 8));
+                var word: u64 = 0;
+                for (key[at .. at + n], 0..) |b, i| word |= @as(u64, b) << @intCast(i * 8);
+                const got = f.load(ty, f.offset(p, @intCast(@sizeOf(value.Str) + at)));
+                same = f.and_(same, f.icmp(jit_c.LLVMIntEQ, got, ir.Module.kInt(ty, word)));
+                at += n;
+            }
+            try f.condBr(same, hit, next);
+            try f.block(next);
+        }
+        try f.br(miss);
+        const yes: i64 = if (op == .eq or op == .in) 1 else 0;
+        try f.block(hit);
+        try f.br(done);
+        try f.block(miss);
+        try f.br(done);
+        try f.block(done);
+        const res = f.phi(t.i64, self.k(yes), hit, self.k(1 - yes), miss);
+        try self.drop(.{ .dyn = d });
+        const fast_end = f.current;
+        try f.br(join);
+        try f.block(slow);
+        const ld = try self.materialize(l, inst.node);
+        const rd = try self.materialize(r, inst.node);
+        const g = try self.compareHelper(inst, op, ld, rd);
+        const slow_end = f.current;
+        try f.br(join);
+        try f.block(join);
+        return dyn(self.k(1), f.phi(t.i64, res, fast_end, g.bits, slow_end), .bool);
     }
 
     fn compareHelper(self: *Gen, inst: *Inst, op: front.CmpOp, ld: Dyn, rd: Dyn) Error!Dyn {
