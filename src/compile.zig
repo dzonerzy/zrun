@@ -161,6 +161,144 @@ pub const SVal = union(enum) {
 };
 
 // ======================================================================
+// Python objects known when compiling
+// ======================================================================
+
+/// Python's types compiled code tells objects apart by (the types
+/// module's), fetched once
+const PyTypes = struct {
+    function: *PyObject,
+    method: *PyObject,
+    stable: *PyObject,
+};
+
+var py_types: ?PyTypes = null;
+
+fn pyTypes() error{Python}!PyTypes {
+    if (py_types) |t| return t;
+    const src =
+        \\import types as _t
+        \\function = _t.FunctionType
+        \\method = _t.MethodType
+        \\stable = (type, _t.ModuleType, _t.FunctionType, _t.BuiltinFunctionType, _t.MethodType,
+        \\    _t.MethodDescriptorType, _t.WrapperDescriptorType, _t.ClassMethodDescriptorType,
+        \\    _t.MethodWrapperType, staticmethod, classmethod, property, frozenset, bytes, range,
+        \\    complex, type(None), type(Ellipsis), type(NotImplemented))
+    ;
+    const ns = runPython(src) orelse return error.Python;
+    defer py.Py_DecRef(ns);
+    var t: PyTypes = undefined;
+    inline for (@typeInfo(PyTypes).@"struct".fields) |fd| {
+        const o = py.c.PyDict_GetItemString(ns, fd.name) orelse return error.Python;
+        // (kept for the process: types live as long)
+        py.Py_IncRef(o);
+        @field(t, fd.name) = o;
+    }
+    py_types = t;
+    return t;
+}
+
+/// Python source run in a fresh namespace: the namespace (a new reference),
+/// or null with the exception.
+fn runPython(src: [:0]const u8) ?*PyObject {
+    const ns = py.c.PyDict_New() orelse return null;
+    const builtins = py.c.PyEval_GetBuiltins() orelse return null;
+    if (py.c.PyDict_SetItemString(ns, "__builtins__", builtins) != 0) {
+        py.Py_DecRef(ns);
+        return null;
+    }
+    const code = py.c.Py_CompileString(src, "<zrun>", py.c.Py_file_input) orelse {
+        py.Py_DecRef(ns);
+        return null;
+    };
+    defer py.Py_DecRef(code);
+    const r = py.c.PyEval_EvalCode(code, ns, ns) orelse {
+        py.Py_DecRef(ns);
+        return null;
+    };
+    py.Py_DecRef(r);
+    return ns;
+}
+
+/// A Python object whose attributes and truth are decided when compiling:
+/// a module, a class, a function, a builtin, an immutable object (what
+/// semantics refer to by name). Anything else (an instance, a list, a
+/// dict...) may change after: read at run time.
+fn stablePy(o: *PyObject) error{Python}!bool {
+    const r = py.c.PyObject_IsInstance(o, (try pyTypes()).stable);
+    if (r < 0) return error.Python;
+    return r == 1;
+}
+
+fn isInstanceOf(o: *PyObject, t: *PyObject) error{Python}!bool {
+    const r = py.c.PyObject_IsInstance(o, t);
+    if (r < 0) return error.Python;
+    return r == 1;
+}
+
+/// The module-level names of a module some function of it assigns
+/// (`global x`): read when the code runs, not when compiling. Learned
+/// once per module (again if names were added since).
+fn reboundGlobals(globals: *PyObject) error{Python}!*PyObject {
+    const n = py.c.PyDict_Size(globals);
+    if (rebound_cache.get(globals)) |e| if (e.len == n) return e.names;
+    if (rebound_scanner == null) {
+        const src =
+            \\import dis, types
+            \\def scan(g):
+            \\    out = set()
+            \\    seen = set()
+            \\    def code(c):
+            \\        if id(c) in seen:
+            \\            return
+            \\        seen.add(id(c))
+            \\        for ins in dis.get_instructions(c):
+            \\            if ins.opname in ("STORE_GLOBAL", "DELETE_GLOBAL"):
+            \\                out.add(ins.argval)
+            \\        for k in c.co_consts:
+            \\            if isinstance(k, types.CodeType):
+            \\                code(k)
+            \\    def visit(v, depth):
+            \\        if isinstance(v, types.FunctionType):
+            \\            if v.__globals__ is g:
+            \\                code(v.__code__)
+            \\        elif isinstance(v, (staticmethod, classmethod)):
+            \\            visit(v.__func__, depth)
+            \\        elif isinstance(v, property):
+            \\            for f in (v.fget, v.fset, v.fdel):
+            \\                if f is not None:
+            \\                    visit(f, depth)
+            \\        elif isinstance(v, type) and depth < 4 and v.__module__ == g.get("__name__"):
+            \\            for x in list(vars(v).values()):
+            \\                visit(x, depth + 1)
+            \\    for v in list(g.values()):
+            \\        visit(v, 0)
+            \\    return frozenset(out)
+        ;
+        const ns = runPython(src) orelse return error.Python;
+        defer py.Py_DecRef(ns);
+        const f = py.c.PyDict_GetItemString(ns, "scan") orelse return error.Python;
+        py.Py_IncRef(f);
+        rebound_scanner = f;
+    }
+    const names = py.c.PyObject_CallFunctionObjArgs(rebound_scanner.?, globals, @as(?*PyObject, null)) orelse return error.Python;
+    if (rebound_cache.fetchRemove(globals)) |old| {
+        py.Py_DecRef(old.value.names);
+    } else py.Py_IncRef(globals);
+    rebound_cache.put(std.heap.c_allocator, globals, .{ .len = n, .names = names }) catch {
+        py.Py_DecRef(names);
+        py.Py_DecRef(globals);
+        _ = py.c.PyErr_NoMemory();
+        return error.Python;
+    };
+    return names;
+}
+
+var rebound_scanner: ?*PyObject = null;
+/// (the module dicts are kept: modules live as long)
+var rebound_cache: std.AutoHashMapUnmanaged(*PyObject, struct { len: isize, names: *PyObject }) = .empty;
+
+// ======================================================================
 // The compiler
 // ======================================================================
 
@@ -347,6 +485,7 @@ pub const Compiler = struct {
         .{ "zr_append", "bpillll" },
         .{ "zr_call_method", "bpillpplp" },
         .{ "zr_call_python", "bpilplp" },
+        .{ "zr_global", "bpilpp" },
         .{ "zr_is_type", "blli" },
         .{ "zr_format", "bpillipp" },
         .{ "zr_concat", "bpiplp" },
@@ -1152,6 +1291,8 @@ const Gen = struct {
             .dict => |d| return .{ .known = d.keys.items.len != 0 },
             .node, .rt, .rt_method, .method, .control => return .{ .known = true },
             .py => |o| {
+                // (an object that may change, a list...: when the code runs)
+                if (!try stablePy(o)) return self.truth(.{ .dyn = try self.materialize(v, at) }, at);
                 const r = py.c.PyObject_IsTrue(o);
                 if (r < 0) return error.Python;
                 return .{ .known = r == 1 };
@@ -1166,7 +1307,6 @@ const Gen = struct {
                     else => self.call("zr_truthy", &.{ d.tag, d.bits }),
                 };
                 try self.drop(v);
-                _ = at;
                 return .{ .dyn = t };
             },
         }
@@ -2605,6 +2745,14 @@ const Gen = struct {
         defer py.Py_DecRef(key);
         // A captured variable first, then the module, then builtins
         if (try closureValue(fobj, name)) |cell_value| return self.constant(cell_value, inst.node);
+        // (one a function assigns: its value when the code runs)
+        const rebound = try reboundGlobals(globals);
+        if (py.c.PySequence_Contains(rebound, key) == 1) {
+            const idx = try self.c.objectIndex(globals);
+            const s = try self.c.m.string(name);
+            try self.callCheck("zr_global", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), s, self.out });
+            return .{ .dyn = try self.loadOut(.any) };
+        }
         if (py.c.PyDict_GetItem(globals, key)) |v| return self.constant(v, inst.node);
         const builtins = py.c.PyImport_ImportModule("builtins") orelse return error.Python;
         defer py.Py_DecRef(builtins);
@@ -2696,6 +2844,9 @@ const Gen = struct {
                 return c.unsupportedAt(inst.func, pos, "rt has no '{s}' in compiled code", .{name});
             },
             .py => |o| {
+                // (an object that may change: its attribute when the code
+                // runs)
+                if (!try stablePy(o)) return self.attr(inst, .{ .dyn = try self.materialize(obj, inst.node) }, name, pos);
                 const key = ph.newString(name) orelse return error.Python;
                 defer py.Py_DecRef(key);
                 const v = py.c.PyObject_GetAttr(o, key) orelse return error.Python;
@@ -2996,9 +3147,26 @@ const Gen = struct {
     /// the semantics (compiled inline), or a builtin.
     fn pyCall(self: *Gen, inst: *Inst, o: *PyObject, args: []const SVal, pos: front.Pos) Error!SVal {
         const c = self.c;
+        const pt = try pyTypes();
+        // A bound method of a Python function: the function, its object
+        // first
+        if (try isInstanceOf(o, pt.method)) {
+            const func = ph.attr(o, "__func__") orelse return error.Python;
+            defer py.Py_DecRef(func);
+            const recv = ph.attr(o, "__self__") orelse return error.Python;
+            defer py.Py_DecRef(recv);
+            if (try isInstanceOf(func, pt.function)) {
+                // (both kept alive by the method, which the code keeps)
+                _ = try c.objectIndex(o);
+                const all = try self.a().alloc(SVal, args.len + 1);
+                all[0] = try self.constant(recv, inst.node);
+                @memcpy(all[1..], args);
+                return self.pyCall(inst, func, all, pos);
+            }
+        }
         // A Python function of the semantics' module (a def: it has code):
         // compiled too
-        if (py.c.PyObject_HasAttrString(o, "__code__") == 1 and py.c.PyObject_HasAttrString(o, "__globals__") == 1) {
+        if (try isInstanceOf(o, pt.function)) {
             const func = try self.helperFunction(o);
             return self.runFunction(func, inst.node, args);
         }

@@ -177,7 +177,7 @@ var next_id: u64 = 0;
 /// Give zgram's JIT the runtime helpers (once per process).
 fn defineHelpers(view: *const llvm.LlvmView) bool {
     if (helpers_defined) return true;
-    const syms = helpers.symbols() ++ helpers.moreSymbols() ++ helpers.formatSymbols() ++ @import("bridge.zig").symbols();
+    const syms = helpers.symbols() ++ @import("bridge.zig").symbols();
     var names: [syms.len][*:0]const u8 = undefined;
     var addrs: [syms.len]u64 = undefined;
     var name_bufs: [syms.len][64:0]u8 = undefined;

@@ -985,6 +985,28 @@ export fn zr_call_python(ctx: *Ctx, node: u32, callee_index: u64, args: [*]const
     return fromResult(ctx, node, py.c.PyObject_CallObject(callee, tuple), out);
 }
 
+/// A module-level name some function assigns (`global`), read when the
+/// code runs from the module's dict (objects[globals_index]), then the
+/// builtins; Python's NameError if neither has it.
+export fn zr_global(ctx: *Ctx, node: u32, globals_index: u64, name: *const value.Str, out: *Value) callconv(.c) bool {
+    const g = ctx.objects[globals_index];
+    const key = ph.newString(name.bytes()) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(key);
+    const v = py.c.PyDict_GetItemWithError(g, key) orelse blk: {
+        if (py.c.PyErr_Occurred() != null) return failPython(ctx, node);
+        const builtins = py.c.PyEval_GetBuiltins() orelse return failPython(ctx, node);
+        break :blk py.c.PyDict_GetItemWithError(builtins, key) orelse {
+            if (py.c.PyErr_Occurred() != null) return failPython(ctx, node);
+            return fail(ctx, node, "name '{s}' is not defined", .{name.bytes()});
+        };
+    };
+    // (a reference of ours: the dict's is another, so a list stays itself)
+    py.Py_IncRef(v);
+    defer py.Py_DecRef(v);
+    out.* = value.fromPython(v) orelse return failPython(ctx, node);
+    return true;
+}
+
 /// isinstance(v, <a builtin type>): by tag (int, float, str, bool, list,
 /// tuple, dict); `code` says which.
 export fn zr_is_type(t: u64, bits: u64, code: u32) callconv(.c) bool {
@@ -1054,54 +1076,21 @@ export fn zr_concat(ctx: *Ctx, node: u32, items: [*]const Value, n: u64, out: *V
     return true;
 }
 
-/// The other helpers, by name
-pub fn moreSymbols() [16]struct { []const u8, usize } {
-    return .{
-        .{ "zr_list", @intFromPtr(&zr_list) },
-        .{ "zr_tuple", @intFromPtr(&zr_tuple) },
-        .{ "zr_dict", @intFromPtr(&zr_dict) },
-        .{ "zr_record", @intFromPtr(&zr_record) },
-        .{ "zr_is_record", @intFromPtr(&zr_is_record) },
-        .{ "zr_getattr", @intFromPtr(&zr_getattr) },
-        .{ "zr_setattr", @intFromPtr(&zr_setattr) },
-        .{ "zr_getitem", @intFromPtr(&zr_getitem) },
-        .{ "zr_setitem", @intFromPtr(&zr_setitem) },
-        .{ "zr_items", @intFromPtr(&zr_items) },
-        .{ "zr_list_len", @intFromPtr(&zr_list_len) },
-        .{ "zr_list_at", @intFromPtr(&zr_list_at) },
-        .{ "zr_append", @intFromPtr(&zr_append) },
-        .{ "zr_call_method", @intFromPtr(&zr_call_method) },
-        .{ "zr_call_python", @intFromPtr(&zr_call_python) },
-        .{ "zr_is_type", @intFromPtr(&zr_is_type) },
-    };
-}
-
-pub fn formatSymbols() [4]struct { []const u8, usize } {
-    return .{
-        .{ "zr_format", @intFromPtr(&zr_format) },
-        .{ "zr_concat", @intFromPtr(&zr_concat) },
-        .{ "zr_unpack", @intFromPtr(&zr_unpack) },
-        .{ "zr_varargs", @intFromPtr(&zr_varargs) },
-    };
-}
+/// The helpers compiled code calls, by name
+const helper_names = [_][]const u8{
+    "zr_incref",   "zr_decref",  "zr_fail",      "zr_unset",         "zr_overflow",
+    "zr_binary",   "zr_compare", "zr_unary",     "zr_truthy",        "zr_function",
+    "zr_call",     "zr_object",  "zr_frame_new", "zr_frame_release", "zr_free",
+    "zr_list",     "zr_tuple",   "zr_dict",      "zr_record",        "zr_is_record",
+    "zr_getattr",  "zr_setattr", "zr_getitem",   "zr_setitem",       "zr_items",
+    "zr_list_len", "zr_list_at", "zr_append",    "zr_call_method",   "zr_call_python",
+    "zr_is_type",  "zr_global",  "zr_format",    "zr_concat",        "zr_unpack",
+    "zr_varargs",
+};
 
 /// The names compiled code calls them by, and their addresses
-pub fn symbols() [15]struct { []const u8, usize } {
-    return .{
-        .{ "zr_incref", @intFromPtr(&zr_incref) },
-        .{ "zr_decref", @intFromPtr(&zr_decref) },
-        .{ "zr_fail", @intFromPtr(&zr_fail) },
-        .{ "zr_unset", @intFromPtr(&zr_unset) },
-        .{ "zr_overflow", @intFromPtr(&zr_overflow) },
-        .{ "zr_binary", @intFromPtr(&zr_binary) },
-        .{ "zr_compare", @intFromPtr(&zr_compare) },
-        .{ "zr_unary", @intFromPtr(&zr_unary) },
-        .{ "zr_truthy", @intFromPtr(&zr_truthy) },
-        .{ "zr_function", @intFromPtr(&zr_function) },
-        .{ "zr_call", @intFromPtr(&zr_call) },
-        .{ "zr_object", @intFromPtr(&zr_object) },
-        .{ "zr_frame_new", @intFromPtr(&zr_frame_new) },
-        .{ "zr_frame_release", @intFromPtr(&zr_frame_release) },
-        .{ "zr_free", @intFromPtr(&zr_free) },
-    };
+pub fn symbols() [helper_names.len]struct { []const u8, usize } {
+    var out: [helper_names.len]struct { []const u8, usize } = undefined;
+    inline for (helper_names, 0..) |name, i| out[i] = .{ name, @intFromPtr(&@field(@This(), name)) };
+    return out;
 }
