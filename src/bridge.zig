@@ -52,73 +52,87 @@ pub const Link = struct {
 /// tree as the compiler reads a known node's: true / false (an error), or
 /// null for one not read here (Python's Node then: a field whose value an
 /// action makes...).
-pub fn nodeAttr(ctx: *Ctx, idx: u32, name: []const u8, out: *Value) ?bool {
+pub fn nodeAttr(ctx: *Ctx, idx: u32, name: *const value.Str, out: *Value) ?bool {
     const link = linkOf(ctx);
     const d = link.data;
     const n = d.nodes[idx];
     const rid = n.ruleId();
-    const eq = std.mem.eql;
-    if (d.grammar.field_ids.get(name)) |field| {
-        const label = d.grammar.labelOf(rid, field);
-        const many = label != null and label.?.many;
-        var count: usize = 0;
-        var only: Value = Value.none_v;
-        var ch = idx + 1;
-        const stop = d.end(idx);
-        // (the labelled children: nodes; one an action makes a value of:
-        // Python's)
-        while (ch < stop) : (ch = d.end(ch)) {
-            if (d.nodes[ch].fieldId() != field) continue;
-            const v = childValue(d, ch) orelse return null;
-            if (v.kind() == .none) continue;
-            count += 1;
-            only = v;
-        }
-        if (!many and count <= 1) {
-            out.* = only;
-            return true;
-        }
-        const l = value.newList(count) orelse return helpers.fail(ctx, idx, "out of memory", .{});
-        ch = idx + 1;
-        while (ch < stop) : (ch = d.end(ch)) {
-            if (d.nodes[ch].fieldId() != field) continue;
-            const v = childValue(d, ch).?;
-            if (v.kind() != .none) _ = value.listPush(l, v);
-        }
-        out.* = Value.obj(.list, &l.head);
+    // (what the name is, worked out once: a literal's str is one per name)
+    const attr = link.compiled.attrOf(name, d.grammar) orelse return helpers.fail(ctx, idx, "out of memory", .{});
+    switch (attr) {
+        .field => |field| return fieldValue(ctx, d, idx, rid, field, out),
+        .kind, .rule => {
+            const is_kind = attr == .kind;
+            const s = link.compiled.nameStr(if (is_kind) d.grammar.kind_names[rid] else d.grammar.rule_names[rid], rid, is_kind) orelse return helpers.fail(ctx, idx, "out of memory", .{});
+            out.* = Value.obj(.str, &s.head);
+        },
+        .text => {
+            const s = link.compiled.textStr(idx, d) orelse return helpers.fail(ctx, idx, "out of memory", .{});
+            value.increfObj(&s.head);
+            out.* = Value.obj(.str, &s.head);
+        },
+        // (plain ints, as the reference mode's Node gives them)
+        .start => out.* = Value.pint(n.text_start),
+        .end => out.* = Value.pint(n.text_end),
+        .line => out.* = Value.pint(d.lineCol(n.text_start).line),
+        .column => out.* = Value.pint(d.lineCol(n.text_start).col),
+        .index => out.* = Value.pint(idx),
+        .parent => {
+            const p = d.parents[idx];
+            out.* = if (p == program_mod.NONE) Value.none_v else .{ .tag = @intFromEnum(value.Tag.node), .bits = p };
+        },
+        .children => {
+            var count: usize = 0;
+            var ch = idx + 1;
+            const stop = d.end(idx);
+            while (ch < stop) : (ch = d.end(ch)) {
+                _ = childValue(d, ch) orelse return null;
+                if (!dropped(d, ch)) count += 1;
+            }
+            const l = value.newList(count) orelse return helpers.fail(ctx, idx, "out of memory", .{});
+            ch = idx + 1;
+            while (ch < stop) : (ch = d.end(ch)) {
+                if (dropped(d, ch)) continue;
+                _ = value.listPush(l, childValue(d, ch).?);
+            }
+            out.* = Value.obj(.list, &l.head);
+        },
+        .other => return null,
+    }
+    return true;
+}
+
+/// A node's labelled field: its child (None: none), or a list of them (a
+/// label that repeats); null for a child an action makes a value of
+/// (Python's conversion).
+fn fieldValue(ctx: *Ctx, d: *const program_mod.Data, idx: u32, rid: u32, field: u8, out: *Value) ?bool {
+    const label = d.grammar.labelOf(rid, field);
+    const many = label != null and label.?.many;
+    var count: usize = 0;
+    var only: Value = Value.none_v;
+    var ch = idx + 1;
+    const stop = d.end(idx);
+    // (the labelled children: nodes; one an action makes a value of:
+    // Python's)
+    while (ch < stop) : (ch = d.end(ch)) {
+        if (d.nodes[ch].fieldId() != field) continue;
+        const v = childValue(d, ch) orelse return null;
+        if (v.kind() == .none) continue;
+        count += 1;
+        only = v;
+    }
+    if (!many and count <= 1) {
+        out.* = only;
         return true;
     }
-    if (eq(u8, name, "kind") or eq(u8, name, "rule")) {
-        const is_kind = eq(u8, name, "kind");
-        const s = link.compiled.nameStr(if (is_kind) d.grammar.kind_names[rid] else d.grammar.rule_names[rid], rid, is_kind) orelse return helpers.fail(ctx, idx, "out of memory", .{});
-        out.* = Value.obj(.str, &s.head);
-        return true;
+    const l = value.newList(count) orelse return helpers.fail(ctx, idx, "out of memory", .{});
+    ch = idx + 1;
+    while (ch < stop) : (ch = d.end(ch)) {
+        if (d.nodes[ch].fieldId() != field) continue;
+        const v = childValue(d, ch).?;
+        if (v.kind() != .none) _ = value.listPush(l, v);
     }
-    if (eq(u8, name, "text")) {
-        const s = value.newStr(d.text(idx)) orelse return helpers.fail(ctx, idx, "out of memory", .{});
-        out.* = Value.obj(.str, &s.head);
-        return true;
-    }
-    // (plain ints, as the reference mode's Node gives them)
-    if (eq(u8, name, "start")) out.* = Value.pint(n.text_start) else if (eq(u8, name, "end")) out.* = Value.pint(n.text_end) else if (eq(u8, name, "line")) out.* = Value.pint(d.lineCol(n.text_start).line) else if (eq(u8, name, "column")) out.* = Value.pint(d.lineCol(n.text_start).col) else if (eq(u8, name, "index")) out.* = Value.pint(idx) else if (eq(u8, name, "parent")) {
-        const p = d.parents[idx];
-        out.* = if (p == program_mod.NONE) Value.none_v else .{ .tag = @intFromEnum(value.Tag.node), .bits = p };
-    } else if (eq(u8, name, "children")) {
-        var count: usize = 0;
-        var ch = idx + 1;
-        const stop = d.end(idx);
-        while (ch < stop) : (ch = d.end(ch)) {
-            _ = childValue(d, ch) orelse return null;
-            if (!dropped(d, ch)) count += 1;
-        }
-        const l = value.newList(count) orelse return helpers.fail(ctx, idx, "out of memory", .{});
-        ch = idx + 1;
-        while (ch < stop) : (ch = d.end(ch)) {
-            if (dropped(d, ch)) continue;
-            _ = value.listPush(l, childValue(d, ch).?);
-        }
-        out.* = Value.obj(.list, &l.head);
-    } else return null;
+    out.* = Value.obj(.list, &l.head);
     return true;
 }
 
@@ -239,10 +253,18 @@ pub export fn zr_run_value(ctx: *Ctx, which: u32, at: u32, tag: u64, bits: u64, 
 /// time: its Python semantic, or its thunk (compiled the first time).
 fn runNode(ctx: *Ctx, which: compile_mod.Which, idx: u32, frame_slot: **value.Frame, owner: u32, out: *Value) i32 {
     const link = linkOf(ctx);
-    if (!link.data.hasFrame(idx) and link.semantic(link.program, idx, which) != null and isPython(link, idx, which)) {
+    // (what it did last time, for the same frames: again)
+    const run_ = link.compiled.runOf(idx, which, link.data.nodes.len) orelse {
+        _ = helpers.fail(ctx, idx, "out of memory", .{});
+        return 0;
+    };
+    if (run_.thunk) |t| if (run_.owner == owner) return t(ctx, frame_slot.*, out);
+    if (run_.python or (!link.data.hasFrame(idx) and link.semantic(link.program, idx, which) != null and isPython(link, idx, which))) {
+        run_.python = true;
         return zr_py_semantic(ctx, @intFromEnum(which), idx, frame_slot, owner, out);
     }
     const thunk = link.compiled.thunk(idx, which, owner) orelse return fromPythonError(ctx, idx, out);
+    run_.* = .{ .thunk = thunk, .owner = owner };
     return thunk(ctx, frame_slot.*, out);
 }
 

@@ -17,6 +17,7 @@ const value = @import("value.zig");
 // reserves every name starting with "llvm.")
 const llvm = @import("jit.zig");
 const program_mod = @import("program.zig");
+const grammar_mod = @import("grammar.zig");
 
 const allocator = std.heap.c_allocator;
 
@@ -59,6 +60,12 @@ pub const Compiled = struct {
     id: u64 = 0,
     /// Thunks compiled, by node, eval or exec, and the frame's owner
     thunks: std.AutoHashMapUnmanaged(ThunkKey, Thunk) = .empty,
+    /// What running a node as a value does, the last time (by node and
+    /// eval or exec: bridge.runNode's, looked up without hashing)
+    runs: []Run = &.{},
+    /// Node attributes by name (attrOf), nodes' texts (textStr)
+    attrs: std.AutoHashMapUnmanaged(*const value.Str, Attr) = .empty,
+    texts: []?*value.Str = &.{},
     /// Kind and rule names as values (node.kind of a node known only at
     /// run time), looked up once (value.literal: immortal)
     names: std.AutoHashMapUnmanaged(u32, *value.Str) = .empty,
@@ -67,6 +74,20 @@ pub const Compiled = struct {
     called: std.AutoHashMapUnmanaged(CalledKey, ?Helper) = .empty,
 
     const ThunkKey = struct { node: u32, which: compile_mod.Which, owner: u32 };
+
+    /// A node run: its thunk for frames of `owner`'s, or its semantic run
+    /// as Python (`python`: so for good, the semantics run as Python only
+    /// grow); neither yet
+    pub const Run = struct { thunk: ?Thunk = null, owner: u32 = 0, python: bool = false };
+
+    /// Where a node run is remembered (null: out of memory).
+    pub fn runOf(self: *Compiled, node: u32, which: compile_mod.Which, nodes: usize) ?*Run {
+        if (self.runs.len == 0) {
+            self.runs = allocator.alloc(Run, nodes * 2) catch return null;
+            @memset(self.runs, .{});
+        }
+        return &self.runs[@as(usize, node) * 2 + @intFromEnum(which)];
+    }
     const CalledKey = struct { func: *PyObject, nargs: usize, rt_mask: u64 };
 
     /// A kind's (or rule's) name as a str value (borrowed: immortal).
@@ -79,6 +100,40 @@ pub const Compiled = struct {
         return s;
     }
 
+    /// What a node's attribute is (bridge.nodeAttr): a labelled field, or
+    /// one every node has
+    pub const Attr = union(enum) { field: u8, kind, rule, text, start, end, line, column, index, parent, children, other };
+
+    /// The attribute a name (a literal's str: one per name, immortal) is,
+    /// worked out once (null: out of memory).
+    pub fn attrOf(self: *Compiled, name: *const value.Str, g: *const grammar_mod.Grammar) ?Attr {
+        if (self.attrs.get(name)) |a| return a;
+        const s = name.bytes();
+        // (a label first: a grammar may have one named `text`...)
+        const attr: Attr = if (g.field_ids.get(s)) |f| .{ .field = f } else blk: {
+            const t = std.meta.stringToEnum(std.meta.Tag(Attr), s) orelse break :blk .other;
+            break :blk switch (t) {
+                .field, .other => .other,
+                inline else => |tt| @unionInit(Attr, @tagName(tt), {}),
+            };
+        };
+        self.attrs.put(allocator, name, attr) catch return null;
+        return attr;
+    }
+
+    /// A node's text as a str (borrowed: kept for the program, a reference
+    /// of its own: one kept after the program lives on).
+    pub fn textStr(self: *Compiled, idx: u32, d: *const program_mod.Data) ?*value.Str {
+        if (self.texts.len == 0) {
+            self.texts = allocator.alloc(?*value.Str, d.nodes.len) catch return null;
+            @memset(self.texts, null);
+        }
+        if (self.texts[idx]) |s| return s;
+        const s = value.newStr(d.text(idx)) orelse return null;
+        self.texts[idx] = s;
+        return s;
+    }
+
     /// The Python objects the code refers to (owned), by index
     pub fn objects(self: *const Compiled) []*PyObject {
         return self.compiler.objects.items;
@@ -88,6 +143,10 @@ pub const Compiled = struct {
         for (self.modules.items) |*m| m.release();
         self.modules.deinit(allocator);
         self.thunks.deinit(allocator);
+        if (self.runs.len > 0) allocator.free(self.runs);
+        self.attrs.deinit(allocator);
+        for (self.texts) |t| if (t) |s| value.decref(value.Value.obj(.str, &s.head));
+        if (self.texts.len > 0) allocator.free(self.texts);
         self.called.deinit(allocator);
         self.names.deinit(allocator);
         for (self.compiler.objects.items) |o| py.Py_DecRef(o);

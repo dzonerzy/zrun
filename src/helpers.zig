@@ -986,7 +986,7 @@ export fn zr_isinstance(ctx: *Ctx, node: u32, t: u64, bits: u64, cls_index: u64,
 export fn zr_getattr(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value.Str, out: *Value) callconv(.c) bool {
     const v = Value{ .tag = t, .bits = bits };
     // (a node's: from the program's tree)
-    if (v.kind() == .node) if (@import("bridge.zig").nodeAttr(ctx, @intCast(v.bits), name.bytes(), out)) |ok| return ok;
+    if (v.kind() == .node) if (@import("bridge.zig").nodeAttr(ctx, @intCast(v.bits), name, out)) |ok| return ok;
     if (v.kind() == .record) {
         const r: *value.Record = @ptrCast(@alignCast(v.ptr()));
         for (r.rtype.fields, 0..) |f, i| {
