@@ -1,0 +1,17 @@
+.{
+    .name = .zrun,
+    .version = "0.1.0",
+    .fingerprint = 0x8af1e236c84c491b,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .PyOZ = .{
+            .url = "https://github.com/pyozig/PyOZ/archive/refs/tags/v0.13.7.tar.gz",
+            .hash = "PyOZ-0.13.7-ntlpPsAZFQC7KgaLCHdY1Lg3wtMevglufs5ZoJmaw55B",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
