@@ -20,15 +20,24 @@ pub var ListType: *PyObject = undefined;
 pub var DictType: *PyObject = undefined;
 pub var RecordType: *PyObject = undefined;
 
-/// What every proxy holds: the native object (a reference), and what its
-/// values need to become Python objects (nodes: the program, kept alive)
+/// What every proxy holds: the native object, and what its values need to
+/// become Python objects (nodes: the program, kept alive).
+///
+/// A native object has one proxy, for its whole life (Python sees the same
+/// object each time: `is`, id()): while compiled code holds the object, the
+/// object holds its proxy (a reference); once it lets go and Python still
+/// has the proxy, the proxy owns the object (`owns`) until it comes back.
 const Proxy = extern struct {
     ob_base: py.c.PyObject,
     obj: *value.Obj,
     maker_ctx: ?*anyopaque,
     maker_fn: ?*const fn (ctx: *anyopaque, idx: u32) ?*PyObject,
     owner: ?*PyObject,
+    owns: bool,
 };
+
+/// The proxy of each native object that has one (value.HAS_PROXY)
+var by_obj: std.AutoHashMapUnmanaged(*value.Obj, *PyObject) = .empty;
 
 fn asProxy(o: ?*PyObject) *Proxy {
     return @ptrCast(@alignCast(o.?));
@@ -63,8 +72,15 @@ fn typeIs(o: *PyObject, t: *PyObject) bool {
     return @as(*PyObject, @ptrCast(@alignCast(o.ob_type))) == t;
 }
 
-/// A proxy of the native object `v` stands for (a new reference).
+/// The proxy of the native object `v` stands for (a new reference): its
+/// own, made the first time.
 pub fn make(v: Value, m: helpers.NodeMaker) ?*PyObject {
+    const o = v.ptr();
+    if (o.flags & value.HAS_PROXY != 0) {
+        const existing = by_obj.get(o).?;
+        py.Py_IncRef(existing);
+        return existing;
+    }
     const t = switch (v.kind()) {
         .list => ListType,
         .dict => DictType,
@@ -74,12 +90,19 @@ pub fn make(v: Value, m: helpers.NodeMaker) ?*PyObject {
     const alloc: py.c.allocfunc = @ptrCast(py.c.PyType_GetSlot(@ptrCast(t), py.c.Py_tp_alloc));
     const obj = alloc.?(@ptrCast(t), 0) orelse return null;
     const p = asProxy(obj);
-    value.incref(v);
-    p.obj = v.ptr();
+    p.obj = o;
+    p.owns = false;
     p.maker_ctx = m.ctx;
     p.maker_fn = m.make_fn;
-    if (m.owner) |o| py.Py_IncRef(o);
+    if (m.owner) |w| py.Py_IncRef(w);
     p.owner = m.owner;
+    by_obj.put(allocator, o, obj) catch {
+        py.Py_DecRef(obj);
+        return py.c.PyErr_NoMemory();
+    };
+    o.flags |= value.HAS_PROXY;
+    // (the object's reference)
+    py.Py_IncRef(obj);
     return obj;
 }
 
@@ -87,15 +110,45 @@ pub fn make(v: Value, m: helpers.NodeMaker) ?*PyObject {
 /// isn't one.
 pub fn unwrap(o: *PyObject) ?Value {
     const kind: value.Tag = if (typeIs(o, ListType)) .list else if (typeIs(o, DictType)) .dict else if (typeIs(o, RecordType)) .record else return null;
-    const v = Value.obj(kind, asProxy(o).obj);
+    const p = asProxy(o);
+    const v = Value.obj(kind, p.obj);
+    if (p.owns) {
+        // (back with compiled code: the object holds its proxy again)
+        p.owns = false;
+        p.obj.rc = 1;
+        py.Py_IncRef(o);
+        return v;
+    }
     value.incref(v);
     return v;
+}
+
+/// Compiled code let go of an object that has a proxy: true if it's to be
+/// freed now (Python doesn't have the proxy either), else the proxy owns
+/// it from now on.
+pub fn released(o: *value.Obj) bool {
+    const proxy = by_obj.get(o).?;
+    if (ph.refcnt(proxy) == 1) {
+        _ = by_obj.remove(o);
+        o.flags &= ~value.HAS_PROXY;
+        py.Py_DecRef(proxy);
+        return true;
+    }
+    asProxy(proxy).owns = true;
+    py.Py_DecRef(proxy);
+    return false;
 }
 
 fn dealloc(o: ?*PyObject) callconv(.c) void {
     const p = asProxy(o);
     const kind: value.Tag = if (typeIs(o.?, ListType)) .list else if (typeIs(o.?, DictType)) .dict else .record;
-    value.decref(Value.obj(kind, p.obj));
+    // (it owned the object: freed with it; else the object is being freed,
+    // released() let go of it)
+    if (p.owns) {
+        _ = by_obj.remove(p.obj);
+        p.obj.flags &= ~value.HAS_PROXY;
+        value.free(kind, p.obj);
+    }
     if (p.owner) |w| py.Py_DecRef(w);
     const t = o.?.ob_type;
     const free: py.c.freefunc = @ptrCast(py.c.PyType_GetSlot(t, py.c.Py_tp_free));

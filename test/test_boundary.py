@@ -32,6 +32,8 @@ BUILTINS = (
     "keys",
     "unlive",
     "live",
+    "same",
+    "back",
 )
 
 
@@ -141,6 +143,18 @@ def make_lang():
             d[k[1]] = "fs"
             d[k[3]] = "box"
             return d.get(1, "no") + d.get(k[2], "no") + d.get(k[3], "no") + d.get(Box(1), "no") + str(len(d))
+        if name == "same":
+            # One object, the same each time Python sees it; Python keeping
+            # it after compiled code let go, changing it, giving it back
+            keep = rt.load(node.name)
+            xs = [1]
+            rt.call(keep, [xs])
+            rt.call(keep, [xs])
+            return rt.call(keep, [None])
+        if name == "back":
+            ys = rt.call(rt.load(node.name), [])
+            ys.append(3)
+            return len(ys) * 10 + ys[1]
         if name == "live":
             # module-level objects Python changes: read when the code runs
             before = COUNTER * 1000 + HOLDER.get(5) * 10 + (1 if STACK else 0)
@@ -249,6 +263,22 @@ def make_lang():
         return SHARED_DICT
 
     @lang.host
+    def same(xs):
+        if xs is not None:
+            KEPT.append((xs, id(xs)))
+            return 0
+        (a, ida), (b, idb) = KEPT[-2:]
+        assert a is b and ida == idb
+        return 1
+
+    @lang.host
+    def back():
+        xs = KEPT[-1][0]
+        del KEPT[:]
+        xs.append(2)
+        return xs
+
+    @lang.host
     def unlive():
         global COUNTER
         COUNTER = 5
@@ -307,6 +337,7 @@ PROGRAMS = {
     "from_python": "print(reset(), grow_shared(), shared_dict(), fresh(), point());\n",
     "keys": "print(keys());\n",
     "live": "print(unlive(), live());\n",
+    "identity": "print(same(), back());\n",
 }
 
 
@@ -315,7 +346,7 @@ def test_shared_with_python(name, capsys):
     out, err = same_in_every_mode(lang, PROGRAMS[name], capsys)
     assert err is None, err
     # (len * 1000 + first * 100 + last, after the host's changes...)
-    assert out.strip() == {"list": "4531", "dict": "231", "record": "53", "from_python": "0 203 5 4 34", "keys": "redfsboxno3", "live": "0 50801161"}[name]
+    assert out.strip() == {"list": "4531", "dict": "231", "record": "53", "from_python": "0 203 5 4 34", "keys": "redfsboxno3", "live": "0 50801161", "identity": "1 32"}[name]
     if name == "from_python":
         assert SHARED == [2, 7] and SHARED_DICT == {"k": 5}
     # (compiled: none of them ran as Python)

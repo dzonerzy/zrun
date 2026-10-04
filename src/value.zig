@@ -99,6 +99,10 @@ pub const Obj = extern struct {
     flags: u32 = 0,
 };
 
+/// A list, dict or record Python has seen: it has a proxy (proxies.zig),
+/// which may outlive compiled code's references
+pub const HAS_PROXY: u32 = 1 << 31;
+
 pub const Str = extern struct {
     head: Obj,
     /// Bytes (UTF-8) and code points
@@ -242,6 +246,8 @@ fn freeFrame(f: *Frame) void {
 }
 
 pub fn free(tag: Tag, o: *Obj) void {
+    // (Python still has its proxy: the proxy keeps it)
+    if (o.flags & HAS_PROXY != 0 and tag != .function and !proxies.released(o)) return;
     switch (tag) {
         .str => {
             const s: *Str = @ptrCast(o);
