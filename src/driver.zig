@@ -8,7 +8,9 @@ const PyObject = ph.PyObject;
 const compile_mod = @import("compile.zig");
 const helpers = @import("helpers.zig");
 const value = @import("value.zig");
-const llvm = @import("llvm.zig");
+// (not named llvm.zig: Zig names functions after their file, and LLVM
+// reserves every name starting with "llvm.")
+const llvm = @import("jit.zig");
 const program_mod = @import("program.zig");
 
 const allocator = std.heap.c_allocator;
