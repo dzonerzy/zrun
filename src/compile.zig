@@ -237,6 +237,62 @@ pub const Compiler = struct {
         try self.m.declare("llvm.sadd.with.overflow.i64", "{ i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)");
         try self.m.declare("llvm.ssub.with.overflow.i64", "{ i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)");
         try self.m.declare("llvm.smul.with.overflow.i64", "{ i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)");
+        try self.m.declare("zr_free", "void @zr_free(i64, i64)");
+        // Reference counts, inline: the runtime's objects (tags 4 to 9)
+        // counted here, unless immortal; Python objects (10) by the runtime
+        try self.m.headPrint(
+            \\define internal void @zr_inc(i64 %tag, i64 %bits) alwaysinline {{
+            \\  %k = sub i64 %tag, 4
+            \\  %obj = icmp ult i64 %k, 6
+            \\  br i1 %obj, label %counted, label %other
+            \\counted:
+            \\  %p = inttoptr i64 %bits to ptr
+            \\  %rc = load i64, ptr %p, align 8
+            \\  %mortal = icmp ult i64 %rc, {d}
+            \\  br i1 %mortal, label %inc, label %done
+            \\inc:
+            \\  %rc1 = add i64 %rc, 1
+            \\  store i64 %rc1, ptr %p, align 8
+            \\  br label %done
+            \\other:
+            \\  %host = icmp eq i64 %tag, 10
+            \\  br i1 %host, label %python, label %done
+            \\python:
+            \\  call void @zr_incref(i64 %tag, i64 %bits)
+            \\  br label %done
+            \\done:
+            \\  ret void
+            \\}}
+            \\
+            \\define internal void @zr_dec(i64 %tag, i64 %bits) alwaysinline {{
+            \\  %k = sub i64 %tag, 4
+            \\  %obj = icmp ult i64 %k, 6
+            \\  br i1 %obj, label %counted, label %other
+            \\counted:
+            \\  %p = inttoptr i64 %bits to ptr
+            \\  %rc = load i64, ptr %p, align 8
+            \\  %mortal = icmp ult i64 %rc, {d}
+            \\  br i1 %mortal, label %dec, label %done
+            \\dec:
+            \\  %rc1 = sub i64 %rc, 1
+            \\  store i64 %rc1, ptr %p, align 8
+            \\  %zero = icmp eq i64 %rc1, 0
+            \\  br i1 %zero, label %free, label %done
+            \\free:
+            \\  call void @zr_free(i64 %tag, i64 %bits)
+            \\  br label %done
+            \\other:
+            \\  %host = icmp eq i64 %tag, 10
+            \\  br i1 %host, label %python, label %done
+            \\python:
+            \\  call void @zr_decref(i64 %tag, i64 %bits)
+            \\  br label %done
+            \\done:
+            \\  ret void
+            \\}}
+            \\
+            \\
+        , .{ value.IMMORTAL, value.IMMORTAL });
     }
 
     /// Each symbol's slot, in the function it lives in; which functions
@@ -422,6 +478,23 @@ const Gen = struct {
     loops: std.ArrayListUnmanaged(LoopTarget) = .empty,
     /// Semantics running inline, innermost last
     insts: std.ArrayListUnmanaged(*Inst) = .empty,
+    /// Loops being compiled (of the semantics or rt.loop): code in one
+    /// runs many times
+    loop_level: u32 = 0,
+
+    /// Code that runs many times (a function's, a loop's): reference
+    /// counts inline; else calls (less code for LLVM to compile).
+    fn hot(self: *const Gen) bool {
+        return self.fnode != NONE or self.loop_level > 0;
+    }
+
+    fn incName(self: *const Gen) []const u8 {
+        return if (self.hot()) "zr_inc" else "zr_incref";
+    }
+
+    fn decName(self: *const Gen) []const u8 {
+        return if (self.hot()) "zr_dec" else "zr_decref";
+    }
 
     fn a(self: *Gen) Allocator {
         return self.c.a;
@@ -478,7 +551,7 @@ const Gen = struct {
             const bp = try f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i32 0, i32 1", .{slot});
             const bits = try f.value("load i64, ptr {s}, align 8", .{bp});
             // (an unset slot holds no reference: zr_decref ignores its tag)
-            try f.emit("call void @zr_decref(i64 {s}, i64 {s})", .{ tag, bits });
+            try f.emit("call void @{s}(i64 {s}, i64 {s})", .{ self.decName(), tag, bits });
         }
     }
 
@@ -571,7 +644,7 @@ const Gen = struct {
         for (0..n) |i| {
             const p = try self.f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i64 {d}", .{ arr, i });
             const v = try self.loadSlot(p, .any);
-            try self.f.emit("call void @zr_decref(i64 {s}, i64 {s})", .{ v.tag, v.bits });
+            try self.f.emit("call void @{s}(i64 {s}, i64 {s})", .{ self.decName(), v.tag, v.bits });
         }
     }
 
@@ -587,13 +660,13 @@ const Gen = struct {
     /// Give up a dynamic value (decref it).
     fn drop(self: *Gen, v: SVal) Error!void {
         switch (v) {
-            .dyn => |d| if (d.heapish()) try self.f.emit("call void @zr_decref(i64 {s}, i64 {s})", .{ d.tag, d.bits }),
+            .dyn => |d| if (d.heapish()) try self.f.emit("call void @{s}(i64 {s}, i64 {s})", .{ self.decName(), d.tag, d.bits }),
             else => {},
         }
     }
 
     fn increfDyn(self: *Gen, d: Dyn) Error!void {
-        if (d.heapish()) try self.f.emit("call void @zr_incref(i64 {s}, i64 {s})", .{ d.tag, d.bits });
+        if (d.heapish()) try self.f.emit("call void @{s}(i64 {s}, i64 {s})", .{ self.incName(), d.tag, d.bits });
     }
 
     /// A slot ({i64, i64}) of the stack: its pointer.
@@ -727,7 +800,7 @@ const Gen = struct {
         const slot = try self.varSlot(si);
         const old = try self.loadSlot(slot, .any);
         try self.storeSlot(slot, v);
-        try self.f.emit("call void @zr_decref(i64 {s}, i64 {s})", .{ old.tag, old.bits });
+        try self.f.emit("call void @{s}(i64 {s}, i64 {s})", .{ self.decName(), old.tag, old.bits });
     }
 
     fn notAVariable(self: *Gen, idx: u32) Error!SVal {
@@ -1148,6 +1221,8 @@ const Gen = struct {
                 try self.f.br(head);
                 try self.f.block(head);
                 inst.dyn_depth += 1;
+                self.loop_level += 1;
+                defer self.loop_level -= 1;
                 const t = try self.truth(try self.expr(inst, w.test_), inst.node);
                 switch (t) {
                     .known => |b| try self.f.br(if (b) body else els),
@@ -1567,6 +1642,8 @@ const Gen = struct {
         const exit = try f.label("endfor");
         try f.br(head);
         try f.block(head);
+        self.loop_level += 1;
+        defer self.loop_level -= 1;
         try f.condBr(try self.iterHead(it), loop_body, els);
         try f.block(loop_body);
         inst.dyn_depth += 1;
@@ -2194,6 +2271,8 @@ const Gen = struct {
         const cont = try f.label("loop_continue");
         const done = try f.label("loop_done");
         try self.loops.append(self.a(), .{ .brk = brk, .cont = cont, .depth = self.insts.items.len });
+        self.loop_level += 1;
+        defer self.loop_level -= 1;
         try self.execValue(body);
         _ = self.loops.pop();
         try f.br(done);
@@ -2951,6 +3030,8 @@ const Gen = struct {
         const done = try f.label("comp_done");
         try f.br(head);
         try f.block(head);
+        self.loop_level += 1;
+        defer self.loop_level -= 1;
         try f.condBr(try self.iterHead(it), body, done);
         try f.block(body);
         inst.dyn_depth += 1;

@@ -105,6 +105,11 @@ export fn zr_decref(tag: u64, bits: u64) callconv(.c) void {
     value.decref(.{ .tag = tag, .bits = bits });
 }
 
+/// An object whose count the compiled code took to 0.
+export fn zr_free(tag: u64, bits: u64) callconv(.c) void {
+    value.free(@enumFromInt(tag), @ptrFromInt(bits));
+}
+
 // ======================================================================
 // Errors
 // ======================================================================
@@ -989,7 +994,7 @@ pub fn formatSymbols() [3]struct { []const u8, usize } {
 }
 
 /// The names compiled code calls them by, and their addresses
-pub fn symbols() [14]struct { []const u8, usize } {
+pub fn symbols() [15]struct { []const u8, usize } {
     return .{
         .{ "zr_incref", @intFromPtr(&zr_incref) },
         .{ "zr_decref", @intFromPtr(&zr_decref) },
@@ -1005,5 +1010,6 @@ pub fn symbols() [14]struct { []const u8, usize } {
         .{ "zr_object", @intFromPtr(&zr_object) },
         .{ "zr_frame_new", @intFromPtr(&zr_frame_new) },
         .{ "zr_frame_release", @intFromPtr(&zr_frame_release) },
+        .{ "zr_free", @intFromPtr(&zr_free) },
     };
 }

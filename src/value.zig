@@ -236,7 +236,7 @@ fn freeFrame(f: *Frame) void {
     allocator.free(@as([*]u8, @ptrCast(f))[0 .. @sizeOf(Frame) + f.len * @sizeOf(Value)]);
 }
 
-fn free(tag: Tag, o: *Obj) void {
+pub fn free(tag: Tag, o: *Obj) void {
     switch (tag) {
         .str => {
             const s: *Str = @ptrCast(o);
