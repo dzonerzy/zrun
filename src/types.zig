@@ -40,7 +40,25 @@ fn initTypes(module: *PyObject) !void {
 
     const bases = py.c.PyTuple_Pack(1, int_type) orelse return error.Python;
     defer py.Py_DecRef(bases);
-    I64 = py.c.PyType_FromSpecWithBases(&i64_spec, bases) orelse return error.Python;
+    // (a type named without a module warns that it has none: it gets one
+    // right after)
+    const warnings = py.c.PyImport_ImportModule("warnings") orelse return error.Python;
+    defer py.Py_DecRef(warnings);
+    const guard = py.c.PyObject_CallMethod(warnings, "catch_warnings", null) orelse return error.Python;
+    defer py.Py_DecRef(guard);
+    const entered = py.c.PyObject_CallMethod(guard, "__enter__", null) orelse return error.Python;
+    py.Py_DecRef(entered);
+    const ignored = py.c.PyObject_CallMethod(warnings, "simplefilter", "(sO)", "ignore", py.c.PyExc_DeprecationWarning);
+    if (ignored) |o| py.Py_DecRef(o);
+    const made = py.c.PyType_FromSpecWithBases(&i64_spec, bases);
+    const exited = py.c.PyObject_CallMethod(guard, "__exit__", "(OOO)", py.Py_None(), py.Py_None(), py.Py_None());
+    if (exited) |o| py.Py_DecRef(o);
+    I64 = made orelse return error.Python;
+    if (ignored == null or exited == null) return error.Python;
+    // (its name stays int, for messages; its module is zrun)
+    const mod_name = ph.newString("zrun") orelse return error.Python;
+    defer py.Py_DecRef(mod_name);
+    if (py.c.PyObject_SetAttrString(I64, "__module__", mod_name) != 0) return error.Python;
     try add(module, "I64", I64);
 
     IntegerOverflow = try newException(module, "IntegerOverflow", py.PyExc_ArithmeticError(), "An integer result outside the 64-bit range.");
@@ -193,8 +211,10 @@ var i64_slots = [_]py.c.PyType_Slot{
     .{ .slot = 0, .pfunc = null },
 };
 
+// (named int: Python's error messages name a value's type, and they must
+// read the same as compiled code's, `'int' object is not subscriptable`)
 var i64_spec = py.c.PyType_Spec{
-    .name = "zrun.I64",
+    .name = "int",
     .basicsize = 0,
     .itemsize = 0,
     .flags = py.c.Py_TPFLAGS_DEFAULT,

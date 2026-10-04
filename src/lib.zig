@@ -22,6 +22,10 @@ const program_mod = @import("program.zig");
 const tree_mod = @import("tree.zig");
 const zabi = @import("zrules_abi.zig");
 const front = @import("front.zig");
+const driver = @import("driver.zig");
+const compile_mod = @import("compile.zig");
+const helpers = @import("helpers.zig");
+const value_mod = @import("value.zig");
 
 const allocator = std.heap.c_allocator;
 const NONE = program_mod.NONE;
@@ -488,8 +492,12 @@ const Program = struct {
     /// the native data, the program's frame. Nodes and functions refer to
     /// it; this class refers to nothing that refers back to it
     _state: ?*PyObject = null,
+    /// The program compiled (once it ran compiled)
+    _compiled: ?*driver.Compiled = null,
 
     fn release(self: *Program) void {
+        if (self._compiled) |c| c.destroy();
+        self._compiled = null;
         inline for (.{ "_state", "_lang", "_source", "_path" }) |f| {
             if (@field(self, f)) |o| py.Py_DecRef(o);
             @field(self, f) = null;
@@ -617,9 +625,75 @@ const Program = struct {
         return unwrap(Language, self._lang.?).?;
     }
 
-    /// Run the program from its start. Raises zrun.Error on a runtime error.
-    pub fn run(self: *Program) ?*PyObject {
-        return onBigStack(runHere, .{self}, self.language()._max_depth);
+    /// `program.run(mode="python")`: run the program from its start, its
+    /// semantics as Python ("python") or compiled to native code
+    /// ("compiled"). Raises zrun.Error on a runtime error, the same in
+    /// every mode.
+    pub fn run(self: *Program, args: pyoz.Args(struct { mode: ?*PyObject = null })) ?*PyObject {
+        const mode: []const u8 = if (optional(args.value.mode)) |m| ph.utf8(m, "mode") orelse return null else "python";
+        if (std.mem.eql(u8, mode, "python")) return onBigStack(runHere, .{self}, self.language()._max_depth);
+        if (std.mem.eql(u8, mode, "compiled")) {
+            if (!self.ensureCompiled()) return null;
+            return onBigStack(runCompiled, .{self}, self.language()._max_depth);
+        }
+        ph.raise(py.PyExc_ValueError(), "mode must be 'python' or 'compiled', not '{s}'", .{mode});
+        return null;
+    }
+
+    /// Compile the program (once).
+    fn ensureCompiled(self: *Program) bool {
+        if (self._compiled != null) return true;
+        const lang = self.language();
+        lang.resolve();
+        const st = self.state();
+        const view = compile_mod.LangView{
+            .grammar = lang._grammar.?,
+            .eval_of = lang._eval_of,
+            .exec_of = lang._exec_of,
+            .functions = lang._functions,
+            .read = &lang._read,
+            .hosts = lang._hosts.?,
+            .tree = st.ctx.?.tree,
+            .analysis = st.analysis,
+        };
+        self._compiled = driver.compileProgram(self.ctx().data, view, types.CompileError) orelse return false;
+        return true;
+    }
+
+    /// `program.compiled_ir()`: the LLVM IR the program compiles to.
+    pub fn compiled_ir(self: *Program) ?*PyObject {
+        if (!self.ensureCompiled()) return null;
+        return ph.newString(self._compiled.?.ir_text);
+    }
+
+    fn makeNodeObject(raw: *anyopaque, idx: u32) ?*PyObject {
+        const self: *Program = @ptrCast(@alignCast(raw));
+        return objects.newNode(self._state.?, self.ctx(), idx);
+    }
+
+    fn runCompiled(self: *Program) ?*PyObject {
+        const c = self._compiled.?;
+        var ectx = helpers.Ctx{
+            .node_maker = .{ .ctx = self, .make_fn = &makeNodeObject },
+            .objects = c.objects,
+            .max_depth = self.language()._max_depth,
+        };
+        defer ectx.deinit();
+        const globals = helpers.zr_frame_new(null, c.globals) orelse {
+            _ = py.c.PyErr_NoMemory();
+            return null;
+        };
+        defer value_mod.decrefFrame(globals);
+        if (c.main(&ectx, globals)) return none();
+        if (py.c.PyErr_Occurred() != null) py.c.PyErr_Clear();
+        // The error, as the reference mode makes it
+        var entries: std.ArrayListUnmanaged(Runtime.StackEntry) = .empty;
+        defer entries.deinit(allocator);
+        for (ectx.err_stack.items) |e| entries.append(allocator, .{ .name = e.name.bytes(), .call = e.node }) catch return null;
+        const exc = Runtime.errorObject(self, ectx.err_node, ectx.err_msg.items, "runtime", entries.items) orelse return null;
+        defer py.Py_DecRef(exc);
+        py.c.PyErr_SetObject(types.Error, exc);
+        return null;
     }
 
     fn runHere(self: *Program) ?*PyObject {
@@ -1391,30 +1465,45 @@ const Runtime = struct {
         return null;
     }
 
-    /// A zrun.Error: its diagnostic at the node, the stack of calls, the
-    /// rendered text as its message.
+    /// A zrun.Error at a node, with the calls being run.
     fn makeError(self: *Runtime, idx: u32, message: []const u8, code: []const u8) ?*PyObject {
-        const d = self.data();
+        var entries: std.ArrayListUnmanaged(StackEntry) = .empty;
+        defer entries.deinit(allocator);
+        var i = self._calls.items.len;
+        while (i > 0) {
+            i -= 1;
+            const f = objects.asFrame(self._calls.items[i]);
+            const fname = ph.utf8(f.name.?, "name") orelse return null;
+            entries.append(allocator, .{ .name = fname, .call = f.call }) catch return null;
+        }
+        return errorObject(self._p.?, idx, message, code, entries.items);
+    }
+
+    /// A frame of an error's stack: the function, the node calling it
+    const StackEntry = struct { name: []const u8, call: u32 };
+
+    /// A zrun.Error: its diagnostic at the node, the stack of calls (innermost
+    /// first), the rendered text as its message. (Both modes make theirs here.)
+    fn errorObject(p: *Program, idx: u32, message: []const u8, code: []const u8, entries: []const StackEntry) ?*PyObject {
+        const d = p.ctx().data;
         const at = if (idx < d.nodes.len) d.nodes[idx] else tree_mod.FlatNode{ .text_start = 0, .text_end = 0, .subtree_size = 0, .meta = 0 };
         const diag = diagnostic("error", code, message, at.text_start, at.text_end, d) orelse return null;
         defer py.Py_DecRef(diag);
         const stack = py.c.PyList_New(0) orelse return null;
         defer py.Py_DecRef(stack);
-        var i = self._calls.items.len;
-        while (i > 0) {
-            i -= 1;
-            const f = objects.asFrame(self._calls.items[i]);
-            const call_node = if (f.call < d.nodes.len) d.nodes[f.call] else at;
-            const fname = ph.utf8(f.name.?, "name") orelse return null;
+        for (entries) |e| {
+            const call_node = if (e.call < d.nodes.len) d.nodes[e.call] else at;
             var buf: [256]u8 = undefined;
-            const note = std.fmt.bufPrint(&buf, "in {s}()", .{fname}) catch "in a call";
+            const note = std.fmt.bufPrint(&buf, "in {s}()", .{e.name}) catch "in a call";
             const nd = diagnostic("note", "call", note, call_node.text_start, call_node.text_end, d) orelse return null;
             defer py.Py_DecRef(nd);
-            const pair = py.c.PyTuple_Pack(2, f.name.?, nd) orelse return null;
+            const name = ph.newString(e.name) orelse return null;
+            defer py.Py_DecRef(name);
+            const pair = py.c.PyTuple_Pack(2, name, nd) orelse return null;
             defer py.Py_DecRef(pair);
             if (py.c.PyList_Append(stack, pair) != 0) return null;
         }
-        const rendered = self.render(diag, stack) orelse return null;
+        const rendered = renderError(p, diag, stack) orelse return null;
         defer py.Py_DecRef(rendered);
         const exc = py.c.PyObject_CallFunctionObjArgs(types.Error, rendered, @as(?*PyObject, null)) orelse return null;
         if (py.c.PyObject_SetAttrString(exc, "diagnostic", diag) != 0 or py.c.PyObject_SetAttrString(exc, "stack", stack) != 0) {
@@ -1424,10 +1513,9 @@ const Runtime = struct {
         return exc;
     }
 
-    /// The error as a compiler prints it: the diagnostic with the source,
-    /// then each call that led there.
-    fn render(self: *Runtime, diag: *PyObject, stack: *PyObject) ?*PyObject {
-        const p = self._p.?;
+    /// The error as a compiler prints it: the diagnostic with the source, then
+    /// each call that led there.
+    fn renderError(p: *Program, diag: *PyObject, stack: *PyObject) ?*PyObject {
         const path = p._path orelse py.Py_None();
         const main = (if (path == py.Py_None())
             py.c.PyObject_CallMethod(diag, "render", "(O)", p._source.?)
@@ -1573,6 +1661,8 @@ fn moduleInit(module: *PyObject) callconv(.c) c_int {
     objects.init(module) catch return -1;
     name_program = ph.newString("<program>") orelse return -1;
     CallerType = py.c.PyType_FromSpec(&caller_spec) orelse return -1;
+    // (compiled code words Python's errors as the reference mode does)
+    helpers.pythonMessage = &pythonMessage;
     return 0;
 }
 
