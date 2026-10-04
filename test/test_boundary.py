@@ -46,6 +46,7 @@ BUILTINS = (
     "fields",
     "matches",
     "isinst",
+    "folds",
 )
 
 
@@ -104,6 +105,56 @@ class Frozen:
 
 def scaled(x, factor=2, offset=0):
     return x * factor + offset
+
+
+FOLD_LOG = []
+
+
+def parsed(text):
+    """Pure, and big (out of line): given a constant, run while compiling."""
+    t = text.strip().lower()
+    neg = t.startswith("-")
+    if neg:
+        t = t[1:]
+    base = 16 if t.startswith("0x") else 10
+    digits = t[2:] if base == 16 else t
+    n = 0
+    for ch in digits:
+        if ch == "_":
+            continue
+        d = "0123456789abcdef".find(ch)
+        if d < 0 or d >= base:
+            raise ValueError("bad digit " + repr(ch) + " in " + repr(text))
+        n = n * base + d
+    return -n if neg else n
+
+
+def logged(text):
+    """Big too, but it changes a list of the module's: run each time."""
+    FOLD_LOG.append(text)
+    t = text.strip().lower()
+    neg = t.startswith("-")
+    if neg:
+        t = t[1:]
+    n = 0
+    for ch in t:
+        n = n * 10 + "0123456789".find(ch)
+    return -n if neg else n
+
+
+def fresh_list(text):
+    """Big, pure, its result a new list each call: run each time."""
+    t = text.strip().lower()
+    out = []
+    for ch in t:
+        if ch == " ":
+            continue
+        out.append(ch)
+    if t.startswith("x"):
+        out.append("x")
+    if t.endswith("y"):
+        out.append("y")
+    return out
 
 
 def returns_in_try(log):
@@ -306,6 +357,27 @@ def make_lang():
                 except TypeError as e:
                     r = r + (str(e),)
                 out.append(r)
+            return out
+        if name == "folds":
+            # helpers given constants: a pure one's result known when
+            # compiling; one changing the module's state, one making a new
+            # list each call, run each time; one raising, raising when run
+            out = [parsed(" 0x1F "), parsed("-1_000"), parsed("42")]
+            FOLD_LOG.clear()
+            out.append(logged("7") + logged("-8"))
+            out.append(list(FOLD_LOG))
+            a = fresh_list("x b y")
+            a.append("!")
+            out.append(a)
+            out.append(fresh_list("x b y"))
+            try:
+                out.append(parsed("12z"))
+            except ValueError as e:
+                out.append(str(e))
+            # (a str method's result known when compiling, not a constant:
+            # bytes, kept for the code)
+            out.append(len("héllo".encode("utf-8")))
+            out.append("ab".encode())
             return out
         if name == "isinst":
             # isinstance() of values of every kind: Python's, natively made
@@ -513,6 +585,10 @@ def make_lang():
         return 3
 
     @lang.host
+    def folds():
+        return 0
+
+    @lang.host
     def isinst():
         return [1, True, 2**70, 2**200, 2.0, "s", MyStr("x"), [1], (1,), {}, None, Color.RED, Point(1, 2), Holder(1), Slot3(1, 2), Box(1)]
 
@@ -603,6 +679,7 @@ PROGRAMS = {
     "fields": "print(fields());\n",
     "matches": "print(matches());\n",
     "isinst": "print(isinst());\n",
+    "folds": "print(folds());\n",
 }
 
 
@@ -624,6 +701,7 @@ def test_shared_with_python(name, capsys):
         "slices": "([2, 3, 4], [5, 3, 1], [], (4, 5), 'ello', 'éllo', [1, 2], [1, 2, 3, 4])",
         "genexp": "(True, False, 12, 2, True, False, '123')",
         "defaults": "(6, 9, 7, 13, 2)",
+        "folds": "[31, -1000, 42, -1, ['7', '-8'], ['x', 'b', 'y', 'x', 'y', '!'], ['x', 'b', 'y', 'x', 'y'], \"bad digit 'z' in '12z'\", 6, b'ab']",
         "trying": "[\"value:invalid literal for int() with base 10: 'x'\", 'key', 'fin', 'body', 'else', 'loop0', 'f0', 'f1', 'f2', 'g1', 'g2', 'rf', 'ret', 'v', 'again', 'inner', 'zero']",
     }.get(name)
     if expected is not None:

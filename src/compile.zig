@@ -301,6 +301,41 @@ fn frozenGlobals(globals: *PyObject) error{Python}!*PyObject {
 fn moduleScan(globals: *PyObject) error{Python}!ScanEntry {
     const n = py.c.PyDict_Size(globals);
     if (rebound_cache.get(globals)) |e| if (e.len == n) return e;
+    try scanners();
+    const pair = py.c.PyObject_CallFunctionObjArgs(rebound_scanner.?, globals, @as(?*PyObject, null)) orelse return error.Python;
+    defer py.Py_DecRef(pair);
+    const entry = ScanEntry{ .len = n, .names = py.c.PyTuple_GetItem(pair, 0).?, .frozen = py.c.PyTuple_GetItem(pair, 1).? };
+    py.Py_IncRef(entry.names);
+    py.Py_IncRef(entry.frozen);
+    if (rebound_cache.fetchRemove(globals)) |old| {
+        py.Py_DecRef(old.value.names);
+        py.Py_DecRef(old.value.frozen);
+    } else py.Py_IncRef(globals);
+    rebound_cache.put(std.heap.c_allocator, globals, entry) catch {
+        py.Py_DecRef(entry.names);
+        py.Py_DecRef(entry.frozen);
+        py.Py_DecRef(globals);
+        _ = py.c.PyErr_NoMemory();
+        return error.Python;
+    };
+    return entry;
+}
+
+/// Whether a Python function is pure: what it returns depends only on its
+/// arguments, and it changes nothing outside it (it reads its parameters
+/// and locals, builtins like len() and int(), exceptions, constants and
+/// tables only read of its module, `math`, other pure functions; it
+/// changes only what it made). Given constants, its result is known when
+/// compiling (Gen.foldCall). Worked out once per function.
+fn pureFunction(o: *PyObject) error{Python}!bool {
+    try scanners();
+    const r = py.c.PyObject_CallFunctionObjArgs(pure_checker.?, o, @as(?*PyObject, null)) orelse return error.Python;
+    defer py.Py_DecRef(r);
+    return r == py.Py_True();
+}
+
+/// The Python code reading modules (moduleScan, pureFunction), made once.
+fn scanners() error{Python}!void {
     if (rebound_scanner == null) {
         const src =
             \\import ast, dis, inspect, sys, types
@@ -371,30 +406,93 @@ fn moduleScan(globals: *PyObject) error{Python}!ScanEntry {
             \\    for v in list(g.values()):
             \\        visit(v, 0)
             \\    return (frozenset(out), frozen(g) - out)
+            \\import builtins, textwrap
+            \\SAFE_BUILTINS = {"int", "float", "str", "len", "chr", "ord", "abs", "min", "max", "bool", "tuple", "list",
+            \\                 "dict", "set", "frozenset", "isinstance", "range", "enumerate", "zip", "sorted", "reversed",
+            \\                 "sum", "any", "all", "repr", "hex", "oct", "bin", "divmod", "round", "pow", "type", "hash",
+            \\                 "format", "iter", "next", "map", "filter", "None", "True", "False"}
+            \\SAFE_MODULES = {"math", "string"}
+            \\IMMUTABLE = (int, float, complex, str, bytes, bool, type(None), frozenset)
+            \\pure_cache = {}
+            \\frozen_cache = {}
+            \\def constant(v):
+            \\    if type(v) is tuple:
+            \\        return all(constant(x) for x in v)
+            \\    return type(v) in IMMUTABLE
+            \\def frozen_of(g):
+            \\    k = id(g)
+            \\    if k not in frozen_cache:
+            \\        frozen_cache[k] = (g, scan(g)[1])
+            \\    return frozen_cache[k][1]
+            \\def pure(fn):
+            \\    if fn in pure_cache:
+            \\        return pure_cache[fn]
+            \\    # (one calling itself, or a cycle: each checked on its own)
+            \\    pure_cache[fn] = True
+            \\    try:
+            \\        ok = check(fn)
+            \\    except Exception:
+            \\        ok = False
+            \\    pure_cache[fn] = ok
+            \\    return ok
+            \\def check(fn):
+            \\    if not isinstance(fn, types.FunctionType) or fn.__closure__ or fn.__kwdefaults__:
+            \\        return False
+            \\    if fn.__defaults__ and not constant(fn.__defaults__):
+            \\        return False
+            \\    fdef = ast.parse(textwrap.dedent(inspect.getsource(fn))).body[0]
+            \\    if not isinstance(fdef, ast.FunctionDef):
+            \\        return False
+            \\    a = fdef.args
+            \\    params = {x.arg for x in a.posonlyargs + a.args + a.kwonlyargs}
+            \\    params |= {x.arg for x in (a.vararg, a.kwarg) if x is not None}
+            \\    local = set(params)
+            \\    for n in ast.walk(fdef):
+            \\        if n is not fdef and isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            \\            return False
+            \\        if isinstance(n, (ast.Global, ast.Nonlocal, ast.Yield, ast.YieldFrom, ast.Await)):
+            \\            return False
+            \\        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            \\            local.add(n.id)
+            \\        if isinstance(n, ast.ExceptHandler) and n.name:
+            \\            local.add(n.name)
+            \\    g = fn.__globals__
+            \\    fz = frozen_of(g)
+            \\    for n in ast.walk(fdef):
+            \\        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in local:
+            \\            if n.id in g:
+            \\                v = g[n.id]
+            \\                if constant(v) or n.id in fz:
+            \\                    continue
+            \\                if isinstance(v, types.ModuleType) and v.__name__ in SAFE_MODULES:
+            \\                    continue
+            \\                if isinstance(v, type) and issubclass(v, BaseException):
+            \\                    continue
+            \\                if isinstance(v, types.FunctionType) and pure(v):
+            \\                    continue
+            \\                return False
+            \\            b = getattr(builtins, n.id, None)
+            \\            if n.id in SAFE_BUILTINS or (isinstance(b, type) and issubclass(b, BaseException)):
+            \\                continue
+            \\            return False
+            \\        # (changing only what it made)
+            \\        if isinstance(n, (ast.Attribute, ast.Subscript)) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            \\            base = n.value
+            \\            while isinstance(base, (ast.Attribute, ast.Subscript)):
+            \\                base = base.value
+            \\            if not (isinstance(base, ast.Name) and base.id in local and base.id not in params):
+            \\                return False
+            \\    return True
         ;
         const ns = runPython(src) orelse return error.Python;
         defer py.Py_DecRef(ns);
         const f = py.c.PyDict_GetItemString(ns, "scan") orelse return error.Python;
+        const p = py.c.PyDict_GetItemString(ns, "pure") orelse return error.Python;
         py.Py_IncRef(f);
+        py.Py_IncRef(p);
         rebound_scanner = f;
+        pure_checker = p;
     }
-    const pair = py.c.PyObject_CallFunctionObjArgs(rebound_scanner.?, globals, @as(?*PyObject, null)) orelse return error.Python;
-    defer py.Py_DecRef(pair);
-    const entry = ScanEntry{ .len = n, .names = py.c.PyTuple_GetItem(pair, 0).?, .frozen = py.c.PyTuple_GetItem(pair, 1).? };
-    py.Py_IncRef(entry.names);
-    py.Py_IncRef(entry.frozen);
-    if (rebound_cache.fetchRemove(globals)) |old| {
-        py.Py_DecRef(old.value.names);
-        py.Py_DecRef(old.value.frozen);
-    } else py.Py_IncRef(globals);
-    rebound_cache.put(std.heap.c_allocator, globals, entry) catch {
-        py.Py_DecRef(entry.names);
-        py.Py_DecRef(entry.frozen);
-        py.Py_DecRef(globals);
-        _ = py.c.PyErr_NoMemory();
-        return error.Python;
-    };
-    return entry;
 }
 
 const ScanEntry = struct { len: isize, names: *PyObject, frozen: *PyObject };
@@ -487,6 +585,7 @@ var record_types: std.AutoHashMapUnmanaged(*PyObject, *value.RecordType) = .empt
 var not_records: std.AutoHashMapUnmanaged(*PyObject, void) = .empty;
 
 var rebound_scanner: ?*PyObject = null;
+var pure_checker: ?*PyObject = null;
 /// (the module dicts are kept: modules live as long)
 var rebound_cache: std.AutoHashMapUnmanaged(*PyObject, ScanEntry) = .empty;
 
@@ -2152,6 +2251,9 @@ const Gen = struct {
             for (items, 0..) |*it, i| it.* = try self.constant(py.c.PyTuple_GetItem(o, @intCast(i)).?, at);
             return .{ .tuple = items };
         }
+        // (kept: it may be one just made (a str method's bytes...), the
+        // code refers to it)
+        _ = try self.c.objectIndex(o);
         return .{ .py = o };
     }
 
@@ -2495,8 +2597,51 @@ const Gen = struct {
         for (self.insts.items) |i| if (i.func == func) return self.outOfLine(func, at, args);
         // (out of line needs the variables in frames: without them, big
         // helpers stay inline)
-        if (func.size > inline_size and self.c.allHeap()) return self.outOfLine(func, at, args);
+        if (func.size > inline_size and self.c.allHeap()) {
+            if (try self.foldCall(func, args)) |v| return v;
+            return self.outOfLine(func, at, args);
+        }
         return self.runFunction(func, at, args);
+    }
+
+    /// A pure helper (pureFunction) given constants (a literal's text...):
+    /// its result now, Python running it once while compiling (an
+    /// immutable one; null: not this call, it runs when the code does (its
+    /// error too)).
+    fn foldCall(self: *Gen, func: *const front.Function, args: []const SVal) Error!?SVal {
+        for (args) |x| if (!allConstant(x)) return null;
+        if (!try pureFunction(func.py_function)) return null;
+        const tuple = py.c.PyTuple_New(@intCast(args.len)) orelse return error.Python;
+        defer py.Py_DecRef(tuple);
+        for (args, 0..) |x, i| _ = py.c.PyTuple_SetItem(tuple, @intCast(i), try self.pyOf(x));
+        const r = py.c.PyObject_CallObject(func.py_function, tuple) orelse {
+            py.c.PyErr_Clear();
+            return null;
+        };
+        defer py.Py_DecRef(r);
+        if (std.c.getenv("ZRUN_STATS") != null) {
+            const ra = py.c.PyObject_Repr(tuple);
+            defer if (ra) |o| py.Py_DecRef(o);
+            const rr = py.c.PyObject_Repr(r);
+            defer if (rr) |o| py.Py_DecRef(o);
+            std.debug.print("known when compiling: {s}{s} = {s}\n", .{ func.name, if (ra) |o| ph.utf8(o, "repr") orelse "?" else "?", if (rr) |o| ph.utf8(o, "repr") orelse "?" else "?" });
+            py.c.PyErr_Clear();
+        }
+        const v = try self.constant(r, self.atNode());
+        if (!allConstant(v)) return null;
+        return v;
+    }
+
+    /// A constant all through: a str, a number, None, a bool, a tuple of
+    /// them.
+    fn allConstant(x: SVal) bool {
+        return switch (x) {
+            .none, .bool, .int, .pint, .float, .str => true,
+            .tuple => |t| for (t) |item| {
+                if (!allConstant(item)) break false;
+            } else true,
+            else => false,
+        };
     }
 
     /// A value given by pointer (an owned reference), `default` where the
