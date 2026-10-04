@@ -415,8 +415,129 @@ fn isIntLike(v: Value) bool {
     return v.kind() == .int or v.kind() == .bool;
 }
 
+/// An int and a float equal exactly, as Python compares them (2**53 + 1
+/// isn't 2.0**53, though it is as a float).
+fn intEqualsFloat(i: i64, f: f64) bool {
+    if (f != @trunc(f) or !(@abs(f) < 9.3e18)) return false;
+    if (f >= 9223372036854775807.0 or f < -9223372036854775808.0) return false;
+    return @as(i64, @intFromFloat(f)) == i;
+}
+
+/// What a Python object is to a dict: compared and hashed by identity
+/// (object's), as one of the native values (a subclass of int, float, str:
+/// an IntEnum...), or by its own __eq__ and __hash__.
+const HostKind = enum { identity, int, float, str, own };
+
+fn hostKind(o: *PyObject) HostKind {
+    const t = ph.typeOf(o);
+    if (py.c.PyType_IsSubtype(t, exact.int) != 0) return .int;
+    if (py.c.PyType_IsSubtype(t, exact.float) != 0) return .float;
+    if (py.c.PyType_IsSubtype(t, exact.str) != 0) return .str;
+    const object = py.types.typeObject("PyBaseObject_Type");
+    if (py.c.PyType_GetSlot(t, py.c.Py_tp_hash) == py.c.PyType_GetSlot(object, py.c.Py_tp_hash) and
+        py.c.PyType_GetSlot(t, py.c.Py_tp_richcompare) == py.c.PyType_GetSlot(object, py.c.Py_tp_richcompare)) return .identity;
+    return .own;
+}
+
+/// An int, a float or a str (native, or a Python object of a subclass of
+/// one: its value, a str's characters borrowed), for comparing
+const Scalar = union(enum) { int: i64, float: f64, str: []const u8, other };
+
+fn scalarOf(v: Value) Scalar {
+    switch (v.kind()) {
+        .int, .bool => return .{ .int = v.asInt() },
+        .float => return .{ .float = v.asFloat() },
+        .str => return .{ .str = @as(*Str, @ptrCast(v.ptr())).bytes() },
+        .host => {},
+        else => return .other,
+    }
+    const o: *PyObject = @ptrFromInt(v.bits);
+    switch (hostKind(o)) {
+        .int => {
+            var overflow: c_int = 0;
+            const n = py.c.PyLong_AsLongLongAndOverflow(o, &overflow);
+            if (overflow != 0 or (n == -1 and py.c.PyErr_Occurred() != null)) {
+                py.c.PyErr_Clear();
+                return .other;
+            }
+            return .{ .int = n };
+        },
+        .float => return .{ .float = py.c.PyFloat_AsDouble(o) },
+        .str => {
+            var len: py.Py_ssize_t = 0;
+            const p = py.c.PyUnicode_AsUTF8AndSize(o, &len) orelse {
+                py.c.PyErr_Clear();
+                return .other;
+            };
+            return .{ .str = p[0..@intCast(len)] };
+        },
+        else => return .other,
+    }
+}
+
+fn hostEqual(a: Value, b: Value) bool {
+    if (a.kind() == .host and b.kind() == .host and a.bits == b.bits) return true;
+    const x = scalarOf(a);
+    const y = scalarOf(b);
+    if (x != .other and y != .other) return switch (x) {
+        .int => |i| switch (y) {
+            .int => |j| i == j,
+            .float => |g| intEqualsFloat(i, g),
+            else => false,
+        },
+        .float => |f| switch (y) {
+            .int => |j| intEqualsFloat(j, f),
+            .float => |g| f == g,
+            else => false,
+        },
+        .str => |s| y == .str and std.mem.eql(u8, s, y.str),
+        .other => unreachable,
+    };
+    // (Python objects: by Python's ==; with a native scalar, as Python
+    // compares them)
+    const pa = scalarObject(a) orelse return false;
+    defer py.Py_DecRef(pa);
+    const pb = scalarObject(b) orelse return false;
+    defer py.Py_DecRef(pb);
+    const r = py.c.PyObject_RichCompareBool(pa, pb, py.c.Py_EQ);
+    if (r < 0) {
+        py.c.PyErr_Clear();
+        return false;
+    }
+    return r == 1;
+}
+
+/// A host value, or a scalar, as a Python object (a new reference); null
+/// for the rest (they're not equal to the Python objects compared).
+fn scalarObject(v: Value) ?*PyObject {
+    const o: ?*PyObject = switch (v.kind()) {
+        .host => blk: {
+            const h: *PyObject = @ptrFromInt(v.bits);
+            py.Py_IncRef(h);
+            break :blk h;
+        },
+        .none => blk: {
+            py.Py_IncRef(py.Py_None());
+            break :blk py.Py_None();
+        },
+        .bool => py.c.PyBool_FromLong(@intFromBool(v.asInt() != 0)),
+        .int => py.c.PyLong_FromLongLong(v.asInt()),
+        .float => py.c.PyFloat_FromDouble(v.asFloat()),
+        .str => blk: {
+            const b = @as(*Str, @ptrCast(v.ptr())).bytes();
+            break :blk py.c.PyUnicode_FromStringAndSize(b.ptr, @intCast(b.len));
+        },
+        else => null,
+    };
+    if (o == null) py.c.PyErr_Clear();
+    return o;
+}
+
 pub fn equal(a: Value, b: Value) bool {
     if (isIntLike(a) and isIntLike(b)) return a.asInt() == b.asInt();
+    if (a.kind() == .float and isIntLike(b)) return intEqualsFloat(b.asInt(), a.asFloat());
+    if (b.kind() == .float and isIntLike(a)) return intEqualsFloat(a.asInt(), b.asFloat());
+    if (a.kind() == .host or b.kind() == .host) return hostEqual(a, b);
     if (numeric(a)) |x| {
         if (numeric(b)) |y| return x == y;
         return false;
@@ -490,12 +611,30 @@ fn hashOf(tag: u64, bits: u64) u64 {
             for (@as(*Tuple, @ptrCast(@alignCast(v.ptr()))).slice()) |item| h = h *% 0x100000001B3 ^ hashOf(item.tag, item.bits);
             return h;
         },
+        .host => return hostHash(@ptrFromInt(bits)),
         else => return std.hash.Wyhash.hash(4, std.mem.asBytes(&bits)),
     }
 }
 
+/// A Python object's hash, alike for the values it equals (hostEqual).
+fn hostHash(o: *PyObject) u64 {
+    const bits = @intFromPtr(o);
+    switch (scalarOf(.{ .tag = @intFromEnum(Tag.host), .bits = bits })) {
+        .int => |i| return hashOf(@intFromEnum(Tag.int), @bitCast(i)),
+        .float => |f| return hashOf(Value.float(f).tag, Value.float(f).bits),
+        .str => |s| return strHash(s),
+        .other => {},
+    }
+    if (hostKind(o) == .identity) return std.hash.Wyhash.hash(4, std.mem.asBytes(&bits));
+    const h = py.c.PyObject_Hash(o);
+    if (h == -1) py.c.PyErr_Clear();
+    return std.hash.Wyhash.hash(5, std.mem.asBytes(&h));
+}
+
 pub fn hashable(v: Value) bool {
     return switch (v.kind()) {
+        // (a Python object: unless its type says it isn't, as a list's does)
+        .host => py.c.PyType_GetSlot(ph.typeOf(@ptrFromInt(v.bits)), py.c.Py_tp_hash) != @as(?*anyopaque, @ptrCast(@constCast(&py.c.PyObject_HashNotImplemented))),
         .list, .dict => false,
         // (a dataclass compared by value isn't; a plain object is, by identity)
         .record => !@as(*Record, @ptrCast(@alignCast(v.ptr()))).rtype.value_eq,
@@ -662,14 +801,36 @@ pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
 }
 
 /// A Python object as a value (a new reference), or null with an
-/// exception (IntegerOverflow for an int outside 64 bits). Python lists,
-/// tuples and dicts are copied; other objects are host values.
+/// exception (IntegerOverflow for an int outside 64 bits). Tuples are
+/// copied; a list or a dict only nothing else refers to (just made: a
+/// call's result...) is copied too (no one can see the difference), one
+/// that's shared is a host value, as other objects are (the same object
+/// both sides see change).
 pub fn fromPython(o: *PyObject) ?Value {
+    return convert(o, ph.refcnt(o) == 1);
+}
+
+/// The types converted (exactly these)
+const exact = struct {
+    const int = py.types.typeObject("PyLong_Type");
+    const float = py.types.typeObject("PyFloat_Type");
+    const str = py.types.typeObject("PyUnicode_Type");
+    const tuple = py.types.typeObject("PyTuple_Type");
+    const list = py.types.typeObject("PyList_Type");
+    const dict = py.types.typeObject("PyDict_Type");
+};
+
+/// (`unique`: the reference given is the only one, the containers it's
+/// in included)
+fn convert(o: *PyObject, unique: bool) ?Value {
     if (o == py.Py_None()) return Value.none_v;
     // (a proxy: the compiled object itself)
     if (proxies.unwrap(o)) |v| return v;
-    if (py.PyBool_Check(o)) return Value.boolean(o == py.Py_True());
-    if (py.PyLong_Check(o)) {
+    // (of exactly these types: a subclass (an IntEnum, a namedtuple...) is
+    // a host value, itself)
+    if (o == py.Py_True() or o == py.Py_False()) return Value.boolean(o == py.Py_True());
+    const ty = ph.typeOf(o);
+    if (ty == exact.int) {
         var overflow: c_int = 0;
         const n = py.c.PyLong_AsLongLongAndOverflow(o, &overflow);
         if (overflow != 0) {
@@ -678,54 +839,79 @@ pub fn fromPython(o: *PyObject) ?Value {
         }
         return Value.int(n);
     }
-    if (py.PyFloat_Check(o)) return Value.float(py.c.PyFloat_AsDouble(o));
-    if (py.PyUnicode_Check(o)) {
-        const s = ph.utf8(o, "str") orelse return null;
+    if (ty == exact.float) return Value.float(py.c.PyFloat_AsDouble(o));
+    if (ty == exact.str) str: {
+        const s = ph.utf8(o, "str") orelse {
+            // (lone surrogates: not UTF-8, kept as the object)
+            py.c.PyErr_Clear();
+            break :str;
+        };
         const str = newStr(s) orelse {
             _ = py.c.PyErr_NoMemory();
             return null;
         };
         return Value.obj(.str, &str.head);
     }
-    if (py.PyList_Check(o) or py.PyTuple_Check(o)) {
-        const seq = py.c.PySequence_Fast(o, "") orelse return null;
-        defer py.Py_DecRef(seq);
-        const n: usize = @intCast(py.c.PySequence_Size(seq));
-        if (py.PyTuple_Check(o)) {
-            const t = newTuple(n) orelse {
-                _ = py.c.PyErr_NoMemory();
+    if (ty == exact.tuple) {
+        const n: usize = @intCast(py.c.PyTuple_Size(o));
+        const t = newTuple(n) orelse {
+            _ = py.c.PyErr_NoMemory();
+            return null;
+        };
+        for (t.slice(), 0..) |*slot, i| {
+            // (borrowed: the tuple's)
+            const item = py.c.PyTuple_GetItem(o, @intCast(i)).?;
+            slot.* = convert(item, unique and ph.refcnt(item) == 1) orelse {
+                // (the items not made yet are None)
+                for (t.slice()[i..]) |*rest| rest.* = Value.none_v;
+                decref(Value.obj(.tuple, &t.head));
                 return null;
             };
-            for (t.slice(), 0..) |*slot, i| {
-                const item = py.c.PySequence_GetItem(seq, @intCast(i)) orelse {
-                    decref(Value.obj(.tuple, &t.head));
-                    return null;
-                };
-                defer py.Py_DecRef(item);
-                slot.* = fromPython(item) orelse {
-                    decref(Value.obj(.tuple, &t.head));
-                    return null;
-                };
-            }
-            return Value.obj(.tuple, &t.head);
         }
+        return Value.obj(.tuple, &t.head);
+    }
+    if (unique and ty == exact.list) {
+        const n: usize = @intCast(py.c.PyList_Size(o));
         const l = newList(n) orelse {
             _ = py.c.PyErr_NoMemory();
             return null;
         };
         for (0..n) |i| {
-            const item = py.c.PySequence_GetItem(seq, @intCast(i)) orelse {
-                decref(Value.obj(.list, &l.head));
-                return null;
-            };
-            defer py.Py_DecRef(item);
-            const v = fromPython(item) orelse {
+            const item = py.c.PyList_GetItem(o, @intCast(i)).?;
+            const v = convert(item, ph.refcnt(item) == 1) orelse {
                 decref(Value.obj(.list, &l.head));
                 return null;
             };
             _ = listPush(l, v);
         }
         return Value.obj(.list, &l.head);
+    }
+    if (unique and ty == exact.dict) {
+        const d = newDict() orelse {
+            _ = py.c.PyErr_NoMemory();
+            return null;
+        };
+        var pos: py.Py_ssize_t = 0;
+        var ko: ?*PyObject = null;
+        var vo: ?*PyObject = null;
+        while (py.c.PyDict_Next(o, &pos, @ptrCast(&ko), @ptrCast(&vo)) != 0) {
+            const k = convert(ko.?, ph.refcnt(ko.?) == 1) orelse {
+                decref(Value.obj(.dict, &d.head));
+                return null;
+            };
+            defer decref(k);
+            const v = convert(vo.?, ph.refcnt(vo.?) == 1) orelse {
+                decref(Value.obj(.dict, &d.head));
+                return null;
+            };
+            defer decref(v);
+            if (!dictSet(d, k, v)) {
+                decref(Value.obj(.dict, &d.head));
+                _ = py.c.PyErr_NoMemory();
+                return null;
+            }
+        }
+        return Value.obj(.dict, &d.head);
     }
     // A compiled function given to Python, back: itself
     if (objects.asFunction(o)) |f| if (f.native) |n| {

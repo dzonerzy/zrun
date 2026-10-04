@@ -5,6 +5,17 @@ const pyoz = @import("PyOZ");
 pub const py = pyoz.py;
 pub const PyObject = pyoz.PyObject;
 
+/// An object's type (Py_TYPE).
+pub inline fn typeOf(o: *PyObject) *py.PyTypeObject {
+    return py.Py_TYPE(o).?;
+}
+
+/// An object's reference count (Py_REFCNT: the first word of an object;
+/// immortal ones read as huge).
+pub inline fn refcnt(o: *PyObject) isize {
+    return @as(*const isize, @ptrCast(@alignCast(o))).*;
+}
+
 /// Raise `exc` with a formatted message.
 pub fn raise(exc: *PyObject, comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;

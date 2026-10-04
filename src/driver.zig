@@ -101,7 +101,9 @@ pub const Compiled = struct {
                 error.OutOfMemory => return oomT(),
                 error.Python => return null,
             };
+            const t0 = nowUs();
             const addr = self.add(name) orelse return null;
+            if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("thunk node={d} which={s} owner={d} llvm={d}us\n", .{ node, @tagName(which), owner, nowUs() - t0 });
             const t: Thunk = @ptrFromInt(addr);
             self.thunks.put(allocator, key, t) catch return oomT();
             return t;
@@ -158,6 +160,12 @@ pub const Compiled = struct {
         return addr;
     }
 };
+
+fn nowUs() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1_000_000 + @divTrunc(@as(i64, ts.nsec), 1000);
+}
 
 fn types() type {
     return @import("types.zig");

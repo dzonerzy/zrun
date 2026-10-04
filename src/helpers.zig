@@ -795,6 +795,14 @@ export fn zr_setitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
             if (!value.dictSet(d, k, x)) return oomFail(ctx, node);
             return true;
         },
+        // (a Python object: itself changed, as Python does it)
+        .host => {
+            var objs: [3]*PyObject = undefined;
+            if (!objects(ctx, &.{ v, k, x }, &objs)) return failPython(ctx, node);
+            defer for (objs) |o| py.Py_DecRef(o);
+            if (py.c.PyObject_SetItem(objs[0], objs[1], objs[2]) != 0) return failPython(ctx, node);
+            return true;
+        },
         else => return fail(ctx, node, "'{s}' object does not support item assignment", .{value.typeName(v)}),
     }
 }
@@ -920,7 +928,15 @@ export fn zr_list_at(t: u64, bits: u64, i: u64, out: *Value) callconv(.c) void {
 export fn zr_append(ctx: *Ctx, node: u32, t: u64, bits: u64, xt: u64, xb: u64) callconv(.c) bool {
     const v = Value{ .tag = t, .bits = bits };
     const x = Value{ .tag = xt, .bits = xb };
-    if (v.kind() != .list) return fail(ctx, node, "'{s}' object has no attribute 'append'", .{value.typeName(v)});
+    if (v.kind() != .list) {
+        // (a Python object's append(), or Python's error)
+        var objs: [2]*PyObject = undefined;
+        if (!objects(ctx, &.{ v, x }, &objs)) return failPython(ctx, node);
+        defer for (objs) |o| py.Py_DecRef(o);
+        const r = py.c.PyObject_CallMethod(objs[0], "append", "(O)", objs[1]) orelse return failPython(ctx, node);
+        py.Py_DecRef(r);
+        return true;
+    }
     value.incref(x);
     if (!value.listPush(@ptrCast(@alignCast(v.ptr())), x)) return oomFail(ctx, node);
     return true;
@@ -973,6 +989,20 @@ export fn zr_call_python(ctx: *Ctx, node: u32, callee_index: u64, args: [*]const
 /// tuple, dict); `code` says which.
 export fn zr_is_type(t: u64, bits: u64, code: u32) callconv(.c) bool {
     const v = Value{ .tag = t, .bits = bits };
+    // (a Python object: of the type or a subclass of it)
+    if (v.kind() == .host) {
+        const o: *PyObject = @ptrFromInt(v.bits);
+        return switch (code) {
+            0 => py.PyLong_Check(o),
+            1 => py.PyFloat_Check(o),
+            2 => py.PyUnicode_Check(o),
+            3 => py.PyBool_Check(o),
+            4 => py.PyList_Check(o),
+            5 => py.PyTuple_Check(o),
+            6 => py.PyDict_Check(o),
+            else => false,
+        };
+    }
     return switch (code) {
         0 => v.kind() == .int or v.kind() == .bool, // int (bool is an int)
         1 => v.kind() == .float,

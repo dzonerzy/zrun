@@ -4,7 +4,9 @@ whatever Python does to a list, a dict or a record the semantics made is
 seen by them, and the other way round. Every program runs in every mode."""
 
 import builtins
+from collections import namedtuple
 from dataclasses import dataclass
+from enum import IntEnum
 
 import pytest
 import zrun
@@ -12,7 +14,23 @@ from conftest import tiny
 from test_modes import same_in_every_mode
 from zrules import Rules, scopes
 
-BUILTINS = ("print", "show", "mutate_list", "mutate_dict", "mutate_point", "keep", "kept", "ops", "py_side")
+BUILTINS = (
+    "print",
+    "show",
+    "mutate_list",
+    "mutate_dict",
+    "mutate_point",
+    "keep",
+    "kept",
+    "ops",
+    "py_side",
+    "reset",
+    "grow_shared",
+    "shared_dict",
+    "fresh",
+    "point",
+    "keys",
+)
 
 
 @dataclass
@@ -29,6 +47,13 @@ class Box:
 
 
 KEPT = []
+SHARED = []
+SHARED_DICT = {}
+Pt = namedtuple("Pt", "x y")
+
+
+class Color(IntEnum):
+    RED = 1
 
 
 def make_lang():
@@ -73,6 +98,32 @@ def make_lang():
             p = Point(1, 2)
             rt.call(rt.load(node.name), [p])
             return p.x * 10 + p.y
+        # Values Python made, changed by the semantics: Python sees it
+        if name == "grow_shared":
+            xs = rt.call(rt.load(node.name), [])
+            xs.append(7)
+            xs[0] = xs[0] + 1
+            again = rt.call(rt.load(node.name), [])
+            return len(again) * 100 + again[0] + isinstance(xs, list)
+        if name == "shared_dict":
+            m = rt.call(rt.load(node.name), [])
+            m["k"] = 5
+            return rt.call(rt.load(node.name), [])["k"]
+        if name == "fresh":
+            xs = rt.call(rt.load(node.name), [])
+            xs.append(4)
+            return len(xs)
+        if name == "point":
+            p = rt.call(rt.load(node.name), [])
+            return p.x * 10 + p[1]
+        if name == "keys":
+            # Python objects as keys: equal and hashed as Python does
+            k = rt.call(rt.load(node.name), [])
+            d = {}
+            d[k[0]] = "red"
+            d[k[1]] = "fs"
+            d[k[3]] = "box"
+            return d.get(1, "no") + d.get(k[2], "no") + d.get(k[3], "no") + d.get(Box(1), "no") + str(len(d))
         if name == "py_side":
             # a list a semantic run as Python changes
             xs = [10, 20]
@@ -161,6 +212,32 @@ def make_lang():
             pass
 
     @lang.host
+    def reset():
+        SHARED[:] = [1]
+        SHARED_DICT.clear()
+        return 0
+
+    @lang.host
+    def grow_shared():
+        return SHARED
+
+    @lang.host
+    def shared_dict():
+        return SHARED_DICT
+
+    @lang.host
+    def keys():
+        return (Color.RED, frozenset({1}), frozenset({1}), Box(2))
+
+    @lang.host
+    def fresh():
+        return [1, 2, 3]
+
+    @lang.host
+    def point():
+        return Pt(3, 4)
+
+    @lang.host
     def keep(v):
         KEPT.append(v)
         return 0
@@ -188,6 +265,8 @@ PROGRAMS = {
     "list": "print(mutate_list());\n",
     "dict": "print(mutate_dict());\n",
     "record": "print(mutate_point());\n",
+    "from_python": "print(reset(), grow_shared(), shared_dict(), fresh(), point());\n",
+    "keys": "print(keys());\n",
 }
 
 
@@ -196,4 +275,8 @@ def test_shared_with_python(name, capsys):
     out, err = same_in_every_mode(lang, PROGRAMS[name], capsys)
     assert err is None, err
     # (len * 1000 + first * 100 + last, after the host's changes...)
-    assert out.strip() == {"list": "4531", "dict": "231", "record": "53"}[name]
+    assert out.strip() == {"list": "4531", "dict": "231", "record": "53", "from_python": "0 203 5 4 34", "keys": "redfsboxno3"}[name]
+    if name == "from_python":
+        assert SHARED == [2, 7] and SHARED_DICT == {"k": 5}
+    # (compiled: none of them ran as Python)
+    assert lang.python_semantics() == {}

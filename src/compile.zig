@@ -964,30 +964,12 @@ const Gen = struct {
     /// control flow that can't follow every path: its literal is marked to
     /// be built at run time, and the program compiled again.
     fn promote(self: *Gen, old: SVal, d: Dyn) Error!void {
-        const ptr: *const anyopaque = switch (old) {
-            .list => |l| l,
-            .dict => |x| x,
-            else => return,
-        };
-        var aliased = false;
-        for (self.insts.items) |inst| {
-            for (inst.locals) |l| switch (l) {
-                .static => |sv| if (refersTo(sv, ptr, 4)) {
-                    aliased = true;
-                },
-                else => {},
-            };
-        }
-        if (!aliased) return;
-        var in_flow = self.loop_level > 0;
-        // (after a return from inside it, the rest runs on some paths only)
-        for (self.insts.items) |inst| in_flow = in_flow or inst.dyn_depth > 0 or inst.result_slot != null;
-        if (in_flow) {
-            const origin = switch (old) {
-                .list => |l| l.origin,
-                .dict => |x| x.origin,
-                else => null,
-            } orelse return;
+        const ptr = containerPtr(old) orelse return;
+        if (!self.aliased(ptr)) return;
+        if (self.inFlow()) {
+            // (one no literal made: a copy, for reading (one changed is
+            // refused: materializeToChange))
+            const origin = originOf(old) orelse return;
             try self.c.lang.escaping.put(std.heap.c_allocator, origin, {});
             self.c.need_retry = true;
             return self.c.unsupported("a list or dict escapes inside run-time control flow: compiled again, made at run time", .{});
@@ -998,6 +980,50 @@ const Gen = struct {
                 else => {},
             };
         }
+    }
+
+    /// A value about to be changed at run time, as materialize makes it: a
+    /// known list or dict no literal made, that variables refer to, can't
+    /// follow inside run-time control flow.
+    fn materializeToChange(self: *Gen, v: SVal, at: u32) Error!Dyn {
+        if (containerPtr(v)) |ptr| if (originOf(v) == null and self.aliased(ptr) and self.inFlow())
+            return self.c.unsupported("a list or dict made when compiling (not by a literal) changed inside run-time control flow isn't compiled yet", .{});
+        return self.materialize(v, at);
+    }
+
+    fn containerPtr(v: SVal) ?*const anyopaque {
+        return switch (v) {
+            .list => |l| l,
+            .dict => |x| x,
+            else => null,
+        };
+    }
+
+    fn originOf(v: SVal) ?*const front.Expr {
+        return switch (v) {
+            .list => |l| l.origin,
+            .dict => |x| x.origin,
+            else => null,
+        };
+    }
+
+    /// A semantic's variable refers to the known container.
+    fn aliased(self: *Gen, ptr: *const anyopaque) bool {
+        for (self.insts.items) |inst| {
+            for (inst.locals) |l| switch (l) {
+                .static => |sv| if (refersTo(sv, ptr, 4)) return true,
+                else => {},
+            };
+        }
+        return false;
+    }
+
+    /// Inside run-time control flow (after a return from inside it too: the
+    /// rest runs on some paths only).
+    fn inFlow(self: *Gen) bool {
+        if (self.loop_level > 0) return true;
+        for (self.insts.items) |inst| if (inst.dyn_depth > 0 or inst.result_slot != null) return true;
+        return false;
     }
 
     fn refersTo(v: SVal, ptr: *const anyopaque, depth: u32) bool {
@@ -2030,12 +2056,12 @@ const Gen = struct {
     }
 
     /// obj[key] = v (all taken): a known container changed now (outside
-    /// run-time control flow), else zr_setitem.
+    /// run-time control flow, at a known key), else zr_setitem (a known one
+    /// made a run-time one first: materialize).
     fn setItem(self: *Gen, inst: *Inst, obj: SVal, key: SVal, v: SVal, pos: front.Pos) Error!void {
+        _ = pos;
         switch (obj) {
-            .list, .dict => {
-                if (inst.dyn_depth > 0 or !key.isStatic() or !isScalar(key))
-                    return self.c.unsupportedAt(inst.func, pos, "changing a list or dict known when compiling inside run-time control flow (or at a run-time key) isn't compiled yet", .{});
+            .list, .dict => if (inst.dyn_depth == 0 and key.isStatic() and isScalar(key)) {
                 if (obj == .dict) return self.sdictSet(obj.dict, key, v);
                 const items = obj.list.items.items;
                 if (key == .int) {
@@ -2051,7 +2077,7 @@ const Gen = struct {
             },
             else => {},
         }
-        const od = try self.materialize(obj, inst.node);
+        const od = try self.materializeToChange(obj, inst.node);
         const kd = try self.materialize(key, inst.node);
         const vd = try self.materialize(v, inst.node);
         const ok = self.call("zr_setitem", &.{ self.ctx, self.k32(inst.node), od.tag, od.bits, kd.tag, kd.bits, vd.tag, vd.bits });
@@ -2730,11 +2756,10 @@ const Gen = struct {
             }
             py.c.PyErr_Clear();
         }
-        // (a known container changed at run time would be a copy changed)
-        if ((obj == .list or obj == .dict) and (eq(u8, name, "append") or isMutating(name)))
-            return c.unsupportedAt(inst.func, pos, "changing a list or dict known when compiling inside run-time control flow isn't compiled yet (keep it in a variable of the semantic)", .{});
-        // At run time: append natively; the rest as Python does it
-        const d = try self.materialize(obj, inst.node);
+        // At run time (a known container made a run-time one: the variables
+        // referring to it see it change): append natively; the rest as
+        // Python does it (on the object itself, through its proxy)
+        const d = try self.materializeToChange(obj, inst.node);
         if (eq(u8, name, "append") and args.len == 1) {
             const x = try self.materialize(args[0], inst.node);
             const ok = self.call("zr_append", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, x.tag, x.bits });
@@ -2743,7 +2768,6 @@ const Gen = struct {
             try self.check(ok);
             return .none;
         }
-        if (isMutating(name)) return c.unsupportedAt(inst.func, pos, "the method {s}() isn't compiled yet", .{name});
         const arr = try self.valueArray(args, inst.node);
         const s = try c.m.string(name);
         const ok = self.call("zr_call_method", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, s, arr, self.k(@intCast(args.len)), self.out });
@@ -2751,12 +2775,6 @@ const Gen = struct {
         try self.drop(.{ .dyn = d });
         try self.check(ok);
         return .{ .dyn = try self.loadOut(.any) };
-    }
-
-    fn isMutating(name: []const u8) bool {
-        const mutating = [_][]const u8{ "extend", "insert", "pop", "remove", "clear", "update", "setdefault", "sort", "reverse", "popitem" };
-        for (mutating) |m| if (std.mem.eql(u8, name, m)) return true;
-        return false;
     }
 
     fn allScalar(items: []const SVal) bool {
