@@ -35,6 +35,11 @@ pub const FunctionSpec = struct {
     body_rule: u16 = NO_RULE,
     name: u8 = 0,
     hoist: bool = true,
+    /// Called with fewer arguments than parameters: an error, or the rest
+    /// are None
+    missing: enum { @"error", none } = .@"error",
+    /// Called with more: an error, dropped, or kept (rt.varargs)
+    extra: enum { @"error", drop, keep } = .@"error",
 };
 
 pub const NO_RULE: u16 = std.math.maxInt(u16);

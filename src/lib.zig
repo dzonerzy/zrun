@@ -240,12 +240,15 @@ const Language = struct {
     }
 
     /// `lang.function(kind, params="params", body="body", name="name",
-    /// hoist=True)`: nodes of `kind` define functions: their parameters
-    /// (a list of name nodes, or nodes with a `name` field), body and name
-    /// are the fields of those labels. With hoist, a scope's functions are
-    /// defined when it is entered (callable before their definition);
-    /// without, when the definition runs.
-    pub fn function(self: *Language, args: pyoz.Args(struct { kind: *PyObject, params: ?*PyObject = null, body: ?*PyObject = null, name: ?*PyObject = null, hoist: bool = true })) ?*PyObject {
+    /// hoist=True, missing="error", extra="error")`: nodes of `kind` define
+    /// functions: their parameters (a list of name nodes, or nodes with a
+    /// `name` field), body and name are the fields of those labels. With
+    /// hoist, a scope's functions are defined when it is entered (callable
+    /// before their definition); without, when the definition runs. A call
+    /// with fewer arguments than parameters is an error, or (missing="none")
+    /// gives the rest None; one with more is an error, or (extra="drop")
+    /// drops them, or (extra="keep") keeps them for the body (rt.varargs).
+    pub fn function(self: *Language, args: pyoz.Args(struct { kind: *PyObject, params: ?*PyObject = null, body: ?*PyObject = null, name: ?*PyObject = null, hoist: bool = true, missing: ?*PyObject = null, extra: ?*PyObject = null })) ?*PyObject {
         const v = args.value;
         const g = self._grammar.?;
         const kind = ph.utf8(v.kind, "kind") orelse return null;
@@ -254,6 +257,20 @@ const Language = struct {
             return null;
         }
         var spec = FunctionSpec{ .hoist = v.hoist };
+        if (optional(v.missing)) |m| {
+            const s = ph.utf8(m, "missing") orelse return null;
+            spec.missing = std.meta.stringToEnum(@TypeOf(spec.missing), s) orelse {
+                ph.raise(py.PyExc_ValueError(), "missing= is \"error\" or \"none\", not '{s}'", .{s});
+                return null;
+            };
+        }
+        if (optional(v.extra)) |e| {
+            const s = ph.utf8(e, "extra") orelse return null;
+            spec.extra = std.meta.stringToEnum(@TypeOf(spec.extra), s) orelse {
+                ph.raise(py.PyExc_ValueError(), "extra= is \"error\", \"drop\" or \"keep\", not '{s}'", .{s});
+                return null;
+            };
+        }
         spec.params = self.labelId(v.params, "params", true) orelse return null;
         // The body: a label, or a rule (an unlabelled block)
         if (optional(v.body)) |b| {
@@ -709,9 +726,30 @@ const Program = struct {
         if (st.globals) |g| py.Py_DecRef(g);
         st.globals = ref(frame);
         const r = rt.self();
-        if (!r.hoist(NONE)) return null;
-        if (!r.execNode(0)) return null;
+        if (!r.hoist(NONE)) return uncaught();
+        if (!r.execNode(0)) return uncaught();
         return none();
+    }
+
+    /// A run ended by an exception: a rt.Throw nothing caught becomes the
+    /// zrun.Error it is (made where it was raised); null.
+    fn uncaught() ?*PyObject {
+        if (py.c.PyErr_ExceptionMatches(types.Throw) == 0) return null;
+        var t: ?*PyObject = null;
+        var v: ?*PyObject = null;
+        var tb: ?*PyObject = null;
+        py.c.PyErr_Fetch(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
+        py.c.PyErr_NormalizeException(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
+        const err = if (v) |exc| py.c.PyObject_GetAttrString(exc, "_zrun_error") else null;
+        if (err) |e| {
+            inline for (.{ t, v, tb }) |o| if (o) |x| py.Py_DecRef(x);
+            py.c.PyErr_SetObject(types.Error, e);
+            py.Py_DecRef(e);
+        } else {
+            py.c.PyErr_Clear();
+            py.c.PyErr_Restore(t, v, tb);
+        }
+        return null;
     }
 
     /// `program.call(name, *args)`: call a function the program defines at
@@ -736,7 +774,7 @@ const Program = struct {
             var rt = Runtime.begin(self) orelse return null;
             defer rt.end();
             rt.self()._frame = ref(st.globals.?);
-            return rt.self().callValue(f, args, null);
+            return rt.self().callValue(f, args, null) orelse uncaught();
         }
         ph.raise(py.PyExc_KeyError(), "the program defines no function '{s}'", .{wanted});
         return null;
@@ -1238,6 +1276,11 @@ const Runtime = struct {
 
     fn hostFailed(self: *Runtime, f: *PyObject) ?*PyObject {
         if (types.pendingControl() != .none or py.c.PyErr_ExceptionMatches(types.Error) != 0) return null;
+        // (a host function can throw an error of the language too)
+        if (py.c.PyErr_ExceptionMatches(types.Throw) != 0) {
+            self.recordThrow(self._at);
+            return null;
+        }
         var buf: [512]u8 = undefined;
         const message = ph.takeError(&buf);
         var name_buf: [128]u8 = undefined;
@@ -1272,7 +1315,7 @@ const Runtime = struct {
         const n_params: usize = @intCast(py.c.PyList_Size(plist));
         const n_args: usize = @intCast(py.c.PyTuple_Size(args));
         const fname = ph.utf8(fo.name.?, "name") orelse return null;
-        if (n_params != n_args) {
+        if ((n_args < n_params and spec.missing == .@"error") or (n_args > n_params and spec.extra == .@"error")) {
             return self.fail(self._at, "{s}() takes {d} argument{s}, {d} given", .{ fname, n_params, if (n_params == 1) "" else "s", n_args });
         }
         const max = self._lang.?._max_depth;
@@ -1280,6 +1323,12 @@ const Runtime = struct {
 
         const frame = objects.newFrame(fnode, self._at, fo.env, fo.name.?) orelse return null;
         if (receiver) |r| objects.asFrame(frame).receiver = ref(r);
+        if (spec.extra == .keep) {
+            objects.asFrame(frame).varargs = py.c.PyTuple_GetSlice(args, @intCast(@min(n_params, n_args)), @intCast(n_args)) orelse {
+                py.Py_DecRef(frame);
+                return null;
+            };
+        }
         const saved = self._frame;
         self._frame = frame;
         self._depth += 1;
@@ -1301,7 +1350,8 @@ const Runtime = struct {
         for (0..n_params) |i| {
             const p = py.c.PyList_GetItem(plist, @intCast(i)).?;
             const target = self.paramName(p) orelse return null;
-            if (!self.storeNode(target, py.c.PyTuple_GetItem(args, @intCast(i)).?)) return null;
+            const arg = if (i < n_args) py.c.PyTuple_GetItem(args, @intCast(i)).? else py.Py_None();
+            if (!self.storeNode(target, arg)) return null;
         }
         const body = if (spec.body != 0)
             objects.fieldOf(program, self.ctx(), fnode, spec.body) orelse return null
@@ -1419,6 +1469,22 @@ const Runtime = struct {
         return self.node(@intCast(index));
     }
 
+    /// `rt.path`: the name the program was loaded under (lang.load(source,
+    /// path)), or None.
+    pub fn get_path(self: *const Runtime) ?*PyObject {
+        return ref(self._p.?._path orelse py.Py_None());
+    }
+
+    /// `rt.varargs`: the arguments the function being run got beyond its
+    /// parameters (a function kind with extra="keep"); () otherwise and at
+    /// the top level.
+    pub fn get_varargs(self: *const Runtime) ?*PyObject {
+        if (self._frame) |o| {
+            if (objects.asFrame(o).varargs) |v| return ref(v);
+        }
+        return py.c.PyTuple_New(0);
+    }
+
     /// What the host passed to the run (None without)
     pub fn get_context(self: *const Runtime) ?*PyObject {
         return ref(self._context orelse py.Py_None());
@@ -1439,6 +1505,11 @@ const Runtime = struct {
         return ref(types.Continue);
     }
 
+    /// raise rt.Throw(value, message=None)
+    pub fn get_Throw(_: *const Runtime) ?*PyObject {
+        return ref(types.Throw);
+    }
+
     // ------------------------------------------------------------------
     // Errors
     // ------------------------------------------------------------------
@@ -1456,10 +1527,52 @@ const Runtime = struct {
     fn raised(self: *Runtime, idx: u32) ?*PyObject {
         if (py.c.PyErr_Occurred() == null) return null;
         if (types.pendingControl() != .none or py.c.PyErr_ExceptionMatches(types.Error) != 0) return null;
+        if (py.c.PyErr_ExceptionMatches(types.Throw) != 0) {
+            self.recordThrow(idx);
+            return null;
+        }
         const msg = pythonMessage() orelse return null;
         defer py.Py_DecRef(msg);
         const text_msg = ph.utf8(msg, "message") orelse return null;
         return self.raiseError(idx, text_msg, "runtime");
+    }
+
+    /// A rt.Throw going by a semantic for the first time: where it was
+    /// raised, kept with it (as the zrun.Error it is if nothing catches it).
+    fn recordThrow(self: *Runtime, idx: u32) void {
+        var t: ?*PyObject = null;
+        var v: ?*PyObject = null;
+        var tb: ?*PyObject = null;
+        py.c.PyErr_Fetch(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
+        py.c.PyErr_NormalizeException(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
+        defer py.c.PyErr_Restore(t, v, tb);
+        const exc = v orelse return;
+        if (py.c.PyObject_HasAttrString(exc, "_zrun_error") == 1) return;
+        const message = throwMessage(exc) orelse {
+            py.c.PyErr_Clear();
+            return;
+        };
+        defer py.Py_DecRef(message);
+        const text_msg = ph.utf8(message, "message") orelse {
+            py.c.PyErr_Clear();
+            return;
+        };
+        const err = self.makeError(idx, text_msg, "runtime") orelse {
+            py.c.PyErr_Clear();
+            return;
+        };
+        defer py.Py_DecRef(err);
+        if (py.c.PyObject_SetAttrString(exc, "_zrun_error", err) != 0) py.c.PyErr_Clear();
+    }
+
+    /// A Throw's message: its own, or str() of its value.
+    fn throwMessage(exc: *PyObject) ?*PyObject {
+        const m = py.c.PyObject_GetAttrString(exc, "message") orelse return null;
+        if (m != py.Py_None()) return py.c.PyObject_Str(m);
+        py.Py_DecRef(m);
+        const val = py.c.PyObject_GetAttrString(exc, "value") orelse return null;
+        defer py.Py_DecRef(val);
+        return py.c.PyObject_Str(val);
     }
 
     fn raiseError(self: *Runtime, idx: u32, message: []const u8, code: []const u8) ?*PyObject {

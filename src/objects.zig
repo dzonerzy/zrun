@@ -430,6 +430,9 @@ fn meta(n: *NodeObject, name: []const u8) ?*PyObject {
     if (eq(u8, name, "span")) return py.c.Py_BuildValue("(II)", @as(c_uint, node.text_start), @as(c_uint, node.text_end));
     if (eq(u8, name, "start")) return py.c.PyLong_FromUnsignedLong(node.text_start);
     if (eq(u8, name, "end")) return py.c.PyLong_FromUnsignedLong(node.text_end);
+    // (1-based, where the node starts; the column in bytes)
+    if (eq(u8, name, "line")) return py.c.PyLong_FromUnsignedLong(data.lineCol(node.text_start).line);
+    if (eq(u8, name, "column")) return py.c.PyLong_FromUnsignedLong(data.lineCol(node.text_start).col);
     if (eq(u8, name, "index")) return py.c.PyLong_FromUnsignedLong(n.idx);
     if (eq(u8, name, "children")) return childValues(n.state.?, ctx, n.idx);
     if (eq(u8, name, "parent")) {
@@ -522,6 +525,9 @@ pub const FrameObject = extern struct {
     /// What the function was called on (rt.call(f, args, receiver=...)),
     /// owned; null: none
     receiver: ?*PyObject,
+    /// The arguments beyond its parameters (a tuple, owned; a function
+    /// kind with extra="keep"), rt.varargs; null: none
+    varargs: ?*PyObject,
 };
 
 pub fn newFrame(scope: u32, call: u32, parent: ?*PyObject, name: *PyObject) ?*PyObject {
@@ -530,6 +536,7 @@ pub fn newFrame(scope: u32, call: u32, parent: ?*PyObject, name: *PyObject) ?*Py
     f.scope = scope;
     f.call = call;
     f.receiver = null;
+    f.varargs = null;
     if (parent) |p| py.Py_IncRef(p);
     f.parent = parent;
     py.Py_IncRef(name);
@@ -567,7 +574,7 @@ fn frameClear(obj: ?*PyObject) callconv(.c) c_int {
         while (it.next()) |v| py.Py_DecRef(v.*);
         slots.clearRetainingCapacity();
     }
-    inline for (.{ "parent", "receiver" }) |field| {
+    inline for (.{ "parent", "receiver", "varargs" }) |field| {
         if (@field(f, field)) |o| {
             @field(f, field) = null;
             py.Py_DecRef(o);
@@ -578,7 +585,7 @@ fn frameClear(obj: ?*PyObject) callconv(.c) c_int {
 
 fn frameTraverse(obj: ?*PyObject, visit: py.c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
     const f: *FrameObject = @ptrCast(@alignCast(obj.?));
-    inline for (.{ f.parent, f.receiver }) |o| {
+    inline for (.{ f.parent, f.receiver, f.varargs }) |o| {
         if (o) |x| {
             const r = visit.?(x, arg);
             if (r != 0) return r;

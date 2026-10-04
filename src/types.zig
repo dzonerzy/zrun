@@ -24,6 +24,7 @@ pub var IntegerOverflow: *PyObject = undefined;
 pub var Return: *PyObject = undefined;
 pub var Break: *PyObject = undefined;
 pub var Continue: *PyObject = undefined;
+pub var Throw: *PyObject = undefined;
 /// int's tp_new, to make I64 instances (calling int.__new__ is refused
 /// for a subclass with its own __new__)
 var int_new: py.c.newfunc = null;
@@ -68,6 +69,40 @@ fn initTypes(module: *PyObject) !void {
     Return = try newException(module, "Return", py.PyExc_Exception(), "raise rt.Return(value): return from the function being run.");
     Break = try newException(module, "Break", py.PyExc_Exception(), "raise rt.Break(): leave the loop rt.loop() is running.");
     Continue = try newException(module, "Continue", py.PyExc_Exception(), "raise rt.Continue(): go on with the loop's next iteration.");
+    Throw = try pythonClass(module, "Throw",
+        \\class Throw(Exception):
+        \\    """raise rt.Throw(value, message=None): an error of the language,
+        \\    carrying a value of it. It goes through semantics and calls until
+        \\    a semantic catches it (`except rt.Throw as e: e.value`); uncaught,
+        \\    it stops the program with a zrun.Error at the node whose semantic
+        \\    raised it: `message`, or str(value)."""
+        \\
+        \\    def __init__(self, value=None, message=None):
+        \\        super().__init__(value, message)
+        \\        self.value = value
+        \\        self.message = message
+        \\
+    );
+}
+
+/// A class defined by Python source (`name` in it), added to the module.
+fn pythonClass(module: *PyObject, comptime name: [:0]const u8, comptime source: [:0]const u8) !*PyObject {
+    const ns = py.c.PyDict_New() orelse return error.Python;
+    defer py.Py_DecRef(ns);
+    const mod_name = ph.newString("zrun") orelse return error.Python;
+    defer py.Py_DecRef(mod_name);
+    if (py.c.PyDict_SetItemString(ns, "__name__", mod_name) != 0) return error.Python;
+    const builtins = py.c.PyEval_GetBuiltins() orelse return error.Python;
+    if (py.c.PyDict_SetItemString(ns, "__builtins__", builtins) != 0) return error.Python;
+    const exec = py.c.PyDict_GetItemString(builtins, "exec") orelse return error.Python;
+    const code = ph.newString(source) orelse return error.Python;
+    defer py.Py_DecRef(code);
+    const r = py.c.PyObject_CallFunctionObjArgs(exec, code, ns, @as(?*PyObject, null)) orelse return error.Python;
+    py.Py_DecRef(r);
+    const cls = py.c.PyDict_GetItemString(ns, name) orelse return error.Python;
+    py.Py_IncRef(cls);
+    try add(module, name, cls);
+    return cls;
 }
 
 fn newException(module: *PyObject, comptime name: [:0]const u8, base: *PyObject, comptime doc: [:0]const u8) !*PyObject {
