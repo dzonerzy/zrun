@@ -1,7 +1,9 @@
 """Lua 5.4 (examples/lua): each program in examples/lua/tests prints what
 real Lua 5.4.7 printed for it (its .expected file, made with `lua`)."""
 
+import contextlib
 import glob
+import io
 import os
 import sys
 
@@ -19,9 +21,7 @@ PROGRAMS = sorted(os.path.basename(p)[:-4] for p in glob.glob(os.path.join(LUA_D
 @pytest.mark.parametrize("mode", ["python", "compiled"])
 @pytest.mark.parametrize("name", PROGRAMS)
 def test_like_real_lua(name, mode, capsys):
-    # (compiled: the semantics the compiler can't compile run as Python,
-    # through the bridge, with everything else native)
-    path = os.path.join(LUA_DIR, "tests", name + ".lua")
+    path =os.path.join(LUA_DIR, "tests", name + ".lua")
     with open(path) as f:
         source = f.read()
     with open(path[:-4] + ".expected") as f:
@@ -30,11 +30,13 @@ def test_like_real_lua(name, mode, capsys):
     assert capsys.readouterr().out == expected
 
 
-def test_python_semantics():
-    # the ones compiled programs run as Python, learned while compiling
-    lua.run("print(1)\n", "x.lua", mode="compiled")
-    why = lua.lang.python_semantics()
-    assert why["chunk"] == "native=False"
+def test_all_native():
+    # every Lua semantic is compiled: none runs as Python (the ones that
+    # would are learned while compiling: lang.python_semantics())
+    for name in PROGRAMS:
+        with open(os.path.join(LUA_DIR, "tests", name + ".lua")) as f, contextlib.redirect_stdout(io.StringIO()):
+            lua.run(f.read(), name + ".lua", mode="compiled")
+    assert lua.lang.python_semantics() == {}
 
 
 def test_uncaught_error():

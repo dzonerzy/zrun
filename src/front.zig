@@ -63,6 +63,9 @@ pub const Expr = struct {
         tuple: []const *Expr,
         dict: struct { keys: []const *Expr, values: []const *Expr },
         list_comp: Comp,
+        /// (x for ...): the list it gives, compiled (all() and any() of
+        /// one stop at the deciding item, as Python's do)
+        gen_exp: Comp,
         dict_comp: struct { key: *Expr, value: *Expr, generators: []const Generator },
         fstring: []const FPart,
     };
@@ -102,10 +105,20 @@ pub const Stmt = struct {
         return_: ?*Expr,
         raise_: ?*Expr,
         assert_: struct { test_: *Expr, msg: ?*Expr },
+        /// try: body, except handlers, else, finally
+        try_: struct { body: []const Stmt, handlers: []const Handler, else_: []const Stmt, finally: []const Stmt },
         break_,
         continue_,
         pass,
     };
+};
+
+/// `except T as name:` (no T: a bare except)
+pub const Handler = struct {
+    pos: Pos,
+    type_: ?*Expr,
+    name: ?u32,
+    body: []const Stmt,
 };
 
 /// A semantic or helper function, read
@@ -320,11 +333,29 @@ const Reader = struct {
             defer py.Py_DecRef(t);
             try self.collectTarget(t);
         }
-        inline for (.{ "body", "orelse" }) |f| {
+        inline for (.{ "body", "orelse", "finalbody" }) |f| {
             if (py.c.PyObject_HasAttrString(s, f) == 1) {
                 const l = try listAttr(s, f);
                 defer py.Py_DecRef(l);
                 try self.collectAssigned(l);
+            }
+        }
+        // (a try's handlers: `as` names and bodies)
+        if (eq(k, "Try")) {
+            const hs = try listAttr(s, "handlers");
+            defer py.Py_DecRef(hs);
+            const n: usize = @intCast(py.c.PyList_Size(hs));
+            for (0..n) |i| {
+                const h = py.c.PyList_GetItem(hs, @intCast(i)).?;
+                const name = ph.attr(h, "name") orelse return error.Python;
+                defer py.Py_DecRef(name);
+                if (name != py.Py_None()) {
+                    const text = try self.alloc().dupe(u8, ph.utf8(name, "a name") orelse return error.Python);
+                    if (self.lookupLocal(text) == null) _ = try self.declare(text);
+                }
+                const body = try listAttr(h, "body");
+                defer py.Py_DecRef(body);
+                try self.collectAssigned(body);
             }
         }
     }
@@ -403,6 +434,24 @@ const Reader = struct {
                 break :blk .{ .raise_ = try self.optExprAttr(s, "exc") };
             }
             if (eq(k, "Assert")) break :blk .{ .assert_ = .{ .test_ = try self.exprAttr(s, "test"), .msg = try self.optExprAttr(s, "msg") } };
+            if (eq(k, "Try")) {
+                const hs = try listAttr(s, "handlers");
+                defer py.Py_DecRef(hs);
+                const n: usize = @intCast(py.c.PyList_Size(hs));
+                const handlers = try self.alloc().alloc(Handler, n);
+                for (handlers, 0..) |*h, i| {
+                    const ho = py.c.PyList_GetItem(hs, @intCast(i)).?;
+                    const name = ph.attr(ho, "name") orelse return error.Python;
+                    defer py.Py_DecRef(name);
+                    var slot: ?u32 = null;
+                    if (name != py.Py_None()) {
+                        const text = try self.alloc().dupe(u8, ph.utf8(name, "a name") orelse return error.Python);
+                        slot = self.lookupLocal(text) orelse try self.declare(text);
+                    }
+                    h.* = .{ .pos = try self.posOf(ho), .type_ = try self.optExprAttr(ho, "type"), .name = slot, .body = try self.stmtListAttr(ho, "body") };
+                }
+                break :blk .{ .try_ = .{ .body = try self.stmtListAttr(s, "body"), .handlers = handlers, .else_ = try self.stmtListAttr(s, "orelse"), .finally = try self.stmtListAttr(s, "finalbody") } };
+            }
             if (eq(k, "Break")) break :blk .break_;
             if (eq(k, "Continue")) break :blk .continue_;
             if (eq(k, "Pass")) break :blk .pass;
@@ -551,11 +600,12 @@ const Reader = struct {
             }
             return self.new(pos, .{ .dict = .{ .keys = try self.exprList(e, "keys"), .values = try self.exprList(e, "values") } });
         }
-        if (eq(k, "ListComp")) {
+        if (eq(k, "ListComp") or eq(k, "GeneratorExp")) {
             const mark = self.comp_scope.items.len;
             defer self.comp_scope.shrinkRetainingCapacity(mark);
             const gens = try self.generators(e);
-            return self.new(pos, .{ .list_comp = .{ .elt = try self.exprAttr(e, "elt"), .generators = gens } });
+            const comp = Comp{ .elt = try self.exprAttr(e, "elt"), .generators = gens };
+            return self.new(pos, if (eq(k, "ListComp")) .{ .list_comp = comp } else .{ .gen_exp = comp });
         }
         if (eq(k, "DictComp")) {
             const mark = self.comp_scope.items.len;
@@ -808,6 +858,31 @@ const Dumper = struct {
                 }
                 try self.print("\n", .{});
             },
+            .try_ => |t| {
+                try self.print("try:\n", .{});
+                try self.stmts(t.body, depth + 1);
+                for (t.handlers) |h| {
+                    try self.indent(depth);
+                    try self.print("except", .{});
+                    if (h.type_) |e| {
+                        try self.print(" ", .{});
+                        try self.expr(e);
+                    }
+                    if (h.name) |slot| try self.print(" as {s}#{d}", .{ self.f.locals[slot], slot });
+                    try self.print(":\n", .{});
+                    try self.stmts(h.body, depth + 1);
+                }
+                if (t.else_.len > 0) {
+                    try self.indent(depth);
+                    try self.print("else:\n", .{});
+                    try self.stmts(t.else_, depth + 1);
+                }
+                if (t.finally.len > 0) {
+                    try self.indent(depth);
+                    try self.print("finally:\n", .{});
+                    try self.stmts(t.finally, depth + 1);
+                }
+            },
             .break_ => try self.print("break\n", .{}),
             .continue_ => try self.print("continue\n", .{}),
             .pass => try self.print("pass\n", .{}),
@@ -960,6 +1035,12 @@ const Dumper = struct {
                 try self.generators(c.generators);
                 try self.print("]", .{});
             },
+            .gen_exp => |c| {
+                try self.print("(", .{});
+                try self.expr(c.elt);
+                try self.generators(c.generators);
+                try self.print(")", .{});
+            },
             .dict_comp => |c| {
                 try self.print("{{", .{});
                 try self.expr(c.key);
@@ -1043,11 +1124,13 @@ fn intAttrOr(obj: *PyObject, name: [*:0]const u8, default: i64) error{Python}!i6
 
 fn stmtName(k: []const u8) []const u8 {
     const table = .{
-        .{ "Try", "`try`" },                 .{ "TryStar", "`try`" },              .{ "With", "`with`" },
-        .{ "AsyncWith", "`async with`" },    .{ "FunctionDef", "a nested `def`" }, .{ "AsyncFunctionDef", "`async def`" },
-        .{ "ClassDef", "a nested `class`" }, .{ "Global", "`global`" },            .{ "Nonlocal", "`nonlocal`" },
-        .{ "Delete", "`del`" },              .{ "Import", "`import`" },            .{ "ImportFrom", "`import`" },
-        .{ "AsyncFor", "`async for`" },      .{ "Match", "`match`" },
+        .{ "TryStar", "`try`" },                .{ "With", "`with`" },
+        .{ "AsyncWith", "`async with`" },       .{ "FunctionDef", "a nested `def`" },
+        .{ "AsyncFunctionDef", "`async def`" }, .{ "ClassDef", "a nested `class`" },
+        .{ "Global", "`global`" },              .{ "Nonlocal", "`nonlocal`" },
+        .{ "Delete", "`del`" },                 .{ "Import", "`import`" },
+        .{ "ImportFrom", "`import`" },          .{ "AsyncFor", "`async for`" },
+        .{ "Match", "`match`" },
     };
     inline for (table) |entry| {
         if (eq(k, entry[0])) return entry[1];
@@ -1057,9 +1140,9 @@ fn stmtName(k: []const u8) []const u8 {
 
 fn exprName(k: []const u8) []const u8 {
     const table = .{
-        .{ "Lambda", "`lambda`" },             .{ "Yield", "`yield`" },  .{ "YieldFrom", "`yield from`" },
-        .{ "Await", "`await`" },               .{ "NamedExpr", "`:=`" }, .{ "GeneratorExp", "a generator expression" },
-        .{ "SetComp", "a set comprehension" }, .{ "Set", "a set" },      .{ "Starred", "*unpacking" },
+        .{ "Lambda", "`lambda`" }, .{ "Yield", "`yield`" },      .{ "YieldFrom", "`yield from`" },
+        .{ "Await", "`await`" },   .{ "NamedExpr", "`:=`" },     .{ "SetComp", "a set comprehension" },
+        .{ "Set", "a set" },       .{ "Starred", "*unpacking" },
     };
     inline for (table) |entry| {
         if (eq(k, entry[0])) return entry[1];

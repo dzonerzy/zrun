@@ -90,6 +90,7 @@ pub const Compiled = struct {
                     // (a semantic it reaches can't be compiled: as Python)
                     if (c.failed_semantic) |s| {
                         if (!self.python.contains(s)) {
+                            if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("thunk {d}: as Python: {s}\n", .{ node, self.failure.message.items });
                             if (!markPython(self.python, s, self.failure.message.items)) return oomT();
                             continue;
                         }
@@ -130,11 +131,19 @@ pub const Compiled = struct {
                 c.forgetModule();
                 switch (e) {
                     error.Unsupported => {
+                        // (its code needs its frame: compiled for the first
+                        // time, it can have one; again)
+                        if (c.need_frames and !(c.layoutOf(fnode) catch return oomA()).heap) {
+                            c.need_frames = false;
+                            c.heapFunction(fnode) catch return oomA();
+                            continue :attempt;
+                        }
                         // (as a thunk's: a literal made at run time, or a
                         // semantic run as Python, and compiled again)
                         if (c.need_retry) continue :attempt;
                         if (c.failed_semantic) |s| {
                             if (!self.python.contains(s)) {
+                                if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("function {d}: as Python: {s}\n", .{ fnode, self.failure.message.items });
                                 if (!markPython(self.python, s, self.failure.message.items)) return oomA();
                                 continue :attempt;
                             }
@@ -226,6 +235,7 @@ fn build(out: *Compiled, data: *program_mod.Data, lang: compile_mod.LangView, pr
             const failed = out.compiler.failed_semantic;
             const need_frames = out.compiler.need_frames;
             const need_retry = out.compiler.need_retry;
+            if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("build attempt: frames={} retry={} heap={} python={}: {s}\n", .{ need_frames, need_retry, force_heap, failed != null, out.failure.message.items });
             // (what this attempt kept)
             for (out.compiler.objects.items) |o| py.Py_DecRef(o);
             out.compiler.m.deinit();

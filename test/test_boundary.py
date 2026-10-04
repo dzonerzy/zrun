@@ -36,6 +36,8 @@ BUILTINS = (
     "back",
     "bigmath",
     "slices",
+    "genexp",
+    "trying",
 )
 
 
@@ -70,6 +72,13 @@ class Holder:
 
     def get(self, k):
         return self.v + k
+
+
+def returns_in_try(log):
+    try:
+        return "ret"
+    finally:
+        log.append("rf")
 
 
 COUNTER = 0
@@ -149,6 +158,67 @@ def make_lang():
             xs = rt.call(rt.load(node.name), [])
             n = len(xs)
             return (xs[1 : n - 1], xs[:: n - 7], xs[n:], tuple(xs)[n - 7 :], "hello"[n - 4 :], "héllo"[n - 4 :], xs[n - 105 : 2], xs[n - 5 : n - 6])
+        if name == "genexp":
+            xs = rt.call(rt.load(node.name), [])
+            seen = []
+            # (any() stops at the first true one: 2)
+            a = any(seen.append(x) or x > 1 for x in xs)
+            b = all(x < 3 for x in xs)
+            return (a, b, sum(x * 2 for x in xs), len(seen), all(x for x in []), any(x for x in ()), "".join(str(x) for x in xs))
+        if name == "trying":
+            out = []
+            try:
+                int("x")
+            except ValueError as e:
+                out.append("value:" + str(e))
+            try:
+                rt.call(rt.load(node.name), [])
+            except (TypeError, zrun.Error):
+                # (a host function's exception: a zrun.Error, as rt.call
+                # raises it)
+                out.append("key")
+            else:
+                out.append("no")
+            finally:
+                out.append("fin")
+            try:
+                out.append("body")
+            except Exception:
+                out.append("bad")
+            else:
+                out.append("else")
+            for i in range(3):
+                try:
+                    if i == 1:
+                        continue
+                    if i == 2:
+                        break
+                    out.append("loop" + str(i))
+                finally:
+                    out.append("f" + str(i))
+            for x in rt.call(rt.load(node.name), [1]):
+                try:
+                    if x == 2:
+                        break
+                finally:
+                    out.append("g" + str(x))
+            out.append(returns_in_try(out))
+            try:
+                try:
+                    raise rt.Throw("v", "m")
+                except rt.Throw as t:
+                    out.append(t.value)
+                    raise
+            except rt.Throw:
+                out.append("again")
+            try:
+                try:
+                    out.append(1 // 0)
+                finally:
+                    out.append("inner")
+            except ZeroDivisionError:
+                out.append("zero")
+            return out
         if name == "bigmath":
             # A semantic's own ints are Python's (beyond 64 bits on the way)
             m = -1 & 0xFFFFFFFFFFFFFFFF
@@ -311,6 +381,16 @@ def make_lang():
         return (Color.RED, frozenset({1}), frozenset({1}), Box(2))
 
     @lang.host
+    def trying(*args):
+        if args:
+            return [1, 2, 3]
+        raise KeyError("k")
+
+    @lang.host
+    def genexp():
+        return [1, 2, 3]
+
+    @lang.host
     def slices():
         return [1, 2, 3, 4, 5]
 
@@ -356,6 +436,8 @@ PROGRAMS = {
     "identity": "print(same(), back());\n",
     "bigmath": "print(bigmath());\n",
     "slices": "print(slices());\n",
+    "genexp": "print(genexp());\n",
+    "trying": "print(trying());\n",
 }
 
 
@@ -364,7 +446,9 @@ def test_shared_with_python(name, capsys):
     out, err = same_in_every_mode(lang, PROGRAMS[name], capsys)
     assert err is None, err
     # (len * 1000 + first * 100 + last, after the host's changes...)
-    assert out.strip() == {"list": "4531", "dict": "231", "record": "53", "from_python": "0 203 5 4 34", "keys": "redfsboxno3", "live": "0 50801161", "identity": "1 32", "bigmath": "-78", "slices": "([2, 3, 4], [5, 3, 1], [], (4, 5), 'ello', 'éllo', [1, 2], [1, 2, 3, 4])"}[name]
+    assert out.strip() == {"list": "4531", "dict": "231", "record": "53", "from_python": "0 203 5 4 34", "keys": "redfsboxno3", "live": "0 50801161", "identity": "1 32", "bigmath": "-78", "slices": "([2, 3, 4], [5, 3, 1], [], (4, 5), 'ello', 'éllo', [1, 2], [1, 2, 3, 4])", "genexp": "(True, False, 12, 2, True, False, '123')",
+        "trying": "[\"value:invalid literal for int() with base 10: 'x'\", 'key', 'fin', 'body', 'else', 'loop0', 'f0', 'f1', 'f2', 'g1', 'g2', 'rf', 'ret', 'v', 'again', 'inner', 'zero']",
+    }[name]
     if name == "from_python":
         assert SHARED == [2, 7] and SHARED_DICT == {"k": 5}
     # (compiled: none of them ran as Python)

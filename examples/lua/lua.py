@@ -477,7 +477,7 @@ def explist_of(node, rt):
 # ----------------------------------------------------------------------
 
 
-@lang.exec("chunk", native=False)
+@lang.exec("chunk")
 def chunk(node, rt):
     # (`return` at the top level ends the chunk)
     try:

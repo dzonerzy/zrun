@@ -28,7 +28,9 @@ pub const Ctx = struct {
     node_maker: NodeMaker,
     /// The Python objects the code refers to (host functions, record
     /// classes...), by index (borrowed: the compiled program holds them)
-    objects: []const *PyObject,
+    /// (the compiler's list itself: compiling more while the program runs
+    /// adds to it, and may move it)
+    objects: *const std.ArrayListUnmanaged(*PyObject),
     /// The language's calls being run, outermost first
     calls: std.ArrayListUnmanaged(CallEntry) = .empty,
     max_depth: u32,
@@ -45,6 +47,15 @@ pub const Ctx = struct {
     /// a zrun.Error raised by Python), the error then: raised again where
     /// Python code is back in charge (owned)
     pending: ?*PyObject = null,
+    /// The Python exception behind the error, when Python code called by
+    /// the compiled code raised it (a ValueError...): what `except` matches
+    /// and Python code above gets (owned)
+    exc: ?*PyObject = null,
+
+    /// The object at an index.
+    pub fn object(self: *const Ctx, i: u64) *PyObject {
+        return self.objects.items[i];
+    }
 
     pub fn deinit(self: *Ctx) void {
         self.calls.deinit(allocator);
@@ -61,6 +72,8 @@ pub const Ctx = struct {
         self.err_stack.clearRetainingCapacity();
         if (self.pending) |p| py.Py_DecRef(p);
         self.pending = null;
+        if (self.exc) |e| py.Py_DecRef(e);
+        self.exc = null;
     }
 };
 
@@ -94,6 +107,24 @@ pub fn fail(ctx: *Ctx, node: u32, comptime fmt: []const u8, args: anytype) bool 
     return false;
 }
 
+/// An error the reference mode raises as a Python exception (a
+/// ZeroDivisionError...): its message, and the exception (`exc`: its
+/// class; Python's own wording of it, `py_msg`, null for the message), for
+/// `except` and Python code above.
+fn failAs(ctx: *Ctx, node: u32, exc: *PyObject, py_msg: ?[]const u8, comptime fmt: []const u8, args: anytype) bool {
+    if (ctx.failed) return false;
+    var buf: [256]u8 = undefined;
+    const text = py_msg orelse (std.fmt.bufPrint(&buf, fmt, args) catch fmt);
+    if (py.c.PyUnicode_FromStringAndSize(text.ptr, @intCast(text.len))) |s| {
+        defer py.Py_DecRef(s);
+        if (py.c.PyObject_CallFunctionObjArgs(exc, s, @as(?*PyObject, null))) |e| {
+            if (ctx.exc) |old| py.Py_DecRef(old);
+            ctx.exc = e;
+        } else py.c.PyErr_Clear();
+    } else py.c.PyErr_Clear();
+    return fail(ctx, node, fmt, args);
+}
+
 /// The Python exception being raised as the run's error (as the reference
 /// mode words it); false.
 fn failPython(ctx: *Ctx, node: u32) bool {
@@ -101,6 +132,21 @@ fn failPython(ctx: *Ctx, node: u32) bool {
     // above to catch, as the bridge does it)
     if (py.c.PyErr_Occurred() != null and (py.c.PyErr_ExceptionMatches(types.Throw) != 0 or py.c.PyErr_ExceptionMatches(types.Error) != 0))
         return @import("bridge.zig").pythonFailure(ctx, node) != 0;
+    // (the exception kept, for `except` and Python code above; its message
+    // the error's)
+    if (!ctx.failed and py.c.PyErr_Occurred() != null) {
+        var t: ?*PyObject = null;
+        var v: ?*PyObject = null;
+        var tb: ?*PyObject = null;
+        py.c.PyErr_Fetch(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
+        py.c.PyErr_NormalizeException(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
+        if (v) |e| {
+            py.Py_IncRef(e);
+            if (ctx.exc) |old| py.Py_DecRef(old);
+            ctx.exc = e;
+        }
+        py.c.PyErr_Restore(t, v, tb);
+    }
     const msg = pythonMessage() orelse {
         py.c.PyErr_Clear();
         return fail(ctx, node, "error", .{});
@@ -149,7 +195,7 @@ export fn zr_unset(ctx: *Ctx, node: u32, name: *const value.Str) callconv(.c) bo
 }
 
 export fn zr_overflow(ctx: *Ctx, node: u32) callconv(.c) bool {
-    return fail(ctx, node, "integer overflow", .{});
+    return failAs(ctx, node, types.IntegerOverflow, null, "integer overflow", .{});
 }
 
 // ======================================================================
@@ -231,39 +277,35 @@ export fn zr_binary(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u6
     if (isInt(a) and isInt(b)) {
         const x = a.asInt();
         const y = b.asInt();
+        // (an I64 among them: an I64, checked; else plain, Python's: past 64
+        // bits a big int)
+        const checked = a.tag == @intFromEnum(Tag.int) or b.tag == @intFromEnum(Tag.int);
+        const mk = if (checked) &Value.int else &Value.pint;
         switch (op) {
-            .add => {
-                const r = @addWithOverflow(x, y);
-                if (r[1] != 0) return zr_overflow(ctx, node);
-                out.* = Value.int(r[0]);
-                return true;
-            },
-            .sub => {
-                const r = @subWithOverflow(x, y);
-                if (r[1] != 0) return zr_overflow(ctx, node);
-                out.* = Value.int(r[0]);
-                return true;
-            },
-            .mul => {
-                const r = @mulWithOverflow(x, y);
-                if (r[1] != 0) return zr_overflow(ctx, node);
-                out.* = Value.int(r[0]);
+            .add, .sub, .mul => {
+                const r = switch (op) {
+                    .add => @addWithOverflow(x, y),
+                    .sub => @subWithOverflow(x, y),
+                    else => @mulWithOverflow(x, y),
+                };
+                if (r[1] != 0) return if (checked) zr_overflow(ctx, node) else pythonBinary(ctx, node, op, a, b, out);
+                out.* = mk(r[0]);
                 return true;
             },
             .floordiv, .mod => {
-                if (y == 0) return fail(ctx, node, "division by zero", .{});
+                if (y == 0) return failAs(ctx, node, py.PyExc_ZeroDivisionError(), "integer division or modulo by zero", "division by zero", .{});
                 if (x == std.math.minInt(i64) and y == -1) {
                     if (op == .mod) {
-                        out.* = Value.int(0);
+                        out.* = mk(0);
                         return true;
                     }
-                    return zr_overflow(ctx, node);
+                    return if (checked) zr_overflow(ctx, node) else pythonBinary(ctx, node, op, a, b, out);
                 }
-                out.* = Value.int(if (op == .floordiv) floorDiv(x, y) else floorMod(x, y));
+                out.* = mk(if (op == .floordiv) floorDiv(x, y) else floorMod(x, y));
                 return true;
             },
             .div => {
-                if (y == 0) return fail(ctx, node, "division by zero", .{});
+                if (y == 0) return failAs(ctx, node, py.PyExc_ZeroDivisionError(), null, "division by zero", .{});
                 out.* = Value.float(@as(f64, @floatFromInt(x)) / @as(f64, @floatFromInt(y)));
                 return true;
             },
@@ -274,7 +316,7 @@ export fn zr_binary(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u6
                     else => x ^ y,
                 };
                 // (bool & bool is a bool)
-                out.* = if (a.kind() == .bool and b.kind() == .bool) Value.boolean(r != 0) else Value.int(r);
+                out.* = if (a.kind() == .bool and b.kind() == .bool) Value.boolean(r != 0) else mk(r);
                 return true;
             },
             else => {},
@@ -307,17 +349,17 @@ export fn zr_binary(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u6
                 return true;
             },
             .div => {
-                if (y == 0) return fail(ctx, node, "division by zero", .{});
+                if (y == 0) return failAs(ctx, node, py.PyExc_ZeroDivisionError(), "float division by zero", "division by zero", .{});
                 out.* = Value.float(x / y);
                 return true;
             },
             .floordiv => {
-                if (y == 0) return fail(ctx, node, "division by zero", .{});
+                if (y == 0) return failAs(ctx, node, py.PyExc_ZeroDivisionError(), "float floor division by zero", "division by zero", .{});
                 out.* = Value.float(@floor(x / y));
                 return true;
             },
             .mod => {
-                if (y == 0) return fail(ctx, node, "division by zero", .{});
+                if (y == 0) return failAs(ctx, node, py.PyExc_ZeroDivisionError(), "float modulo", "division by zero", .{});
                 out.* = Value.float(floatMod(x, y));
                 return true;
             },
@@ -454,28 +496,34 @@ const Unary = enum(u32) { neg, pos, not_, invert };
 export fn zr_unary(ctx: *Ctx, node: u32, op_code: u32, t: u64, bits: u64, out: *Value) callconv(.c) bool {
     const a = Value{ .tag = t, .bits = bits };
     const op: Unary = @enumFromInt(op_code);
+    // (an I64 stays one, checked; a plain int or a bool gives a plain int)
+    const checked = a.tag == @intFromEnum(Tag.int);
+    const mk = if (checked) &Value.int else &Value.pint;
     switch (op) {
         .not_ => {
             out.* = Value.boolean(!value.truthy(a));
             return true;
         },
         .neg => if (isInt(a)) {
-            if (a.asInt() == std.math.minInt(i64)) return zr_overflow(ctx, node);
-            out.* = Value.int(-a.asInt());
-            return true;
+            if (a.asInt() == std.math.minInt(i64)) {
+                if (checked) return zr_overflow(ctx, node);
+            } else {
+                out.* = mk(-a.asInt());
+                return true;
+            }
         } else if (a.kind() == .float) {
             out.* = Value.float(-a.asFloat());
             return true;
         },
         .pos => if (isInt(a)) {
-            out.* = Value.int(a.asInt());
+            out.* = mk(a.asInt());
             return true;
         } else if (a.kind() == .float) {
             out.* = a;
             return true;
         },
         .invert => if (isInt(a)) {
-            out.* = Value.int(~a.asInt());
+            out.* = mk(~a.asInt());
             return true;
         },
     }
@@ -525,7 +573,8 @@ export fn zr_varargs(ctx: *Ctx, node: u32, args: [*]const Value, nargs: u64, npa
     const n = if (nargs > nparams) nargs - nparams else 0;
     const t = value.newTuple(n) orelse return oomFail(ctx, node);
     for (t.slice(), 0..) |*slot, i| {
-        const v = args[nparams + i];
+        // (arguments as rt.call hands them over: ints I64s)
+        const v = args[nparams + i].checked();
         value.incref(v);
         slot.* = v;
     }
@@ -562,6 +611,9 @@ pub export fn zr_call(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Val
             ctx.calls.append(allocator, .{ .name = fo.name, .node = node }) catch return fail(ctx, node, "out of memory", .{});
             defer _ = ctx.calls.pop();
             const code: Code = @ptrCast(@alignCast(fo.code.?));
+            // (its result as rt.call gives it: an int an I64; its
+            // parameters are made I64s by its code)
+            defer out.* = out.*.checked();
             if (nargs >= nparams) return code(ctx, fo.env, args, nargs, receiver, out);
             // Fewer than its parameters: the rest None (the code reads one
             // argument per parameter)
@@ -577,19 +629,21 @@ pub export fn zr_call(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Val
             const n = nargs + @intFromBool(receiver != null);
             const tuple = py.c.PyTuple_New(@intCast(n)) orelse return failPython(ctx, node);
             defer py.Py_DecRef(tuple);
+            // (its arguments and result as rt.call hands them over: ints
+            // I64s)
             var k: usize = 0;
             if (receiver) |r| {
-                const o = value.toPython(r.*, ctx.node_maker) orelse return failPython(ctx, node);
+                const o = value.toPython(r.*.checked(), ctx.node_maker) orelse return failPython(ctx, node);
                 _ = py.c.PyTuple_SetItem(tuple, 0, o);
                 k = 1;
             }
             for (args[0..nargs], 0..) |a, i| {
-                const o = value.toPython(a, ctx.node_maker) orelse return failPython(ctx, node);
+                const o = value.toPython(a.checked(), ctx.node_maker) orelse return failPython(ctx, node);
                 _ = py.c.PyTuple_SetItem(tuple, @intCast(k + i), o);
             }
             const r = py.c.PyObject_CallObject(callee, tuple) orelse return hostFailed(ctx, node, callee);
             defer py.Py_DecRef(r);
-            out.* = value.fromPython(r) orelse return failPython(ctx, node);
+            out.* = (value.fromPython(r) orelse return failPython(ctx, node)).checked();
             return true;
         },
         else => return fail(ctx, node, "'{s}' value is not callable", .{value.typeName(f)}),
@@ -616,7 +670,7 @@ fn hostFailed(ctx: *Ctx, node: u32, f: *PyObject) bool {
 
 /// A host object of the program (a host function...) as a value.
 export fn zr_object(ctx: *Ctx, idx: u64, out: *Value) callconv(.c) void {
-    const o = ctx.objects[idx];
+    const o = ctx.object(idx);
     py.Py_IncRef(o);
     out.* = .{ .tag = @intFromEnum(Tag.host), .bits = @intFromPtr(o) };
 }
@@ -665,7 +719,7 @@ export fn zr_dict(ctx: *Ctx, node: u32, keys: [*]const Value, vals: [*]const Val
     for (0..n) |i| {
         if (!value.hashable(keys[i])) {
             value.decref(Value.obj(.dict, &d.head));
-            return fail(ctx, node, "unhashable type: '{s}'", .{value.typeName(keys[i])});
+            return failAs(ctx, node, py.PyExc_TypeError(), null, "unhashable type: '{s}'", .{value.typeName(keys[i])});
         }
         if (!value.dictSet(d, keys[i], vals[i])) return oomFail(ctx, node);
     }
@@ -711,7 +765,7 @@ export fn zr_isinstance(ctx: *Ctx, node: u32, t: u64, bits: u64, cls_index: u64,
     var objs: [1]*PyObject = undefined;
     if (!objects(ctx, &.{v}, &objs)) return failPython(ctx, node);
     defer py.Py_DecRef(objs[0]);
-    const r = py.c.PyObject_IsInstance(objs[0], ctx.objects[cls_index]);
+    const r = py.c.PyObject_IsInstance(objs[0], ctx.object(cls_index));
     if (r < 0) return failPython(ctx, node);
     out.* = Value.boolean(r == 1);
     return true;
@@ -726,7 +780,7 @@ export fn zr_getattr(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value
             if (std.mem.eql(u8, f, name.bytes())) {
                 const x = r.fields()[i];
                 // (a slot never assigned: as Python says it)
-                if (x.tag == UNSET) return fail(ctx, node, "'{s}' object has no attribute '{s}'", .{ r.rtype.name, f });
+                if (x.tag == UNSET) return failAs(ctx, node, py.PyExc_AttributeError(), null, "'{s}' object has no attribute '{s}'", .{ r.rtype.name, f });
                 value.incref(x);
                 out.* = x;
                 return true;
@@ -768,7 +822,7 @@ export fn zr_setattr(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value
         if (py.c.PyObject_SetAttr(o, key, val) != 0) return failPython(ctx, node);
         return true;
     }
-    return fail(ctx, node, "'{s}' object has no attribute '{s}'", .{ value.typeName(v), name.bytes() });
+    return failAs(ctx, node, py.PyExc_AttributeError(), null, "'{s}' object has no attribute '{s}'", .{ value.typeName(v), name.bytes() });
 }
 
 /// Normalize an index (negative from the end); null if out of range.
@@ -786,7 +840,7 @@ export fn zr_getitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
     switch (v.kind()) {
         .list, .tuple => if (isInt(k)) {
             const items = if (v.kind() == .list) @as(*value.List, @ptrCast(@alignCast(v.ptr()))).slice() else @as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).slice();
-            const i = index(k.asInt(), items.len) orelse return fail(ctx, node, "{s} index out of range", .{@tagName(v.kind())});
+            const i = index(k.asInt(), items.len) orelse return failAs(ctx, node, py.PyExc_IndexError(), null, "{s} index out of range", .{@tagName(v.kind())});
             value.incref(items[i]);
             out.* = items[i];
             return true;
@@ -818,15 +872,15 @@ export fn zr_setitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
     switch (v.kind()) {
         .list => if (isInt(k)) {
             const l: *value.List = @ptrCast(@alignCast(v.ptr()));
-            const i = index(k.asInt(), l.len) orelse return fail(ctx, node, "list assignment index out of range", .{});
+            const i = index(k.asInt(), l.len) orelse return failAs(ctx, node, py.PyExc_IndexError(), null, "list assignment index out of range", .{});
             value.incref(x);
             value.decref(l.items.?[i]);
             l.items.?[i] = x;
             return true;
-        } else return fail(ctx, node, "list indices must be integers or slices, not {s}", .{value.typeName(k)}),
+        } else return failAs(ctx, node, py.PyExc_TypeError(), null, "list indices must be integers or slices, not {s}", .{value.typeName(k)}),
         .dict => {
             const d: *value.Dict = @ptrCast(@alignCast(v.ptr()));
-            if (!value.hashable(k)) return fail(ctx, node, "unhashable type: '{s}'", .{value.typeName(k)});
+            if (!value.hashable(k)) return failAs(ctx, node, py.PyExc_TypeError(), null, "unhashable type: '{s}'", .{value.typeName(k)});
             if (!value.dictSet(d, k, x)) return oomFail(ctx, node);
             return true;
         },
@@ -838,7 +892,7 @@ export fn zr_setitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
             if (py.c.PyObject_SetItem(objs[0], objs[1], objs[2]) != 0) return failPython(ctx, node);
             return true;
         },
-        else => return fail(ctx, node, "'{s}' object does not support item assignment", .{value.typeName(v)}),
+        else => return failAs(ctx, node, py.PyExc_TypeError(), null, "'{s}' object does not support item assignment", .{value.typeName(v)}),
     }
 }
 
@@ -1010,7 +1064,7 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
 /// A builtin called with arguments, as Python does it (int(), float(),
 /// len(), zip()... of run-time values): a host object of the program.
 export fn zr_call_python(ctx: *Ctx, node: u32, callee_index: u64, args: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
-    const callee = ctx.objects[callee_index];
+    const callee = ctx.object(callee_index);
     const tuple = py.c.PyTuple_New(@intCast(n)) orelse return failPython(ctx, node);
     defer py.Py_DecRef(tuple);
     for (args[0..n], 0..) |a, i| {
@@ -1029,7 +1083,7 @@ export fn zr_slice(ctx: *Ctx, node: u32, t: u64, bits: u64, lt: u64, lb: u64, ht
         // (ints or None: else Python's error)
         for (bounds) |b| if (b.kind() != .none and !isInt(b)) break :native;
         const step: i64 = if (bounds[2].kind() == .none) 1 else bounds[2].asInt();
-        if (step == 0) return fail(ctx, node, "slice step cannot be zero", .{});
+        if (step == 0) return failAs(ctx, node, py.PyExc_ValueError(), null, "slice step cannot be zero", .{});
         const len: i64 = switch (v.kind()) {
             .list => @intCast(@as(*value.List, @ptrCast(@alignCast(v.ptr()))).len),
             .tuple => @intCast(@as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).len),
@@ -1132,7 +1186,7 @@ export fn zr_call_seq(ctx: *Ctx, node: u32, ft: u64, fb: u64, st: u64, sb: u64, 
 /// code runs from the module's dict (objects[globals_index]), then the
 /// builtins; Python's NameError if neither has it.
 export fn zr_global(ctx: *Ctx, node: u32, globals_index: u64, name: *const value.Str, out: *Value) callconv(.c) bool {
-    const g = ctx.objects[globals_index];
+    const g = ctx.object(globals_index);
     const key = ph.newString(name.bytes()) orelse return failPython(ctx, node);
     defer py.Py_DecRef(key);
     const v = py.c.PyDict_GetItemWithError(g, key) orelse blk: {
@@ -1140,7 +1194,7 @@ export fn zr_global(ctx: *Ctx, node: u32, globals_index: u64, name: *const value
         const builtins = py.c.PyEval_GetBuiltins() orelse return failPython(ctx, node);
         break :blk py.c.PyDict_GetItemWithError(builtins, key) orelse {
             if (py.c.PyErr_Occurred() != null) return failPython(ctx, node);
-            return fail(ctx, node, "name '{s}' is not defined", .{name.bytes()});
+            return failAs(ctx, node, py.PyExc_NameError(), null, "name '{s}' is not defined", .{name.bytes()});
         };
     };
     // (a reference of ours: the dict's is another, so a list stays itself)

@@ -34,14 +34,12 @@ class TestSubset:
     @pytest.mark.parametrize(
         "source, reason",
         [
-            ("    try:\n        pass\n    except Exception:\n        pass\n", "`try` can't be compiled"),
             ("    f = lambda x: x\n", "`lambda` can't be compiled"),
             ("    with open('x') as f:\n        pass\n", "`with` can't be compiled"),
             ("    def inner():\n        pass\n", "a nested `def` can't be compiled"),
             ("    global g\n", "`global` can't be compiled"),
             ("    del node\n", "`del` can't be compiled"),
             ("    x = (y := 1)\n", "`:=` can't be compiled"),
-            ("    return (x for x in node.children)\n", "a generator expression can't be compiled"),
             ("    return {1, 2}\n", "a set can't be compiled"),
             ("    return rt.call(*node.children)\n", "*unpacking can't be compiled"),
             ("    return node @ rt\n", "the operator MatMult can't be compiled"),
@@ -69,15 +67,13 @@ class TestSubset:
     def test_the_line_in_a_real_file(self):
         def semantic(node, rt):
             x = 1
-            try:
+            with open("f") as f:
                 x = 2
-            finally:
-                pass
             return x
 
         with pytest.raises(zrun.CompileError) as e:
             lang().ir(semantic)
-        assert e.value.line == line_of(semantic, "try:") and e.value.column == 13
+        assert e.value.line == line_of(semantic, "with ") and e.value.column == 13
 
     def test_parameters(self):
         def defaults(node, rt=None):
@@ -125,6 +121,32 @@ class TestReading:
             "        x#2 add= 1\n"
             "    return (tuple [c#4 for c#4 in node#0.children if c#4], x#2)\n"
         )
+
+    def test_try(self):
+        def f(node, rt):
+            try:
+                x = 1
+            except (ValueError, KeyError) as e:
+                raise
+            except Exception:
+                pass
+            else:
+                x = 2
+            finally:
+                x = 3
+
+        assert self.ir(f).splitlines()[1:] == [
+            "    try:",
+            "        x#2 = 1",
+            "    except (tuple global ValueError, global KeyError) as e#3:",
+            "        raise",
+            "    except global Exception:",
+            "        pass",
+            "    else:",
+            "        x#2 = 2",
+            "    finally:",
+            "        x#2 = 3",
+        ]
 
     def test_big_ints(self):
         def f(node, rt):

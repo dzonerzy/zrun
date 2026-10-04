@@ -418,23 +418,27 @@ var rebound_cache: std.AutoHashMapUnmanaged(*PyObject, struct { len: isize, name
 // The compiler
 // ======================================================================
 
-/// A helper compiled out of line for some arguments: those known when
-/// compiling are part of it (a node, rt, a str...: its code is decided
-/// for them), the others (`.dyn` here) are given at run time
+/// In a helper's code out of line, the node its errors are reported at:
+/// its caller's, given at run time
+const AT_PARAM: u32 = NONE - 2;
+/// In a helper's code out of line, the scope of the frames it runs in: its
+/// caller's, given at run time
+const OWNER_PARAM: u32 = NONE - 3;
+
+/// A helper compiled out of line, once for the calls like it: the
+/// arguments it's made for (rt, Python objects, bools: its code depends on
+/// them most), the others (`.dyn` here: nodes, strs, values) given at run
+/// time
 const HelperSpec = struct {
     func: *const front.Function,
-    /// The node errors in it are reported at (the semantic calling it)
-    at: u32,
-    /// The scope whose frames it runs in
-    owner: u32,
     args: []const SVal,
     name: [:0]const u8,
     /// The semantic it runs for (run as Python if the helper can't be
     /// compiled)
     semantic: ?*PyObject,
 
-    fn matches(self: *const HelperSpec, func: *const front.Function, at: u32, owner: u32, args: []const SVal) bool {
-        if (self.func != func or self.at != at or self.owner != owner or self.args.len != args.len) return false;
+    fn matches(self: *const HelperSpec, func: *const front.Function, args: []const SVal) bool {
+        if (self.func != func or self.args.len != args.len) return false;
         for (self.args, args) |x, y| {
             if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
             const same = switch (x) {
@@ -494,6 +498,8 @@ pub const Compiler = struct {
     /// was found
     force_heap: bool = false,
     need_frames: bool = false,
+    /// Every layout is on the heap (those made later too)
+    all_heap: bool = false,
     /// A literal was marked to be built at run time: compile again
     need_retry: bool = false,
     /// Helpers compiled out of line (one already being run inline, called
@@ -557,22 +563,28 @@ pub const Compiler = struct {
         }
     }
 
-    /// A helper's code out of line: `i32 <name>(ctx, frame, args, out)`,
-    /// a status as a thunk's (its result in out), the run-time arguments
-    /// in `args`, in the frames of `frame` (the caller's: rt.eval... there).
+    /// A helper's code out of line: `i32 <name>(ctx, frame, args, at,
+    /// owner, receiver, varargs, out)`, a status as a thunk's (its result
+    /// in out), the run-time arguments in `args`, run in its caller's
+    /// frames (`frame`, of the scope `owner`: rt.eval there), its errors
+    /// reported at node `at`, the caller's receiver and varargs given.
     fn genHelper(self: *Compiler, h: *HelperSpec) Error!void {
-        const t = self.m.t;
-        const fun = try self.m.function(h.name, t.i32, &.{ t.ptr, t.ptr, t.ptr, t.ptr }, true);
-        var fnode = h.owner;
-        while (fnode != NONE and !self.isFunctionNode(fnode)) fnode = self.ownerOf(fnode);
-        var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = fnode, .layout = try self.layoutOf(fnode), .thunk = true, .helper_semantic = h.semantic };
+        const fun = try self.helperFn(h.name);
+        var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = NONE, .layout = try self.layoutOf(NONE), .thunk = true, .detached = true, .helper_semantic = h.semantic };
         // (one that can't be compiled: its semantic runs as Python)
         errdefer if (self.failed_semantic == null) {
             self.failed_semantic = h.semantic;
         };
         g.ctx = g.f.param(0);
-        g.out_param = g.f.param(3);
-        try g.thunkPrologue(h.owner, g.f.param(1));
+        g.frame = g.f.param(1);
+        g.at_param = g.f.param(3);
+        g.owner_param = g.f.param(4);
+        g.recv_slot = g.f.param(5);
+        g.varargs_slot = g.f.param(6);
+        g.out_param = g.f.param(7);
+        g.out = try g.f.alloca(self.m.t.val);
+        g.err_label = try g.f.label("error");
+        g.ret_label = try g.f.label("return");
         // (its arguments: the known ones, the others from the array, a
         // reference each)
         const args = try self.a.alloc(SVal, h.args.len);
@@ -587,12 +599,18 @@ pub const Compiler = struct {
             args[i] = .{ .dyn = d };
             j += 1;
         }
-        const v = try g.materialize(try g.runFunction(h.func, h.at, args), h.at);
+        const v = try g.materialize(try g.runFunction(h.func, AT_PARAM, args), AT_PARAM);
         try g.storeSlot(g.out_param, v);
         try g.f.ret(self.m.k32(1));
         try g.f.block(g.err_label);
         try g.f.ret(self.m.k32(0));
         g.f.finish();
+    }
+
+    /// A helper's code out of line, declared in this module.
+    fn helperFn(self: *Compiler, name: []const u8) !ir.Fn {
+        const t = self.m.t;
+        return self.m.function(name, t.i32, &.{ t.ptr, t.ptr, t.ptr, t.i32, t.i32, t.ptr, t.ptr, t.ptr }, true);
     }
 
     /// Whether any of the language's semantics run as Python.
@@ -699,6 +717,8 @@ pub const Compiler = struct {
         .{ "zr_call_seq", "bpillllpp" },
         .{ "zr_raise", "bpill" },
         .{ "zr_slice", "bpillllllllp" },
+        .{ "zr_exc_matches", "bpl" },
+        .{ "zr_exc_catch", "bpip" },
         .{ "zr_is_type", "blli" },
         .{ "zr_format", "bpillipp" },
         .{ "zr_concat", "bpiplp" },
@@ -800,9 +820,17 @@ pub const Compiler = struct {
         }
         (try self.layoutOf(NONE)).heap = true;
         // Block scopes with frames of their own: on the heap (closures keep
-        // them)
+        // them), and what's around them up to their function (a frame's
+        // parent is the frame around it)
         var it = d.frame_scopes.keyIterator();
-        while (it.next()) |scope| (try self.layoutOf(scope.*)).heap = true;
+        while (it.next()) |scope| {
+            (try self.layoutOf(scope.*)).heap = true;
+            var up = self.ownerOf(scope.*);
+            while (true) : (up = self.ownerOf(up)) {
+                (try self.layoutOf(up)).heap = true;
+                if (up == NONE or self.isFunctionNode(up)) break;
+            }
+        }
         // Semantics run as Python (and nodes run through the bridge) see the
         // variables through the frames: every function's on the heap
         if (self.force_heap or self.anyPython()) {
@@ -811,6 +839,7 @@ pub const Compiler = struct {
             }
             var lit = self.layouts.valueIterator();
             while (lit.next()) |l| l.*.heap = true;
+            self.all_heap = true;
         }
     }
 
@@ -825,11 +854,25 @@ pub const Compiler = struct {
         return NONE;
     }
 
-    fn layoutOf(self: *Compiler, fnode: u32) !*Layout {
+    /// A function's variables (and its block scopes') in frames: one not
+    /// compiled yet, whose code needs its frame.
+    pub fn heapFunction(self: *Compiler, fnode: u32) !void {
+        (try self.layoutOf(fnode)).heap = true;
+        var it = self.layouts.iterator();
+        while (it.next()) |e| {
+            var up = e.key_ptr.*;
+            while (up != NONE and !self.isFunctionNode(up)) up = self.ownerOf(up);
+            if (up == fnode) e.value_ptr.*.heap = true;
+        }
+    }
+
+    pub fn layoutOf(self: *Compiler, fnode: u32) !*Layout {
         const entry = try self.layouts.getOrPut(self.a, fnode);
         if (!entry.found_existing) {
             entry.value_ptr.* = try self.a.create(Layout);
-            entry.value_ptr.*.* = .{};
+            // (one made after the layouts were worked out: as the rest, all
+            // on the heap if they are)
+            entry.value_ptr.*.* = .{ .heap = self.all_heap };
         }
         return entry.value_ptr.*;
     }
@@ -957,8 +1000,11 @@ const Inst = struct {
     exit_label: ir.Block,
     /// Run-time control flow depth within it (if, while...)
     dyn_depth: u32 = 0,
+    /// Try bodies it's in (a return there goes through their finally; a
+    /// raise there lands in their handlers, the rest isn't dead)
+    in_try: u32 = 0,
     /// Python loop targets of the semantic itself (break / continue)
-    loops: std.ArrayListUnmanaged(struct { brk: ir.Block, cont: ir.Block }) = .empty,
+    loops: std.ArrayListUnmanaged(PyLoop) = .empty,
     /// It returned (outside run-time control flow): the rest is dead
     done: bool = false,
     /// Slots of values it holds for a while (a run-time loop's items):
@@ -975,7 +1021,44 @@ const Local = union(enum) {
 
 /// An rt.loop's targets, and how many semantics ran when it started (those
 /// above are left by a Break / Continue)
-const LoopTarget = struct { brk: ir.Block, cont: ir.Block, depth: usize, scope_depth: usize = 0 };
+const LoopTarget = struct { brk: ir.Block, cont: ir.Block, depth: usize, scope_depth: usize = 0, tries: usize };
+
+/// A semantic's own loop (break / continue): its targets, and the try
+/// statements around it (jumping out leaves those inside)
+const PyLoop = struct { brk: ir.Block, cont: ir.Block, tries: usize };
+
+/// A try statement being compiled
+const TryFrame = struct {
+    inst: *Inst,
+    /// The semantics, scopes, run when it started
+    depth: usize,
+    scope_depth: usize,
+    /// In its body: errors go to its handlers (else: in its handlers,
+    /// else or finally, only its finally runs on the way out)
+    catching: bool = true,
+    finally: []const front.Stmt,
+    /// Where errors went before it
+    outer_err: ir.Block,
+    /// Each handler's code, and the exception it caught (a slot: None when
+    /// it caught a jump)
+    handler_blocks: []ir.Block,
+    caught: []ir.Value,
+    /// The handler catching rt.Return / rt.Break / rt.Continue (jumps in
+    /// compiled code; exceptions caught by an `except` in Python), if any
+    catch_return: ?usize = null,
+    catch_break: ?usize = null,
+    catch_continue: ?usize = null,
+
+    fn catches(self: *const TryFrame, kind: RtMethod) ?usize {
+        if (!self.catching) return null;
+        return switch (kind) {
+            .Return => self.catch_return,
+            .Break => self.catch_break,
+            .Continue => self.catch_continue,
+            else => null,
+        };
+    }
+};
 
 const Gen = struct {
     c: *Compiler,
@@ -1009,6 +1092,11 @@ const Gen = struct {
     ret_label: ir.Block = null,
     /// rt.loop targets, innermost last
     loops: std.ArrayListUnmanaged(LoopTarget) = .empty,
+    /// Try statements being compiled, innermost last
+    tries: std.ArrayListUnmanaged(*TryFrame) = .empty,
+    /// The exceptions of the handlers being compiled (slots), innermost
+    /// last: what a bare `raise` raises again
+    caught: std.ArrayListUnmanaged(ir.Value) = .empty,
     /// Semantics running inline, innermost last
     insts: std.ArrayListUnmanaged(*Inst) = .empty,
     /// Loops being compiled (of the semantics or rt.loop): code in one
@@ -1021,8 +1109,16 @@ const Gen = struct {
     /// semantic run as Python): it returns a status, its value in
     /// `out_param`; the first `base_scopes` scopes are the caller's
     thunk: bool = false,
-    /// A helper's code out of line: the semantic it runs for
+    /// A helper's code out of line: the semantic it runs for, and the node
+    /// its errors are reported at (a parameter: AT_PARAM stands for it)
     helper_semantic: ?*PyObject = null,
+    at_param: ir.Value = null,
+    /// A helper's code out of line runs in its caller's frames, whatever
+    /// they are (`detached`): the scope they're of is a parameter
+    /// (OWNER_PARAM stands for it); its receiver and varargs are given
+    /// (pointers, null for none)
+    detached: bool = false,
+    owner_param: ir.Value = null,
     out_param: ir.Value = null,
     base_scopes: usize = 0,
 
@@ -1051,6 +1147,10 @@ const Gen = struct {
 
     /// An i32 constant (node indexes, operator codes).
     fn k32(self: *Gen, n: u32) ir.Value {
+        // (in a helper's code out of line: the node errors are reported
+        // at is its caller's, a parameter)
+        if (n == AT_PARAM) return self.at_param.?;
+        if (n == OWNER_PARAM) return self.owner_param.?;
         return self.c.m.k32(n);
     }
 
@@ -1255,7 +1355,8 @@ const Gen = struct {
             .dyn => |d| d,
             .none => self.noneDyn(),
             .bool => |b| self.konst(1, @intFromBool(b), .bool),
-            .int, .pint => |n| self.konst(2, n, .int),
+            .int => |n| self.konst(2, n, .int),
+            .pint => |n| self.konst(@intCast(value.PINT_TAG), n, .int),
             .float => |x| self.konst(3, @bitCast(x), .float),
             .str => |s| .{ .tag = self.k(4), .bits = self.f.ptrToInt(try self.c.m.string(s)), .shape = .str },
             .node => |n| self.konst(11, n, .node),
@@ -1543,6 +1644,8 @@ const Gen = struct {
     fn frameOf(self: *Gen, owner: u32, comptime unreachable_msg: []const u8) Error!ir.Value {
         const c = self.c;
         const f = &self.f;
+        // (a helper's code out of line runs in frames it doesn't know)
+        if (self.detached) return c.unsupported("a variable known when compiling is used in a helper compiled out of line", .{});
         var i = self.scopes.items.len;
         while (i > 0) {
             i -= 1;
@@ -1565,7 +1668,12 @@ const Gen = struct {
     /// function's.
     fn currentFrame(self: *Gen) Error!ir.Value {
         if (self.scopes.items.len > 0) return self.f.load(self.c.m.t.ptr, self.scopes.items[self.scopes.items.len - 1].slot);
-        return self.frame orelse self.c.unsupported("a block scope with a frame in a function without one (node {d})", .{self.fnode});
+        return self.frame orelse {
+            // (the code here needs its frame: compiled again with every
+            // function's variables in frames)
+            self.c.need_frames = true;
+            return self.c.unsupported("code here needs the frame of a function without one (node {d}): compiled again with frames", .{self.fnode});
+        };
     }
 
     /// A block scope with frames of its own, entered: a new frame (in a
@@ -1807,6 +1915,7 @@ const Gen = struct {
     fn checkedAt(self: *Gen, v: SVal, at: u32) Error!SVal {
         switch (v) {
             .pint => |n| return .{ .int = n },
+            .dyn => |d| return .{ .dyn = self.checkedDyn(d) },
             .py => |o| if (ph.typeOf(o) == @as(*py.c.PyTypeObject, @ptrCast(py.types.typeObject("PyLong_Type")))) {
                 const where = if (self.insts.items.len > 0) self.insts.items[self.insts.items.len - 1].node else at;
                 try self.failAt(where, "integer overflow");
@@ -1817,15 +1926,24 @@ const Gen = struct {
         return v;
     }
 
+    /// A run-time value as rt hands it over (a plain int made an I64: its
+    /// tag).
+    fn checkedDyn(self: *Gen, d: Dyn) Dyn {
+        if (d.shape != .int and d.shape != .any) return d;
+        const f = &self.f;
+        const plain = f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intCast(value.PINT_TAG)));
+        return .{ .tag = f.select(plain, self.k(2), d.tag), .bits = d.bits, .shape = d.shape };
+    }
+
     /// A Python constant as a value known here.
     fn constant(self: *Gen, o: *PyObject, at: u32) Error!SVal {
         if (o == py.Py_None()) return .none;
         if (o == py.Py_True() or o == py.Py_False()) return .{ .bool = o == py.Py_True() };
-        const t: *PyObject = @ptrCast(ph.typeOf(o));
+        const t: *PyObject = @ptrCast(@alignCast(ph.typeOf(o)));
         const is_i64 = t == types_mod.I64;
         // (an int: a plain one, or an I64, an int of the program; a subclass,
         // an IntEnum..., is itself)
-        if (is_i64 or t == @as(*PyObject, @ptrCast(py.types.typeObject("PyLong_Type")))) {
+        if (is_i64 or t == @as(*PyObject, @ptrCast(@alignCast(py.types.typeObject("PyLong_Type"))))) {
             var overflow: c_int = 0;
             const n = py.c.PyLong_AsLongLongAndOverflow(o, &overflow);
             // (beyond 64 bits: a big int, a Python object; an I64 never is)
@@ -2052,6 +2170,7 @@ const Gen = struct {
     /// scope being run, or the function (NONE: the program).
     fn currentOwner(self: *const Gen) u32 {
         if (self.scopes.items.len > 0) return self.scopes.items[self.scopes.items.len - 1].scope;
+        if (self.detached) return OWNER_PARAM;
         return self.fnode;
     }
 
@@ -2087,7 +2206,49 @@ const Gen = struct {
 
     /// Leave by a Return with a value (an owned reference): the function's
     /// result; out of a thunk, its status.
+    /// Leaving the try statements above `stop` by a jump (`ctl`: rt.Return,
+    /// rt.Break, rt.Continue; null: a return, break or continue of the
+    /// semantic's): each one's finally on the way, innermost first; or a
+    /// handler catching it (as Python's `except` catches those): to it,
+    /// true.
+    fn leaveTries(self: *Gen, stop: usize, ctl: ?RtMethod) Error!bool {
+        var i = self.tries.items.len;
+        while (i > stop) {
+            i -= 1;
+            const fr = self.tries.items[i];
+            if (ctl) |kind| if (fr.catches(kind)) |h| {
+                try self.releaseAbove(fr.depth);
+                self.releaseScopesAbove(fr.scope_depth);
+                try self.dropTemp(fr.caught[h]);
+                try self.f.br(fr.handler_blocks[h]);
+                try self.f.block(try self.f.label("after_jump"));
+                return true;
+            };
+            if (fr.finally.len > 0) try self.runFinally(i);
+        }
+        return false;
+    }
+
+    /// A try's finally where code leaves it by a jump: compiled there, the
+    /// try (and those in it) not around it, its errors going on out.
+    fn runFinally(self: *Gen, i: usize) Error!void {
+        const fr = self.tries.items[i];
+        const saved = try self.a().dupe(*TryFrame, self.tries.items);
+        const saved_err = self.err_label;
+        self.tries.shrinkRetainingCapacity(i);
+        self.err_label = fr.outer_err;
+        try self.stmts(fr.inst, fr.finally);
+        self.err_label = saved_err;
+        self.tries.clearRetainingCapacity();
+        try self.tries.appendSlice(self.a(), saved);
+    }
+
     fn returnWith(self: *Gen, d: Dyn, at: u32) Error!void {
+        // (through the try statements here: caught, or their finally run)
+        if (try self.leaveTries(0, .Return)) {
+            try self.drop(.{ .dyn = d });
+            return;
+        }
         if (self.thunk) {
             try self.releaseAbove(0);
             self.releaseScopesAbove(self.base_scopes);
@@ -2109,6 +2270,10 @@ const Gen = struct {
     /// Leave by a Break or a Continue: to the rt.loop running here; out of a
     /// thunk, its status; else an error.
     fn loopJump(self: *Gen, kind: RtMethod, at: u32) Error!void {
+        // (through the try statements inside the loop: caught, or their
+        // finally run)
+        const stop = if (self.loops.items.len > 0) self.loops.items[self.loops.items.len - 1].tries else 0;
+        if (try self.leaveTries(stop, kind)) return;
         if (self.loops.items.len == 0) {
             if (self.thunk) {
                 try self.releaseAbove(0);
@@ -2136,6 +2301,27 @@ const Gen = struct {
         return self.runFunction(func, at, args);
     }
 
+    /// A value given by pointer (an owned reference), `default` where the
+    /// pointer is null.
+    fn loadGiven(self: *Gen, ptr: ir.Value, default: SVal) Error!Dyn {
+        const f = &self.f;
+        const slot = try self.valSlot();
+        const given = try f.label("given");
+        const none = try f.label("not_given");
+        const join = try f.label("got");
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, f.ptrToInt(ptr), self.k(0)), none, given);
+        try f.block(given);
+        const v = try self.loadSlot(ptr, .any);
+        try self.increfDyn(v);
+        try self.storeSlot(slot, v);
+        try f.br(join);
+        try f.block(none);
+        try self.storeSlot(slot, try self.materialize(default, AT_PARAM));
+        try f.br(join);
+        try f.block(join);
+        return self.loadSlot(slot, .any);
+    }
+
     /// The biggest helper run inline (expressions)
     const inline_size = 40;
     /// The longest range() known when compiling that's unrolled
@@ -2151,34 +2337,27 @@ const Gen = struct {
             return c.unsupported("a recursive helper is called here: the program needs its variables in frames", .{});
         }
         if (args.len != func.param_count) return c.unsupportedAt(func, .{ .line = func.first_line }, "called with {d} arguments, takes {d}", .{ args.len, func.param_count });
-        // What it's made for: nodes, rt, strs... (all but run-time values
-        // and containers: those are given); past a few versions of it, only
-        // what can't be given (rt, Python objects)
-        var versions: usize = 0;
-        for (c.helper_fns.items) |h| {
-            if (h.func == func) versions += 1;
-        }
-        const general = versions >= 8;
+        // What it's made for: rt, Python objects, None, bools (its code
+        // depends on them most, and they're few); nodes, strs and values
+        // are given (one version serves every call like it)
         const key = try self.a().alloc(SVal, args.len);
         var given: usize = 0;
         for (args, key) |x, *slot| {
             slot.* = switch (x) {
-                .rt, .py, .none => x,
-                .bool, .node, .str => if (general) .{ .dyn = undefined } else x,
-                .rt_method, .control, .method => return c.unsupportedAt(func, .{ .line = func.first_line }, "a {s} can't be given to a recursive helper", .{@tagName(x)}),
+                .rt, .py, .none, .bool => x,
+                .rt_method, .control, .method => return c.unsupportedAt(func, .{ .line = func.first_line }, "a {s} can't be given to a helper compiled out of line", .{@tagName(x)}),
                 else => .{ .dyn = undefined },
             };
             if (slot.* == .dyn) given += 1;
         }
-        const owner = self.currentOwner();
         const spec = for (c.helper_fns.items) |h| {
-            if (h.matches(func, at, owner, key)) break h;
+            if (h.matches(func, key)) break h;
         } else blk: {
             const h = try c.a.create(HelperSpec);
             // (the semantic: the outermost one run here, or the one this
             // helper's code runs for)
             const semantic = self.helper_semantic orelse if (self.insts.items.len > 0) self.insts.items[0].func.py_function else null;
-            h.* = .{ .func = func, .at = at, .owner = owner, .args = key, .name = try std.fmt.allocPrintSentinel(c.a, "{s}_h{d}", .{ c.m.prefix, c.helper_fns.items.len }, 0), .semantic = semantic };
+            h.* = .{ .func = func, .args = key, .name = try std.fmt.allocPrintSentinel(c.a, "{s}_h{d}", .{ c.m.prefix, c.helper_fns.items.len }, 0), .semantic = semantic };
             try c.helper_fns.append(c.a, h);
             try c.helper_queue.append(c.a, h);
             break :blk h;
@@ -2193,9 +2372,13 @@ const Gen = struct {
             try self.storeSlot(self.elem(arr, j), ds[j]);
             j += 1;
         }
-        const t = c.m.t;
-        const fun = try c.m.function(spec.name, t.i32, &.{ t.ptr, t.ptr, t.ptr, t.ptr }, true);
-        const status = self.f.call(fun, &.{ self.ctx, try self.currentFrame(), arr, self.out });
+        // (the frames here, their scope; the receiver and varargs here)
+        const null_ptr = c.m.nullPtr();
+        const fn_here = !self.detached and self.fnode != NONE;
+        const recv = if (self.detached or fn_here) self.recv_slot else null_ptr;
+        const varargs = if (self.detached or (fn_here and c.specOf(self.fnode).?.extra == .keep)) self.varargs_slot else null_ptr;
+        const fun = try c.helperFn(spec.name);
+        const status = self.f.call(fun, &.{ self.ctx, try self.currentFrame(), arr, self.k32(at), self.k32(self.currentOwner()), recv, varargs, self.out });
         for (ds) |d| try self.drop(.{ .dyn = d });
         try self.statusJumps(status, at);
         return .{ .dyn = try self.loadOut(.any) };
@@ -2230,7 +2413,7 @@ const Gen = struct {
 
     /// The semantic's result: kept, or in its slot (and to its exit).
     fn setResult(self: *Gen, inst: *Inst, v: SVal) Error!void {
-        if (inst.dyn_depth == 0 and inst.result_slot == null) {
+        if (inst.dyn_depth == 0 and inst.result_slot == null and inst.in_try == 0) {
             inst.result = v;
             inst.done = true;
             return;
@@ -2241,11 +2424,15 @@ const Gen = struct {
             break :blk s;
         };
         try self.storeSlot(slot, try self.materialize(v, inst.node));
+        // (the finally of the try statements it's in, first)
+        var stop = self.tries.items.len;
+        while (stop > 0 and self.tries.items[stop - 1].inst == inst) stop -= 1;
+        _ = try self.leaveTries(stop, null);
         // (the locals as they are on this path: a value assigned after
         // a return inside run-time control flow isn't there on the others)
         try self.releaseLocals(inst);
         try self.f.br(inst.exit_label);
-        if (inst.dyn_depth == 0) {
+        if (inst.dyn_depth == 0 and inst.in_try == 0) {
             inst.done = true;
         } else try self.f.block(try self.f.label("after_return"));
     }
@@ -2360,7 +2547,7 @@ const Gen = struct {
                     .dyn => |cond| try self.f.condBr(cond, body, els),
                 }
                 try self.f.block(body);
-                try inst.loops.append(self.a(), .{ .brk = exit, .cont = head });
+                try inst.loops.append(self.a(), .{ .brk = exit, .cont = head, .tries = self.tries.items.len });
                 try self.stmts(inst, w.body);
                 _ = inst.loops.pop();
                 try self.f.br(head);
@@ -2376,9 +2563,16 @@ const Gen = struct {
                 try self.setResult(inst, v);
             },
             .raise_ => |r| {
-                const v = if (r) |e| try self.expr(inst, e) else return self.c.unsupportedAt(inst.func, s.pos, "a bare `raise` can't be compiled", .{});
+                const v = if (r) |e| try self.expr(inst, e) else blk: {
+                    // (bare: the exception being handled, again)
+                    if (self.caught.items.len == 0) return self.c.unsupportedAt(inst.func, s.pos, "a bare `raise` outside an except can't be compiled", .{});
+                    const d = try self.loadSlot(self.caught.items[self.caught.items.len - 1], .any);
+                    try self.increfDyn(d);
+                    break :blk SVal{ .dyn = d };
+                };
                 try self.raise(inst, v, s.pos);
             },
+            .try_ => |t| try self.tryStmt(inst, t),
             .assert_ => |as| {
                 const t = try self.truth(try self.expr(inst, as.test_), inst.node);
                 const msg: []const u8 = if (as.msg) |m| blk: {
@@ -2401,10 +2595,169 @@ const Gen = struct {
             .break_, .continue_ => {
                 if (inst.loops.items.len == 0) return self.c.unsupportedAt(inst.func, s.pos, "this break or continue can't be compiled", .{});
                 const target = inst.loops.items[inst.loops.items.len - 1];
+                _ = try self.leaveTries(target.tries, null);
                 try self.f.br(if (s.kind == .break_) target.brk else target.cont);
                 try self.f.block(try self.f.label("after_jump"));
             },
         }
+    }
+
+    /// try / except / else / finally. Errors in the body go to the handlers
+    /// (each matched at run time against its classes: zr_exc_matches); a
+    /// jump out (return, rt.Return...) runs the finally on the way, or is
+    /// caught by a handler whose class covers it; the finally runs on every
+    /// way out. (What the semantics run inside the body held when an error
+    /// left them isn't released: a caught error leaks those.)
+    fn tryStmt(self: *Gen, inst: *Inst, t: @FieldType(front.Stmt.Kind, "try_")) Error!void {
+        const c = self.c;
+        const f = &self.f;
+        // (what the handlers, else and finally assign: slots, as every path
+        // sees them; what the body assigns, if read where an error in the
+        // body may land (anywhere but the body itself): a loop's known
+        // items in the body stay known)
+        const parts = try self.a().alloc([]const front.Stmt, t.handlers.len + 2);
+        parts[0] = t.else_;
+        parts[1] = t.finally;
+        for (t.handlers, parts[2..]) |h, *p| p.* = h.body;
+        try self.prepareDynamic(inst, parts);
+        for (t.handlers) |h| if (h.name) |slot| try self.toSlot(inst, slot);
+        var assigned = std.AutoHashMapUnmanaged(u32, void).empty;
+        collectAssigned(t.body, &assigned, self.a()) catch return error.OutOfMemory;
+        var read = std.AutoHashMapUnmanaged(u32, void).empty;
+        collectReads(inst.func.body, t.body, &read, self.a()) catch return error.OutOfMemory;
+        var it = assigned.keyIterator();
+        while (it.next()) |slot| if (read.contains(slot.*)) try self.toSlot(inst, slot.*);
+
+        const fr = try self.a().create(TryFrame);
+        fr.* = .{
+            .inst = inst,
+            .depth = self.insts.items.len,
+            .scope_depth = self.scopes.items.len,
+            .finally = t.finally,
+            .outer_err = self.err_label,
+            .handler_blocks = try self.a().alloc(ir.Block, t.handlers.len),
+            .caught = try self.a().alloc(ir.Value, t.handlers.len),
+        };
+        // The handlers' classes (known when compiling: an object index; null
+        // for a bare except), and the jumps they catch
+        const classes = try self.a().alloc(?usize, t.handlers.len);
+        const types_ = @import("types.zig");
+        for (t.handlers, 0..) |h, i| {
+            fr.handler_blocks[i] = try f.label("handler");
+            fr.caught[i] = try self.noneSlot();
+            classes[i] = null;
+            const te = h.type_ orelse {
+                if (fr.catch_return == null) fr.catch_return = i;
+                if (fr.catch_break == null) fr.catch_break = i;
+                if (fr.catch_continue == null) fr.catch_continue = i;
+                continue;
+            };
+            const cls: *PyObject = switch (try self.expr(inst, te)) {
+                .py => |o| o,
+                .rt_method => |m| controlClass(m) orelse return c.unsupportedAt(inst.func, h.pos, "an except's classes must be known when compiling", .{}),
+                .tuple => |items| blk: {
+                    const tuple = py.c.PyTuple_New(@intCast(items.len)) orelse return error.Python;
+                    for (items, 0..) |x, j| {
+                        const o = switch (x) {
+                            .py => |o| o,
+                            .rt_method => |m| controlClass(m),
+                            else => null,
+                        } orelse return c.unsupportedAt(inst.func, h.pos, "an except's classes must be known when compiling", .{});
+                        py.Py_IncRef(o);
+                        _ = py.c.PyTuple_SetItem(tuple, @intCast(j), o);
+                    }
+                    _ = try c.objectIndex(tuple);
+                    py.Py_DecRef(tuple);
+                    break :blk tuple;
+                },
+                else => return c.unsupportedAt(inst.func, h.pos, "an except's classes must be known when compiling", .{}),
+            };
+            classes[i] = try c.objectIndex(cls);
+            // (rt.Return, rt.Break, rt.Continue are exceptions in Python)
+            if (fr.catch_return == null and py.c.PyObject_IsSubclass(types_.Return, cls) == 1) fr.catch_return = i;
+            if (fr.catch_break == null and py.c.PyObject_IsSubclass(types_.Break, cls) == 1) fr.catch_break = i;
+            if (fr.catch_continue == null and py.c.PyObject_IsSubclass(types_.Continue, cls) == 1) fr.catch_continue = i;
+            if (py.c.PyErr_Occurred() != null) return error.Python;
+            if (h.name != null and (fr.catch_return == i or fr.catch_break == i or fr.catch_continue == i))
+                return c.unsupportedAt(inst.func, h.pos, "`except ... as` catching rt.Return, rt.Break or rt.Continue can't be compiled", .{});
+        }
+        const catcher = try f.label("except");
+        const handled = try f.label("handled");
+        const done = try f.label("endtry");
+        // (errors in the handlers and the else: the finally, then on)
+        const fin_err = if (t.finally.len > 0) try f.label("finally_error") else fr.outer_err;
+
+        // The body (run straight through): its errors to the handlers
+        try self.tries.append(self.a(), fr);
+        self.err_label = catcher;
+        inst.in_try += 1;
+        try self.stmts(inst, t.body);
+        inst.in_try -= 1;
+        // (a jump in it: the rest of it dead, not what follows it)
+        inst.done = false;
+        fr.catching = false;
+        // The rest: on some paths only
+        inst.dyn_depth += 1;
+        defer inst.dyn_depth -= 1;
+        self.err_label = fin_err;
+        try self.stmts(inst, t.else_);
+        try f.br(handled);
+
+        // An error: the first handler matching it
+        try f.block(catcher);
+        for (t.handlers, 0..) |_, i| {
+            const next = try f.label("next_handler");
+            if (classes[i]) |idx| {
+                const yes = try f.label("matched");
+                try f.condBr(self.call("zr_exc_matches", &.{ self.ctx, self.k(@intCast(idx)) }), yes, next);
+                try f.block(yes);
+            }
+            try self.callCheck("zr_exc_catch", &.{ self.ctx, self.k32(inst.node), self.out });
+            try self.storeSlot(fr.caught[i], try self.loadOut(.any));
+            try f.br(fr.handler_blocks[i]);
+            try f.block(next);
+        }
+        // (none: the error goes on, after the finally)
+        try f.br(fin_err);
+
+        // The handlers (reached from an error, or a jump they catch)
+        for (t.handlers, 0..) |h, i| {
+            try f.block(fr.handler_blocks[i]);
+            if (h.name) |slot| {
+                const e = try self.loadSlot(fr.caught[i], .any);
+                try self.increfDyn(e);
+                try self.assign(inst, .{ .local = slot }, .{ .dyn = e }, h.pos);
+            }
+            try self.caught.append(self.a(), fr.caught[i]);
+            try self.stmts(inst, h.body);
+            _ = self.caught.pop();
+            try self.dropTemp(fr.caught[i]);
+            try f.br(handled);
+        }
+        _ = self.tries.pop();
+
+        // Every way out: the finally
+        self.err_label = fr.outer_err;
+        try f.block(handled);
+        try self.stmts(inst, t.finally);
+        try f.br(done);
+        if (t.finally.len > 0) {
+            try f.block(fin_err);
+            try self.stmts(inst, t.finally);
+            try f.br(fr.outer_err);
+        }
+        try f.block(done);
+    }
+
+    /// rt.Return, rt.Break, rt.Continue as the exception classes they are.
+    fn controlClass(m: RtMethod) ?*PyObject {
+        const types_ = @import("types.zig");
+        return switch (m) {
+            .Return => types_.Return,
+            .Break => types_.Break,
+            .Continue => types_.Continue,
+            else => null,
+        };
     }
 
     /// Before run-time control flow (an if on a run-time value, a loop): the
@@ -2627,7 +2980,7 @@ const Gen = struct {
             const next = try self.f.label("next");
             if (item == .dyn) try self.increfDyn(item.dyn);
             try self.assign(inst, target, item, pos);
-            try inst.loops.append(self.a(), .{ .brk = exit, .cont = next });
+            try inst.loops.append(self.a(), .{ .brk = exit, .cont = next, .tries = self.tries.items.len });
             try self.stmts(inst, body);
             _ = inst.loops.pop();
             try self.f.block(next);
@@ -2717,7 +3070,7 @@ const Gen = struct {
         const parts = try self.a().alloc(Dyn, if (it.kind == .enumerate) 2 else it.slots.len);
         var n: usize = 0;
         if (it.kind == .enumerate) {
-            parts[0] = .{ .tag = self.k(2), .bits = i, .shape = .int };
+            parts[0] = .{ .tag = self.k(@intCast(value.PINT_TAG)), .bits = i, .shape = .int };
             n = 1;
         }
         for (it.slots) |slot| {
@@ -2776,7 +3129,7 @@ const Gen = struct {
         try f.block(loop_body);
         inst.dyn_depth += 1;
         try self.iterItem(inst, it, target, pos);
-        try inst.loops.append(self.a(), .{ .brk = exit, .cont = step });
+        try inst.loops.append(self.a(), .{ .brk = exit, .cont = step, .tries = self.tries.items.len });
         try self.stmts(inst, body);
         _ = inst.loops.pop();
         try f.br(step);
@@ -2856,7 +3209,7 @@ const Gen = struct {
                 if (e.kind == .tuple) return .{ .tuple = l.items.items };
                 return self.literal(.{ .list = l }, e, inst.node);
             },
-            .list_comp => |comp| return self.literal(try self.listComp(inst, comp, e.pos), e, inst.node),
+            .list_comp, .gen_exp => |comp| return self.literal(try self.listComp(inst, comp, e.pos), e, inst.node),
             .dict => |x| {
                 const d = try self.a().create(SDict);
                 d.* = .{ .origin = e };
@@ -3156,6 +3509,11 @@ const Gen = struct {
                 inline for (@typeInfo(RtMethod).@"enum".fields) |fd| {
                     if (eq(u8, name, fd.name)) return .{ .rt_method = @enumFromInt(fd.value) };
                 }
+                // (out of line: the caller's, given; none: None, ())
+                if (self.detached and (eq(u8, name, "receiver") or eq(u8, name, "varargs"))) {
+                    const is_recv = eq(u8, name, "receiver");
+                    return .{ .dyn = try self.loadGiven(if (is_recv) self.recv_slot else self.varargs_slot, if (is_recv) .none else .{ .tuple = &.{} }) };
+                }
                 if (eq(u8, name, "receiver")) {
                     if (self.fnode == NONE) return .none;
                     // (the function's: its call's, or the one around's)
@@ -3302,6 +3660,11 @@ const Gen = struct {
                 },
             }
         } else callee = try self.expr(inst, func_e);
+        // all() / any() of a generator expression: up to the item deciding
+        if (callee == .py and args_e.len == 1 and kws.len == 0 and args_e[0].kind == .gen_exp) {
+            if (isBuiltin(callee.py, "all")) return self.allAny(inst, args_e[0].kind.gen_exp, false, pos);
+            if (isBuiltin(callee.py, "any")) return self.allAny(inst, args_e[0].kind.gen_exp, true, pos);
+        }
         // (arguments in order, as Python evaluates them)
         const args = try self.a().alloc(SVal, args_e.len);
         for (args, args_e) |*slot, ae| slot.* = try self.expr(inst, ae);
@@ -3433,7 +3796,7 @@ const Gen = struct {
         const brk = try f.label("loop_break");
         const cont = try f.label("loop_continue");
         const done = try f.label("loop_done");
-        try self.loops.append(self.a(), .{ .brk = brk, .cont = cont, .depth = self.insts.items.len, .scope_depth = self.scopes.items.len });
+        try self.loops.append(self.a(), .{ .brk = brk, .cont = cont, .depth = self.insts.items.len, .scope_depth = self.scopes.items.len, .tries = self.tries.items.len });
         self.loop_level += 1;
         defer self.loop_level -= 1;
         try self.execValue(body);
@@ -3815,7 +4178,7 @@ const Gen = struct {
         if (is_zip) {
             for (lists, 0..) |l, j| _ = self.call("zr_list_at", &.{ l.tag, l.bits, i, self.elem(arr, j) });
         } else {
-            try self.storeSlot(self.elem(arr, 0), .{ .tag = self.k(2), .bits = i, .shape = .int });
+            try self.storeSlot(self.elem(arr, 0), .{ .tag = self.k(@intCast(value.PINT_TAG)), .bits = i, .shape = .int });
             _ = self.call("zr_list_at", &.{ lists[0].tag, lists[0].bits, i, self.elem(arr, 1) });
         }
         try self.callCheck("zr_tuple", &.{ self.ctx, self.k32(inst.node), arr, self.k(@intCast(width)), self.out });
@@ -3875,13 +4238,14 @@ const Gen = struct {
         // Ints: inline, checked; for values that may be ints, behind a check
         // of their tags (anything else: the helper, off the fast path)
         if (canBeInt(ld) and canBeInt(rd) and (op == .add or op == .sub or op == .mul)) {
-            if (ld.shape == .int and rd.shape == .int) return dyn(self.k(2), try self.checkedInt(inst, op, ld.bits, rd.bits), .int);
             const fast = try f.label("int");
             const slow = try f.label("generic");
             const join = try f.label("joined");
             try f.condBr(try self.intGuard(ld, rd), fast, slow);
             try f.block(fast);
-            const res = try self.checkedInt(inst, op, ld.bits, rd.bits);
+            // (an I64 among them: an I64, I64 & plain being I64's tag)
+            const tag = f.and_(ld.tag, rd.tag);
+            const res = try self.checkedInt(inst, op, ld.bits, rd.bits, tag, slow);
             const fast_end = f.current;
             try f.br(join);
             try f.block(slow);
@@ -3890,9 +4254,9 @@ const Gen = struct {
             try f.br(join);
             try f.block(join);
             const i64t = self.c.m.t.i64;
-            const tag = f.phi(i64t, self.k(2), fast_end, g.tag, slow_end);
+            const tag_v = f.phi(i64t, tag, fast_end, g.tag, slow_end);
             const bits = f.phi(i64t, res, fast_end, g.bits, slow_end);
-            return dyn(tag, bits, .any);
+            return dyn(tag_v, bits, .any);
         }
         return .{ .dyn = try self.binaryHelper(inst, op, ld, rd) };
     }
@@ -3901,17 +4265,21 @@ const Gen = struct {
         return d.shape == .int or d.shape == .any;
     }
 
-    /// Both values are ints (an i1): their tags checked where not known.
+    /// Both values are ints, I64s or plain (an i1): their tags checked
+    /// where not known.
     fn intGuard(self: *Gen, ld: Dyn, rd: Dyn) Error!ir.Value {
         const f = &self.f;
         const yes = self.c.m.k1(true);
-        const a_ = if (ld.shape == .int) yes else f.icmp(jit_c.LLVMIntEQ, ld.tag, self.k(2));
-        const b = if (rd.shape == .int) yes else f.icmp(jit_c.LLVMIntEQ, rd.tag, self.k(2));
+        const not_plain = self.k(~@as(i64, @intCast(value.PLAIN)));
+        const a_ = if (ld.shape == .int) yes else f.icmp(jit_c.LLVMIntEQ, f.and_(ld.tag, not_plain), self.k(2));
+        const b = if (rd.shape == .int) yes else f.icmp(jit_c.LLVMIntEQ, f.and_(rd.tag, not_plain), self.k(2));
         return f.and_(a_, b);
     }
 
-    /// a op b on i64s, an overflow an error at the node.
-    fn checkedInt(self: *Gen, inst: *Inst, op: front.BinOp, a_: ir.Value, b: ir.Value) Error!ir.Value {
+    /// a op b on i64s, the result's tag `tag`: an overflow an error at the
+    /// node for an I64; for plain ints, Python's big int (`big`: the
+    /// helper's path).
+    fn checkedInt(self: *Gen, inst: *Inst, op: front.BinOp, a_: ir.Value, b: ir.Value, tag: ir.Value, big: ir.Block) Error!ir.Value {
         const f = &self.f;
         const intrinsic = switch (op) {
             .add => self.c.sadd,
@@ -3923,8 +4291,11 @@ const Gen = struct {
         const ovf = f.extract(pair, 1);
         const bad = try f.label("overflow");
         const good = try f.label("no_overflow");
+        const checked = try f.label("i64_overflow");
         try f.condBr(ovf, bad, good);
         try f.block(bad);
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, tag, self.k(@intCast(value.PINT_TAG))), big, checked);
+        try f.block(checked);
         _ = self.call("zr_overflow", &.{ self.ctx, self.k32(inst.node) });
         try f.br(self.err_label);
         try f.block(good);
@@ -4211,12 +4582,31 @@ const Gen = struct {
         return .{ .dyn = try self.loadSlot(sink.slot, .list) };
     }
 
+    /// any(x for ...) / all(x for ...): the elements in turn until one
+    /// decides (true for any, false for all), as Python's stop there.
+    fn allAny(self: *Gen, inst: *Inst, comp: front.Comp, is_any: bool, pos: front.Pos) Error!SVal {
+        const f = &self.f;
+        const slot = try self.valSlot();
+        try self.storeSlot(slot, self.konst(1, @intFromBool(!is_any), .bool));
+        var sink = Sink{ .kind = .decide, .list = undefined, .slot = slot, .elt = comp.elt, .is_any = is_any, .exit = try f.label("decided") };
+        // (each element may end it: what follows runs on some paths only)
+        inst.dyn_depth += 1;
+        try self.compLoops(inst, comp.generators, 0, pos, &sink);
+        inst.dyn_depth -= 1;
+        try f.br(sink.exit);
+        try f.block(sink.exit);
+        return .{ .dyn = try self.loadSlot(slot, .bool) };
+    }
+
     /// Where a comprehension's elements go
     const Sink = struct {
-        kind: enum { static_list, list_into, dict_into } = .static_list,
+        kind: enum { static_list, list_into, dict_into, decide } = .static_list,
         list: *SList,
-        /// The run-time list or dict (a stack slot)
+        /// The run-time list or dict (a stack slot); any()/all()'s result
         slot: ir.Value = null,
+        /// any() or all(): which, and where a deciding element jumps to
+        is_any: bool = false,
+        exit: ir.Block = null,
         elt: ?*const front.Expr = null,
         key: ?*const front.Expr = null,
         value: ?*const front.Expr = null,
@@ -4312,6 +4702,22 @@ const Gen = struct {
                 try self.drop(.{ .dyn = v });
                 try self.check(ok);
             },
+            .decide => {
+                const f = &self.f;
+                const t = try self.truth(try self.expr(inst, sink.elt.?), inst.node);
+                // (deciding: the result, and out)
+                const decides = switch (t) {
+                    .known => |b| self.c.m.k1(b == sink.is_any),
+                    .dyn => |b| if (sink.is_any) b else f.xor(b, self.c.m.k1(true)),
+                };
+                const yes = try f.label("decides");
+                const go_on = try f.label("undecided");
+                try f.condBr(decides, yes, go_on);
+                try f.block(yes);
+                try self.storeSlot(sink.slot, self.konst(1, @intFromBool(sink.is_any), .bool));
+                try f.br(sink.exit);
+                try f.block(go_on);
+            },
         }
     }
 };
@@ -4334,6 +4740,15 @@ fn collectAssigned(body: []const front.Stmt, set: *std.AutoHashMapUnmanaged(u32,
             try collectAssigned(x.body, set, a);
             try collectAssigned(x.else_, set, a);
         },
+        .try_ => |x| {
+            try collectAssigned(x.body, set, a);
+            try collectAssigned(x.else_, set, a);
+            try collectAssigned(x.finally, set, a);
+            for (x.handlers) |h| {
+                if (h.name) |slot| try set.put(a, slot, {});
+                try collectAssigned(h.body, set, a);
+            }
+        },
         .expr => |e| try collectMutated(e, set, a),
         else => {},
     };
@@ -4349,6 +4764,133 @@ fn collectTarget(t: front.Target, set: *std.AutoHashMapUnmanaged(u32, void), a: 
 }
 
 /// `x.append(...)`: x is mutated (a list's or dict's mutating methods).
+/// The locals statements read (or change in place), anywhere in them but
+/// the statement list `skip` (a try's body).
+fn collectReads(body: []const front.Stmt, skip: []const front.Stmt, set: *std.AutoHashMapUnmanaged(u32, void), a: Allocator) !void {
+    if (body.ptr == skip.ptr and body.len == skip.len) return;
+    for (body) |s| switch (s.kind) {
+        .assign => |x| {
+            for (x.targets) |t| try targetReads(t, set, a);
+            try exprReads(x.value, set, a);
+        },
+        .aug => |x| {
+            try targetReads(x.target, set, a);
+            if (x.target == .local) try set.put(a, x.target.local, {});
+            try exprReads(x.value, set, a);
+        },
+        .expr => |e| try exprReads(e, set, a),
+        .if_ => |x| {
+            try exprReads(x.test_, set, a);
+            try collectReads(x.body, skip, set, a);
+            try collectReads(x.else_, skip, set, a);
+        },
+        .while_ => |x| {
+            try exprReads(x.test_, set, a);
+            try collectReads(x.body, skip, set, a);
+            try collectReads(x.else_, skip, set, a);
+        },
+        .for_ => |x| {
+            try targetReads(x.target, set, a);
+            try exprReads(x.iter, set, a);
+            try collectReads(x.body, skip, set, a);
+            try collectReads(x.else_, skip, set, a);
+        },
+        .return_, .raise_ => |e| if (e) |x| try exprReads(x, set, a),
+        .assert_ => |x| {
+            try exprReads(x.test_, set, a);
+            if (x.msg) |m| try exprReads(m, set, a);
+        },
+        .try_ => |x| {
+            try collectReads(x.body, skip, set, a);
+            try collectReads(x.else_, skip, set, a);
+            try collectReads(x.finally, skip, set, a);
+            for (x.handlers) |h| {
+                if (h.type_) |e| try exprReads(e, set, a);
+                try collectReads(h.body, skip, set, a);
+            }
+        },
+        .break_, .continue_, .pass => {},
+    };
+}
+
+/// (a target's reads: an attribute's or item's object and index)
+fn targetReads(t: front.Target, set: *std.AutoHashMapUnmanaged(u32, void), a: Allocator) !void {
+    switch (t) {
+        .local => {},
+        .tuple => |ts| for (ts) |x| try targetReads(x, set, a),
+        .attr => |x| try exprReads(x.obj, set, a),
+        .index => |x| {
+            try exprReads(x.obj, set, a);
+            try exprReads(x.index, set, a);
+        },
+    }
+}
+
+fn exprReads(e: *const front.Expr, set: *std.AutoHashMapUnmanaged(u32, void), a: Allocator) Allocator.Error!void {
+    switch (e.kind) {
+        .local => |slot| try set.put(a, slot, {}),
+        .int, .big, .float, .str, .bool, .none, .global => {},
+        .attr => |x| try exprReads(x.obj, set, a),
+        .index => |x| {
+            try exprReads(x.obj, set, a);
+            try exprReads(x.index, set, a);
+        },
+        .slice => |x| {
+            try exprReads(x.obj, set, a);
+            inline for (.{ x.lo, x.hi, x.step }) |p| if (p) |y| try exprReads(y, set, a);
+        },
+        .call => |x| {
+            try exprReads(x.func, set, a);
+            for (x.args) |y| try exprReads(y, set, a);
+            for (x.keywords) |k| try exprReads(k.value, set, a);
+        },
+        .binary => |x| {
+            try exprReads(x.left, set, a);
+            try exprReads(x.right, set, a);
+        },
+        .unary => |x| try exprReads(x.operand, set, a),
+        .and_, .or_, .list, .tuple => |xs| for (xs) |y| try exprReads(y, set, a),
+        .compare => |x| {
+            try exprReads(x.first, set, a);
+            for (x.rest) |y| try exprReads(y, set, a);
+        },
+        .cond => |x| {
+            try exprReads(x.test_, set, a);
+            try exprReads(x.then, set, a);
+            try exprReads(x.else_, set, a);
+        },
+        .dict => |x| {
+            for (x.keys) |y| try exprReads(y, set, a);
+            for (x.values) |y| try exprReads(y, set, a);
+        },
+        .list_comp, .gen_exp => |c| {
+            try exprReads(c.elt, set, a);
+            for (c.generators) |g| try genReads(g, set, a);
+        },
+        .dict_comp => |c| {
+            try exprReads(c.key, set, a);
+            try exprReads(c.value, set, a);
+            for (c.generators) |g| try genReads(g, set, a);
+        },
+        .fstring => |parts| for (parts) |p| try fpartReads(p, set, a),
+    }
+}
+
+fn genReads(g: front.Generator, set: *std.AutoHashMapUnmanaged(u32, void), a: Allocator) Allocator.Error!void {
+    try exprReads(g.iter, set, a);
+    for (g.ifs) |y| try exprReads(y, set, a);
+}
+
+fn fpartReads(p: front.FPart, set: *std.AutoHashMapUnmanaged(u32, void), a: Allocator) Allocator.Error!void {
+    switch (p) {
+        .text => {},
+        .value => |v| {
+            try exprReads(v.expr, set, a);
+            for (v.spec) |s| try fpartReads(s, set, a);
+        },
+    }
+}
+
 fn collectMutated(e: *const front.Expr, set: *std.AutoHashMapUnmanaged(u32, void), a: Allocator) !void {
     if (e.kind != .call) return;
     const func = e.kind.call.func;

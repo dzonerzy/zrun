@@ -77,7 +77,8 @@ pub export fn zr_py_semantic(ctx: *Ctx, which: u32, idx: u32, frame_slot: **valu
     const r = py.c.PyObject_CallFunctionObjArgs(func, node, rt, @as(?*PyObject, null)) orelse return fromPythonError(ctx, idx, out);
     defer py.Py_DecRef(r);
     if (w == .eval) {
-        out.* = value.fromPython(r) orelse return fromPythonError(ctx, idx, out);
+        // (as rt.eval gives it: an int an I64)
+        out.* = (value.fromPython(r) orelse return fromPythonError(ctx, idx, out)).checked();
     }
     return 1;
 }
@@ -148,7 +149,6 @@ fn runNode(ctx: *Ctx, which: compile_mod.Which, idx: u32, frame_slot: **value.Fr
         return zr_py_semantic(ctx, @intFromEnum(which), idx, frame_slot, owner, out);
     }
     const thunk = link.compiled.thunk(idx, which, owner) orelse return fromPythonError(ctx, idx, out);
-    ctx.objects = link.compiled.objects();
     return thunk(ctx, frame_slot.*, out);
 }
 
@@ -159,7 +159,7 @@ fn fromPythonError(ctx: *Ctx, idx: u32, out: *Value) i32 {
         .ret => {
             const v = types.takeReturn() orelse return pythonFailure(ctx, idx);
             defer py.Py_DecRef(v);
-            out.* = value.fromPython(v) orelse return pythonFailure(ctx, idx);
+            out.* = (value.fromPython(v) orelse return pythonFailure(ctx, idx)).checked();
             return 2;
         },
         .brk => {
@@ -201,6 +201,20 @@ pub fn pythonFailure(ctx: *Ctx, idx: u32) i32 {
         ctx.pending = exc;
         _ = helpers.fail(ctx, idx, "a Python exception", .{});
         return 0;
+    }
+    // (any other exception: kept with the error, its message the error's)
+    if (!ctx.failed) {
+        var t: ?*PyObject = null;
+        var v: ?*PyObject = null;
+        var tb: ?*PyObject = null;
+        py.c.PyErr_Fetch(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
+        py.c.PyErr_NormalizeException(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
+        if (v) |e| {
+            py.Py_IncRef(e);
+            if (ctx.exc) |old| py.Py_DecRef(old);
+            ctx.exc = e;
+        }
+        py.c.PyErr_Restore(t, v, tb);
     }
     const msg = helpers.pythonMessage() orelse {
         py.c.PyErr_Clear();
@@ -255,6 +269,15 @@ fn raiseCompiledError(ctx: *Ctx) ?*PyObject {
         const t: *PyObject = @ptrCast(@alignCast(p.ob_type));
         py.c.PyErr_SetObject(t, p);
         py.Py_DecRef(p);
+        ctx.clearError();
+        return null;
+    }
+    // (a Python exception behind it: raised as itself, as in the reference
+    // mode)
+    if (ctx.exc) |e| {
+        ctx.exc = null;
+        py.c.PyErr_SetObject(@ptrCast(@alignCast(ph.typeOf(e))), e);
+        py.Py_DecRef(e);
         ctx.clearError();
         return null;
     }
@@ -315,11 +338,44 @@ pub export fn zr_raise(ctx: *Ctx, at: u32, t: u64, bits: u64) callconv(.c) bool 
     if (is_type and py.c.PyObject_IsSubclass(o, base) == 1) {
         py.c.PyErr_SetNone(o);
     } else if (py.c.PyObject_IsInstance(o, base) == 1) {
-        py.c.PyErr_SetObject(@ptrCast(ph.typeOf(o)), o);
+        py.c.PyErr_SetObject(@ptrCast(@alignCast(ph.typeOf(o))), o);
     } else {
         ph.raise(py.PyExc_TypeError(), "exceptions must derive from BaseException", .{});
     }
     return pythonFailure(ctx, at) != 0;
+}
+
+/// `except cls:` in compiled code: whether the error being raised is one
+/// (objects[cls_index]: a class or a tuple of them). An error of the
+/// compiled code itself is a zrun.Error, as Python code above would see it.
+pub export fn zr_exc_matches(ctx: *Ctx, cls_index: u64) callconv(.c) bool {
+    const cls = ctx.object(cls_index);
+    const r = if (ctx.pending orelse ctx.exc) |e|
+        py.c.PyObject_IsInstance(e, cls)
+    else
+        py.c.PyObject_IsSubclass(types.Error, cls);
+    if (r < 0) py.c.PyErr_Clear();
+    return r == 1;
+}
+
+/// The error being raised, caught (`except ... as e`): the exception
+/// object in `out` (a host value), the error cleared.
+pub export fn zr_exc_catch(ctx: *Ctx, at: u32, out: *Value) callconv(.c) bool {
+    var exc: *PyObject = undefined;
+    if (ctx.pending orelse ctx.exc) |e| {
+        py.Py_IncRef(e);
+        exc = e;
+    } else {
+        const link = linkOf(ctx);
+        exc = link.error_object(link.program, ctx.err_node, ctx.err_msg.items, ctx.err_stack.items) orelse {
+            py.c.PyErr_Clear();
+            ctx.clearError();
+            return helpers.fail(ctx, at, "out of memory", .{});
+        };
+    }
+    ctx.clearError();
+    out.* = .{ .tag = @intFromEnum(value.Tag.host), .bits = @intFromPtr(exc) };
+    return true;
 }
 
 /// `rt` as a value compiled code passes (to a Python function: f(rt,
@@ -520,7 +576,8 @@ fn rtStore(self: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     if (py.c.PyArg_UnpackTuple(args, "store", 2, 2, &name, &v) == 0) return null;
     const idx = nodeIndex(r, name.?, "a variable's name") orelse return null;
     const slot = varSlot(r, idx) orelse return null;
-    const nv = value.fromPython(v.?) orelse return null;
+    // (stored as rt.store does: an int an I64)
+    const nv = (value.fromPython(v.?) orelse return null).checked();
     const old = slot.*;
     slot.* = nv;
     if (old.tag != helpers.UNSET) value.decref(old);
@@ -541,7 +598,6 @@ fn rtFunction(self: ?*PyObject, x: ?*PyObject) callconv(.c) ?*PyObject {
         return raiseCompiledError(ctx);
     };
     const addr = link.compiled.functionAddr(fnode) orelse return null;
-    ctx.objects = link.compiled.objects();
     const env = frameOf(r, c.ownerOf(fnode), fnode) orelse return null;
     const name_text = if (fspec.name != 0) if (program_mod.labelled(d, fnode, fspec.name)) |nn| d.text(nn) else "<anonymous>" else "<anonymous>";
     const name = value.newStr(name_text) orelse return py.c.PyErr_NoMemory();
@@ -585,7 +641,7 @@ fn rtCall(self: ?*PyObject, args: ?*PyObject, kwargs: ?*PyObject) callconv(.c) ?
     for (0..n) |i| {
         const item = py.c.PySequence_GetItem(seq, @intCast(i)) orelse return null;
         defer py.Py_DecRef(item);
-        vals[i] = value.fromPython(item) orelse return null;
+        vals[i] = (value.fromPython(item) orelse return null).checked();
         made += 1;
     }
     var recv_v: Value = Value.none_v;
@@ -819,11 +875,13 @@ pub fn init(module: *PyObject) !void {
 }
 
 /// The bridge's helpers, by name (for the JIT)
-pub fn symbols() [4]struct { []const u8, usize } {
+pub fn symbols() [6]struct { []const u8, usize } {
     return .{
         .{ "zr_py_semantic", @intFromPtr(&zr_py_semantic) },
         .{ "zr_run_value", @intFromPtr(&zr_run_value) },
         .{ "zr_runtime", @intFromPtr(&zr_runtime) },
         .{ "zr_raise", @intFromPtr(&zr_raise) },
+        .{ "zr_exc_matches", @intFromPtr(&zr_exc_matches) },
+        .{ "zr_exc_catch", @intFromPtr(&zr_exc_catch) },
     };
 }

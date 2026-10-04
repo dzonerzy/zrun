@@ -40,14 +40,38 @@ pub const Tag = enum(u64) {
     _,
 };
 
+/// An int is an I64 (tag int: the program's, its arithmetic checked) or a
+/// plain one (this tag: a semantic's own, as Python's: overflowing 64 bits
+/// makes a big int); kind() is .int for both. (int | PLAIN: a tag test
+/// `tag & ~PLAIN == int` is true for either)
+pub const PLAIN: u64 = 16;
+pub const PINT_TAG: u64 = @intFromEnum(Tag.int) | PLAIN;
+
 pub const Value = extern struct {
     tag: u64,
     bits: u64,
 
     pub const none_v = Value{ .tag = @intFromEnum(Tag.none), .bits = 0 };
 
+    /// An I64 (an int of the program).
     pub fn int(v: i64) Value {
         return .{ .tag = @intFromEnum(Tag.int), .bits = @bitCast(v) };
+    }
+
+    /// A plain int.
+    pub fn pint(v: i64) Value {
+        return .{ .tag = PINT_TAG, .bits = @bitCast(v) };
+    }
+
+    /// A plain int (not an I64).
+    pub fn isPlain(self: Value) bool {
+        return self.tag == PINT_TAG;
+    }
+
+    /// As rt hands values over in the reference mode (I64(): a plain int
+    /// made an I64; anything else as it is).
+    pub fn checked(self: Value) Value {
+        return if (self.tag == PINT_TAG) .{ .tag = @intFromEnum(Tag.int), .bits = self.bits } else self;
     }
 
     pub fn float(v: f64) Value {
@@ -63,6 +87,7 @@ pub const Value = extern struct {
     }
 
     pub fn kind(self: Value) Tag {
+        if (self.tag == PINT_TAG) return .int;
         return @enumFromInt(self.tag);
     }
 
@@ -790,7 +815,8 @@ pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
             py.Py_IncRef(b);
             return b;
         },
-        .int => return types.fromInt(v.asInt()),
+        // (an I64, or a plain int, as the reference mode has them)
+        .int => return if (v.isPlain()) py.c.PyLong_FromLongLong(v.asInt()) else types.fromInt(v.asInt()),
         .float => return py.c.PyFloat_FromDouble(v.asFloat()),
         .str => {
             const s: *Str = @ptrCast(v.ptr());
@@ -828,7 +854,8 @@ pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
 }
 
 /// A Python object as a value (a new reference), or null with an
-/// exception (IntegerOverflow for an int outside 64 bits). Tuples are
+/// exception. An I64 is an int of the program, an int a plain one (a big
+/// one, beyond 64 bits: a host value, Python's). Tuples are
 /// copied; a list or a dict only nothing else refers to (just made: a
 /// call's result...) is copied too (no one can see the difference), one
 /// that's shared is a host value, as other objects are (the same object
@@ -857,15 +884,14 @@ fn convert(o: *PyObject, unique: bool) ?Value {
     // a host value, itself)
     if (o == py.Py_True() or o == py.Py_False()) return Value.boolean(o == py.Py_True());
     const ty = ph.typeOf(o);
-    // (zrun.I64 too: the ints rt gives Python)
-    if (ty == exact.int or @as(*PyObject, @ptrCast(ty)) == types.I64) {
+    // (an int: plain; zrun.I64, what rt gives Python: the program's)
+    const is_i64 = @as(*PyObject, @ptrCast(@alignCast(ty))) == types.I64;
+    if (ty == exact.int or is_i64) big: {
         var overflow: c_int = 0;
         const n = py.c.PyLong_AsLongLongAndOverflow(o, &overflow);
-        if (overflow != 0) {
-            py.c.PyErr_SetString(types.IntegerOverflow, "integer overflow");
-            return null;
-        }
-        return Value.int(n);
+        // (beyond 64 bits: Python's own, a host value; an I64 never is)
+        if (overflow != 0) break :big;
+        return if (is_i64) Value.int(n) else Value.pint(n);
     }
     if (ty == exact.float) return Value.float(py.c.PyFloat_AsDouble(o));
     if (ty == exact.str) str: {
