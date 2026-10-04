@@ -1,0 +1,32 @@
+5	el	llo	ello	Hello	
+65	Hi		ababab
+42    42 42   | 00042 +42
+3.142 1.234568e+04 0.0001 1e+20 100
+1 1.5 true      right|left      |
+ff FF 10 A %
+"line\
+break \"quoted\" \\ end"
+5	2	nil
+4	nil	6	5
+2024	01	15
+trim me
+key	value
+3	5
+[nested]
+<hello> <world>	2
+HELLO WORLD	2
+Bob is 42	2
+-a-b-c-	4
+two one three	1
+W (W) W	3
+a:1 b:2 c:3
+ Camel Case String	3
+3 items	x
+11
+3	ABC	HI	tab	here	single 'q'
+long
+string	with ]] inside
+2	a
+desserts	mixed	MIXED
+123	-0.0	1e+15	1e+16	9.2233720368548e+18	0.1
+1020	1.5	-1

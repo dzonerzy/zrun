@@ -1,0 +1,8 @@
+cat says meow	rex says woof	rex fetches
+Animal(cat)	Dog(rex)
+true	true
+(4,6)	(2,2)	(3,6)	(6,8)	(-1,-2)
+true	true	true	false	2	(1,2)|(3,4)	10
+a!	b!
+2	nil	get a,get b,set c
+5	0

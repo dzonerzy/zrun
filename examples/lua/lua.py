@@ -291,6 +291,10 @@ def to_integer(v):
 
 
 def where(rt, node):
+    """`chunk:line: ` of a node; nothing for None (code of the library,
+    which Lua's messages give no position for)."""
+    if node is None:
+        return ""
     name = rt.path if rt.path is not None else "input"
     return "%s:%d: " % (name, node.line)
 
@@ -306,6 +310,8 @@ def describe(rt, node):
     if node is None:
         return ""
     k = node.kind
+    if k == "paren":
+        return describe(rt, node.children[0])
     if k == "var":
         return " (%s '%s')" % ("local" if rt.scope(node) is not None else "global", node.text)
     if k == "member":
@@ -352,11 +358,18 @@ def index(rt, node, obj, key):
         else:
             h = metamethod(obj, "__index")
             if h is None:
-                lua_error(rt, node, "attempt to index a %s value%s" % (type_name(obj), describe(rt, node.target)))
+                lua_error(rt, node, "attempt to index a %s value%s" % (type_name(obj), describe(rt, target_of(node))))
         if is_function(h):
             return one(call(rt, node, h, [obj, key]))
         obj = h
     lua_error(rt, node, "'__index' chain too long; possible loop")
+
+
+def target_of(node):
+    """What a call, an index or a member applies to (None without one)."""
+    if node is None or node.kind not in ("call", "method_call", "index", "member"):
+        return None
+    return node.target
 
 
 def setindex(rt, node, obj, key, value):
@@ -369,15 +382,15 @@ def setindex(rt, node, obj, key, value):
             h = metamethod(obj, "__newindex")
             if h is None:
                 if key is None:
-                    lua_error(rt, node, "index is nil")
+                    lua_error(rt, node, "table index is nil")
                 if type(key) is float and key != key:
-                    lua_error(rt, node, "index is NaN")
+                    lua_error(rt, node, "table index is NaN")
                 obj.set(key, value)
                 return
         else:
             h = metamethod(obj, "__newindex")
             if h is None:
-                lua_error(rt, node, "attempt to index a %s value%s" % (type_name(obj), describe(rt, node.target)))
+                lua_error(rt, node, "attempt to index a %s value%s" % (type_name(obj), describe(rt, target_of(node))))
         if is_function(h):
             call(rt, node, h, [obj, key, value])
             return
@@ -391,7 +404,8 @@ def setindex(rt, node, obj, key, value):
 
 
 def call(rt, node, f, args):
-    """Call a Lua value with arguments: its results (a list)."""
+    """Call a Lua value with arguments: its results (a list). `node` is the
+    call expression, or None for a call made by the library (pcall's)."""
     if isinstance(f, zrun.Function):
         r = rt.call(f, args)
         return r if isinstance(r, list) else []
@@ -403,7 +417,7 @@ def call(rt, node, f, args):
     h = metamethod(f, "__call")
     if h is not None:
         return call(rt, node, h, [f] + args)
-    lua_error(rt, node, "attempt to call a %s value%s" % (type_name(f), describe(rt, node.target)))
+    lua_error(rt, node, "attempt to call a %s value%s" % (type_name(f), describe(rt, target_of(node))))
 
 
 def call_args(node, rt):
@@ -551,17 +565,18 @@ def while_stmt(node, rt):
 @lang.exec("repeat_stmt")
 def repeat_stmt(node, rt):
     body = node.children[0]
-    while True:
-        if not rt.loop(body):
-            break
-        if truthy(rt.eval(body.cond)):
-            break
+    while rt.loop(body):
+        pass
 
 
 @lang.exec("repeat_body")
 def repeat_body(node, rt):
+    # (the condition sees the body's locals: it's evaluated in its scope,
+    # and ends the loop as a break does)
     for c in node.children[:-1]:
         rt.exec(c)
+    if truthy(rt.eval(node.cond)):
+        raise rt.Break()
 
 
 @lang.exec("if_stmt")
@@ -587,11 +602,9 @@ def for_num(node, rt):
     limit = rt.eval(bounds[1])
     step = rt.eval(bounds[2]) if len(bounds) > 2 else 1
     body = node.children[-1]
-    for what, v in (("initial", start), ("limit", limit), ("step", step)):
+    for what, v in (("initial value", start), ("limit", limit), ("step", step)):
         if not is_number(v):
-            n = str_to_number(v) if isinstance(v, str) else None
-            if n is None:
-                lua_error(rt, node, "'for' %s value must be a number" % what)
+            lua_error(rt, node, "bad 'for' %s (number expected, got %s)" % (what, type_name(v)))
     if is_int(start) and is_int(step):
         if step == 0:
             lua_error(rt, node, "'for' step is zero")
@@ -606,6 +619,8 @@ def for_num(node, rt):
             lim = limit
         i = start
         while (i <= lim) if step > 0 else (i >= lim):
+            # (a new variable each time round: closures keep theirs)
+            rt.fresh(node)
             rt.store(node.var, i)
             if not rt.loop(body):
                 break
@@ -621,6 +636,7 @@ def for_num(node, rt):
         lua_error(rt, node, "'for' step is zero")
     x = fstart
     while (x <= flimit) if fstep > 0 else (x >= flimit):
+        rt.fresh(node)
         rt.store(node.var, x)
         if not rt.loop(body):
             break
@@ -641,6 +657,7 @@ def for_in(node, rt):
         if first is None:
             break
         control = first
+        rt.fresh(node)
         for i in range(len(names)):
             rt.store(names[i], vals[i] if i < len(vals) else None)
         if not rt.loop(body):
@@ -872,19 +889,43 @@ def binop(rt, node, op, a, b):
 
 
 def arith(rt, node, op, a, b):
-    x = tonumber_arith(a)
-    y = tonumber_arith(b)
-    if x is None or y is None:
-        h = metamethod(a, ARITH_EVENTS[op])
-        if h is None:
-            h = metamethod(b, ARITH_EVENTS[op])
-        if h is not None:
-            return one(call(rt, node, h, [a, b]))
-        bad = node.left if x is None else node.right
-        badv = a if x is None else b
-        if isinstance(badv, str):
-            lua_error(rt, node, "attempt to perform arithmetic on a string value%s" % describe(rt, bad))
-        lua_error(rt, node, "attempt to perform arithmetic on a %s value%s" % (type_name(badv), describe(rt, bad)))
+    if is_number(a) and is_number(b):
+        return arith_numbers(rt, node, op, a, b)
+    # Anything else: a metamethod (strings have them: their numbers, as
+    # Lua's string library converts them)
+    event = ARITH_EVENTS[op]
+    h = metamethod(a, event)
+    if h is None:
+        h = metamethod(b, event)
+    if h is not None:
+        return one(call(rt, node, h, [a, b]))
+    # (Lua blames the first operand that isn't a number)
+    bad, badv = (node.left, a) if not is_number(a) else (node.right, b)
+    lua_error(rt, node, "attempt to perform arithmetic on a %s value%s" % (type_name(badv), describe(rt, bad)))
+
+
+def string_arith(event):
+    """A string's arithmetic metamethod (`"10" + 1`): both operands as
+    numbers, else the other operand's metamethod, else an error."""
+    op = [k for k, v in ARITH_EVENTS.items() if v == event][0]
+
+    def fn(rt, node, args):
+        a = args[0] if args else None
+        b = args[1] if len(args) > 1 else None
+        x = tonumber_arith(a)
+        y = tonumber_arith(b)
+        if x is not None and y is not None:
+            return [arith_numbers(rt, node, op, x, y)]
+        if not isinstance(b, str):
+            h = metamethod(b, event)
+            if h is not None:
+                return call(rt, node, h, [a, b])
+        lua_error(rt, node, "attempt to %s a '%s' with a '%s'" % (event[2:], type_name(a), type_name(b)))
+
+    return Builtin(event, fn)
+
+
+def arith_numbers(rt, node, op, x, y):
     if is_int(x) and is_int(y):
         xi = int(x)
         yi = int(y)
@@ -896,11 +937,11 @@ def arith(rt, node, op, a, b):
             return wrap(xi * yi)
         if op == "//":
             if yi == 0:
-                lua_error(rt, node, "attempt to perform 'n//0'")
+                lua_error(rt, node, "attempt to divide by zero")
             return wrap(xi // yi)
         if op == "%":
             if yi == 0:
-                lua_error(rt, node, "attempt to perform 'n%%0'")
+                lua_error(rt, node, "attempt to perform 'n%0'")
             return wrap(xi % yi)
     fx = float(x)
     fy = float(y)
@@ -926,7 +967,8 @@ def arith(rt, node, op, a, b):
             if fx == 0 or fx != fx:
                 return math.nan
             return math.copysign(math.inf, fx) * math.copysign(1.0, fy)
-        return float(math.floor(fx / fy))
+        q = fx / fy
+        return float(math.floor(q)) if math.isfinite(q) else q
     # %
     if fy == 0:
         return math.nan
@@ -1119,7 +1161,30 @@ def got(v, i, args):
 
 
 def arg_error(rt, node, i, fname, message):
-    lua_error(rt, node, "bad argument #%d to '%s' (%s)" % (i + 1, fname, message))
+    """A bad argument to a library function. Called from Lua code: at the
+    call, named as it was called (a method's self not counted); called by
+    the library (node None): no position, its full name (`string.rep`)."""
+    if node is None:
+        name = QUALIFIED.get(fname, fname)
+    else:
+        name = call_name(node) or fname
+        if node.kind == "method_call":
+            i -= 1
+    lua_error(rt, node, "bad argument #%d to '%s' (%s)" % (i + 1, name, message))
+
+
+def call_name(node):
+    """The name a call expression calls its function by, if it has one."""
+    if node.kind == "method_call":
+        return node.method.text
+    if node.kind != "call":
+        return None
+    t = node.target
+    if t.kind == "var":
+        return t.text
+    if t.kind == "member":
+        return t.name.text
+    return None
 
 
 def opt(args, i, default):
@@ -1127,12 +1192,21 @@ def opt(args, i, default):
     return default if v is None else v
 
 
+# Library functions' full names (string.rep), by their names
+QUALIFIED = {}
+
+
 def lib(table, name, qualified=None):
     def register(fn):
         table.set(name, Builtin(qualified or name, fn))
+        prefix = LIB_NAMES.get(id(table), "")
+        QUALIFIED.setdefault(name, prefix + name)
         return fn
 
     return register
+
+
+LIB_NAMES = {}
 
 
 OUT = []
@@ -1234,8 +1308,12 @@ def lua_getmetatable(rt, node, args):
 @lib(G, "assert")
 def lua_assert(rt, node, args):
     if not args or not truthy(args[0]):
+        # (as error() at level 1: a string message gets the position)
         if len(args) > 1:
-            raise rt.Throw(args[1], tostring(rt, node, args[1]))
+            m = args[1]
+            if isinstance(m, str):
+                m = where(rt, node) + m
+            raise rt.Throw(m, tostring(rt, node, m))
         lua_error(rt, node, "assertion failed!")
     return list(args)
 
@@ -1244,7 +1322,9 @@ def lua_assert(rt, node, args):
 def lua_error_fn(rt, node, args):
     v = opt(args, 0, None)
     level = to_integer(opt(args, 1, 1))
-    if isinstance(v, str) and level and level > 0:
+    # (level 1: where error was called; 2 blames the caller, which this
+    # Lua doesn't track: no position, as for a call made by the library)
+    if isinstance(v, str) and level == 1:
         v = where(rt, node) + v
     raise rt.Throw(v, tostring(rt, node, v) if v is not None else "nil")
 
@@ -1253,7 +1333,8 @@ def lua_error_fn(rt, node, args):
 def lua_pcall(rt, node, args):
     f = arg(rt, node, args, 0, "pcall", "any")
     try:
-        return [True] + call(rt, node, f, list(args[1:]))
+        # (called by the library: errors it raises itself have no position)
+        return [True] + call(rt, None, f, list(args[1:]))
     except rt.Throw as e:
         return [False, e.value]
     except zrun.Error as e:
@@ -1265,11 +1346,11 @@ def lua_xpcall(rt, node, args):
     f = opt(args, 0, None)
     handler = opt(args, 1, None)
     try:
-        return [True] + call(rt, node, f, list(args[2:]))
+        return [True] + call(rt, None, f, list(args[2:]))
     except rt.Throw as e:
-        return [False] + call(rt, node, handler, [e.value])
+        return [False] + call(rt, None, handler, [e.value])
     except zrun.Error as e:
-        return [False] + call(rt, node, handler, [e.diagnostic.message])
+        return [False] + call(rt, None, handler, [e.diagnostic.message])
 
 
 @lib(G, "select")
@@ -1342,6 +1423,7 @@ G.set("_VERSION", "Lua 5.4")
 
 TABLE = Table()
 G.set("table", TABLE)
+LIB_NAMES[id(TABLE)] = "table."
 TABLE.set("unpack", Builtin("unpack", lua_unpack))
 
 
@@ -1445,6 +1527,7 @@ def table_pack(rt, node, args):
 
 MATH = Table()
 G.set("math", MATH)
+LIB_NAMES[id(MATH)] = "math."
 MATH.set("pi", math.pi)
 MATH.set("huge", math.inf)
 MATH.set("maxinteger", 2**63 - 1)
@@ -1528,7 +1611,7 @@ def math_modf(rt, node, args):
 @lib(MATH, "tointeger", "tointeger")
 def math_tointeger(rt, node, args):
     v = opt(args, 0, None)
-    return [to_integer(v) if is_number(v) else None]
+    return [to_integer(v) if is_number(v) or isinstance(v, str) else None]
 
 
 @lib(MATH, "type", "type")
@@ -1575,7 +1658,7 @@ def math_atan(rt, node, args):
 def math_ult(rt, node, args):
     a = arg(rt, node, args, 0, "ult", "integer")
     b = arg(rt, node, args, 1, "ult", "integer")
-    return [(a & 0xFFFFFFFFFFFFFFFF) < (b & 0xFFFFFFFFFFFFFFFF)]
+    return [(int(a) & 0xFFFFFFFFFFFFFFFF) < (int(b) & 0xFFFFFFFFFFFFFFFF)]
 
 
 # (a fixed sequence: runs give the same numbers in every mode)
@@ -1608,7 +1691,7 @@ def math_random(rt, node, args):
 
 @lib(MATH, "randomseed", "randomseed")
 def math_randomseed(rt, node, args):
-    RANDOM_STATE[0] = (to_integer(opt(args, 0, 0)) or 0) & 0xFFFFFFFFFFFFFFFF or 0x2545F4914F6CDD1D
+    RANDOM_STATE[0] = int(to_integer(opt(args, 0, 0)) or 0) & 0xFFFFFFFFFFFFFFFF or 0x2545F4914F6CDD1D
     return []
 
 
@@ -1616,6 +1699,7 @@ def math_randomseed(rt, node, args):
 
 OS = Table()
 G.set("os", OS)
+LIB_NAMES[id(OS)] = "os."
 
 
 @lib(OS, "time", "time")
@@ -1635,6 +1719,7 @@ def os_getenv(rt, node, args):
 
 IO = Table()
 G.set("io", IO)
+LIB_NAMES[id(IO)] = "io."
 
 
 @lib(IO, "write", "write")
@@ -1653,7 +1738,11 @@ def io_write(rt, node, args):
 
 STRING = Table()
 G.set("string", STRING)
+LIB_NAMES[id(STRING)] = "string."
 STRING_META.set("__index", STRING)
+for _event in ARITH_EVENTS.values():
+    STRING_META.set(_event, string_arith(_event))
+STRING_META.set("__unm", Builtin("__unm", lambda rt, node, args: string_arith("__sub").fn(rt, node, [0, args[0]]) if tonumber_arith(args[0]) is not None else lua_error(rt, node, "attempt to perform arithmetic on a string value")))
 
 
 def str_index(i, n):
@@ -1745,7 +1834,7 @@ def format_q(rt, node, v):
             if ch in '"\\':
                 out.append("\\" + ch)
             elif ch == "\n":
-                out.append("\\n")
+                out.append("\\\n")
             elif ch == "\r":
                 out.append("\\r")
             elif ch == "\0":
@@ -1757,7 +1846,7 @@ def format_q(rt, node, v):
         out.append('"')
         return "".join(out)
     if is_int(v):
-        return "0x%x" % (v & 0xFFFFFFFFFFFFFFFF) if v == -(2**63) else str(int(v))
+        return "0x%x" % (int(v) & 0xFFFFFFFFFFFFFFFF) if v == -(2**63) else str(int(v))
     if type(v) is float:
         if v == math.inf:
             return "1e9999"
@@ -1810,12 +1899,12 @@ def string_format(rt, node, args):
             out.append(("%" + spec + "d") % k)
         elif conv == "u":
             k = arg(rt, node, args, a - 1, "format", "integer")
-            out.append(("%" + spec + "d") % (k & 0xFFFFFFFFFFFFFFFF))
+            out.append(("%" + spec + "d") % (int(k) & 0xFFFFFFFFFFFFFFFF))
         elif conv == "c":
             out.append(chr(arg(rt, node, args, a - 1, "format", "integer")))
         elif conv in "xXo":
             k = arg(rt, node, args, a - 1, "format", "integer")
-            out.append(("%" + spec + conv) % (k & 0xFFFFFFFFFFFFFFFF))
+            out.append(("%" + spec + conv) % (int(k) & 0xFFFFFFFFFFFFFFFF))
         elif conv in "eEfFgG":
             x = float(arg(rt, node, args, a - 1, "format", "number"))
             if x != x or x in (math.inf, -math.inf):
@@ -2265,7 +2354,7 @@ if __name__ == "__main__":
     with open(path) as f:
         src = f.read()
     try:
-        run(src, os.path.basename(path))
+        run(src, path, args=sys.argv[2:])
     except (zrun.LoadError, zrun.Error) as e:
         builtins.print(e, file=sys.stderr)
         sys.exit(1)

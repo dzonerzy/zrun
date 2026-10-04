@@ -967,7 +967,7 @@ const Runtime = struct {
         return Module.selfObject(Runtime, self);
     }
 
-    fn data(self: *Runtime) *program_mod.Data {
+    fn data(self: *const Runtime) *program_mod.Data {
         return self._p.?.ctx().data;
     }
 
@@ -1024,6 +1024,50 @@ const Runtime = struct {
     }
 
     fn evalNode(self: *Runtime, idx: u32) ?*PyObject {
+        if (!self.data().hasFrame(idx)) return self.evalHere(idx);
+        const saved = self.enterScope(idx) orelse return null;
+        defer self.leaveScope(saved);
+        return self.evalHere(idx);
+    }
+
+    /// A block scope with frames of its own, entered: its frame (a new
+    /// one) is the current frame, its hoisted functions are defined. The
+    /// frame it replaces (for leaveScope), or null with an exception.
+    fn enterScope(self: *Runtime, idx: u32) ?*PyObject {
+        const saved = self._frame.?;
+        const frame = objects.newFrame(idx, NONE, saved, objects.asFrame(saved).name.?) orelse return null;
+        self._frame = frame;
+        if (!self.hoist(idx)) {
+            self.leaveScope(saved);
+            return null;
+        }
+        return saved;
+    }
+
+    fn leaveScope(self: *Runtime, saved: *PyObject) void {
+        const frame = self._frame.?;
+        self._frame = saved;
+        py.Py_DecRef(frame);
+    }
+
+    /// `rt.fresh(node)`: from here, the variables of the block scope `node`
+    /// (being run) are new ones, closures made so far keeping theirs: a
+    /// loop's variable is a new one each time round (Lua's `for`,
+    /// JavaScript's `for (let ...)`). Nothing for a scope whose variables no
+    /// closure sees.
+    pub fn fresh(self: *Runtime, n: *PyObject) ?*PyObject {
+        const idx = self.nodeIndex(n, "node") orelse return null;
+        if (!self.data().hasFrame(idx)) return none();
+        const cur = self._frame.?;
+        const f = objects.asFrame(cur);
+        if (f.scope != idx) return self.fail(idx, "rt.fresh(): this scope isn't the one being run", .{});
+        const frame = objects.newFrame(idx, NONE, f.parent, f.name.?) orelse return null;
+        self._frame = frame;
+        py.Py_DecRef(cur);
+        return none();
+    }
+
+    fn evalHere(self: *Runtime, idx: u32) ?*PyObject {
         const prev = self._at;
         self._at = idx;
         defer self._at = prev;
@@ -1074,6 +1118,13 @@ const Runtime = struct {
     }
 
     fn execNode(self: *Runtime, idx: u32) bool {
+        if (!self.data().hasFrame(idx)) return self.execHere(idx);
+        const saved = self.enterScope(idx) orelse return false;
+        defer self.leaveScope(saved);
+        return self.execHere(idx);
+    }
+
+    fn execHere(self: *Runtime, idx: u32) bool {
         const prev = self._at;
         self._at = idx;
         defer self._at = prev;
@@ -1479,8 +1530,13 @@ const Runtime = struct {
     /// parameters (a function kind with extra="keep"); () otherwise and at
     /// the top level.
     pub fn get_varargs(self: *const Runtime) ?*PyObject {
-        if (self._frame) |o| {
-            if (objects.asFrame(o).varargs) |v| return ref(v);
+        // (the function's frame: the block scopes' frames are inside it)
+        var fo = self._frame;
+        while (fo) |o| {
+            const f = objects.asFrame(o);
+            if (f.varargs) |v| return ref(v);
+            if (f.scope == NONE or !self.data().hasFrame(f.scope)) break;
+            fo = f.parent;
         }
         return py.c.PyTuple_New(0);
     }

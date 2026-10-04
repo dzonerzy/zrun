@@ -1,0 +1,9 @@
+{"name":"zrun","nested":{"list":[1,2,[3]],"ok":true},"ratio":0.5,"tags":["fast","lua"],"text":"say \"hi\"\n","version":1}
+true	3	say "hi"
+
+256 trees of depth 4 check: 7936
+64 trees of depth 6 check: 8128
+16 trees of depth 8 check: 8176
+46	199	2 3 5 7 11 13 17 19 23 29
+the=4 quick=3 dog=2 fox=2 
+id:x1 op:= num:3.5 op:* op:( id:y op:+ num:42 op:)

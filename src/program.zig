@@ -72,6 +72,30 @@ pub const Data = struct {
     /// Per rule: the function spec of its kind, if it is a function kind
     functions: []const ?FunctionSpec,
     line_starts: []u32,
+    /// Block scopes (a scope that isn't a function) with a frame of their
+    /// own each time they run: those defining a variable a function made
+    /// inside them uses (each closure keeps the one it was made in, as
+    /// block scoping has it). Their variables live there.
+    frame_scopes: std.AutoHashMapUnmanaged(u32, void) = .empty,
+
+    pub fn isFunction(self: *const Data, node: u32) bool {
+        const r = self.rule(node);
+        return r < self.functions.len and self.functions[r] != null;
+    }
+
+    /// The function node around a node (itself excluded; NONE: the program).
+    pub fn functionOf(self: *const Data, node: u32) u32 {
+        var n = self.parents[node];
+        while (n != NONE and n < self.nodes.len) : (n = self.parents[n]) {
+            if (self.isFunction(n)) return n;
+        }
+        return NONE;
+    }
+
+    /// Whether a node is a block scope with frames of its own.
+    pub fn hasFrame(self: *const Data, node: u32) bool {
+        return self.frame_scopes.contains(node);
+    }
 
     pub fn deinit(self: *Data) void {
         self.arena.deinit();
@@ -104,11 +128,16 @@ pub const Data = struct {
         return if (s == NONE) null else s;
     }
 
-    /// The function node a symbol's variable lives in (NONE: the program):
-    /// the innermost function node around its scope.
+    /// The node whose frame a symbol's variable lives in (NONE: the
+    /// program's): its scope if that has frames of its own, else the
+    /// innermost function node around its scope.
     pub fn homeOf(self: *Data, sym: u32) u32 {
         if (self.home[sym] != UNSET) return self.home[sym];
         var n = self.syms[sym].scope;
+        if (n != NONE and self.hasFrame(n)) {
+            self.home[sym] = n;
+            return n;
+        }
         while (n != NONE and n < self.nodes.len) : (n = self.parents[n]) {
             if (self.functions[self.rule(n)] != null) break;
         }
@@ -185,6 +214,26 @@ pub fn build(gpa: Allocator, grammar: *const grammar_mod.Grammar, functions: []c
         .functions = functions,
         .line_starts = line_starts.items,
     };
+
+    // Block scopes with frames: a variable of one used from a function
+    // made inside it (the root runs once: its variables are the program's)
+    if (analysis) |view| {
+        if (view.use_nodes) |un| {
+            const views = (view.symbols orelse @as([*]const zabi.SymbolView, &.{}))[0..view.symbol_count];
+            for (views) |v| {
+                const scope = v.scope;
+                if (scope == zabi.NONE or scope == 0 or scope >= nodes.len or data.isFunction(scope)) continue;
+                if (data.frame_scopes.contains(scope)) continue;
+                const home_fn = data.functionOf(scope);
+                for (un[v.uses_start..][0..v.uses_len]) |u| {
+                    if (u < nodes.len and data.functionOf(u) != home_fn) {
+                        try data.frame_scopes.put(a, scope, {});
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     // Hoisted functions: each function node whose name is a symbol, by the
     // function its name lives in

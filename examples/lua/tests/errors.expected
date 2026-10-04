@@ -1,0 +1,28 @@
+false	plain
+false	msg
+false	table	42
+false	errors.lua:5: attempt to index a nil value (local 't')
+false	errors.lua:6: attempt to perform arithmetic on a nil value
+false	errors.lua:7: attempt to compare string with number
+false	errors.lua:8: attempt to compare two table values
+false	errors.lua:9: attempt to get length of a nil value
+false	errors.lua:10: attempt to call a string value (constant 'x')
+false	errors.lua:11: attempt to call a nil value (global 'undefined_fn')
+false	errors.lua:12: attempt to divide by zero
+false	errors.lua:13: attempt to perform 'n%0'
+false	errors.lua:14: attempt to add a 'string' with a 'number'
+true	true	32
+false	bad argument #1 to 'string.rep' (string expected, got no value)
+false	bad argument #1 to 'setmetatable' (table expected, got number)
+4
+false	handled: errors.lua:19: deep
+false	errors.lua:20: bottom
+false	assertion failed!
+false	custom
+true	1	2
+false	outer after inner
+nil|false
+false	errors.lua:31: table index is nil
+false	invalid key to 'next'
+3	nil	8
+false	errors.lua:34: number has no integer representation

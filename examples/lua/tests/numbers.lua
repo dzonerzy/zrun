@@ -1,0 +1,21 @@
+print(1 == 1.0, 1 < 1.5, -0.0 == 0.0, 3 / 2, 4 / 2, 7 // 2, 7.0 // 2, -7 // 2, 7 % 3, -7 % 3, 7 % -3, 5.5 % 2)
+print(2^0.5, 10 // 3.0, 1e308 * 10, -1e308 * 10, math.huge // 1)
+print(math.maxinteger, math.mininteger, math.maxinteger + 1, math.mininteger - 1, -math.mininteger)
+print(math.maxinteger // -1, math.mininteger // -1, 5 // -2, -5 // 2)
+print(0x7fffffffffffffff, 0xffffffffffffffff, 0x10p1, 0xA.8p0, 1e2, .5, 3., 2^63, -(2^63))
+print(9007199254740993, 2^53 + 1, 123456789012345678)
+print(math.floor(-3.5), math.ceil(-3.5), math.floor(2^62), math.abs(math.mininteger), math.max(3, 3.5), math.min(-1, -1.5))
+print(math.fmod(7, 3), math.fmod(-7, 3), math.fmod(7, -3), math.fmod(7.5, 2), math.modf(3.7), math.modf(-3.7))
+print(tonumber("  12  "), tonumber("1e3"), tonumber("0x"), tonumber(""), tonumber("12a"), tonumber("ff", 16), tonumber("777", 8), tonumber("1.5e2"))
+print(string.format("%.14g", 0.1 + 0.2), 0.1 + 0.2 == 0.3, 100000000000000, 1e14)
+print(1 << 63, 1 << 64, -1 >> 1, -1 >> 63, 3 ~ 5, ~5, 0xF0 & 0x3C, 0xF0 | 0x0F)
+print(7 // 0.0, -7 // 0.0, 0/0 == 0/0, math.huge - math.huge ~= math.huge - math.huge)
+print(math.type(1), math.type(1.0), math.type("1"), math.ult(1, -1))
+local n = 0
+for i = math.maxinteger - 2, math.maxinteger do n = n + 1 end
+print(n)
+for i = 1, 0 do print("never") end
+for i = 1, 3, 1.5 do io.write(i, " ") end print()
+for i = 3, 1, -1 do io.write(i, " ") end print()
+print(8 // 3 * 3 + 8 % 3, 2^-1, 10 - - 2, - - 3)
+print(1 < 2 == true, "a" .. "b" == "ab", not nil == true, 1 and 2, nil or "d", false and error("x"))

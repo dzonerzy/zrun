@@ -75,7 +75,7 @@ pub const Dyn = struct {
     }
 };
 
-pub const RtMethod = enum { eval, exec, loop, load, store, function, call, @"error", kind, text, span, scope, symbol, type_of, node_at, Return, Break, Continue };
+pub const RtMethod = enum { eval, exec, loop, load, store, function, call, @"error", kind, text, span, scope, symbol, type_of, node_at, fresh, Return, Break, Continue };
 
 /// A list known at compile time (its items may be dynamic): mutable, with
 /// identity (aliases see changes)
@@ -336,6 +336,21 @@ pub const Compiler = struct {
             layout.heap = true;
         }
         (try self.layoutOf(NONE)).heap = true;
+        // Block scopes with frames of their own: on the heap (closures keep
+        // them)
+        var it = d.frame_scopes.keyIterator();
+        while (it.next()) |scope| (try self.layoutOf(scope.*)).heap = true;
+    }
+
+    /// The node whose frame the code of a node runs in: the innermost
+    /// function node or block scope with frames around it (NONE: the
+    /// program's).
+    pub fn ownerOf(self: *const Compiler, idx: u32) u32 {
+        var n = self.data.parents[idx];
+        while (n != NONE) : (n = self.data.parents[n]) {
+            if (self.isFunctionNode(n) or self.data.hasFrame(n)) return n;
+        }
+        return NONE;
     }
 
     fn layoutOf(self: *Compiler, fnode: u32) !*Layout {
@@ -492,7 +507,7 @@ const Local = union(enum) {
 
 /// An rt.loop's targets, and how many semantics ran when it started (those
 /// above are left by a Break / Continue)
-const LoopTarget = struct { brk: ir.Block, cont: ir.Block, depth: usize };
+const LoopTarget = struct { brk: ir.Block, cont: ir.Block, depth: usize, scope_depth: usize = 0 };
 
 const Gen = struct {
     c: *Compiler,
@@ -524,6 +539,9 @@ const Gen = struct {
     /// Loops being compiled (of the semantics or rt.loop): code in one
     /// runs many times
     loop_level: u32 = 0,
+    /// Block scopes with frames being run here, innermost last: their
+    /// frame pointers' slots
+    scopes: std.ArrayListUnmanaged(struct { scope: u32, slot: ir.Value }) = .empty,
 
     /// Code that runs many times (a function's, a loop's): reference
     /// counts inline; else calls (less code for LLVM to compile).
@@ -794,35 +812,97 @@ const Gen = struct {
     // Variables of the language
     // ------------------------------------------------------------------
 
-    /// The slot pointer of a symbol's variable, from this function: its
-    /// own, or one of the functions around it through the frames.
+    /// The slot pointer of a symbol's variable, from here: in this
+    /// function's frame or stack, a block scope's frame, or a frame around
+    /// this function.
     fn varSlot(self: *Gen, sym: u32) Error!ir.Value {
         const c = self.c;
         const f = &self.f;
         const home = c.data.homeOf(sym);
         const slot = c.slot_of.get(sym).?;
-        if (home == self.fnode) {
-            if (self.frame) |fr| return f.offset(fr, 32 + 16 * @as(i64, slot));
-            return self.var_slots.items[slot];
-        }
-        // Out through the frames: env is the frame of the function around
-        const frame = try self.outerFrame(home, "a variable of another function isn't reachable from here");
+        if (home == self.fnode and self.frame == null) return self.var_slots.items[slot];
+        const frame = try self.frameOf(home, "a variable of another function isn't reachable from here");
         return f.offset(frame, 32 + 16 * @as(i64, slot));
     }
 
-    /// The frame of an enclosing function (`home`), through the frames'
-    /// parents.
-    fn outerFrame(self: *Gen, home: u32, comptime unreachable_msg: []const u8) Error!ir.Value {
+    /// The frame of `owner` (a function node, a block scope with frames,
+    /// or NONE for the program) seen from here: a block scope running in
+    /// this function, this function's, or one around it through the
+    /// frames' parents.
+    fn frameOf(self: *Gen, owner: u32, comptime unreachable_msg: []const u8) Error!ir.Value {
         const c = self.c;
         const f = &self.f;
-        var frame: ir.Value = if (self.fnode == NONE) self.globals else self.env;
-        var at = c.enclosingFunction(self.fnode);
-        while (at != home) {
-            if (at == NONE) return c.unsupported(unreachable_msg ++ " (node {d})", .{home});
+        var i = self.scopes.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.scopes.items[i].scope == owner) return f.load(c.m.t.ptr, self.scopes.items[i].slot);
+        }
+        if (owner == self.fnode) return self.frame orelse c.unsupported(unreachable_msg ++ " (node {d})", .{owner});
+        if (self.fnode == NONE) return c.unsupported(unreachable_msg ++ " (node {d})", .{owner});
+        // (env is the frame the function was made in)
+        var frame: ir.Value = self.env;
+        var at = c.ownerOf(self.fnode);
+        while (at != owner) {
+            if (at == NONE) return c.unsupported(unreachable_msg ++ " (node {d})", .{owner});
             frame = f.load(c.m.t.ptr, f.offset(frame, 16));
-            at = c.enclosingFunction(at);
+            at = c.ownerOf(at);
         }
         return frame;
+    }
+
+    /// The frame code runs in here: the innermost block scope's, or the
+    /// function's.
+    fn currentFrame(self: *Gen) Error!ir.Value {
+        if (self.scopes.items.len > 0) return self.f.load(self.c.m.t.ptr, self.scopes.items[self.scopes.items.len - 1].slot);
+        return self.frame orelse self.c.unsupported("a block scope with a frame in a function without one (node {d})", .{self.fnode});
+    }
+
+    /// A block scope with frames of its own, entered: a new frame (in a
+    /// slot: rt.fresh replaces it), its hoisted functions defined.
+    fn enterScope(self: *Gen, idx: u32) Error!void {
+        const c = self.c;
+        const parent = try self.frameOf(c.ownerOf(idx), "a block scope's frame isn't reachable from here");
+        const n = (try c.layoutOf(idx)).syms.items.len;
+        const frame = self.call("zr_frame_new", &.{ parent, self.k(@intCast(n)) });
+        const slot = try self.f.alloca(c.m.t.ptr);
+        self.f.store(frame, slot);
+        try self.scopes.append(self.a(), .{ .scope = idx, .slot = slot });
+        try self.hoist(idx);
+    }
+
+    fn leaveScope(self: *Gen) Error!void {
+        const s = self.scopes.pop().?;
+        _ = self.call("zr_frame_release", &.{self.f.load(self.c.m.t.ptr, s.slot)});
+    }
+
+    /// Release the frames of the block scopes above `depth` (leaving them
+    /// by a jump), keeping them active for the code after the jump.
+    fn releaseScopesAbove(self: *Gen, depth: usize) void {
+        var i = self.scopes.items.len;
+        while (i > depth) {
+            i -= 1;
+            _ = self.call("zr_frame_release", &.{self.f.load(self.c.m.t.ptr, self.scopes.items[i].slot)});
+        }
+    }
+
+    /// rt.fresh(node): the block scope's frame replaced by a new one.
+    fn freshScope(self: *Gen, idx: u32) Error!void {
+        const c = self.c;
+        if (!c.data.hasFrame(idx)) return;
+        var i = self.scopes.items.len;
+        while (i > 0) {
+            i -= 1;
+            const s = self.scopes.items[i];
+            if (s.scope != idx) continue;
+            const old = self.f.load(c.m.t.ptr, s.slot);
+            const parent = self.f.load(c.m.t.ptr, self.f.offset(old, 16));
+            const n = (try c.layoutOf(idx)).syms.items.len;
+            const frame = self.call("zr_frame_new", &.{ parent, self.k(@intCast(n)) });
+            _ = self.call("zr_frame_release", &.{old});
+            self.f.store(frame, s.slot);
+            return;
+        }
+        return c.unsupported("rt.fresh(): node {d} isn't a scope being run", .{idx});
     }
 
     /// rt.load(name): the variable (an owned reference); a builtin's host
@@ -893,10 +973,7 @@ const Gen = struct {
     /// The frame a function made from `fnode` sees: the frame of the
     /// function around it (here, or through the frames).
     fn envFor(self: *Gen, fnode: u32) Error!ir.Value {
-        const c = self.c;
-        const outer = c.enclosingFunction(fnode);
-        if (outer == self.fnode) return self.frame orelse c.unsupported("a function made in a function whose variables aren't in a frame (node {d})", .{fnode});
-        return self.outerFrame(outer, "a function made outside the function around it");
+        return self.frameOf(self.c.ownerOf(fnode), "a function made outside the function or scope around it");
     }
 
     /// rt.function(node): a function value.
@@ -1079,8 +1156,16 @@ const Gen = struct {
         return c.lang.read.get(fobj) orelse return c.unsupported("the semantic of {s} is native=False: compiled code can't run it yet", .{c.data.grammar.kind_names[rid]});
     }
 
-    /// rt.eval of a node.
+    /// rt.eval of a node (a block scope with frames: in a new one).
     fn evalNode(self: *Gen, idx: u32) Error!SVal {
+        if (!self.c.data.hasFrame(idx)) return self.evalHere(idx);
+        try self.enterScope(idx);
+        const v = try self.evalHere(idx);
+        try self.leaveScope();
+        return v;
+    }
+
+    fn evalHere(self: *Gen, idx: u32) Error!SVal {
         if (try self.semanticOf(idx, .eval)) |func| return self.runSemantic(func, idx);
         // Defaults: a name's variable; an only child's value
         const d = self.c.data;
@@ -1104,8 +1189,15 @@ const Gen = struct {
         }
     }
 
-    /// rt.exec of a node.
+    /// rt.exec of a node (a block scope with frames: in a new one).
     fn execNode(self: *Gen, idx: u32) Error!void {
+        if (!self.c.data.hasFrame(idx)) return self.execHere(idx);
+        try self.enterScope(idx);
+        try self.execHere(idx);
+        try self.leaveScope();
+    }
+
+    fn execHere(self: *Gen, idx: u32) Error!void {
         const c = self.c;
         if (try self.semanticOf(idx, .exec)) |func| {
             try self.drop(try self.runSemantic(func, idx));
@@ -1527,6 +1619,7 @@ const Gen = struct {
                 }
                 const d = try self.materialize(if (ctl.value) |x| x.* else .none, inst.node);
                 try self.releaseAbove(0);
+                self.releaseScopesAbove(0);
                 try self.storeSlot(self.result, d);
                 try self.f.br(self.ret_label);
             },
@@ -1549,8 +1642,9 @@ const Gen = struct {
     }
 
     fn releaseAboveLoop(self: *Gen, target: LoopTarget) Error!void {
-        // (the semantics run inside the loop's body)
+        // (the semantics run inside the loop's body, and its block scopes)
         try self.releaseAbove(target.depth);
+        self.releaseScopesAbove(target.scope_depth);
     }
 
     fn forLoop(self: *Gen, inst: *Inst, target: front.Target, iter_e: *const front.Expr, body: []const front.Stmt, else_: []const front.Stmt, pos: front.Pos) Error!void {
@@ -2247,7 +2341,7 @@ const Gen = struct {
     fn rtCall(self: *Gen, inst: *Inst, m: RtMethod, args: []const SVal, receiver: ?SVal, pos: front.Pos) Error!SVal {
         const c = self.c;
         const want: usize = switch (m) {
-            .eval, .exec, .loop, .load, .function, .kind, .text, .span, .scope, .symbol, .type_of, .node_at => 1,
+            .eval, .exec, .loop, .load, .function, .kind, .text, .span, .scope, .symbol, .type_of, .node_at, .fresh => 1,
             .store, .call => 2,
             .@"error" => 2,
             .Return => if (args.len == 0) 0 else 1,
@@ -2271,6 +2365,10 @@ const Gen = struct {
                 return .none;
             },
             .function => return self.makeFunction(try self.nodeArg(inst, args[0], pos)),
+            .fresh => {
+                try self.freshScope(try self.nodeArg(inst, args[0], pos));
+                return .none;
+            },
             .call => return self.dynCall(inst, args[0], args[1], receiver),
             .@"error" => {
                 const n = switch (args[0]) {
@@ -2337,7 +2435,7 @@ const Gen = struct {
         const brk = try f.label("loop_break");
         const cont = try f.label("loop_continue");
         const done = try f.label("loop_done");
-        try self.loops.append(self.a(), .{ .brk = brk, .cont = cont, .depth = self.insts.items.len });
+        try self.loops.append(self.a(), .{ .brk = brk, .cont = cont, .depth = self.insts.items.len, .scope_depth = self.scopes.items.len });
         self.loop_level += 1;
         defer self.loop_level -= 1;
         try self.execValue(body);

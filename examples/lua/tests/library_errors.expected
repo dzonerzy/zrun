@@ -1,0 +1,23 @@
+false	library_errors.lua:1: bad argument #1 to 'rep' (string expected, got no value)
+false	library_errors.lua:2: bad argument #1 to 'r' (string expected, got no value)
+false	library_errors.lua:3: bad argument #1 to 'rep' (number expected, got no value)
+false	library_errors.lua:4: assertion failed!
+false	library_errors.lua:5: m
+false	library_errors.lua:6: bad argument #1 to 'setmetatable' (table expected, got number)
+false	library_errors.lua:7: e
+false	e
+false	library_errors.lua:9: idx foo
+false	library_errors.lua:10: bad argument #1 to 'insert' (table expected, got nil)
+false	library_errors.lua:11: attempt to call a nil value (method 'bad')
+false	library_errors.lua:12: attempt to concatenate a table value
+false	library_errors.lua:13: attempt to perform arithmetic on a table value
+false	library_errors.lua:14: attempt to compare number with string
+false	library_errors.lua:15: bad 'for' limit (number expected, got string)
+false	library_errors.lua:16: bad argument #1 to 'floor' (number expected, got string)
+false	bad argument #2 to 'string.format' (number has no integer representation)
+false	library_errors.lua:18: bad argument #1 to 'format' (number has no integer representation)
+false	library_errors.lua:19: bad argument #1 to 'tostring' (value expected)
+false	bad argument #1 to 'ipairs' (value expected)
+false	library_errors.lua:21: attempt to index a nil value (local 'a')
+false	library_errors.lua:22: attempt to index a nil value (global 'x')
+false	library_errors.lua:23: number has no integer representation
