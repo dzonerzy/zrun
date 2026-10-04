@@ -1,177 +1,427 @@
-//! Writing LLVM IR as text: a module's functions, their blocks and
-//! instructions, numbered SSA names, string constants. The compiler
-//! (compile.zig) writes through this; zgram's LLVM parses and compiles it.
+//! Building LLVM IR in memory through LLVM's C API (zgram's, through
+//! jit.zig): a module, its functions, their blocks and instructions,
+//! string constants. The compiler (compile.zig) builds through this;
+//! zgram's JIT compiles the module.
 
 const std = @import("std");
 const value = @import("value.zig");
+const jit = @import("jit.zig");
+const c = jit.c;
+const L = jit.f;
 const Allocator = std.mem.Allocator;
+
+pub const Value = c.LLVMValueRef;
+pub const Block = c.LLVMBasicBlockRef;
+pub const Type = c.LLVMTypeRef;
+
+/// A function to call: its value and type
+pub const Fn = struct { v: Value, ty: Type };
+
+/// The types the compiler uses
+pub const Types = struct {
+    i1: Type,
+    i8: Type,
+    i32: Type,
+    i64: Type,
+    f64: Type,
+    ptr: Type,
+    void: Type,
+    /// A runtime value: { tag, bits }
+    val: Type,
+    /// A checked arithmetic result: { i64, i1 }
+    ovf: Type,
+};
 
 pub const Module = struct {
     gpa: Allocator,
-    /// Type and global declarations, constants
-    head: std.ArrayList(u8) = .empty,
-    /// Function definitions
-    body: std.ArrayList(u8) = .empty,
-    /// Declared external functions (helpers), once each
-    declared: std.StringHashMapUnmanaged(void) = .empty,
-    /// String constants by content: the global's name
-    strings: std.StringHashMapUnmanaged(u32) = .empty,
-    next_global: u32 = 0,
+    ctx: c.LLVMContextRef,
+    mod: c.LLVMModuleRef,
+    t: Types,
     /// A prefix making the module's symbols unique in the process
     prefix: []const u8,
+    /// String constants by content
+    strings: std.StringHashMapUnmanaged(Value) = .empty,
+    /// Functions by name (helpers declared, the module's own)
+    fns: std.StringHashMapUnmanaged(Fn) = .empty,
+    /// Given to the JIT: no longer ours to free
+    taken: bool = false,
 
     pub fn init(gpa: Allocator, prefix: []const u8) Module {
-        return .{ .gpa = gpa, .prefix = prefix };
+        const ctx = L("LLVMContextCreate")();
+        const mod = L("LLVMModuleCreateWithNameInContext")("zrun", ctx);
+        const i64t = L("LLVMInt64TypeInContext")(ctx);
+        const i1t = L("LLVMInt1TypeInContext")(ctx);
+        var val_fields = [_]Type{ i64t, i64t };
+        var ovf_fields = [_]Type{ i64t, i1t };
+        return .{
+            .gpa = gpa,
+            .ctx = ctx,
+            .mod = mod,
+            .prefix = prefix,
+            .t = .{
+                .i1 = i1t,
+                .i8 = L("LLVMInt8TypeInContext")(ctx),
+                .i32 = L("LLVMInt32TypeInContext")(ctx),
+                .i64 = i64t,
+                .f64 = L("LLVMDoubleTypeInContext")(ctx),
+                .ptr = L("LLVMPointerTypeInContext")(ctx, 0),
+                .void = L("LLVMVoidTypeInContext")(ctx),
+                .val = L("LLVMStructTypeInContext")(ctx, &val_fields, 2, 0),
+                .ovf = L("LLVMStructTypeInContext")(ctx, &ovf_fields, 2, 0),
+            },
+        };
     }
 
     pub fn deinit(self: *Module) void {
-        self.head.deinit(self.gpa);
-        self.body.deinit(self.gpa);
-        var it = self.declared.keyIterator();
-        while (it.next()) |k| self.gpa.free(k.*);
-        self.declared.deinit(self.gpa);
-        var it2 = self.strings.keyIterator();
-        while (it2.next()) |k| self.gpa.free(k.*);
-        self.strings.deinit(self.gpa);
-    }
-
-    /// The whole module's text (owned by the caller).
-    pub fn text(self: *Module) ![]u8 {
-        var out: std.ArrayList(u8) = .empty;
-        try out.appendSlice(self.gpa, self.head.items);
-        try out.append(self.gpa, '\n');
-        try out.appendSlice(self.gpa, self.body.items);
-        return out.toOwnedSlice(self.gpa);
-    }
-
-    pub fn headPrint(self: *Module, comptime fmt: []const u8, args: anytype) !void {
-        try self.head.print(self.gpa, fmt, args);
-    }
-
-    /// Declare an external function once: `declare <signature>`.
-    pub fn declare(self: *Module, name: []const u8, signature: []const u8) !void {
-        if (self.declared.contains(name)) return;
-        try self.declared.put(self.gpa, try self.gpa.dupe(u8, name), {});
-        try self.headPrint("declare {s}\n", .{signature});
-    }
-
-    /// An immortal string object for a literal (a global laid out as the
-    /// runtime's Str): its global's name, `@<prefix>_s<n>`.
-    pub fn string(self: *Module, bytes: []const u8) ![]const u8 {
-        if (self.strings.get(bytes)) |n| return std.fmt.allocPrint(self.gpa, "@{s}_s{d}", .{ self.prefix, n });
-        const n = self.next_global;
-        self.next_global += 1;
-        try self.strings.put(self.gpa, try self.gpa.dupe(u8, bytes), n);
-        const chars = std.unicode.utf8CountCodepoints(bytes) catch bytes.len;
-        const h: i64 = @bitCast(value.strHash(bytes));
-        try self.headPrint("@{s}_s{d} = private unnamed_addr constant {{ i64, i32, i32, i64, i64, i64, [{d} x i8] }} {{ i64 4611686018427387904, i32 4, i32 0, i64 {d}, i64 {d}, i64 {d}, [{d} x i8] c\"", .{ self.prefix, n, bytes.len, bytes.len, chars, h, bytes.len });
-        for (bytes) |c| {
-            if (c >= 0x20 and c < 0x7F and c != '"' and c != '\\') {
-                try self.head.append(self.gpa, c);
-            } else try self.headPrint("\\{X:0>2}", .{c});
+        if (!self.taken) {
+            L("LLVMDisposeModule")(self.mod);
+            L("LLVMContextDispose")(self.ctx);
         }
-        try self.headPrint("\" }}, align 8\n", .{});
-        return std.fmt.allocPrint(self.gpa, "@{s}_s{d}", .{ self.prefix, n });
+        self.strings.deinit(self.gpa);
+        self.fns.deinit(self.gpa);
+    }
+
+    /// The module for the JIT (it takes the module and its context).
+    pub fn take(self: *Module) c.LLVMModuleRef {
+        self.taken = true;
+        return self.mod;
+    }
+
+    /// The module as text (for debugging: Program.compiled_ir()), owned by
+    /// the caller.
+    pub fn text(self: *Module) ![]u8 {
+        const s = L("LLVMPrintModuleToString")(self.mod);
+        defer L("LLVMDisposeMessage")(s);
+        return self.gpa.dupe(u8, std.mem.span(s));
+    }
+
+    fn z(self: *Module, s: []const u8) ![:0]u8 {
+        return self.gpa.dupeZ(u8, s);
+    }
+
+    pub fn fnType(self: *Module, ret: Type, params: []const Type) Type {
+        _ = self;
+        return L("LLVMFunctionType")(ret, @constCast(params.ptr), @intCast(params.len), 0);
+    }
+
+    /// Declare an external function (a runtime helper) once.
+    pub fn declare(self: *Module, name: []const u8, ret: Type, params: []const Type) !void {
+        if (self.fns.contains(name)) return;
+        const ty = self.fnType(ret, params);
+        const v = L("LLVMAddFunction")(self.mod, try self.z(name), ty);
+        try self.fns.put(self.gpa, name, .{ .v = v, .ty = ty });
+    }
+
+    /// A function of the module by name: made (with this type) the first
+    /// time; internal unless `external`.
+    pub fn function(self: *Module, name: []const u8, ret: Type, params: []const Type, external: bool) !Fn {
+        if (self.fns.get(name)) |f| return f;
+        const ty = self.fnType(ret, params);
+        const v = L("LLVMAddFunction")(self.mod, try self.z(name), ty);
+        if (!external) L("LLVMSetLinkage")(v, c.LLVMInternalLinkage);
+        const f = Fn{ .v = v, .ty = ty };
+        try self.fns.put(self.gpa, name, f);
+        return f;
+    }
+
+    pub fn get(self: *Module, name: []const u8) Fn {
+        return self.fns.get(name) orelse std.debug.panic("zrun: {s} isn't declared", .{name});
+    }
+
+    /// An LLVM intrinsic ("llvm.sadd.with.overflow") for some types.
+    pub fn intrinsic(self: *Module, name: []const u8, types: []const Type) Fn {
+        const id = L("LLVMLookupIntrinsicID")(name.ptr, name.len);
+        const v = L("LLVMGetIntrinsicDeclaration")(self.mod, id, @constCast(types.ptr), types.len);
+        return .{ .v = v, .ty = L("LLVMGlobalGetValueType")(v) };
+    }
+
+    /// Mark a function always inlined.
+    pub fn alwaysInline(self: *Module, f: Fn) void {
+        const kind = L("LLVMGetEnumAttributeKindForName")("alwaysinline", "alwaysinline".len);
+        const attr = L("LLVMCreateEnumAttribute")(self.ctx, kind, 0);
+        L("LLVMAddAttributeAtIndex")(f.v, std.math.maxInt(c_uint), attr); // (LLVMAttributeFunctionIndex)
+    }
+
+    pub fn k64(self: *Module, n: i64) Value {
+        return L("LLVMConstInt")(self.t.i64, @bitCast(n), 1);
+    }
+
+    pub fn k32(self: *Module, n: u32) Value {
+        return L("LLVMConstInt")(self.t.i32, n, 0);
+    }
+
+    pub fn k1(self: *Module, b: bool) Value {
+        return L("LLVMConstInt")(self.t.i1, @intFromBool(b), 0);
+    }
+
+    pub fn nullPtr(self: *Module) Value {
+        return L("LLVMConstNull")(self.t.ptr);
+    }
+
+    /// A pointer known when compiling (an object of the compiler's).
+    pub fn ptrConst(self: *Module, addr: usize) Value {
+        return L("LLVMConstIntToPtr")(L("LLVMConstInt")(self.t.i64, addr, 0), self.t.ptr);
+    }
+
+    /// An immortal string object for a literal: a constant global laid out
+    /// as the runtime's Str (header, lengths, its hash, the bytes).
+    pub fn string(self: *Module, bytes: []const u8) !Value {
+        if (self.strings.get(bytes)) |g| return g;
+        const t = self.t;
+        const chars = std.unicode.utf8CountCodepoints(bytes) catch bytes.len;
+        const arr = L("LLVMConstStringInContext2")(self.ctx, bytes.ptr, bytes.len, 1);
+        var fields = [_]Value{
+            self.k64(@bitCast(value.IMMORTAL)),
+            self.k32(4),
+            self.k32(0),
+            self.k64(@intCast(bytes.len)),
+            self.k64(@intCast(chars)),
+            self.k64(@bitCast(value.strHash(bytes))),
+            arr,
+        };
+        const init_v = L("LLVMConstStructInContext")(self.ctx, &fields, fields.len, 0);
+        const name = try std.fmt.allocPrintSentinel(self.gpa, "{s}_s{d}", .{ self.prefix, self.strings.count() }, 0);
+        _ = t;
+        const g = L("LLVMAddGlobal")(self.mod, L("LLVMTypeOf")(init_v), name);
+        L("LLVMSetInitializer")(g, init_v);
+        L("LLVMSetGlobalConstant")(g, 1);
+        L("LLVMSetLinkage")(g, c.LLVMPrivateLinkage);
+        L("LLVMSetUnnamedAddress")(g, c.LLVMGlobalUnnamedAddr);
+        L("LLVMSetAlignment")(g, 8);
+        try self.strings.put(self.gpa, try self.gpa.dupe(u8, bytes), g);
+        return g;
     }
 };
 
-/// One function being written
+/// One function being built
 pub const Function = struct {
     m: *Module,
-    /// Allocas, written at the top of the entry block
-    entry: std.ArrayList(u8) = .empty,
-    code: std.ArrayList(u8) = .empty,
-    next_tmp: u32 = 0,
+    fv: Value,
+    /// The entry block: allocas and their first values (then a jump to the
+    /// code)
+    entry: Block,
+    eb: c.LLVMBuilderRef,
+    /// The code's builder, and the block it's in
+    b: c.LLVMBuilderRef,
+    current: Block,
+    start: Block,
     next_label: u32 = 0,
-    /// Whether the current block has its terminator
-    terminated: bool = false,
-    /// The current block's label (for phis)
-    current: []const u8 = "entry",
+    /// Every block made (finish() closes those left open)
+    blocks: std.ArrayListUnmanaged(Block) = .empty,
 
-    pub fn init(m: *Module) Function {
-        return .{ .m = m };
+    pub fn init(m: *Module, fv: Value) Function {
+        const entry = L("LLVMAppendBasicBlockInContext")(m.ctx, fv, "entry");
+        const start = L("LLVMAppendBasicBlockInContext")(m.ctx, fv, "start");
+        const eb = L("LLVMCreateBuilderInContext")(m.ctx);
+        L("LLVMPositionBuilderAtEnd")(eb, entry);
+        const b = L("LLVMCreateBuilderInContext")(m.ctx);
+        L("LLVMPositionBuilderAtEnd")(b, start);
+        return .{ .m = m, .fv = fv, .entry = entry, .eb = eb, .b = b, .current = start, .start = start };
     }
 
-    pub fn deinit(self: *Function) void {
-        self.entry.deinit(self.m.gpa);
-        self.code.deinit(self.m.gpa);
-    }
-
-    /// Write the function into the module: `define <signature> { ... }`.
-    pub fn finish(self: *Function, signature: []const u8) !void {
-        const m = self.m;
-        try m.body.print(m.gpa, "define {s} {{\nentry:\n", .{signature});
-        try m.body.appendSlice(m.gpa, self.entry.items);
-        try m.body.appendSlice(m.gpa, self.code.items);
-        if (!self.terminated) try m.body.appendSlice(m.gpa, "  unreachable\n");
-        try m.body.appendSlice(m.gpa, "}\n\n");
-    }
-
-    /// A fresh SSA name: %t<n>.
-    pub fn tmp(self: *Function) ![]const u8 {
-        const n = self.next_tmp;
-        self.next_tmp += 1;
-        return std.fmt.allocPrint(self.m.gpa, "%t{d}", .{n});
-    }
-
-    /// A fresh block label (without %): <prefix><n>.
-    pub fn label(self: *Function, prefix: []const u8) ![]const u8 {
-        const n = self.next_label;
-        self.next_label += 1;
-        return std.fmt.allocPrint(self.m.gpa, "{s}{d}", .{ prefix, n });
-    }
-
-    /// An instruction (indented, a line).
-    pub fn emit(self: *Function, comptime fmt: []const u8, args: anytype) !void {
-        if (self.terminated) return; // (dead code after a jump)
-        try self.code.appendSlice(self.m.gpa, "  ");
-        try self.code.print(self.m.gpa, fmt, args);
-        try self.code.append(self.m.gpa, '\n');
-    }
-
-    /// An instruction giving a value: `%tN = <instr>`; the name.
-    pub fn value(self: *Function, comptime fmt: []const u8, args: anytype) ![]const u8 {
-        const t = try self.tmp();
-        if (!self.terminated) {
-            try self.code.print(self.m.gpa, "  {s} = ", .{t});
-            try self.code.print(self.m.gpa, fmt, args);
-            try self.code.append(self.m.gpa, '\n');
+    /// Close the function: the entry jumps to the code; a block left open
+    /// (one made but never used, or the end of dead code) is unreachable.
+    pub fn finish(self: *Function) void {
+        _ = L("LLVMBuildBr")(self.eb, self.start);
+        if (!self.terminated()) _ = L("LLVMBuildUnreachable")(self.b);
+        for (self.blocks.items) |blk| {
+            if (L("LLVMGetBasicBlockTerminator")(blk) != null) continue;
+            L("LLVMPositionBuilderAtEnd")(self.b, blk);
+            _ = L("LLVMBuildUnreachable")(self.b);
         }
-        return t;
+        self.blocks.deinit(self.m.gpa);
+        L("LLVMDisposeBuilder")(self.eb);
+        L("LLVMDisposeBuilder")(self.b);
     }
 
-    /// An alloca in the entry block; its name.
-    pub fn alloca(self: *Function, ty: []const u8) ![]const u8 {
-        const t = try self.tmp();
-        try self.entry.print(self.m.gpa, "  {s} = alloca {s}, align 8\n", .{ t, ty });
-        return t;
+    pub fn param(self: *Function, i: u32) Value {
+        return L("LLVMGetParam")(self.fv, i);
     }
 
-    /// Start a block (a jump to it ends the current one if it has none).
-    pub fn block(self: *Function, name: []const u8) !void {
-        if (!self.terminated) try self.code.print(self.m.gpa, "  br label %{s}\n", .{name});
-        try self.code.print(self.m.gpa, "{s}:\n", .{name});
-        self.terminated = false;
-        self.current = name;
+    /// A fresh block.
+    pub fn label(self: *Function, prefix: []const u8) !Block {
+        self.next_label += 1;
+        var buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrintZ(&buf, "{s}{d}", .{ prefix[0..@min(prefix.len, 40)], self.next_label }) catch "b";
+        const blk = L("LLVMAppendBasicBlockInContext")(self.m.ctx, self.fv, name);
+        try self.blocks.append(self.m.gpa, blk);
+        return blk;
     }
 
-    /// A value from two predecessors: `phi <ty> [a, %from_a], [b, %from_b]`.
-    pub fn phi(self: *Function, ty: []const u8, a: []const u8, from_a: []const u8, b: []const u8, from_b: []const u8) ![]const u8 {
-        return self.value("phi {s} [ {s}, %{s} ], [ {s}, %{s} ]", .{ ty, a, from_a, b, from_b });
+    pub fn terminated(self: *const Function) bool {
+        return L("LLVMGetBasicBlockTerminator")(self.current) != null;
     }
 
-    pub fn br(self: *Function, target: []const u8) !void {
-        try self.emit("br label %{s}", .{target});
-        self.terminated = true;
+    /// Code after a jump is dead: it goes in a block of its own (nothing
+    /// jumps to it).
+    fn open(self: *Function) void {
+        if (!self.terminated()) return;
+        const dead = L("LLVMAppendBasicBlockInContext")(self.m.ctx, self.fv, "dead");
+        // (closed by finish(); out of memory here only leaves it unclosed,
+        // which the verifier reports)
+        self.blocks.append(self.m.gpa, dead) catch {};
+        L("LLVMPositionBuilderAtEnd")(self.b, dead);
+        self.current = dead;
     }
 
-    pub fn condBr(self: *Function, cond: []const u8, yes: []const u8, no: []const u8) !void {
-        try self.emit("br i1 {s}, label %{s}, label %{s}", .{ cond, yes, no });
-        self.terminated = true;
+    // (blocks, jumps and slots return error unions, as the rest of the
+    // compiler's building does: `try f.block(b)`)
+
+    /// Continue in a block (the current one, still open, jumps to it).
+    pub fn block(self: *Function, blk: Block) error{OutOfMemory}!void {
+        if (!self.terminated()) _ = L("LLVMBuildBr")(self.b, blk);
+        L("LLVMPositionBuilderAtEnd")(self.b, blk);
+        self.current = blk;
     }
 
-    pub fn ret(self: *Function, comptime fmt: []const u8, args: anytype) !void {
-        try self.emit("ret " ++ fmt, args);
-        self.terminated = true;
+    pub fn br(self: *Function, blk: Block) error{OutOfMemory}!void {
+        self.open();
+        _ = L("LLVMBuildBr")(self.b, blk);
+    }
+
+    pub fn condBr(self: *Function, cond: Value, yes: Block, no: Block) error{OutOfMemory}!void {
+        self.open();
+        _ = L("LLVMBuildCondBr")(self.b, cond, yes, no);
+    }
+
+    pub fn ret(self: *Function, v: Value) error{OutOfMemory}!void {
+        self.open();
+        _ = L("LLVMBuildRet")(self.b, v);
+    }
+
+    pub fn retVoid(self: *Function) error{OutOfMemory}!void {
+        self.open();
+        _ = L("LLVMBuildRetVoid")(self.b);
+    }
+
+    /// A stack slot (in the entry block).
+    pub fn alloca(self: *Function, ty: Type) error{OutOfMemory}!Value {
+        const a = L("LLVMBuildAlloca")(self.eb, ty, "");
+        L("LLVMSetAlignment")(a, 8);
+        return a;
+    }
+
+    /// A store done once, in the entry block (a slot's first value).
+    pub fn entryStore(self: *Function, v: Value, ptr: Value) void {
+        const s = L("LLVMBuildStore")(self.eb, v, ptr);
+        L("LLVMSetAlignment")(s, 8);
+    }
+
+    pub fn add(self: *Function, a: Value, b: Value) Value {
+        self.open();
+        return L("LLVMBuildAdd")(self.b, a, b, "");
+    }
+
+    pub fn sub(self: *Function, a: Value, b: Value) Value {
+        self.open();
+        return L("LLVMBuildSub")(self.b, a, b, "");
+    }
+
+    pub fn and_(self: *Function, a: Value, b: Value) Value {
+        self.open();
+        return L("LLVMBuildAnd")(self.b, a, b, "");
+    }
+
+    pub fn or_(self: *Function, a: Value, b: Value) Value {
+        self.open();
+        return L("LLVMBuildOr")(self.b, a, b, "");
+    }
+
+    pub fn xor(self: *Function, a: Value, b: Value) Value {
+        self.open();
+        return L("LLVMBuildXor")(self.b, a, b, "");
+    }
+
+    pub fn icmp(self: *Function, pred: c.LLVMIntPredicate, a: Value, b: Value) Value {
+        self.open();
+        return L("LLVMBuildICmp")(self.b, pred, a, b, "");
+    }
+
+    pub fn fcmp(self: *Function, pred: c.LLVMRealPredicate, a: Value, b: Value) Value {
+        self.open();
+        return L("LLVMBuildFCmp")(self.b, pred, a, b, "");
+    }
+
+    /// An i1 as an i64 (0 or 1).
+    pub fn zext64(self: *Function, v: Value) Value {
+        self.open();
+        return L("LLVMBuildZExt")(self.b, v, self.m.t.i64, "");
+    }
+
+    pub fn bitcast(self: *Function, v: Value, ty: Type) Value {
+        self.open();
+        return L("LLVMBuildBitCast")(self.b, v, ty, "");
+    }
+
+    pub fn ptrToInt(self: *Function, v: Value) Value {
+        self.open();
+        return L("LLVMBuildPtrToInt")(self.b, v, self.m.t.i64, "");
+    }
+
+    pub fn intToPtr(self: *Function, v: Value) Value {
+        self.open();
+        return L("LLVMBuildIntToPtr")(self.b, v, self.m.t.ptr, "");
+    }
+
+    pub fn load(self: *Function, ty: Type, ptr: Value) Value {
+        self.open();
+        const v = L("LLVMBuildLoad2")(self.b, ty, ptr, "");
+        L("LLVMSetAlignment")(v, 8);
+        return v;
+    }
+
+    pub fn store(self: *Function, v: Value, ptr: Value) void {
+        self.open();
+        const s = L("LLVMBuildStore")(self.b, v, ptr);
+        L("LLVMSetAlignment")(s, 8);
+    }
+
+    /// &p[i] for elements of a type.
+    pub fn at(self: *Function, ty: Type, ptr: Value, i: Value) Value {
+        self.open();
+        var idx = [_]Value{i};
+        return L("LLVMBuildInBoundsGEP2")(self.b, ty, ptr, &idx, 1, "");
+    }
+
+    /// &p.field_i of a struct.
+    pub fn field(self: *Function, ty: Type, ptr: Value, i: u32) Value {
+        self.open();
+        var idx = [_]Value{ self.m.k32(0), self.m.k32(i) };
+        return L("LLVMBuildInBoundsGEP2")(self.b, ty, ptr, &idx, 2, "");
+    }
+
+    /// p + n bytes.
+    pub fn offset(self: *Function, ptr: Value, n: i64) Value {
+        return self.at(self.m.t.i8, ptr, self.m.k64(n));
+    }
+
+    pub fn extract(self: *Function, v: Value, i: u32) Value {
+        self.open();
+        return L("LLVMBuildExtractValue")(self.b, v, i, "");
+    }
+
+    pub fn select(self: *Function, cond: Value, a: Value, b: Value) Value {
+        self.open();
+        return L("LLVMBuildSelect")(self.b, cond, a, b, "");
+    }
+
+    /// A value from two predecessors.
+    pub fn phi(self: *Function, ty: Type, a: Value, from_a: Block, b: Value, from_b: Block) Value {
+        self.open();
+        const p = L("LLVMBuildPhi")(self.b, ty, "");
+        var vals = [_]Value{ a, b };
+        var blocks = [_]Block{ from_a, from_b };
+        L("LLVMAddIncoming")(p, &vals, &blocks, 2);
+        return p;
+    }
+
+    pub fn call(self: *Function, f: Fn, args: []const Value) Value {
+        self.open();
+        return L("LLVMBuildCall2")(self.b, f.ty, f.v, @constCast(args.ptr), @intCast(args.len), "");
+    }
+
+    /// A call of a declared function by name.
+    pub fn callName(self: *Function, name: []const u8, args: []const Value) Value {
+        return self.call(self.m.get(name), args);
     }
 };

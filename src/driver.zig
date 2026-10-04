@@ -24,23 +24,15 @@ pub const Compiled = struct {
     objects: []*PyObject,
     /// The number of the top level's variables
     globals: usize,
-    /// The IR, for debugging (Program.compiled_ir())
-    ir_text: []u8,
     /// The record types its values use
     record_types: []*value.RecordType,
 
     pub fn destroy(self: *Compiled) void {
         self.module.release();
-        for (self.record_types) |t| {
-            for (t.fields) |f| allocator.free(f);
-            allocator.free(t.fields);
-            allocator.free(t.name);
-            allocator.destroy(t);
-        }
+        for (self.record_types) |t| freeRecordType(t);
         allocator.free(self.record_types);
         for (self.objects) |o| py.Py_DecRef(o);
         allocator.free(self.objects);
-        allocator.free(self.ir_text);
         allocator.destroy(self);
     }
 };
@@ -70,6 +62,23 @@ fn defineHelpers(view: *const llvm.LlvmView) bool {
     return true;
 }
 
+/// Build a program's module (in the compiler `c`); false with an exception
+/// (zrun.CompileError when the semantics can't be compiled).
+fn build(c: *compile_mod.Compiler, failure: *compile_mod.Failure, compile_error: *PyObject) bool {
+    c.compileProgram() catch |e| switch (e) {
+        error.Unsupported => {
+            ph.raise(compile_error, "{s}", .{failure.message.items});
+            return false;
+        },
+        error.OutOfMemory => {
+            _ = py.c.PyErr_NoMemory();
+            return false;
+        },
+        error.Python => return false,
+    };
+    return true;
+}
+
 /// Compile a program: null with an exception (zrun.CompileError when the
 /// semantics can't be compiled).
 pub fn compileProgram(data: *program_mod.Data, lang: compile_mod.LangView, compile_error: *PyObject) ?*Compiled {
@@ -84,21 +93,12 @@ pub fn compileProgram(data: *program_mod.Data, lang: compile_mod.LangView, compi
     var failure = compile_mod.Failure{};
     var c = compile_mod.Compiler.init(a, data, lang, prefix, &failure);
     defer c.deinit(allocator);
-    c.compileProgram() catch |e| switch (e) {
-        error.Unsupported => {
-            ph.raise(compile_error, "{s}", .{failure.message.items});
-            return null;
-        },
-        error.OutOfMemory => return oom(),
-        error.Python => return null,
-    };
-    const text = c.m.text() catch return oom();
-    const ir_text = allocator.dupe(u8, text) catch return oom();
+    defer c.m.deinit();
+    if (!build(&c, &failure, compile_error)) return null;
 
     var err: [2048]u8 = undefined;
     @memset(&err, 0);
-    const module = llvm.compile(view, ir_text, 2, &err) catch {
-        allocator.free(ir_text);
+    const module = llvm.compile(view, c.m.take(), 2, &err) catch {
         ph.raise(py.PyExc_RuntimeError(), "zrun: LLVM rejected the compiled program (a zrun bug): {s}", .{std.mem.sliceTo(&err, 0)});
         return null;
     };
@@ -107,7 +107,6 @@ pub fn compileProgram(data: *program_mod.Data, lang: compile_mod.LangView, compi
     if (addr == 0) {
         var m = module;
         m.release();
-        allocator.free(ir_text);
         ph.raise(py.PyExc_RuntimeError(), "zrun: the compiled program has no entry point", .{});
         return null;
     }
@@ -115,8 +114,37 @@ pub fn compileProgram(data: *program_mod.Data, lang: compile_mod.LangView, compi
     const objs = allocator.dupe(*PyObject, c.objects.items) catch return oom();
     const globals = if (c.layouts.get(program_mod.NONE)) |l| l.syms.items.len else 0;
     const records = allocator.dupe(*value.RecordType, c.record_list.items) catch return oom();
-    out.* = .{ .module = module, .main = @ptrFromInt(addr), .objects = objs, .globals = globals, .ir_text = ir_text, .record_types = records };
+    out.* = .{ .module = module, .main = @ptrFromInt(addr), .objects = objs, .globals = globals, .record_types = records };
     return out;
+}
+
+/// The LLVM IR a program compiles to, as text (before optimization), for
+/// debugging: a new str, or null with an exception.
+pub fn irText(data: *program_mod.Data, lang: compile_mod.LangView, compile_error: *PyObject) ?*PyObject {
+    _ = llvm.get() orelse return null;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var failure = compile_mod.Failure{};
+    var c = compile_mod.Compiler.init(a, data, lang, "zr_ir", &failure);
+    defer c.deinit(allocator);
+    defer c.m.deinit();
+    // (objects the IR refers to are kept by the compiler: released here)
+    defer for (c.objects.items) |o| py.Py_DecRef(o);
+    defer for (c.record_list.items) |t| freeRecordType(t);
+    if (!build(&c, &failure, compile_error)) return null;
+    const text = c.m.text() catch {
+        _ = py.c.PyErr_NoMemory();
+        return null;
+    };
+    return ph.newString(text);
+}
+
+fn freeRecordType(t: *value.RecordType) void {
+    for (t.fields) |f| allocator.free(f);
+    allocator.free(t.fields);
+    allocator.free(t.name);
+    allocator.destroy(t);
 }
 
 fn oom() ?*Compiled {

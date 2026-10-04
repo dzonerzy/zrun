@@ -35,6 +35,10 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // LLVM's C API headers (only the prototypes: the functions come from
+    // zgram's LLVM, through its zgram.llvm.v1 capsule)
+    user_lib_mod.addIncludePath(b.path("vendor/llvm/include"));
+
     // Single source for the version string returned by zrun.version()
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", @import("build.zig.zon").version);

@@ -641,12 +641,12 @@ const Program = struct {
     }
 
     /// Compile the program (once).
-    fn ensureCompiled(self: *Program) bool {
-        if (self._compiled != null) return true;
+    /// What the compiler needs of the language (and of this program's tree).
+    fn langView(self: *Program) compile_mod.LangView {
         const lang = self.language();
         lang.resolve();
         const st = self.state();
-        const view = compile_mod.LangView{
+        return .{
             .grammar = lang._grammar.?,
             .eval_of = lang._eval_of,
             .exec_of = lang._exec_of,
@@ -656,14 +656,18 @@ const Program = struct {
             .tree = st.ctx.?.tree,
             .analysis = st.analysis,
         };
-        self._compiled = driver.compileProgram(self.ctx().data, view, types.CompileError) orelse return false;
+    }
+
+    fn ensureCompiled(self: *Program) bool {
+        if (self._compiled != null) return true;
+        self._compiled = driver.compileProgram(self.ctx().data, self.langView(), types.CompileError) orelse return false;
         return true;
     }
 
-    /// `program.compiled_ir()`: the LLVM IR the program compiles to.
+    /// `program.compiled_ir()`: the LLVM IR the program compiles to (before
+    /// LLVM optimizes it), as text.
     pub fn compiled_ir(self: *Program) ?*PyObject {
-        if (!self.ensureCompiled()) return null;
-        return ph.newString(self._compiled.?.ir_text);
+        return driver.irText(self.ctx().data, self.langView(), types.CompileError);
     }
 
     fn makeNodeObject(raw: *anyopaque, idx: u32) ?*PyObject {

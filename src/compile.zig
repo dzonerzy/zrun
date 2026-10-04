@@ -1,5 +1,6 @@
 //! The compiler: a program's semantics, partially evaluated for its tree,
-//! written as LLVM IR (ir.zig) and JIT-compiled by zgram's LLVM.
+//! built as LLVM IR in memory (ir.zig, LLVM's C API) and JIT-compiled by
+//! zgram's LLVM.
 //!
 //! Each semantic is run at compile time with its node as a known value:
 //! whatever depends only on the tree (fields, kinds, texts, `node.op ==
@@ -21,6 +22,8 @@ const py = ph.py;
 const PyObject = ph.PyObject;
 const front = @import("front.zig");
 const ir = @import("ir.zig");
+const jit_c = @import("jit.zig").c;
+const L = @import("jit.zig").f;
 const program_mod = @import("program.zig");
 const grammar_mod = @import("grammar.zig");
 const helpers = @import("helpers.zig");
@@ -57,10 +60,11 @@ pub const Error = error{ OutOfMemory, Python, Unsupported };
 
 pub const Shape = enum { any, none, bool, int, float, str, list, tuple, dict, record, function, node };
 
-/// A value only known at run time: operands (SSA names or constants)
+/// A value only known at run time: its two words (LLVM values: computed,
+/// or constants)
 pub const Dyn = struct {
-    tag: []const u8,
-    bits: []const u8,
+    tag: ir.Value,
+    bits: ir.Value,
     shape: Shape,
 
     fn heapish(self: Dyn) bool {
@@ -163,6 +167,10 @@ pub const Compiler = struct {
     /// the arena: the compiled program keeps them)
     record_types: std.AutoHashMapUnmanaged(*PyObject, *value.RecordType) = .empty,
     record_list: std.ArrayListUnmanaged(*value.RecordType) = .empty,
+    /// Checked i64 arithmetic (LLVM's intrinsics)
+    sadd: ir.Fn = undefined,
+    ssub: ir.Fn = undefined,
+    smul: ir.Fn = undefined,
 
     pub fn init(a: Allocator, data: *program_mod.Data, lang: LangView, prefix: []const u8, failure: *Failure) Compiler {
         return .{ .a = a, .data = data, .lang = lang, .m = ir.Module.init(a, prefix), .failure = failure };
@@ -197,102 +205,115 @@ pub const Compiler = struct {
         while (self.queue.pop()) |fnode| try self.genFunction(fnode);
     }
 
-    fn declareRuntime(self: *Compiler) !void {
-        const decls = [_][2][]const u8{
-            .{ "zr_incref", "void @zr_incref(i64, i64)" },
-            .{ "zr_decref", "void @zr_decref(i64, i64)" },
-            .{ "zr_fail", "i1 @zr_fail(ptr, i32, ptr)" },
-            .{ "zr_unset", "i1 @zr_unset(ptr, i32, ptr)" },
-            .{ "zr_overflow", "i1 @zr_overflow(ptr, i32)" },
-            .{ "zr_binary", "i1 @zr_binary(ptr, i32, i32, i64, i64, i64, i64, ptr)" },
-            .{ "zr_compare", "i1 @zr_compare(ptr, i32, i32, i64, i64, i64, i64, ptr)" },
-            .{ "zr_unary", "i1 @zr_unary(ptr, i32, i32, i64, i64, ptr)" },
-            .{ "zr_truthy", "i1 @zr_truthy(i64, i64)" },
-            .{ "zr_function", "i1 @zr_function(ptr, ptr, ptr, i32, ptr, i64, ptr)" },
-            .{ "zr_call", "i1 @zr_call(ptr, i32, i64, i64, ptr, i64, ptr, ptr)" },
-            .{ "zr_object", "void @zr_object(ptr, i64, ptr)" },
-            .{ "zr_frame_new", "ptr @zr_frame_new(ptr, i64)" },
-            .{ "zr_frame_release", "void @zr_frame_release(ptr)" },
-            .{ "zr_list", "i1 @zr_list(ptr, i32, ptr, i64, ptr)" },
-            .{ "zr_tuple", "i1 @zr_tuple(ptr, i32, ptr, i64, ptr)" },
-            .{ "zr_dict", "i1 @zr_dict(ptr, i32, ptr, ptr, i64, ptr)" },
-            .{ "zr_record", "i1 @zr_record(ptr, i32, ptr, ptr, ptr)" },
-            .{ "zr_is_record", "i1 @zr_is_record(i64, i64, ptr)" },
-            .{ "zr_getattr", "i1 @zr_getattr(ptr, i32, i64, i64, ptr, ptr)" },
-            .{ "zr_setattr", "i1 @zr_setattr(ptr, i32, i64, i64, ptr, i64, i64)" },
-            .{ "zr_getitem", "i1 @zr_getitem(ptr, i32, i64, i64, i64, i64, ptr)" },
-            .{ "zr_setitem", "i1 @zr_setitem(ptr, i32, i64, i64, i64, i64, i64, i64)" },
-            .{ "zr_items", "i1 @zr_items(ptr, i32, i64, i64, ptr)" },
-            .{ "zr_list_len", "i64 @zr_list_len(i64, i64)" },
-            .{ "zr_list_at", "void @zr_list_at(i64, i64, i64, ptr)" },
-            .{ "zr_append", "i1 @zr_append(ptr, i32, i64, i64, i64, i64)" },
-            .{ "zr_call_method", "i1 @zr_call_method(ptr, i32, i64, i64, ptr, ptr, i64, ptr)" },
-            .{ "zr_call_python", "i1 @zr_call_python(ptr, i32, i64, ptr, i64, ptr)" },
-            .{ "zr_is_type", "i1 @zr_is_type(i64, i64, i32)" },
-            .{ "zr_format", "i1 @zr_format(ptr, i32, i64, i64, i32, ptr, ptr)" },
-            .{ "zr_concat", "i1 @zr_concat(ptr, i32, ptr, i64, ptr)" },
-            .{ "zr_unpack", "i1 @zr_unpack(ptr, i32, i64, i64, i64, ptr)" },
+    /// The runtime's helpers (helpers.zig), by name and signature: the
+    /// result then the parameters, one letter each (v void, b i1, i i32,
+    /// l i64, p ptr).
+    const runtime_decls = [_][2][]const u8{
+        .{ "zr_incref", "vll" },
+        .{ "zr_decref", "vll" },
+        .{ "zr_free", "vll" },
+        .{ "zr_fail", "bpip" },
+        .{ "zr_unset", "bpip" },
+        .{ "zr_overflow", "bpi" },
+        .{ "zr_binary", "bpiillllp" },
+        .{ "zr_compare", "bpiillllp" },
+        .{ "zr_unary", "bpiillp" },
+        .{ "zr_truthy", "bll" },
+        .{ "zr_function", "bpppiplp" },
+        .{ "zr_call", "bpillplpp" },
+        .{ "zr_object", "vplp" },
+        .{ "zr_frame_new", "ppl" },
+        .{ "zr_frame_release", "vp" },
+        .{ "zr_list", "bpiplp" },
+        .{ "zr_tuple", "bpiplp" },
+        .{ "zr_dict", "bpipplp" },
+        .{ "zr_record", "bpippp" },
+        .{ "zr_is_record", "bllp" },
+        .{ "zr_getattr", "bpillpp" },
+        .{ "zr_setattr", "bpillpll" },
+        .{ "zr_getitem", "bpillllp" },
+        .{ "zr_setitem", "bpillllll" },
+        .{ "zr_items", "bpillp" },
+        .{ "zr_list_len", "lll" },
+        .{ "zr_list_at", "vlllp" },
+        .{ "zr_append", "bpillll" },
+        .{ "zr_call_method", "bpillpplp" },
+        .{ "zr_call_python", "bpilplp" },
+        .{ "zr_is_type", "blli" },
+        .{ "zr_format", "bpillipp" },
+        .{ "zr_concat", "bpiplp" },
+        .{ "zr_unpack", "bpilllp" },
+    };
+
+    fn letterType(self: *Compiler, l: u8) ir.Type {
+        const t = self.m.t;
+        return switch (l) {
+            'v' => t.void,
+            'b' => t.i1,
+            'i' => t.i32,
+            'l' => t.i64,
+            'p' => t.ptr,
+            else => unreachable,
         };
-        for (decls) |d| try self.m.declare(d[0], d[1]);
-        try self.m.declare("llvm.sadd.with.overflow.i64", "{ i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)");
-        try self.m.declare("llvm.ssub.with.overflow.i64", "{ i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)");
-        try self.m.declare("llvm.smul.with.overflow.i64", "{ i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)");
-        try self.m.declare("zr_free", "void @zr_free(i64, i64)");
+    }
+
+    fn declareRuntime(self: *Compiler) !void {
+        for (runtime_decls) |d| {
+            var params: [12]ir.Type = undefined;
+            for (d[1][1..], 0..) |l, i| params[i] = self.letterType(l);
+            try self.m.declare(d[0], self.letterType(d[1][0]), params[0 .. d[1].len - 1]);
+        }
+        const t = self.m.t;
+        const i64s = [_]ir.Type{t.i64};
+        self.sadd = self.m.intrinsic("llvm.sadd.with.overflow", &i64s);
+        self.ssub = self.m.intrinsic("llvm.ssub.with.overflow", &i64s);
+        self.smul = self.m.intrinsic("llvm.smul.with.overflow", &i64s);
         // Reference counts, inline: the runtime's objects (tags 4 to 9)
         // counted here, unless immortal; Python objects (10) by the runtime
-        try self.m.headPrint(
-            \\define internal void @zr_inc(i64 %tag, i64 %bits) alwaysinline {{
-            \\  %k = sub i64 %tag, 4
-            \\  %obj = icmp ult i64 %k, 6
-            \\  br i1 %obj, label %counted, label %other
-            \\counted:
-            \\  %p = inttoptr i64 %bits to ptr
-            \\  %rc = load i64, ptr %p, align 8
-            \\  %mortal = icmp ult i64 %rc, {d}
-            \\  br i1 %mortal, label %inc, label %done
-            \\inc:
-            \\  %rc1 = add i64 %rc, 1
-            \\  store i64 %rc1, ptr %p, align 8
-            \\  br label %done
-            \\other:
-            \\  %host = icmp eq i64 %tag, 10
-            \\  br i1 %host, label %python, label %done
-            \\python:
-            \\  call void @zr_incref(i64 %tag, i64 %bits)
-            \\  br label %done
-            \\done:
-            \\  ret void
-            \\}}
-            \\
-            \\define internal void @zr_dec(i64 %tag, i64 %bits) alwaysinline {{
-            \\  %k = sub i64 %tag, 4
-            \\  %obj = icmp ult i64 %k, 6
-            \\  br i1 %obj, label %counted, label %other
-            \\counted:
-            \\  %p = inttoptr i64 %bits to ptr
-            \\  %rc = load i64, ptr %p, align 8
-            \\  %mortal = icmp ult i64 %rc, {d}
-            \\  br i1 %mortal, label %dec, label %done
-            \\dec:
-            \\  %rc1 = sub i64 %rc, 1
-            \\  store i64 %rc1, ptr %p, align 8
-            \\  %zero = icmp eq i64 %rc1, 0
-            \\  br i1 %zero, label %free, label %done
-            \\free:
-            \\  call void @zr_free(i64 %tag, i64 %bits)
-            \\  br label %done
-            \\other:
-            \\  %host = icmp eq i64 %tag, 10
-            \\  br i1 %host, label %python, label %done
-            \\python:
-            \\  call void @zr_decref(i64 %tag, i64 %bits)
-            \\  br label %done
-            \\done:
-            \\  ret void
-            \\}}
-            \\
-            \\
-        , .{ value.IMMORTAL, value.IMMORTAL });
+        try self.refcountFunction("zr_inc", "zr_incref", false);
+        try self.refcountFunction("zr_dec", "zr_decref", true);
+    }
+
+    /// zr_inc / zr_dec(tag, bits): a count changed inline (always inlined).
+    fn refcountFunction(self: *Compiler, name: []const u8, python_helper: []const u8, dec: bool) !void {
+        const m = &self.m;
+        const t = m.t;
+        const fun = try m.function(name, t.void, &.{ t.i64, t.i64 }, false);
+        m.alwaysInline(fun);
+        var f = ir.Function.init(m, fun.v);
+        const tag = f.param(0);
+        const bits = f.param(1);
+        const counted = try f.label("counted");
+        const change = try f.label("change");
+        const other = try f.label("other");
+        const python = try f.label("python");
+        const done = try f.label("done");
+        const k = f.sub(tag, m.k64(4));
+        try f.condBr(f.icmp(jit_c.LLVMIntULT, k, m.k64(6)), counted, other);
+        try f.block(counted);
+        const p = f.intToPtr(bits);
+        const rc = f.load(t.i64, p);
+        try f.condBr(f.icmp(jit_c.LLVMIntULT, rc, m.k64(@bitCast(value.IMMORTAL))), change, done);
+        try f.block(change);
+        if (dec) {
+            const rc1 = f.sub(rc, m.k64(1));
+            f.store(rc1, p);
+            const free = try f.label("free");
+            try f.condBr(f.icmp(jit_c.LLVMIntEQ, rc1, m.k64(0)), free, done);
+            try f.block(free);
+            _ = f.callName("zr_free", &.{ tag, bits });
+        } else {
+            f.store(f.add(rc, m.k64(1)), p);
+        }
+        try f.br(done);
+        try f.block(other);
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, tag, m.k64(10)), python, done);
+        try f.block(python);
+        _ = f.callName(python_helper, &.{ tag, bits });
+        try f.br(done);
+        try f.block(done);
+        try f.retVoid();
+        f.finish();
     }
 
     /// Each symbol's slot, in the function it lives in; which functions
@@ -340,18 +361,26 @@ pub const Compiler = struct {
         return NONE;
     }
 
-    fn fnName(self: *Compiler, fnode: u32) ![]const u8 {
-        if (fnode == NONE) return std.fmt.allocPrint(self.a, "@{s}_main", .{self.m.prefix});
-        return std.fmt.allocPrint(self.a, "@{s}_f{d}", .{ self.m.prefix, fnode });
+    /// The LLVM function of the top level (NONE: `<prefix>_main(ctx,
+    /// globals)`, the entry point) or of a language function
+    /// (`<prefix>_f<node>(ctx, env, args, nargs, recv, result)`).
+    fn llvmFunction(self: *Compiler, fnode: u32) !ir.Fn {
+        const t = self.m.t;
+        if (fnode == NONE) {
+            const name = try std.fmt.allocPrint(self.a, "{s}_main", .{self.m.prefix});
+            return self.m.function(name, t.i1, &.{ t.ptr, t.ptr }, true);
+        }
+        const name = try std.fmt.allocPrint(self.a, "{s}_f{d}", .{ self.m.prefix, fnode });
+        return self.m.function(name, t.i1, &.{ t.ptr, t.ptr, t.ptr, t.i64, t.ptr, t.ptr }, false);
     }
 
     /// The code of a language function, compiled (queued if it isn't yet).
-    fn functionCode(self: *Compiler, fnode: u32) ![]const u8 {
+    fn functionCode(self: *Compiler, fnode: u32) !ir.Value {
         if (!self.compiled_fns.contains(fnode)) {
             try self.compiled_fns.put(self.a, fnode, {});
             try self.queue.append(self.a, fnode);
         }
-        return self.fnName(fnode);
+        return (try self.llvmFunction(fnode)).v;
     }
 
     /// The record type of a dataclass (made once).
@@ -390,7 +419,17 @@ pub const Compiler = struct {
 
     /// Generate one function: the top level (NONE) or a language function.
     fn genFunction(self: *Compiler, fnode: u32) Error!void {
-        var g = Gen{ .c = self, .f = ir.Function.init(&self.m), .fnode = fnode, .layout = try self.layoutOf(fnode) };
+        const fun = try self.llvmFunction(fnode);
+        var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = fnode, .layout = try self.layoutOf(fnode) };
+        g.ctx = g.f.param(0);
+        if (fnode == NONE) {
+            g.globals = g.f.param(1);
+        } else {
+            g.env = g.f.param(1);
+            g.args = g.f.param(2);
+            g.recv = g.f.param(4);
+            g.result = g.f.param(5);
+        }
         try g.prologue();
         if (fnode == NONE) {
             try g.hoist(NONE);
@@ -409,12 +448,7 @@ pub const Compiler = struct {
             try g.execValue(body);
         }
         try g.epilogue();
-        const name = try self.fnName(fnode);
-        const sig = if (fnode == NONE)
-            try std.fmt.allocPrint(self.a, "i1 {s}(ptr %ctx, ptr %globals)", .{name})
-        else
-            try std.fmt.allocPrint(self.a, "internal i1 {s}(ptr %ctx, ptr %env, ptr %args, i64 %nargs, ptr %recv, ptr %result)", .{name});
-        try g.f.finish(sig);
+        g.f.finish();
     }
 
     pub fn specOf(self: *const Compiler, idx: u32) ?FunctionSpec {
@@ -436,44 +470,53 @@ const Inst = struct {
     /// Its result: known (returned outside run-time control flow) or in a
     /// slot (returned from inside it)
     result: ?SVal = null,
-    result_slot: ?[]const u8 = null,
-    exit_label: []const u8,
+    result_slot: ?ir.Value = null,
+    exit_label: ir.Block,
     /// Run-time control flow depth within it (if, while...)
     dyn_depth: u32 = 0,
     /// Python loop targets of the semantic itself (break / continue)
-    loops: std.ArrayListUnmanaged(struct { brk: []const u8, cont: []const u8 }) = .empty,
+    loops: std.ArrayListUnmanaged(struct { brk: ir.Block, cont: ir.Block }) = .empty,
     /// It returned (outside run-time control flow): the rest is dead
     done: bool = false,
     /// Slots of values it holds for a while (a run-time loop's items):
     /// None but while held, released with its locals
-    temps: std.ArrayListUnmanaged([]const u8) = .empty,
+    temps: std.ArrayListUnmanaged(ir.Value) = .empty,
 };
 
 const Local = union(enum) {
     unset,
     static: SVal,
     /// In a stack slot (an alloca of {i64, i64}), with the shape last stored
-    slot: struct { ptr: []const u8, shape: Shape },
+    slot: struct { ptr: ir.Value, shape: Shape },
 };
 
 /// An rt.loop's targets, and how many semantics ran when it started (those
 /// above are left by a Break / Continue)
-const LoopTarget = struct { brk: []const u8, cont: []const u8, depth: usize };
+const LoopTarget = struct { brk: ir.Block, cont: ir.Block, depth: usize };
 
 const Gen = struct {
     c: *Compiler,
     f: ir.Function,
     fnode: u32,
     layout: *Layout,
+    /// The function's parameters: the context; the globals (the top
+    /// level), or the frame around, the arguments, the receiver and the
+    /// result slot (a language function)
+    ctx: ir.Value = null,
+    globals: ir.Value = null,
+    env: ir.Value = null,
+    args: ir.Value = null,
+    recv: ir.Value = null,
+    result: ir.Value = null,
     /// The frame pointer (a heap frame) or null (stack slots)
-    frame: ?[]const u8 = null,
+    frame: ?ir.Value = null,
     /// Stack slots of the variables, by layout slot (stack layouts)
-    var_slots: std.ArrayListUnmanaged([]const u8) = .empty,
+    var_slots: std.ArrayListUnmanaged(ir.Value) = .empty,
     /// Scratch space for helpers' results
-    out: []const u8 = "",
+    out: ir.Value = null,
     /// Where errors go (return false), and returns (rt.Return)
-    err_label: []const u8 = "",
-    ret_label: []const u8 = "",
+    err_label: ir.Block = null,
+    ret_label: ir.Block = null,
     /// rt.loop targets, innermost last
     loops: std.ArrayListUnmanaged(LoopTarget) = .empty,
     /// Semantics running inline, innermost last
@@ -500,29 +543,56 @@ const Gen = struct {
         return self.c.a;
     }
 
+    /// An i64 constant.
+    fn k(self: *Gen, n: i64) ir.Value {
+        return self.c.m.k64(n);
+    }
+
+    /// An i32 constant (node indexes, operator codes).
+    fn k32(self: *Gen, n: u32) ir.Value {
+        return self.c.m.k32(n);
+    }
+
+    /// A runtime helper's call.
+    fn call(self: *Gen, name: []const u8, args: []const ir.Value) ir.Value {
+        return self.f.callName(name, args);
+    }
+
+    /// A helper that can fail: called, then to the error exit on false.
+    fn callCheck(self: *Gen, name: []const u8, args: []const ir.Value) Error!void {
+        try self.check(self.call(name, args));
+    }
+
+    /// A slot of n values (in the entry block).
+    fn valueSlots(self: *Gen, n: usize) Error!ir.Value {
+        const t = self.c.m.t;
+        return self.f.alloca(L("LLVMArrayType2")(t.val, @max(n, 1)));
+    }
+
+    /// &arr[i] of an array of values.
+    fn elem(self: *Gen, arr: ir.Value, i: usize) ir.Value {
+        return self.f.at(self.c.m.t.val, arr, self.k(@intCast(i)));
+    }
+
     fn prologue(self: *Gen) Error!void {
         const f = &self.f;
-        self.out = try f.alloca("{ i64, i64 }");
+        const t = self.c.m.t;
+        self.out = try f.alloca(t.val);
         self.err_label = try f.label("error");
         self.ret_label = try f.label("return");
         const n = self.layout.syms.items.len;
         if (self.fnode == NONE) {
-            self.frame = "%globals";
+            self.frame = self.globals;
         } else if (self.layout.heap) {
-            self.frame = try f.value("call ptr @zr_frame_new(ptr %env, i64 {d})", .{n});
+            self.frame = self.call("zr_frame_new", &.{ self.env, self.k(@intCast(n)) });
         } else {
-            for (0..n) |_| {
-                const slot = try f.alloca("{ i64, i64 }");
-                try self.var_slots.append(self.a(), slot);
-            }
+            for (0..n) |_| try self.var_slots.append(self.a(), try f.alloca(t.val));
             // (unset until assigned; the entry block runs once)
-            for (self.var_slots.items) |slot| {
-                try f.entry.print(self.a(), "  store i64 {d}, ptr {s}, align 8\n", .{ helpers.UNSET, slot });
-            }
+            for (self.var_slots.items) |slot| f.entryStore(self.k(@bitCast(helpers.UNSET)), slot);
         }
         if (self.fnode != NONE) {
             // (None until a Return says otherwise)
-            try f.emit("store {{ i64, i64 }} {{ i64 0, i64 0 }}, ptr %result, align 8", .{});
+            try self.storeSlot(self.result, .{ .tag = self.k(0), .bits = self.k(0), .shape = .none });
         }
     }
 
@@ -531,27 +601,24 @@ const Gen = struct {
         try f.br(self.ret_label);
         try f.block(self.ret_label);
         try self.releaseFrame();
-        try f.ret("i1 true", .{});
+        try f.ret(self.c.m.k1(true));
         try f.block(self.err_label);
         try self.releaseFrame();
-        try f.ret("i1 false", .{});
+        try f.ret(self.c.m.k1(false));
     }
 
     /// Drop the function's variables (its heap frame, or its stack slots'
     /// values).
     fn releaseFrame(self: *Gen) Error!void {
-        const f = &self.f;
         if (self.fnode == NONE) return;
         if (self.frame) |fr| {
-            try f.emit("call void @zr_frame_release(ptr {s})", .{fr});
+            _ = self.call("zr_frame_release", &.{fr});
             return;
         }
         for (self.var_slots.items) |slot| {
-            const tag = try f.value("load i64, ptr {s}, align 8", .{slot});
-            const bp = try f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i32 0, i32 1", .{slot});
-            const bits = try f.value("load i64, ptr {s}, align 8", .{bp});
-            // (an unset slot holds no reference: zr_decref ignores its tag)
-            try f.emit("call void @{s}(i64 {s}, i64 {s})", .{ self.decName(), tag, bits });
+            const v = try self.loadSlot(slot, .any);
+            // (an unset slot holds no reference: decrefs ignore its tag)
+            _ = self.call(self.decName(), &.{ v.tag, v.bits });
         }
     }
 
@@ -560,7 +627,7 @@ const Gen = struct {
     // ------------------------------------------------------------------
 
     /// After a helper that can fail: on false, to the error exit.
-    fn check(self: *Gen, ok: []const u8) Error!void {
+    fn check(self: *Gen, ok: ir.Value) Error!void {
         const cont = try self.f.label("ok");
         try self.f.condBr(ok, cont, self.err_label);
         try self.f.block(cont);
@@ -569,7 +636,7 @@ const Gen = struct {
     /// A runtime error at a node with a fixed message: to the error exit.
     fn failAt(self: *Gen, node: u32, message: []const u8) Error!void {
         const s = try self.c.m.string(message);
-        _ = try self.f.value("call i1 @zr_fail(ptr %ctx, i32 {d}, ptr {s})", .{ node, s });
+        _ = self.call("zr_fail", &.{ self.ctx, self.k32(node), s });
         try self.f.br(self.err_label);
         // (the code after it is unreachable: a fresh block keeps it valid)
         try self.f.block(try self.f.label("dead"));
@@ -579,27 +646,33 @@ const Gen = struct {
     // Values: making them dynamic, dropping them
     // ------------------------------------------------------------------
 
-    fn dyn(tag: []const u8, bits: []const u8, shape: Shape) SVal {
+    fn dyn(tag: ir.Value, bits: ir.Value, shape: Shape) SVal {
         return .{ .dyn = .{ .tag = tag, .bits = bits, .shape = shape } };
+    }
+
+    /// A value of a tag and constant bits.
+    fn konst(self: *Gen, tag: i64, bits: i64, shape: Shape) Dyn {
+        return .{ .tag = self.k(tag), .bits = self.k(bits), .shape = shape };
+    }
+
+    /// None at run time.
+    fn noneDyn(self: *Gen) Dyn {
+        return self.konst(0, 0, .none);
     }
 
     /// A value's run-time form (an owned reference).
     fn materialize(self: *Gen, v: SVal, at: u32) Error!Dyn {
-        const f = &self.f;
         return switch (v) {
             .dyn => |d| d,
-            .none => .{ .tag = "0", .bits = "0", .shape = .none },
-            .bool => |b| .{ .tag = "1", .bits = if (b) "1" else "0", .shape = .bool },
-            .int => |n| .{ .tag = "2", .bits = try std.fmt.allocPrint(self.a(), "{d}", .{n}), .shape = .int },
-            .float => |x| .{ .tag = "3", .bits = try std.fmt.allocPrint(self.a(), "{d}", .{@as(i64, @bitCast(x))}), .shape = .float },
-            .str => |s| blk: {
-                const g = try self.c.m.string(s);
-                break :blk .{ .tag = "4", .bits = try f.value("ptrtoint ptr {s} to i64", .{g}), .shape = .str };
-            },
-            .node => |n| .{ .tag = "11", .bits = try std.fmt.allocPrint(self.a(), "{d}", .{n}), .shape = .node },
+            .none => self.noneDyn(),
+            .bool => |b| self.konst(1, @intFromBool(b), .bool),
+            .int => |n| self.konst(2, n, .int),
+            .float => |x| self.konst(3, @bitCast(x), .float),
+            .str => |s| .{ .tag = self.k(4), .bits = self.f.ptrToInt(try self.c.m.string(s)), .shape = .str },
+            .node => |n| self.konst(11, n, .node),
             .py => |o| blk: {
                 const idx = try self.c.objectIndex(o);
-                try f.emit("call void @zr_object(ptr %ctx, i64 {d}, ptr {s})", .{ idx, self.out });
+                _ = self.call("zr_object", &.{ self.ctx, self.k(@intCast(idx)), self.out });
                 break :blk try self.loadOut(.any);
             },
             .list => |l| self.buildSequence("zr_list", l.items.items, at, .list),
@@ -610,13 +683,11 @@ const Gen = struct {
     }
 
     /// A stack array of values (each materialized: owned references).
-    fn valueArray(self: *Gen, items: []const SVal, at: u32) Error![]const u8 {
-        const f = &self.f;
-        const arr = try f.alloca(try std.fmt.allocPrint(self.a(), "[{d} x {{ i64, i64 }}]", .{@max(items.len, 1)}));
+    fn valueArray(self: *Gen, items: []const SVal, at: u32) Error!ir.Value {
+        const arr = try self.valueSlots(items.len);
         for (items, 0..) |item, i| {
             const d = try self.materialize(item, at);
-            const p = try f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i64 {d}", .{ arr, i });
-            try self.storeSlot(p, d);
+            try self.storeSlot(self.elem(arr, i), d);
         }
         return arr;
     }
@@ -624,15 +695,14 @@ const Gen = struct {
     /// A run-time list or tuple of known items (they're taken).
     fn buildSequence(self: *Gen, helper: []const u8, items: []const SVal, at: u32, shape: Shape) Error!Dyn {
         const arr = try self.valueArray(items, at);
-        const ok = try self.f.value("call i1 @{s}(ptr %ctx, i32 {d}, ptr {s}, i64 {d}, ptr {s})", .{ helper, at, arr, items.len, self.out });
-        try self.check(ok);
+        try self.callCheck(helper, &.{ self.ctx, self.k32(at), arr, self.k(@intCast(items.len)), self.out });
         return self.loadOut(shape);
     }
 
     fn buildDict(self: *Gen, d: *SDict, at: u32) Error!Dyn {
         const keys = try self.valueArray(d.keys.items, at);
         const vals = try self.valueArray(d.values.items, at);
-        const ok = try self.f.value("call i1 @zr_dict(ptr %ctx, i32 {d}, ptr {s}, ptr {s}, i64 {d}, ptr {s})", .{ at, keys, vals, d.keys.items.len, self.out });
+        const ok = self.call("zr_dict", &.{ self.ctx, self.k32(at), keys, vals, self.k(@intCast(d.keys.items.len)), self.out });
         // (zr_dict borrowed them)
         try self.dropArray(keys, d.keys.items.len);
         try self.dropArray(vals, d.values.items.len);
@@ -640,48 +710,45 @@ const Gen = struct {
         return self.loadOut(.dict);
     }
 
-    fn dropArray(self: *Gen, arr: []const u8, n: usize) Error!void {
+    fn dropArray(self: *Gen, arr: ir.Value, n: usize) Error!void {
         for (0..n) |i| {
-            const p = try self.f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i64 {d}", .{ arr, i });
-            const v = try self.loadSlot(p, .any);
-            try self.f.emit("call void @{s}(i64 {s}, i64 {s})", .{ self.decName(), v.tag, v.bits });
+            const v = try self.loadSlot(self.elem(arr, i), .any);
+            _ = self.call(self.decName(), &.{ v.tag, v.bits });
         }
     }
 
     /// The helpers' result slot, read (an owned reference).
     fn loadOut(self: *Gen, shape: Shape) Error!Dyn {
-        const f = &self.f;
-        const tag = try f.value("load i64, ptr {s}, align 8", .{self.out});
-        const bp = try f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i32 0, i32 1", .{self.out});
-        const bits = try f.value("load i64, ptr {s}, align 8", .{bp});
-        return .{ .tag = tag, .bits = bits, .shape = shape };
+        return self.loadSlot(self.out, shape);
     }
 
     /// Give up a dynamic value (decref it).
     fn drop(self: *Gen, v: SVal) Error!void {
         switch (v) {
-            .dyn => |d| if (d.heapish()) try self.f.emit("call void @{s}(i64 {s}, i64 {s})", .{ self.decName(), d.tag, d.bits }),
+            .dyn => |d| if (d.heapish()) {
+                _ = self.call(self.decName(), &.{ d.tag, d.bits });
+            },
             else => {},
         }
     }
 
     fn increfDyn(self: *Gen, d: Dyn) Error!void {
-        if (d.heapish()) try self.f.emit("call void @{s}(i64 {s}, i64 {s})", .{ self.incName(), d.tag, d.bits });
+        if (d.heapish()) _ = self.call(self.incName(), &.{ d.tag, d.bits });
     }
 
     /// A slot ({i64, i64}) of the stack: its pointer.
-    fn storeSlot(self: *Gen, slot: []const u8, d: Dyn) Error!void {
+    fn storeSlot(self: *Gen, slot: ir.Value, d: Dyn) Error!void {
         const f = &self.f;
-        try f.emit("store i64 {s}, ptr {s}, align 8", .{ d.tag, slot });
-        const bp = try f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i32 0, i32 1", .{slot});
-        try f.emit("store i64 {s}, ptr {s}, align 8", .{ d.bits, bp });
+        const t = self.c.m.t;
+        f.store(d.tag, slot);
+        f.store(d.bits, f.field(t.val, slot, 1));
     }
 
-    fn loadSlot(self: *Gen, slot: []const u8, shape: Shape) Error!Dyn {
+    fn loadSlot(self: *Gen, slot: ir.Value, shape: Shape) Error!Dyn {
         const f = &self.f;
-        const tag = try f.value("load i64, ptr {s}, align 8", .{slot});
-        const bp = try f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i32 0, i32 1", .{slot});
-        const bits = try f.value("load i64, ptr {s}, align 8", .{bp});
+        const t = self.c.m.t;
+        const tag = f.load(t.i64, slot);
+        const bits = f.load(t.i64, f.field(t.val, slot, 1));
         return .{ .tag = tag, .bits = bits, .shape = shape };
     }
 
@@ -689,7 +756,7 @@ const Gen = struct {
     // Truth
     // ------------------------------------------------------------------
 
-    const Truth = union(enum) { known: bool, dyn: []const u8 };
+    const Truth = union(enum) { known: bool, dyn: ir.Value };
 
     fn truth(self: *Gen, v: SVal, at: u32) Error!Truth {
         switch (v) {
@@ -709,14 +776,12 @@ const Gen = struct {
             },
             .dyn => |d| {
                 const f = &self.f;
+                const m = &self.c.m;
                 const t = switch (d.shape) {
-                    .bool, .int => try f.value("icmp ne i64 {s}, 0", .{d.bits}),
-                    .none => "false",
-                    .float => blk: {
-                        const x = try f.value("bitcast i64 {s} to double", .{d.bits});
-                        break :blk try f.value("fcmp une double {s}, 0.0", .{x});
-                    },
-                    else => try f.value("call i1 @zr_truthy(i64 {s}, i64 {s})", .{ d.tag, d.bits }),
+                    .bool, .int => f.icmp(jit_c.LLVMIntNE, d.bits, self.k(0)),
+                    .none => m.k1(false),
+                    .float => f.fcmp(jit_c.LLVMRealUNE, f.bitcast(d.bits, m.t.f64), L("LLVMConstNull")(m.t.f64)),
+                    else => self.call("zr_truthy", &.{ d.tag, d.bits }),
                 };
                 try self.drop(v);
                 _ = at;
@@ -731,24 +796,33 @@ const Gen = struct {
 
     /// The slot pointer of a symbol's variable, from this function: its
     /// own, or one of the functions around it through the frames.
-    fn varSlot(self: *Gen, sym: u32) Error![]const u8 {
+    fn varSlot(self: *Gen, sym: u32) Error!ir.Value {
         const c = self.c;
         const f = &self.f;
         const home = c.data.homeOf(sym);
         const slot = c.slot_of.get(sym).?;
         if (home == self.fnode) {
-            if (self.frame) |fr| return f.value("getelementptr inbounds i8, ptr {s}, i64 {d}", .{ fr, 32 + 16 * slot });
+            if (self.frame) |fr| return f.offset(fr, 32 + 16 * @as(i64, slot));
             return self.var_slots.items[slot];
         }
         // Out through the frames: env is the frame of the function around
-        var frame: []const u8 = if (self.fnode == NONE) "%globals" else "%env";
+        const frame = try self.outerFrame(home, "a variable of another function isn't reachable from here");
+        return f.offset(frame, 32 + 16 * @as(i64, slot));
+    }
+
+    /// The frame of an enclosing function (`home`), through the frames'
+    /// parents.
+    fn outerFrame(self: *Gen, home: u32, comptime unreachable_msg: []const u8) Error!ir.Value {
+        const c = self.c;
+        const f = &self.f;
+        var frame: ir.Value = if (self.fnode == NONE) self.globals else self.env;
         var at = c.enclosingFunction(self.fnode);
         while (at != home) {
-            if (at == NONE) return c.unsupported("a variable of another function isn't reachable from here (node {d})", .{sym});
-            frame = try f.value("load ptr, ptr {s}, align 8", .{try f.value("getelementptr inbounds i8, ptr {s}, i64 16", .{frame})});
+            if (at == NONE) return c.unsupported(unreachable_msg ++ " (node {d})", .{home});
+            frame = f.load(c.m.t.ptr, f.offset(frame, 16));
             at = c.enclosingFunction(at);
         }
-        return f.value("getelementptr inbounds i8, ptr {s}, i64 {d}", .{ frame, 32 + 16 * slot });
+        return frame;
     }
 
     /// rt.load(name): the variable (an owned reference); a builtin's host
@@ -771,13 +845,13 @@ const Gen = struct {
         const slot = try self.varSlot(si);
         const v = try self.loadSlot(slot, .any);
         // Unset: an error at the name
-        const is_unset = try f.value("icmp eq i64 {s}, {d}", .{ v.tag, helpers.UNSET });
+        const is_unset = f.icmp(jit_c.LLVMIntEQ, v.tag, self.k(@bitCast(helpers.UNSET)));
         const bad = try f.label("unset");
         const good = try f.label("set");
         try f.condBr(is_unset, bad, good);
         try f.block(bad);
         const name = try c.m.string(sym.name);
-        _ = try f.value("call i1 @zr_unset(ptr %ctx, i32 {d}, ptr {s})", .{ name_node, name });
+        _ = self.call("zr_unset", &.{ self.ctx, self.k32(name_node), name });
         try f.br(self.err_label);
         try f.block(good);
         try self.increfDyn(v);
@@ -800,7 +874,7 @@ const Gen = struct {
         const slot = try self.varSlot(si);
         const old = try self.loadSlot(slot, .any);
         try self.storeSlot(slot, v);
-        try self.f.emit("call void @{s}(i64 {s}, i64 {s})", .{ self.decName(), old.tag, old.bits });
+        _ = self.call(self.decName(), &.{ old.tag, old.bits });
     }
 
     fn notAVariable(self: *Gen, idx: u32) Error!SVal {
@@ -818,18 +892,11 @@ const Gen = struct {
 
     /// The frame a function made from `fnode` sees: the frame of the
     /// function around it (here, or through the frames).
-    fn envFor(self: *Gen, fnode: u32) Error![]const u8 {
+    fn envFor(self: *Gen, fnode: u32) Error!ir.Value {
         const c = self.c;
         const outer = c.enclosingFunction(fnode);
         if (outer == self.fnode) return self.frame orelse c.unsupported("a function made in a function whose variables aren't in a frame (node {d})", .{fnode});
-        var frame: []const u8 = if (self.fnode == NONE) "%globals" else "%env";
-        var at = c.enclosingFunction(self.fnode);
-        while (at != outer) {
-            if (at == NONE) return c.unsupported("a function made outside the function around it (node {d})", .{fnode});
-            frame = try self.f.value("load ptr, ptr {s}, align 8", .{try self.f.value("getelementptr inbounds i8, ptr {s}, i64 16", .{frame})});
-            at = c.enclosingFunction(at);
-        }
-        return frame;
+        return self.outerFrame(outer, "a function made outside the function around it");
     }
 
     /// rt.function(node): a function value.
@@ -844,8 +911,7 @@ const Gen = struct {
         const name_text = if (spec.name != 0) if (program_mod.labelled(c.data, fnode, spec.name)) |nn| c.data.text(nn) else "<anonymous>" else "<anonymous>";
         const name = try c.m.string(name_text);
         const nparams = self.paramNodes(fnode, spec).len;
-        const ok = try self.f.value("call i1 @zr_function(ptr %ctx, ptr {s}, ptr {s}, i32 {d}, ptr {s}, i64 {d}, ptr {s})", .{ code, env, fnode, name, nparams, self.out });
-        try self.check(ok);
+        try self.callCheck("zr_function", &.{ self.ctx, code, env, self.k32(fnode), name, self.k(@intCast(nparams)), self.out });
         return .{ .dyn = try self.loadOut(.function) };
     }
 
@@ -876,10 +942,8 @@ const Gen = struct {
     }
 
     fn bindParams(self: *Gen, fnode: u32, spec: FunctionSpec) Error!void {
-        const f = &self.f;
         for (self.paramNodes(fnode, spec), 0..) |p, i| {
-            const ap = try f.value("getelementptr inbounds {{ i64, i64 }}, ptr %args, i64 {d}", .{i});
-            const v = try self.loadSlot(ap, .any);
+            const v = try self.loadSlot(self.elem(self.args, i), .any);
             try self.increfDyn(v);
             try self.storeVar(p, .{ .dyn = v });
         }
@@ -1113,7 +1177,7 @@ const Gen = struct {
             return;
         }
         const slot = inst.result_slot orelse blk: {
-            const s = try self.f.alloca("{ i64, i64 }");
+            const s = try self.valSlot();
             inst.result_slot = s;
             break :blk s;
         };
@@ -1137,23 +1201,28 @@ const Gen = struct {
 
     /// A slot holding None from the function's start (whichever path
     /// reaches a release of it, it holds a value).
-    fn noneSlot(self: *Gen) Error![]const u8 {
-        const slot = try self.f.alloca("{ i64, i64 }");
-        try self.f.entry.print(self.a(), "  store {{ i64, i64 }} {{ i64 0, i64 0 }}, ptr {s}, align 8\n", .{slot});
+    fn noneSlot(self: *Gen) Error!ir.Value {
+        const slot = try self.valSlot();
+        self.f.entryStore(L("LLVMConstNull")(self.c.m.t.val), slot);
         return slot;
     }
 
+    /// A slot for a value (in the entry block).
+    fn valSlot(self: *Gen) Error!ir.Value {
+        return self.f.alloca(self.c.m.t.val);
+    }
+
     /// A temporary slot of a semantic (None until used).
-    fn tempSlot(self: *Gen, inst: *Inst) Error![]const u8 {
+    fn tempSlot(self: *Gen, inst: *Inst) Error!ir.Value {
         const slot = try self.noneSlot();
         try inst.temps.append(self.a(), slot);
         return slot;
     }
 
     /// Give up a temporary slot's value (None again).
-    fn dropTemp(self: *Gen, slot: []const u8) Error!void {
+    fn dropTemp(self: *Gen, slot: ir.Value) Error!void {
         try self.drop(.{ .dyn = try self.loadSlot(slot, .any) });
-        try self.storeSlot(slot, .{ .tag = "0", .bits = "0", .shape = .none });
+        try self.storeSlot(slot, self.noneDyn());
     }
 
     /// Release the locals of the semantics above `depth` (leaving them by a
@@ -1341,13 +1410,12 @@ const Gen = struct {
                 };
                 // At run time (and the errors, as Python words them)
                 const d = try self.materialize(v, inst.node);
-                const arr = try self.f.alloca(try std.fmt.allocPrint(self.a(), "[{d} x {{ i64, i64 }}]", .{@max(ts.len, 1)}));
-                const ok = try self.f.value("call i1 @zr_unpack(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, i64 {d}, ptr {s})", .{ inst.node, d.tag, d.bits, ts.len, arr });
+                const arr = try self.valueSlots(ts.len);
+                const ok = self.call("zr_unpack", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, self.k(@intCast(ts.len)), arr });
                 try self.drop(.{ .dyn = d });
                 try self.check(ok);
                 for (ts, 0..) |x, i| {
-                    const p = try self.f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i64 {d}", .{ arr, i });
-                    try self.assign(inst, x, .{ .dyn = try self.loadSlot(p, .any) }, pos);
+                    try self.assign(inst, x, .{ .dyn = try self.loadSlot(self.elem(arr, i), .any) }, pos);
                 }
             },
             .attr => |x| try self.setAttr(inst, try self.expr(inst, x.obj), x.name, v, pos),
@@ -1367,7 +1435,7 @@ const Gen = struct {
         }
         const vd = try self.materialize(v, inst.node);
         const s = try self.c.m.string(name);
-        const ok = try self.f.value("call i1 @zr_setattr(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, ptr {s}, i64 {s}, i64 {s})", .{ inst.node, obj.dyn.tag, obj.dyn.bits, s, vd.tag, vd.bits });
+        const ok = self.call("zr_setattr", &.{ self.ctx, self.k32(inst.node), obj.dyn.tag, obj.dyn.bits, s, vd.tag, vd.bits });
         try self.drop(.{ .dyn = vd });
         try self.drop(obj);
         try self.check(ok);
@@ -1398,7 +1466,7 @@ const Gen = struct {
         const od = try self.materialize(obj, inst.node);
         const kd = try self.materialize(key, inst.node);
         const vd = try self.materialize(v, inst.node);
-        const ok = try self.f.value("call i1 @zr_setitem(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, i64 {s}, i64 {s}, i64 {s}, i64 {s})", .{ inst.node, od.tag, od.bits, kd.tag, kd.bits, vd.tag, vd.bits });
+        const ok = self.call("zr_setitem", &.{ self.ctx, self.k32(inst.node), od.tag, od.bits, kd.tag, kd.bits, vd.tag, vd.bits });
         try self.drop(.{ .dyn = vd });
         try self.drop(.{ .dyn = kd });
         try self.drop(.{ .dyn = od });
@@ -1459,7 +1527,7 @@ const Gen = struct {
                 }
                 const d = try self.materialize(if (ctl.value) |x| x.* else .none, inst.node);
                 try self.releaseAbove(0);
-                try self.storeSlot("%result", d);
+                try self.storeSlot(self.result, d);
                 try self.f.br(self.ret_label);
             },
             .Break, .Continue => {
@@ -1517,9 +1585,9 @@ const Gen = struct {
     /// several in step (zip), or one with its indexes (enumerate)
     const RtIter = struct {
         kind: enum { plain, zip, enumerate },
-        slots: []const []const u8,
+        slots: []const ir.Value,
         /// The index slot (an i64)
-        index: []const u8 = "",
+        index: ir.Value = null,
     };
 
     /// The iteration of a loop's iterable; zip() and enumerate() of
@@ -1535,7 +1603,7 @@ const Gen = struct {
                     if (v != .list and v != .tuple) break false;
                 } else true;
                 if (all_known or args.len == 0) return self.iterationOf(inst, (try self.builtinCall(inst, callee.py, args, e.pos)).?);
-                const slots = try self.a().alloc([]const u8, args.len);
+                const slots = try self.a().alloc(ir.Value, args.len);
                 for (args, slots) |v, *slot| {
                     slot.* = try self.tempSlot(inst);
                     try self.storeSlot(slot.*, try self.itemsOf(inst, v));
@@ -1551,7 +1619,7 @@ const Gen = struct {
             .list => |l| return .{ .known = l.items.items },
             .tuple => |t| return .{ .known = t },
             else => {
-                const slots = try self.a().alloc([]const u8, 1);
+                const slots = try self.a().alloc(ir.Value, 1);
                 slots[0] = try self.tempSlot(inst);
                 try self.storeSlot(slots[0], try self.itemsOf(inst, v));
                 return .{ .runtime = .{ .kind = .plain, .slots = slots } };
@@ -1561,22 +1629,21 @@ const Gen = struct {
 
     /// Before the loop: its index, 0.
     fn iterStart(self: *Gen, it: *RtIter) Error!void {
-        it.index = try self.f.alloca("i64");
-        try self.f.emit("store i64 0, ptr {s}", .{it.index});
+        it.index = try self.f.alloca(self.c.m.t.i64);
+        self.f.store(self.k(0), it.index);
     }
 
     /// The loop's head: whether there's an item at the index (the lengths
     /// read each time: a list growing in the loop is gone over, as Python
     /// does).
-    fn iterHead(self: *Gen, it: RtIter) Error![]const u8 {
+    fn iterHead(self: *Gen, it: RtIter) Error!ir.Value {
         const f = &self.f;
-        const i = try f.value("load i64, ptr {s}", .{it.index});
-        var more: []const u8 = "true";
+        const i = f.load(self.c.m.t.i64, it.index);
+        var more = self.c.m.k1(true);
         for (it.slots) |slot| {
             const l = try self.loadSlot(slot, .list);
-            const n = try f.value("call i64 @zr_list_len(i64 {s}, i64 {s})", .{ l.tag, l.bits });
-            const c = try f.value("icmp slt i64 {s}, {s}", .{ i, n });
-            more = try f.value("and i1 {s}, {s}", .{ more, c });
+            const n = self.call("zr_list_len", &.{ l.tag, l.bits });
+            more = f.and_(more, f.icmp(jit_c.LLVMIntSLT, i, n));
         }
         return more;
     }
@@ -1584,18 +1651,18 @@ const Gen = struct {
     /// The item at the index, into the loop's target.
     fn iterItem(self: *Gen, inst: *Inst, it: RtIter, target: front.Target, pos: front.Pos) Error!void {
         const f = &self.f;
-        const i = try f.value("load i64, ptr {s}", .{it.index});
+        const i = f.load(self.c.m.t.i64, it.index);
         const parts = try self.a().alloc(Dyn, if (it.kind == .enumerate) 2 else it.slots.len);
-        var k: usize = 0;
+        var n: usize = 0;
         if (it.kind == .enumerate) {
-            parts[0] = .{ .tag = "2", .bits = i, .shape = .int };
-            k = 1;
+            parts[0] = .{ .tag = self.k(2), .bits = i, .shape = .int };
+            n = 1;
         }
         for (it.slots) |slot| {
             const l = try self.loadSlot(slot, .list);
-            try f.emit("call void @zr_list_at(i64 {s}, i64 {s}, i64 {s}, ptr {s})", .{ l.tag, l.bits, i, self.out });
-            parts[k] = try self.loadOut(.any);
-            k += 1;
+            _ = self.call("zr_list_at", &.{ l.tag, l.bits, i, self.out });
+            parts[n] = try self.loadOut(.any);
+            n += 1;
         }
         if (it.kind == .plain) return self.assign(inst, target, .{ .dyn = parts[0] }, pos);
         // (a, b) in zip(...): each straight into its name
@@ -1610,9 +1677,8 @@ const Gen = struct {
 
     fn iterStep(self: *Gen, it: RtIter) Error!void {
         const f = &self.f;
-        const i = try f.value("load i64, ptr {s}", .{it.index});
-        const next = try f.value("add i64 {s}, 1", .{i});
-        try f.emit("store i64 {s}, ptr {s}", .{ next, it.index });
+        const i = f.load(self.c.m.t.i64, it.index);
+        f.store(f.add(i, self.k(1)), it.index);
     }
 
     fn iterEnd(self: *Gen, it: RtIter) Error!void {
@@ -1681,7 +1747,7 @@ const Gen = struct {
                 const obj = try self.expr(inst, x.obj);
                 return self.attr(inst, obj, x.name, e.pos);
             },
-            .call => |x| return self.call(inst, x.func, x.args, x.keywords, e.pos),
+            .call => |x| return self.callExpr(inst, x.func, x.args, x.keywords, e.pos),
             .binary => |x| {
                 const l = try self.expr(inst, x.left);
                 const r = try self.expr(inst, x.right);
@@ -1736,13 +1802,13 @@ const Gen = struct {
                     if (!keys[i].isStatic() or !isScalar(keys[i])) dynamic = true;
                 }
                 if (!dynamic) {
-                    for (keys, vals) |k, v| try self.sdictSet(d, k, v);
+                    for (keys, vals) |key, v| try self.sdictSet(d, key, v);
                     return .{ .dict = d };
                 }
                 // Keys only known at run time: a run-time dict
                 const ka = try self.valueArray(keys, inst.node);
                 const va = try self.valueArray(vals, inst.node);
-                const ok = try self.f.value("call i1 @zr_dict(ptr %ctx, i32 {d}, ptr {s}, ptr {s}, i64 {d}, ptr {s})", .{ inst.node, ka, va, keys.len, self.out });
+                const ok = self.call("zr_dict", &.{ self.ctx, self.k32(inst.node), ka, va, self.k(@intCast(keys.len)), self.out });
                 try self.dropArray(ka, keys.len);
                 try self.dropArray(va, vals.len);
                 try self.check(ok);
@@ -1802,13 +1868,13 @@ const Gen = struct {
         }
     }
 
-    fn sdictSet(self: *Gen, d: *SDict, k: SVal, v: SVal) Error!void {
-        if (d.find(k)) |i| {
+    fn sdictSet(self: *Gen, d: *SDict, key: SVal, v: SVal) Error!void {
+        if (d.find(key)) |i| {
             try self.drop(d.values.items[i]);
             d.values.items[i] = v;
             return;
         }
-        try d.keys.append(self.a(), k);
+        try d.keys.append(self.a(), key);
         try d.values.append(self.a(), v);
     }
 
@@ -1841,9 +1907,9 @@ const Gen = struct {
                 .str => {
                     const o = try self.pyOf(obj);
                     defer py.Py_DecRef(o);
-                    const k = try self.pyOf(key);
-                    defer py.Py_DecRef(k);
-                    if (py.c.PyObject_GetItem(o, k)) |r| {
+                    const ko = try self.pyOf(key);
+                    defer py.Py_DecRef(ko);
+                    if (py.c.PyObject_GetItem(o, ko)) |r| {
                         defer py.Py_DecRef(r);
                         return self.constant(r, inst.node);
                     }
@@ -1854,7 +1920,7 @@ const Gen = struct {
         }
         const od = try self.materialize(obj, inst.node);
         const kd = try self.materialize(key, inst.node);
-        const ok = try self.f.value("call i1 @zr_getitem(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, i64 {s}, i64 {s}, ptr {s})", .{ inst.node, od.tag, od.bits, kd.tag, kd.bits, self.out });
+        const ok = self.call("zr_getitem", &.{ self.ctx, self.k32(inst.node), od.tag, od.bits, kd.tag, kd.bits, self.out });
         try self.drop(.{ .dyn = od });
         try self.drop(.{ .dyn = kd });
         try self.check(ok);
@@ -1864,7 +1930,6 @@ const Gen = struct {
     /// An f-string: known pieces joined now; else each piece formatted at
     /// run time (Python's format()) and joined.
     fn fstring(self: *Gen, inst: *Inst, parts: []const front.FPart, pos: front.Pos) Error!SVal {
-        const f = &self.f;
         const pieces = try self.a().alloc(SVal, parts.len);
         var all_known = true;
         for (parts, 0..) |p, i| switch (p) {
@@ -1895,7 +1960,7 @@ const Gen = struct {
                     all_known = false;
                     const d = try self.materialize(x, inst.node);
                     const spec_s = try self.c.m.string(if (spec == .str) spec.str else return self.c.unsupportedAt(inst.func, pos, "a format spec only known at run time isn't compiled yet", .{}));
-                    const ok = try f.value("call i1 @zr_format(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, i32 {d}, ptr {s}, ptr {s})", .{ inst.node, d.tag, d.bits, v.conversion, spec_s, self.out });
+                    const ok = self.call("zr_format", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, self.k32(v.conversion), spec_s, self.out });
                     try self.drop(.{ .dyn = d });
                     try self.check(ok);
                     pieces[i] = .{ .dyn = try self.loadOut(.str) };
@@ -1908,7 +1973,7 @@ const Gen = struct {
             return .{ .str = buf.items };
         }
         const arr = try self.valueArray(pieces, inst.node);
-        const ok = try f.value("call i1 @zr_concat(ptr %ctx, i32 {d}, ptr {s}, i64 {d}, ptr {s})", .{ inst.node, arr, pieces.len, self.out });
+        const ok = self.call("zr_concat", &.{ self.ctx, self.k32(inst.node), arr, self.k(@intCast(pieces.len)), self.out });
         try self.dropArray(arr, pieces.len);
         try self.check(ok);
         return .{ .dyn = try self.loadOut(.str) };
@@ -1920,7 +1985,7 @@ const Gen = struct {
         const empty = try self.a().create(SDict);
         empty.* = .{};
         const d = try self.buildDict(empty, inst.node);
-        const slot = try self.f.alloca("{ i64, i64 }");
+        const slot = try self.valSlot();
         try self.storeSlot(slot, d);
         var sink = Sink{ .kind = .dict_into, .list = undefined, .slot = slot, .key = key_e, .value = val_e };
         try self.compLoops(inst, gens, 0, pos, &sink);
@@ -2009,14 +2074,14 @@ const Gen = struct {
                     if (self.fnode == NONE) return .none;
                     // (the receiver of the function being run)
                     const f = &self.f;
-                    const has = try f.value("icmp ne ptr %recv, null", .{});
-                    const slot = try f.alloca("{ i64, i64 }");
-                    try self.storeSlot(slot, .{ .tag = "0", .bits = "0", .shape = .none });
+                    const has = f.icmp(jit_c.LLVMIntNE, self.recv, self.c.m.nullPtr());
+                    const slot = try self.valSlot();
+                    try self.storeSlot(slot, self.noneDyn());
                     const yes = try f.label("recv");
                     const join = try f.label("recv_end");
                     try f.condBr(has, yes, join);
                     try f.block(yes);
-                    const v = try self.loadSlot("%recv", .any);
+                    const v = try self.loadSlot(self.recv, .any);
                     try self.increfDyn(v);
                     try self.storeSlot(slot, v);
                     try f.block(join);
@@ -2038,7 +2103,7 @@ const Gen = struct {
             .dyn => |d| {
                 // A field of a record (or an attribute of a Python object)
                 const s = try c.m.string(name);
-                const ok = try self.f.value("call i1 @zr_getattr(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, ptr {s}, ptr {s})", .{ inst.node, d.tag, d.bits, s, self.out });
+                const ok = self.call("zr_getattr", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, s, self.out });
                 try self.drop(obj);
                 try self.check(ok);
                 return .{ .dyn = try self.loadOut(.any) };
@@ -2092,7 +2157,7 @@ const Gen = struct {
         const d = try self.materialize(obj, inst.node);
         if (eq(u8, name, "append") and args.len == 1) {
             const x = try self.materialize(args[0], inst.node);
-            const ok = try self.f.value("call i1 @zr_append(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, i64 {s}, i64 {s})", .{ inst.node, d.tag, d.bits, x.tag, x.bits });
+            const ok = self.call("zr_append", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, x.tag, x.bits });
             try self.drop(.{ .dyn = x });
             try self.drop(.{ .dyn = d });
             try self.check(ok);
@@ -2101,7 +2166,7 @@ const Gen = struct {
         if (isMutating(name)) return c.unsupportedAt(inst.func, pos, "the method {s}() isn't compiled yet", .{name});
         const arr = try self.valueArray(args, inst.node);
         const s = try c.m.string(name);
-        const ok = try self.f.value("call i1 @zr_call_method(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, ptr {s}, ptr {s}, i64 {d}, ptr {s})", .{ inst.node, d.tag, d.bits, s, arr, args.len, self.out });
+        const ok = self.call("zr_call_method", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, s, arr, self.k(@intCast(args.len)), self.out });
         try self.dropArray(arr, args.len);
         try self.drop(.{ .dyn = d });
         try self.check(ok);
@@ -2136,7 +2201,8 @@ const Gen = struct {
     // Calls
     // ------------------------------------------------------------------
 
-    fn call(self: *Gen, inst: *Inst, func_e: *const front.Expr, args_e: []const *const front.Expr, kws: []const front.Keyword, pos: front.Pos) Error!SVal {
+    /// A call expression of a semantic.
+    fn callExpr(self: *Gen, inst: *Inst, func_e: *const front.Expr, args_e: []const *const front.Expr, kws: []const front.Keyword, pos: front.Pos) Error!SVal {
         const c = self.c;
         // obj.name(...): a method of a value, or an attribute of rt, a node,
         // a module
@@ -2265,8 +2331,9 @@ const Gen = struct {
     /// rt.loop(body): run the body; false if it broke out.
     fn rtLoop(self: *Gen, body: SVal) Error!SVal {
         const f = &self.f;
-        const flag = try f.alloca("i1");
-        try f.emit("store i1 true, ptr {s}", .{flag});
+        const m = &self.c.m;
+        const flag = try f.alloca(m.t.i1);
+        f.store(m.k1(true), flag);
         const brk = try f.label("loop_break");
         const cont = try f.label("loop_continue");
         const done = try f.label("loop_done");
@@ -2277,18 +2344,21 @@ const Gen = struct {
         _ = self.loops.pop();
         try f.br(done);
         try f.block(brk);
-        try f.emit("store i1 false, ptr {s}", .{flag});
+        f.store(m.k1(false), flag);
         try f.br(done);
         try f.block(cont);
         try f.br(done);
         try f.block(done);
-        const v = try f.value("load i1, ptr {s}", .{flag});
-        return dyn("1", try f.value("zext i1 {s} to i64", .{v}), .bool);
+        return self.boolDyn(f.load(m.t.i1, flag));
+    }
+
+    /// A run-time bool from an i1.
+    fn boolDyn(self: *Gen, b: ir.Value) SVal {
+        return dyn(self.k(1), self.f.zext64(b), .bool);
     }
 
     /// Call a run-time function value (or a host function) with arguments.
     fn dynCall(self: *Gen, inst: *Inst, fv: SVal, args_v: SVal, receiver: ?SVal) Error!SVal {
-        const f = &self.f;
         const items: []const SVal = switch (args_v) {
             .list => |l| l.items.items,
             .tuple => |t| t,
@@ -2297,22 +2367,21 @@ const Gen = struct {
         const fd = try self.materialize(fv, inst.node);
         // The arguments, in a stack array
         const n = items.len;
-        const arr = try f.alloca(try std.fmt.allocPrint(self.a(), "[{d} x {{ i64, i64 }}]", .{@max(n, 1)}));
+        const arr = try self.valueSlots(n);
         const ds = try self.a().alloc(Dyn, n);
         for (items, 0..) |item, i| {
             ds[i] = try self.materialize(item, inst.node);
-            const p = try f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i64 {d}", .{ arr, i });
-            try self.storeSlot(p, ds[i]);
+            try self.storeSlot(self.elem(arr, i), ds[i]);
         }
-        var recv_ptr: []const u8 = "null";
+        var recv_ptr = self.c.m.nullPtr();
         var recv_d: ?Dyn = null;
         if (receiver) |r| {
             recv_d = try self.materialize(r, inst.node);
-            const p = try f.alloca("{ i64, i64 }");
+            const p = try self.valSlot();
             try self.storeSlot(p, recv_d.?);
             recv_ptr = p;
         }
-        const ok = try f.value("call i1 @zr_call(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, ptr {s}, i64 {d}, ptr {s}, ptr {s})", .{ inst.node, fd.tag, fd.bits, arr, n, recv_ptr, self.out });
+        const ok = self.call("zr_call", &.{ self.ctx, self.k32(inst.node), fd.tag, fd.bits, arr, self.k(@intCast(n)), recv_ptr, self.out });
         // (the call borrowed them)
         for (ds) |d| try self.drop(.{ .dyn = d });
         if (recv_d) |r| try self.drop(.{ .dyn = r });
@@ -2336,7 +2405,7 @@ const Gen = struct {
             const rtype = try c.recordType(o);
             if (args.len != rtype.fields.len) return c.unsupportedAt(inst.func, pos, "{s}() takes {d} fields, given {d} (keywords and defaults aren't compiled yet)", .{ rtype.name, rtype.fields.len, args.len });
             const arr = try self.valueArray(args, inst.node);
-            const ok = try self.f.value("call i1 @zr_record(ptr %ctx, i32 {d}, ptr {s}, ptr {s}, ptr {s})", .{ inst.node, try self.ptrConst(rtype), arr, self.out });
+            const ok = self.call("zr_record", &.{ self.ctx, self.k32(inst.node), self.ptrConst(rtype), arr, self.out });
             try self.check(ok);
             return .{ .dyn = try self.loadOut(.record) };
         }
@@ -2347,15 +2416,15 @@ const Gen = struct {
     }
 
     /// A pointer known when compiling, as an IR constant.
-    fn ptrConst(self: *Gen, p: anytype) Error![]const u8 {
-        return std.fmt.allocPrint(self.a(), "inttoptr (i64 {d} to ptr)", .{@intFromPtr(p)});
+    fn ptrConst(self: *Gen, p: anytype) ir.Value {
+        return self.c.m.ptrConst(@intFromPtr(p));
     }
 
     /// Call a Python object at run time with the arguments.
     fn callPython(self: *Gen, inst: *Inst, o: *PyObject, args: []const SVal) Error!SVal {
         const idx = try self.c.objectIndex(o);
         const arr = try self.valueArray(args, inst.node);
-        const ok = try self.f.value("call i1 @zr_call_python(ptr %ctx, i32 {d}, i64 {d}, ptr {s}, i64 {d}, ptr {s})", .{ inst.node, idx, arr, args.len, self.out });
+        const ok = self.call("zr_call_python", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), arr, self.k(@intCast(args.len)), self.out });
         try self.dropArray(arr, args.len);
         try self.check(ok);
         return .{ .dyn = try self.loadOut(.any) };
@@ -2431,7 +2500,7 @@ const Gen = struct {
                 for (0..n) |i| {
                     const items = try self.a().alloc(SVal, if (is_zip) args.len else 2);
                     if (is_zip) {
-                        for (seqs[0..args.len], 0..) |s, k| items[k] = try self.copyOf(s[i]);
+                        for (seqs[0..args.len], 0..) |s, j| items[j] = try self.copyOf(s[i]);
                     } else {
                         items[0] = .{ .int = @intCast(i) };
                         items[1] = try self.copyOf(seqs[0][i]);
@@ -2495,9 +2564,9 @@ const Gen = struct {
         if (py.c.PyObject_HasAttrString(o, "__dataclass_fields__") == 1) {
             if (v.isStatic()) return .{ .bool = false };
             const rtype = try c.recordType(o);
-            const r = try self.f.value("call i1 @zr_is_record(i64 {s}, i64 {s}, ptr {s})", .{ v.dyn.tag, v.dyn.bits, try self.ptrConst(rtype) });
+            const r = self.call("zr_is_record", &.{ v.dyn.tag, v.dyn.bits, self.ptrConst(rtype) });
             try self.drop(v);
-            return dyn("1", try self.f.value("zext i1 {s} to i64", .{r}), .bool);
+            return self.boolDyn(r);
         }
         const codes = [_]struct { [*:0]const u8, u32 }{ .{ "int", 0 }, .{ "float", 1 }, .{ "str", 2 }, .{ "bool", 3 }, .{ "list", 4 }, .{ "tuple", 5 }, .{ "dict", 6 } };
         for (codes) |entry| if (isBuiltin(o, entry[0])) {
@@ -2511,9 +2580,9 @@ const Gen = struct {
                 6 => v == .dict,
                 else => false,
             } };
-            const r = try self.f.value("call i1 @zr_is_type(i64 {s}, i64 {s}, i32 {d})", .{ v.dyn.tag, v.dyn.bits, entry[1] });
+            const r = self.call("zr_is_type", &.{ v.dyn.tag, v.dyn.bits, self.k32(entry[1]) });
             try self.drop(v);
-            return dyn("1", try self.f.value("zext i1 {s} to i64", .{r}), .bool);
+            return self.boolDyn(r);
         };
         return c.unsupportedAt(inst.func, pos, "isinstance() with this type isn't compiled yet", .{});
     }
@@ -2524,18 +2593,17 @@ const Gen = struct {
             try self.drop(b);
             return a_;
         }
-        const x = try self.truth(a_, inst.node);
-        const y = try self.truth(b, inst.node);
-        const xa = switch (x) {
-            .known => |k| if (k) "true" else "false",
+        const x = self.truthValue(try self.truth(a_, inst.node));
+        const y = self.truthValue(try self.truth(b, inst.node));
+        return self.boolDyn(self.f.or_(x, y));
+    }
+
+    /// A truth as an i1.
+    fn truthValue(self: *Gen, t: Truth) ir.Value {
+        return switch (t) {
+            .known => |b| self.c.m.k1(b),
             .dyn => |d| d,
         };
-        const yb = switch (y) {
-            .known => |k| if (k) "true" else "false",
-            .dyn => |d| d,
-        };
-        const r = try self.f.value("or i1 {s}, {s}", .{ xa, yb });
-        return dyn("1", try self.f.value("zext i1 {s} to i64", .{r}), .bool);
     }
 
     /// zip() / enumerate() of run-time values: a list of tuples built by a
@@ -2548,52 +2616,42 @@ const Gen = struct {
         const lists = try self.a().alloc(Dyn, args.len);
         for (args, 0..) |x, i| lists[i] = try self.itemsOf(inst, x);
         // n = min of the lengths
-        var n: []const u8 = "-1";
+        var n = self.k(0);
         for (lists, 0..) |l, i| {
-            const len = try f.value("call i64 @zr_list_len(i64 {s}, i64 {s})", .{ l.tag, l.bits });
+            const len = self.call("zr_list_len", &.{ l.tag, l.bits });
             if (i == 0) n = len else {
-                const less = try f.value("icmp slt i64 {s}, {s}", .{ len, n });
-                n = try f.value("select i1 {s}, i64 {s}, i64 {s}", .{ less, len, n });
+                n = f.select(f.icmp(jit_c.LLVMIntSLT, len, n), len, n);
             }
         }
-        if (lists.len == 0) n = "0";
         // An empty list, then a tuple appended per index
         const empty = try self.buildSequence("zr_list", &.{}, inst.node, .list);
-        const result = try f.alloca("{ i64, i64 }");
+        const result = try self.valSlot();
         try self.storeSlot(result, empty);
-        const i_slot = try f.alloca("i64");
-        try f.emit("store i64 0, ptr {s}", .{i_slot});
+        const i_slot = try f.alloca(c.m.t.i64);
+        f.store(self.k(0), i_slot);
         const head = try f.label("zip");
         const body = try f.label("zip_body");
         const done = try f.label("zip_done");
         try f.br(head);
         try f.block(head);
-        const i = try f.value("load i64, ptr {s}", .{i_slot});
-        const more = try f.value("icmp slt i64 {s}, {s}", .{ i, n });
-        try f.condBr(more, body, done);
+        const i = f.load(c.m.t.i64, i_slot);
+        try f.condBr(f.icmp(jit_c.LLVMIntSLT, i, n), body, done);
         try f.block(body);
         const width = if (is_zip) lists.len else 2;
-        const arr = try f.alloca(try std.fmt.allocPrint(self.a(), "[{d} x {{ i64, i64 }}]", .{@max(width, 1)}));
+        const arr = try self.valueSlots(width);
         if (is_zip) {
-            for (lists, 0..) |l, k| {
-                const p = try f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i64 {d}", .{ arr, k });
-                try f.emit("call void @zr_list_at(i64 {s}, i64 {s}, i64 {s}, ptr {s})", .{ l.tag, l.bits, i, p });
-            }
+            for (lists, 0..) |l, j| _ = self.call("zr_list_at", &.{ l.tag, l.bits, i, self.elem(arr, j) });
         } else {
-            const p0 = try f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i64 0", .{arr});
-            try self.storeSlot(p0, .{ .tag = "2", .bits = i, .shape = .int });
-            const p1 = try f.value("getelementptr inbounds {{ i64, i64 }}, ptr {s}, i64 1", .{arr});
-            try f.emit("call void @zr_list_at(i64 {s}, i64 {s}, i64 {s}, ptr {s})", .{ lists[0].tag, lists[0].bits, i, p1 });
+            try self.storeSlot(self.elem(arr, 0), .{ .tag = self.k(2), .bits = i, .shape = .int });
+            _ = self.call("zr_list_at", &.{ lists[0].tag, lists[0].bits, i, self.elem(arr, 1) });
         }
-        const ok = try f.value("call i1 @zr_tuple(ptr %ctx, i32 {d}, ptr {s}, i64 {d}, ptr {s})", .{ inst.node, arr, width, self.out });
-        try self.check(ok);
+        try self.callCheck("zr_tuple", &.{ self.ctx, self.k32(inst.node), arr, self.k(@intCast(width)), self.out });
         const tup = try self.loadOut(.tuple);
         const acc = try self.loadSlot(result, .list);
-        const ok2 = try f.value("call i1 @zr_append(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, i64 {s}, i64 {s})", .{ inst.node, acc.tag, acc.bits, tup.tag, tup.bits });
+        const ok2 = self.call("zr_append", &.{ self.ctx, self.k32(inst.node), acc.tag, acc.bits, tup.tag, tup.bits });
         try self.drop(.{ .dyn = tup });
         try self.check(ok2);
-        const next = try f.value("add i64 {s}, 1", .{i});
-        try f.emit("store i64 {s}, ptr {s}", .{ next, i_slot });
+        f.store(f.add(i, self.k(1)), i_slot);
         try f.br(head);
         try f.block(done);
         for (lists) |l| try self.drop(.{ .dyn = l });
@@ -2604,7 +2662,7 @@ const Gen = struct {
     fn itemsOf(self: *Gen, inst: *Inst, v: SVal) Error!Dyn {
         const d = try self.materialize(v, inst.node);
         if (d.shape == .list) return d;
-        const ok = try self.f.value("call i1 @zr_items(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, ptr {s})", .{ inst.node, d.tag, d.bits, self.out });
+        const ok = self.call("zr_items", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, self.out });
         try self.drop(.{ .dyn = d });
         try self.check(ok);
         return self.loadOut(.list);
@@ -2638,7 +2696,7 @@ const Gen = struct {
         // Ints: inline, checked; for values that may be ints, behind a check
         // of their tags (anything else: the helper, off the fast path)
         if (canBeInt(ld) and canBeInt(rd) and (op == .add or op == .sub or op == .mul)) {
-            if (ld.shape == .int and rd.shape == .int) return dyn("2", try self.checkedInt(inst, op, ld.bits, rd.bits), .int);
+            if (ld.shape == .int and rd.shape == .int) return dyn(self.k(2), try self.checkedInt(inst, op, ld.bits, rd.bits), .int);
             const fast = try f.label("int");
             const slow = try f.label("generic");
             const join = try f.label("joined");
@@ -2652,8 +2710,9 @@ const Gen = struct {
             const slow_end = f.current;
             try f.br(join);
             try f.block(join);
-            const tag = try f.phi("i64", "2", fast_end, g.tag, slow_end);
-            const bits = try f.phi("i64", res, fast_end, g.bits, slow_end);
+            const i64t = self.c.m.t.i64;
+            const tag = f.phi(i64t, self.k(2), fast_end, g.tag, slow_end);
+            const bits = f.phi(i64t, res, fast_end, g.bits, slow_end);
             return dyn(tag, bits, .any);
         }
         return .{ .dyn = try self.binaryHelper(inst, op, ld, rd) };
@@ -2664,29 +2723,30 @@ const Gen = struct {
     }
 
     /// Both values are ints (an i1): their tags checked where not known.
-    fn intGuard(self: *Gen, ld: Dyn, rd: Dyn) Error![]const u8 {
+    fn intGuard(self: *Gen, ld: Dyn, rd: Dyn) Error!ir.Value {
         const f = &self.f;
-        const a_ = if (ld.shape == .int) "true" else try f.value("icmp eq i64 {s}, 2", .{ld.tag});
-        const b = if (rd.shape == .int) "true" else try f.value("icmp eq i64 {s}, 2", .{rd.tag});
-        return f.value("and i1 {s}, {s}", .{ a_, b });
+        const yes = self.c.m.k1(true);
+        const a_ = if (ld.shape == .int) yes else f.icmp(jit_c.LLVMIntEQ, ld.tag, self.k(2));
+        const b = if (rd.shape == .int) yes else f.icmp(jit_c.LLVMIntEQ, rd.tag, self.k(2));
+        return f.and_(a_, b);
     }
 
     /// a op b on i64s, an overflow an error at the node.
-    fn checkedInt(self: *Gen, inst: *Inst, op: front.BinOp, a_: []const u8, b: []const u8) Error![]const u8 {
+    fn checkedInt(self: *Gen, inst: *Inst, op: front.BinOp, a_: ir.Value, b: ir.Value) Error!ir.Value {
         const f = &self.f;
         const intrinsic = switch (op) {
-            .add => "sadd",
-            .sub => "ssub",
-            else => "smul",
+            .add => self.c.sadd,
+            .sub => self.c.ssub,
+            else => self.c.smul,
         };
-        const pair = try f.value("call {{ i64, i1 }} @llvm.{s}.with.overflow.i64(i64 {s}, i64 {s})", .{ intrinsic, a_, b });
-        const res = try f.value("extractvalue {{ i64, i1 }} {s}, 0", .{pair});
-        const ovf = try f.value("extractvalue {{ i64, i1 }} {s}, 1", .{pair});
+        const pair = f.call(intrinsic, &.{ a_, b });
+        const res = f.extract(pair, 0);
+        const ovf = f.extract(pair, 1);
         const bad = try f.label("overflow");
         const good = try f.label("no_overflow");
         try f.condBr(ovf, bad, good);
         try f.block(bad);
-        _ = try f.value("call i1 @zr_overflow(ptr %ctx, i32 {d})", .{inst.node});
+        _ = self.call("zr_overflow", &.{ self.ctx, self.k32(inst.node) });
         try f.br(self.err_label);
         try f.block(good);
         return res;
@@ -2694,8 +2754,7 @@ const Gen = struct {
 
     /// a op b by the runtime (both taken).
     fn binaryHelper(self: *Gen, inst: *Inst, op: front.BinOp, ld: Dyn, rd: Dyn) Error!Dyn {
-        const f = &self.f;
-        const ok = try f.value("call i1 @zr_binary(ptr %ctx, i32 {d}, i32 {d}, i64 {s}, i64 {s}, i64 {s}, i64 {s}, ptr {s})", .{ inst.node, @intFromEnum(op), ld.tag, ld.bits, rd.tag, rd.bits, self.out });
+        const ok = self.call("zr_binary", &.{ self.ctx, self.k32(inst.node), self.k32(@intFromEnum(op)), ld.tag, ld.bits, rd.tag, rd.bits, self.out });
         try self.drop(.{ .dyn = ld });
         try self.drop(.{ .dyn = rd });
         try self.check(ok);
@@ -2814,36 +2873,31 @@ const Gen = struct {
             const other = if (l == .none) r else l;
             if (other.isStatic()) return .{ .bool = (other == .none) == (op == .is) };
             const d = other.dyn;
-            const f = &self.f;
-            const t = try f.value("icmp {s} i64 {s}, 0", .{ if (op == .is) "eq" else "ne", d.tag });
+            const t = self.f.icmp(if (op == .is) jit_c.LLVMIntEQ else jit_c.LLVMIntNE, d.tag, self.k(0));
             try self.drop(other);
-            return dyn("1", try f.value("zext i1 {s} to i64", .{t}), .bool);
+            return self.boolDyn(t);
         }
         const f = &self.f;
         const ld = try self.materialize(l, inst.node);
         const rd = try self.materialize(r, inst.node);
-        const pred: ?[]const u8 = switch (op) {
-            .eq => "eq",
-            .ne => "ne",
-            .lt => "slt",
-            .le => "sle",
-            .gt => "sgt",
-            .ge => "sge",
+        const pred: ?jit_c.LLVMIntPredicate = switch (op) {
+            .eq => jit_c.LLVMIntEQ,
+            .ne => jit_c.LLVMIntNE,
+            .lt => jit_c.LLVMIntSLT,
+            .le => jit_c.LLVMIntSLE,
+            .gt => jit_c.LLVMIntSGT,
+            .ge => jit_c.LLVMIntSGE,
             else => null,
         };
         if (pred != null and canBeInt(ld) and canBeInt(rd)) {
-            if (ld.shape == .int and rd.shape == .int) {
-                const t = try f.value("icmp {s} i64 {s}, {s}", .{ pred.?, ld.bits, rd.bits });
-                return dyn("1", try f.value("zext i1 {s} to i64", .{t}), .bool);
-            }
+            if (ld.shape == .int and rd.shape == .int) return self.boolDyn(f.icmp(pred.?, ld.bits, rd.bits));
             // (ints: inline, behind a check of the tags)
             const fast = try f.label("int_cmp");
             const slow = try f.label("generic_cmp");
             const join = try f.label("cmp_joined");
             try f.condBr(try self.intGuard(ld, rd), fast, slow);
             try f.block(fast);
-            const t = try f.value("icmp {s} i64 {s}, {s}", .{ pred.?, ld.bits, rd.bits });
-            const res = try f.value("zext i1 {s} to i64", .{t});
+            const res = f.zext64(f.icmp(pred.?, ld.bits, rd.bits));
             const fast_end = f.current;
             try f.br(join);
             try f.block(slow);
@@ -2851,13 +2905,13 @@ const Gen = struct {
             const slow_end = f.current;
             try f.br(join);
             try f.block(join);
-            return dyn("1", try f.phi("i64", res, fast_end, g.bits, slow_end), .bool);
+            return dyn(self.k(1), f.phi(self.c.m.t.i64, res, fast_end, g.bits, slow_end), .bool);
         }
         return .{ .dyn = try self.compareHelper(inst, op, ld, rd) };
     }
 
     fn compareHelper(self: *Gen, inst: *Inst, op: front.CmpOp, ld: Dyn, rd: Dyn) Error!Dyn {
-        const ok = try self.f.value("call i1 @zr_compare(ptr %ctx, i32 {d}, i32 {d}, i64 {s}, i64 {s}, i64 {s}, i64 {s}, ptr {s})", .{ inst.node, @intFromEnum(op), ld.tag, ld.bits, rd.tag, rd.bits, self.out });
+        const ok = self.call("zr_compare", &.{ self.ctx, self.k32(inst.node), self.k32(@intFromEnum(op)), ld.tag, ld.bits, rd.tag, rd.bits, self.out });
         try self.drop(.{ .dyn = ld });
         try self.drop(.{ .dyn = rd });
         try self.check(ok);
@@ -2868,10 +2922,7 @@ const Gen = struct {
         if (op == .not_) {
             return switch (try self.truth(v, inst.node)) {
                 .known => |b| .{ .bool = !b },
-                .dyn => |t| blk: {
-                    const n = try self.f.value("xor i1 {s}, true", .{t});
-                    break :blk dyn("1", try self.f.value("zext i1 {s} to i64", .{n}), .bool);
-                },
+                .dyn => |t| self.boolDyn(self.f.xor(t, self.c.m.k1(true))),
             };
         }
         if (v.isStatic() and isScalar(v)) {
@@ -2888,9 +2939,8 @@ const Gen = struct {
             }
             py.c.PyErr_Clear();
         }
-        const f = &self.f;
         const d = try self.materialize(v, inst.node);
-        const ok = try f.value("call i1 @zr_unary(ptr %ctx, i32 {d}, i32 {d}, i64 {s}, i64 {s}, ptr {s})", .{ inst.node, @intFromEnum(op), d.tag, d.bits, self.out });
+        const ok = self.call("zr_unary", &.{ self.ctx, self.k32(inst.node), self.k32(@intFromEnum(op)), d.tag, d.bits, self.out });
         try self.drop(.{ .dyn = d });
         try self.check(ok);
         return .{ .dyn = try self.loadOut(if (d.shape == .int or d.shape == .float) d.shape else .any) };
@@ -2909,7 +2959,7 @@ const Gen = struct {
             }
             // At run time: the value, or the next one's
             const f = &self.f;
-            const slot = try f.alloca("{ i64, i64 }");
+            const slot = try self.valSlot();
             try self.storeSlot(slot, v.dyn);
             try self.increfDyn(v.dyn);
             const t = (try self.truth(v, inst.node)).dyn;
@@ -2935,24 +2985,15 @@ const Gen = struct {
             try self.drop(b);
             return a_;
         }
-        const x = (try self.truth(a_, inst.node));
-        const y = (try self.truth(b, inst.node));
-        const xa = switch (x) {
-            .known => |k| if (k) "true" else "false",
-            .dyn => |d| d,
-        };
-        const yb = switch (y) {
-            .known => |k| if (k) "true" else "false",
-            .dyn => |d| d,
-        };
-        const r = try self.f.value("and i1 {s}, {s}", .{ xa, yb });
-        return dyn("1", try self.f.value("zext i1 {s} to i64", .{r}), .bool);
+        const x = self.truthValue(try self.truth(a_, inst.node));
+        const y = self.truthValue(try self.truth(b, inst.node));
+        return self.boolDyn(self.f.and_(x, y));
     }
 
     /// `x if cond else y` with a run-time cond.
-    fn branchValue(self: *Gen, inst: *Inst, cond: []const u8, then_e: *const front.Expr, else_e: *const front.Expr) Error!SVal {
+    fn branchValue(self: *Gen, inst: *Inst, cond: ir.Value, then_e: *const front.Expr, else_e: *const front.Expr) Error!SVal {
         const f = &self.f;
-        const slot = try f.alloca("{ i64, i64 }");
+        const slot = try self.valSlot();
         const yes = try f.label("ifexp_then");
         const no = try f.label("ifexp_else");
         const join = try f.label("ifexp_end");
@@ -2987,7 +3028,7 @@ const Gen = struct {
         kind: enum { static_list, list_into, dict_into } = .static_list,
         list: *SList,
         /// The run-time list or dict (a stack slot)
-        slot: []const u8 = "",
+        slot: ir.Value = null,
         elt: ?*const front.Expr = null,
         key: ?*const front.Expr = null,
         value: ?*const front.Expr = null,
@@ -2998,7 +3039,7 @@ const Gen = struct {
         if (sink.kind != .static_list) return;
         const items = sink.list.items.items;
         const d = try self.buildSequence("zr_list", items, inst.node, .list);
-        const slot = try self.f.alloca("{ i64, i64 }");
+        const slot = try self.valSlot();
         try self.storeSlot(slot, d);
         sink.kind = .list_into;
         sink.slot = slot;
@@ -3065,22 +3106,21 @@ const Gen = struct {
     }
 
     fn compEmit(self: *Gen, inst: *Inst, sink: *Sink) Error!void {
-        const f = &self.f;
         switch (sink.kind) {
             .static_list => try sink.list.items.append(self.a(), try self.expr(inst, sink.elt.?)),
             .list_into => {
                 const x = try self.materialize(try self.expr(inst, sink.elt.?), inst.node);
                 const l = try self.loadSlot(sink.slot, .list);
-                const ok = try f.value("call i1 @zr_append(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, i64 {s}, i64 {s})", .{ inst.node, l.tag, l.bits, x.tag, x.bits });
+                const ok = self.call("zr_append", &.{ self.ctx, self.k32(inst.node), l.tag, l.bits, x.tag, x.bits });
                 try self.drop(.{ .dyn = x });
                 try self.check(ok);
             },
             .dict_into => {
-                const k = try self.materialize(try self.expr(inst, sink.key.?), inst.node);
+                const key = try self.materialize(try self.expr(inst, sink.key.?), inst.node);
                 const v = try self.materialize(try self.expr(inst, sink.value.?), inst.node);
                 const d = try self.loadSlot(sink.slot, .dict);
-                const ok = try f.value("call i1 @zr_setitem(ptr %ctx, i32 {d}, i64 {s}, i64 {s}, i64 {s}, i64 {s}, i64 {s}, i64 {s})", .{ inst.node, d.tag, d.bits, k.tag, k.bits, v.tag, v.bits });
-                try self.drop(.{ .dyn = k });
+                const ok = self.call("zr_setitem", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, key.tag, key.bits, v.tag, v.bits });
+                try self.drop(.{ .dyn = key });
                 try self.drop(.{ .dyn = v });
                 try self.check(ok);
             },
