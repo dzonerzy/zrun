@@ -68,6 +68,10 @@ pub const Expr = struct {
         gen_exp: Comp,
         dict_comp: struct { key: *Expr, value: *Expr, generators: []const Generator },
         fstring: []const FPart,
+        /// The function being run, called out of line with the arguments
+        /// it was given (made by the compiler: a helper whose first `if`
+        /// runs inline, the rest out of line)
+        outline,
     };
 };
 
@@ -1061,6 +1065,7 @@ const Dumper = struct {
                 try self.fparts(parts);
                 try self.print("\"", .{});
             },
+            .outline => try self.print("<out of line>", .{}),
         }
     }
 

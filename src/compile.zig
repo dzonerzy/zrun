@@ -852,6 +852,8 @@ pub const Compiler = struct {
     kinds: std.AutoHashMapUnmanaged(u32, ?Kind) = .empty,
     /// Symbols always set where they're read (Gen.alwaysSet), worked out
     always_set: std.AutoHashMapUnmanaged(u32, bool) = .empty,
+    /// Helpers' first `if` to run inline, the rest out of line (headOf)
+    heads: std.AutoHashMapUnmanaged(*const front.Function, ?[]const front.Stmt) = .empty,
     /// By semantic or helper read: the reads of its locals that move their
     /// value out (localMoves), worked out
     local_moves: std.AutoHashMapUnmanaged(*const front.Function, *std.AutoHashMapUnmanaged(*const front.Expr, void)) = .empty,
@@ -3288,7 +3290,12 @@ const Gen = struct {
             return self.outOfLine(func, at, args);
         // (out of line needs the variables in frames: without them, big
         // helpers stay inline; one small with what's known here, inline)
-        if (func.size > inline_size and self.c.allHeap() and try self.foldedSize(func, args) > folded_inline_size) {            if (try self.foldCall(func, args)) |v| return v;
+        if (func.size > inline_size and self.c.allHeap() and try self.foldedSize(func, args) > folded_inline_size) {
+            if (try self.foldCall(func, args)) |v| return v;
+            // (its first `if` small with what's known: that inline, the
+            // rest out of line)
+            if (try self.headOf(func)) |head| if (try self.foldedSizeOf(func, head, args) <= folded_inline_size)
+                return self.runBody(func, head, at, args);
             return self.outOfLine(func, at, args);
         }
         return self.runFunction(func, at, args);
@@ -3310,8 +3317,81 @@ const Gen = struct {
         return false;
     }
 
+    /// A helper's first `if` whose body ends in a return (its common case,
+    /// in the style `if is_number(a): return ...`, the rest the uncommon
+    /// ones): `if test: body else: return <the helper out of line>`, to run
+    /// inline. Null: it hasn't one, or its test may change something (it's
+    /// run again out of line).
+    fn headOf(self: *Gen, func: *const front.Function) Error!?[]const front.Stmt {
+        const c = self.c;
+        if (c.heads.get(func)) |h| return h;
+        const result: ?[]const front.Stmt = blk: {
+            if (func.body.len < 2 or func.body[0].kind != .if_) break :blk null;
+            const first = func.body[0];
+            const x = first.kind.if_;
+            if (x.else_.len != 0 or x.body.len == 0) break :blk null;
+            switch (x.body[x.body.len - 1].kind) {
+                .return_, .raise_ => {},
+                else => break :blk null,
+            }
+            const globals = ph.attr(func.py_function, "__globals__") orelse return error.Python;
+            defer py.Py_DecRef(globals);
+            if (!try pureExpr(x.test_, globals)) break :blk null;
+            const rest = try c.a.create(front.Expr);
+            rest.* = .{ .pos = first.pos, .kind = .outline };
+            const else_ = try c.a.alloc(front.Stmt, 1);
+            else_[0] = .{ .pos = first.pos, .kind = .{ .return_ = rest } };
+            const head = try c.a.alloc(front.Stmt, 1);
+            head[0] = .{ .pos = first.pos, .kind = .{ .if_ = .{ .test_ = x.test_, .body = x.body, .else_ = else_ } } };
+            break :blk head;
+        };
+        try c.heads.put(c.a, func, result);
+        return result;
+    }
+
+    /// Whether an expression changes nothing (run again, it gives the same):
+    /// reads, comparisons, isinstance() and the like, calls of the
+    /// semantics' module's pure functions (pureFunction).
+    fn pureExpr(e: *const front.Expr, globals: *PyObject) Error!bool {
+        switch (e.kind) {
+            .int, .big, .float, .str, .bool, .none, .local, .global => return true,
+            .attr => |x| return pureExpr(x.obj, globals),
+            .index => |x| return try pureExpr(x.obj, globals) and try pureExpr(x.index, globals),
+            .binary => |x| return try pureExpr(x.left, globals) and try pureExpr(x.right, globals),
+            .unary => |x| return pureExpr(x.operand, globals),
+            .compare => |x| {
+                if (!try pureExpr(x.first, globals)) return false;
+                for (x.rest) |y| if (!try pureExpr(y, globals)) return false;
+                return true;
+            },
+            .and_, .or_, .list, .tuple => |xs| {
+                for (xs) |y| if (!try pureExpr(y, globals)) return false;
+                return true;
+            },
+            .call => |x| {
+                if (x.keywords.len != 0 or x.func.kind != .global) return false;
+                for (x.args) |y| if (!try pureExpr(y, globals)) return false;
+                const name = x.func.kind.global;
+                const key = ph.newString(name) orelse return error.Python;
+                defer py.Py_DecRef(key);
+                if (py.c.PyDict_GetItem(globals, key)) |o| {
+                    const pt = try pyTypes();
+                    return try isInstanceOf(o, pt.function) and try pureFunction(o);
+                }
+                const builtins_ok = [_][]const u8{ "isinstance", "type", "len", "callable" };
+                for (builtins_ok) |b| if (std.mem.eql(u8, b, name)) return true;
+                return false;
+            },
+            else => return false,
+        }
+    }
+
     /// A helper's size run inline with these arguments (FoldedSize).
     fn foldedSize(self: *Gen, func: *const front.Function, args: []const SVal) Error!usize {
+        return self.foldedSizeOf(func, func.body, args);
+    }
+
+    fn foldedSizeOf(self: *Gen, func: *const front.Function, body: []const front.Stmt, args: []const SVal) Error!usize {
         const globals = ph.attr(func.py_function, "__globals__") orelse return error.Python;
         defer py.Py_DecRef(globals);
         const known = try self.a().alloc(FoldedSize.Known, func.locals.len);
@@ -3327,7 +3407,7 @@ const Gen = struct {
             .py => |o| .{ .obj = o },
             else => .unknown,
         };
-        _ = try fs.stmts(func.body);
+        _ = try fs.stmts(body);
         return fs.n;
     }
 
@@ -3588,6 +3668,11 @@ const Gen = struct {
 
     /// Run a front function inline with arguments.
     fn runFunction(self: *Gen, func: *const front.Function, at: u32, args: []const SVal) Error!SVal {
+        return self.runBody(func, func.body, at, args);
+    }
+
+    /// Run statements of a front function (its body, or headOf's) inline.
+    fn runBody(self: *Gen, func: *const front.Function, body: []const front.Stmt, at: u32, args: []const SVal) Error!SVal {
         if (self.insts.items.len > 200) return self.c.unsupported("semantics nest more than 200 deep (recursive helpers aren't compiled yet)", .{});
         const locals = try self.a().alloc(Local, func.locals.len);
         @memset(locals, .unset);
@@ -3598,7 +3683,7 @@ const Gen = struct {
         try self.insts.append(self.a(), inst);
         defer _ = self.insts.pop();
 
-        try self.stmts(inst, func.body);
+        try self.stmts(inst, body);
         // Falling off the end: None
         if (!inst.done) try self.setResult(inst, .none);
         // The exit: where returns from run-time control flow meet (each
@@ -4481,6 +4566,13 @@ const Gen = struct {
             .str => |s| return .{ .str = s },
             .bool => |b| return .{ .bool = b },
             .none => return .none,
+            // (the helper being run, out of line, with its arguments: its
+            // parameters' values, unchanged by its first `if`'s test)
+            .outline => {
+                const args = try self.a().alloc(SVal, inst.func.param_count);
+                for (args, 0..) |*x, i| x.* = try self.readLocal(inst, @intCast(i), e.pos);
+                return self.outOfLine(inst.func, inst.node, args);
+            },
             .local => |slot| {
                 // (its last read: its value moved out, the local done with)
                 if (inst.locals[slot] == .static and inst.dyn_depth == 0 and try self.c.isMove(inst.func, e)) {
@@ -7321,7 +7413,7 @@ const FoldedSize = struct {
     fn countExpr(e: *const front.Expr) usize {
         var n: usize = 1;
         switch (e.kind) {
-            .int, .big, .float, .str, .bool, .none, .global, .local => {},
+            .int, .big, .float, .str, .bool, .none, .global, .local, .outline => {},
             .attr => |x| n += countExpr(x.obj),
             .index => |x| n += countExpr(x.obj) + countExpr(x.index),
             .slice => |x| {
@@ -7466,7 +7558,8 @@ fn targetLocalReads(t: front.Target, out: *std.ArrayListUnmanaged(LocalRead), a:
 fn localReads(e: *const front.Expr, plain: bool, out: *std.ArrayListUnmanaged(LocalRead), a: Allocator) Allocator.Error!void {
     switch (e.kind) {
         .local => |slot| try out.append(a, .{ .slot = slot, .e = e, .plain = plain }),
-        .int, .big, .float, .str, .bool, .none, .global => {},
+        // (.outline: only in the compiler's own statements, never read here)
+        .int, .big, .float, .str, .bool, .none, .global, .outline => {},
         .attr => |x| try localReads(x.obj, plain, out, a),
         .index => |x| {
             try localReads(x.obj, plain, out, a);
@@ -7546,7 +7639,8 @@ fn targetReads(t: front.Target, set: *std.AutoHashMapUnmanaged(u32, void), a: Al
 fn exprReads(e: *const front.Expr, set: *std.AutoHashMapUnmanaged(u32, void), a: Allocator) Allocator.Error!void {
     switch (e.kind) {
         .local => |slot| try set.put(a, slot, {}),
-        .int, .big, .float, .str, .bool, .none, .global => {},
+        // (.outline reads the parameters, which its `if` doesn't assign)
+        .int, .big, .float, .str, .bool, .none, .global, .outline => {},
         .attr => |x| try exprReads(x.obj, set, a),
         .index => |x| {
             try exprReads(x.obj, set, a);

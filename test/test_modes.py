@@ -280,6 +280,56 @@ def test_wrapping_arithmetic(name, capsys):
         assert err is None and out
 
 
+def combine(a, b):
+    """A helper too big to run inline whose first `if` is its common case
+    (ints): that runs inline, the rest out of line."""
+    if isinstance(a, int) and isinstance(b, int):
+        return a + b
+    if isinstance(a, str) and isinstance(b, str):
+        joined = a + b
+        if len(joined) > 10:
+            return joined[:5] + "..." + joined[-5:]
+        return joined
+    if isinstance(a, str):
+        return a + str(b) + "/" + str(len(a)) + "/" + str(b) + "/" + str(len(str(b)))
+    if isinstance(b, str):
+        return str(a) + b + "/" + str(len(b)) + "/" + str(a) + "/" + str(len(str(a)))
+    return [a, b, a, b, a, b, a, b, a, b, a, b, a, b, a, b, a, b]
+
+
+def _common_case_lang():
+    """tiny whose + goes through combine(), with a semantic run as Python
+    (Neg: the variables in frames, helpers too big run out of line)."""
+    lang = zrun.Language(tiny.PARSER, tiny.RULES)
+    lang.function("FuncDef")
+    lang.exec(["Let", "Assign"])(tiny.assign)
+    lang.exec("Return")(tiny.return_)
+    lang.eval("Call")(tiny.call)
+    lang.eval("Neg", native=False)(tiny.neg)
+
+    @lang.eval("BinOp")
+    def binop(node, rt):
+        return combine(rt.eval(node.left), rt.eval(node.right))
+
+    @lang.host
+    def print(*args):
+        builtins.print(*args)
+
+    return lang
+
+
+COMMON_CASE = {
+    "ints": "fn f(a, b) { return a + b + 1; }\nprint(f(2, 3), f(-4, 4));\n",
+    "the_rest": 'fn f(a, b) { return a + b; }\nprint(f("ab", "cd"), f("abcdefgh", "ijklmn"), f("x", 7), f(7, "x"), f(1, 2));\n',
+}
+
+
+@pytest.mark.parametrize("name", sorted(COMMON_CASE))
+def test_common_case_inline(name, capsys):
+    out, err = same_in_every_mode(_common_case_lang(), COMMON_CASE[name], capsys)
+    assert err is None and out
+
+
 def _python_lang():
     """tiny with calls whose semantics use Python's loops, comprehensions,
     unpacking and item assignment on values known only at run time."""
