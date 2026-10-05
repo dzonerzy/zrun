@@ -134,6 +134,32 @@ class TestTypes:
         # both modes)
         assert outs["python"] == outs["compiled"] == "the value isn't what types() says the type fn(...) -> void is"
 
+    def test_typed_entries(self, capsys):
+        # functions whose parameters are declared ints and bools: called with
+        # them plain where the arguments' kinds are known (n - 1, a literal), by
+        # the argument list where not (a list's item), from methods too
+        src = """
+struct Acc {
+    total: int;
+    fn add(by: int, twice: bool) -> int {
+        if twice { total = total + by; }
+        total = total + by;
+        return total;
+    }
+}
+fn fib(n: int) -> int { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); }
+fn pick(a: int, b: int, first: bool) -> int { if first { return a; } return b; }
+let xs = [7, 8];
+let acc = Acc(0);
+acc.add(2, true);
+print(fib(15), pick(3, 4, false), pick(xs[0], 2, false), pick(1, xs[1], true), acc.add(xs[1], false));
+"""
+        assert self.outcomes(src) == {"python": None, "compiled": None}
+        assert capsys.readouterr().out == "610 4 2 1 12\n610 4 2 1 12\n"
+        ir = typed.lang.load(src, "prog").compiled_ir()
+        # (fib's and pick's typed entries)
+        assert ir.count("define i1 @zr_ir_t") == 2
+
     def test_not_a_mapping(self):
         with pytest.raises(TypeError):
             typed.lang.types(3)

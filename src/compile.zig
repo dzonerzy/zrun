@@ -846,6 +846,8 @@ pub const Compiler = struct {
     kinds: std.AutoHashMapUnmanaged(u32, ?Kind) = .empty,
     /// Symbols always set where they're read (Gen.alwaysSet), worked out
     always_set: std.AutoHashMapUnmanaged(u32, bool) = .empty,
+    /// Functions' typed entries (Gen.typedParams), worked out
+    typed_params: std.AutoHashMapUnmanaged(u32, ?[]const Shape) = .empty,
     /// By node: its kind's str (kindTable); by label, its child (fieldTable)
     kind_table: ?[]u64 = null,
     owner_table: ?[]u64 = null,
@@ -1450,11 +1452,26 @@ pub const Compiler = struct {
             return self.m.function(name, t.i1, &.{ t.ptr, t.ptr }, true);
         }
         // (external: modules compiled later, thunks, call them by name)
+        if (fnode & TYPED != 0) {
+            // (`<prefix>_t<node>(ctx, env, recv, result, params...)`: its
+            // parameters plain values, of the kinds declared)
+            const n = self.typed_params.get(fnode & ~TYPED).?.?.len;
+            const params = try self.a.alloc(ir.Type, 4 + n);
+            @memcpy(params[0..4], &[_]ir.Type{ t.ptr, t.ptr, t.ptr, t.ptr });
+            @memset(params[4..], t.i64);
+            const name = try std.fmt.allocPrint(self.a, "{s}_t{d}", .{ self.m.prefix, fnode & ~TYPED });
+            return self.m.function(name, t.i1, params, true);
+        }
         const name = try std.fmt.allocPrint(self.a, "{s}_f{d}", .{ self.m.prefix, fnode });
         return self.m.function(name, t.i1, &.{ t.ptr, t.ptr, t.ptr, t.i64, t.ptr, t.ptr }, true);
     }
 
-    /// The code of a language function, compiled (queued if it isn't yet).
+    /// A function node's typed entry, in the queue and the compiled
+    /// functions: the node with this bit.
+    pub const TYPED: u32 = 1 << 30;
+
+    /// The code of a language function (`fnode | TYPED`: its typed entry),
+    /// compiled (queued if it isn't yet).
     pub fn functionCode(self: *Compiler, fnode: u32) !ir.Value {
         if (!self.compiled_fns.contains(fnode)) {
             try self.compiled_fns.put(self.a, fnode, {});
@@ -1480,12 +1497,20 @@ pub const Compiler = struct {
     }
 
     /// Generate one function: the top level (NONE) or a language function.
-    pub fn genFunction(self: *Compiler, fnode: u32) Error!void {
-        const fun = try self.llvmFunction(fnode);
-        var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = fnode, .layout = try self.layoutOf(fnode), .unit = std.hash.Wyhash.hash(3, std.mem.asBytes(&fnode)) };
+    pub fn genFunction(self: *Compiler, key: u32) Error!void {
+        const fun = try self.llvmFunction(key);
+        const fnode = if (key == NONE) key else key & ~TYPED;
+        var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = fnode, .layout = try self.layoutOf(fnode), .unit = std.hash.Wyhash.hash(3, std.mem.asBytes(&key)) };
         g.ctx = g.f.param(0);
         if (fnode == NONE) {
             g.globals = g.f.param(1);
+        } else if (key & TYPED != 0) {
+            g.typed = true;
+            g.env = g.f.param(1);
+            g.args = self.m.nullPtr();
+            g.nargs = g.k(@intCast(self.typed_params.get(fnode).?.?.len));
+            g.recv = g.f.param(2);
+            g.result = g.f.param(3);
         } else {
             g.env = g.f.param(1);
             g.args = g.f.param(2);
@@ -1632,6 +1657,9 @@ const Gen = struct {
     var_slots: std.ArrayListUnmanaged(ir.Value) = .empty,
     /// The argument count (a language function)
     nargs: ir.Value = null,
+    /// A function's typed entry: its parameters are the LLVM function's,
+    /// plain values of their declared kinds (Gen.typedParams)
+    typed: bool = false,
     /// The receiver and the extra arguments of the function being run
     /// (rt.receiver, rt.varargs): two hidden slots of its frame, or stack
     /// slots
@@ -2510,11 +2538,45 @@ const Gen = struct {
     }
 
     fn bindParams(self: *Gen, fnode: u32, spec: FunctionSpec) Error!void {
+        if (self.typed) {
+            const shapes = (try self.typedParams(fnode)).?;
+            for (self.paramNodes(fnode, spec), shapes, 0..) |p, s, i| {
+                const tag: value.Tag = if (s == .int) .int else shapeTag(s);
+                try self.storeVar(p, dyn(self.k(@intCast(@intFromEnum(tag))), self.f.param(@intCast(4 + i)), s));
+            }
+            return;
+        }
         for (self.paramNodes(fnode, spec), 0..) |p, i| {
             const v = try self.loadSlot(self.elem(self.args, i), .any);
             try self.increfDyn(v);
             try self.storeVar(p, .{ .dyn = v });
         }
+    }
+
+    /// The kinds of a function's parameters, when it has a typed entry
+    /// (called with them plain values, no argument list): it takes
+    /// parameters only, each declared (Language.types()) an int, a float or
+    /// a bool. Null: it hasn't.
+    fn typedParams(self: *Gen, fnode: u32) Error!?[]const Shape {
+        const c = self.c;
+        if (c.typed_params.get(fnode)) |r| return r;
+        const result = blk: {
+            const spec = c.specOf(fnode) orelse break :blk null;
+            if (spec.extra == .keep) break :blk null;
+            const params = self.paramNodes(fnode, spec);
+            if (params.len == 0) break :blk null;
+            const shapes = try c.a.alloc(Shape, params.len);
+            for (params, shapes) |p, *s| {
+                const kind = try c.kindOfNode(p) orelse break :blk null;
+                switch (kind.shape) {
+                    .int, .float, .bool => s.* = kind.shape,
+                    else => break :blk null,
+                }
+            }
+            break :blk shapes;
+        };
+        try c.typed_params.put(c.a, fnode, result);
+        return result;
     }
 
     /// Whether a variable always has a value where code reads it: a
@@ -5345,7 +5407,7 @@ const Gen = struct {
             recv_ptr = p;
         }
         const ok = if (fd.func != NONE and n == try self.paramCount(fd.func))
-            try self.directCall(inst, fd, arr, n, recv_ptr)
+            try self.directCall(inst, fd, arr, ds, recv_ptr)
         else
             self.call("zr_call", &.{ self.ctx, self.k32(inst.node), fd.tag, fd.bits, arr, self.k(@intCast(n)), recv_ptr, self.out });
         // (the call borrowed them)
@@ -5365,13 +5427,18 @@ const Gen = struct {
     /// A call of a function value that is most likely language function
     /// `fd.func` given all its parameters: its code called directly, the
     /// language's call stack kept inline, when the value's code is that
-    /// function's and the stack has room; anything else by zr_call. The
+    /// function's and the stack has room (arguments of the kinds its typed
+    /// entry takes: that, given them plain); anything else by zr_call. The
     /// call's status (an i1).
-    fn directCall(self: *Gen, inst: *Inst, fd: Dyn, arr: ir.Value, n: usize, recv_ptr: ir.Value) Error!ir.Value {
+    fn directCall(self: *Gen, inst: *Inst, fd: Dyn, arr: ir.Value, ds: []const Dyn, recv_ptr: ir.Value) Error!ir.Value {
         const f = &self.f;
         const m = &self.c.m;
         const t = m.t;
+        const n = ds.len;
         const code = try self.c.functionCode(fd.func);
+        const typed = if (try self.typedParams(fd.func)) |shapes| for (shapes, ds) |s, d| {
+            if (d.shape != s) break false;
+        } else true else false;
         const is_fn = try f.label("call_is_fn");
         const direct = try f.label("call_direct");
         const slow = try f.label("call_generic");
@@ -5395,7 +5462,13 @@ const Gen = struct {
         f.store(self.k32(inst.node), f.offset(at, @offsetOf(helpers.CallEntry, "node")));
         f.store(f.add(depth, self.k(1)), depth_p);
         const env = f.load(t.ptr, f.offset(fo, @offsetOf(value.Function, "env")));
-        const st = f.call(.{ .v = code, .ty = (try self.c.llvmFunction(fd.func)).ty }, &.{ ctx, env, arr, self.k(@intCast(n)), recv_ptr, self.out });
+        const st = if (typed) blk: {
+            const entry_code = try self.c.functionCode(fd.func | Compiler.TYPED);
+            const params = try self.a().alloc(ir.Value, 4 + n);
+            @memcpy(params[0..4], &[_]ir.Value{ ctx, env, recv_ptr, self.out });
+            for (params[4..], ds) |*p, d| p.* = d.bits;
+            break :blk f.call(.{ .v = entry_code, .ty = (try self.c.llvmFunction(fd.func | Compiler.TYPED)).ty }, params);
+        } else f.call(.{ .v = code, .ty = (try self.c.llvmFunction(fd.func)).ty }, &.{ ctx, env, arr, self.k(@intCast(n)), recv_ptr, self.out });
         f.store(depth, depth_p);
         // (its result as rt.call gives it: an int an I64)
         const out_tag = f.load(t.i64, self.out);
