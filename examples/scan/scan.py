@@ -1,6 +1,8 @@
 """scan: a small YARA-like rule language, run by zrun as an engine.
 
     python scan.py rules.scan PATH... [--threads N]
+    python scan.py rules.scan --compile rules.zrc     (compiled ahead of time)
+    python scan.py rules.zrc PATH...                  (loaded without compiling)
 
 A rule set is a function of a file's bytes:
 
@@ -205,6 +207,10 @@ for _name in NATIVE:
 
 
 def load(path):
+    """A rule set: its source, or a compiled module of it (.zrc: compiled
+    ahead of time, `--compile`)."""
+    if path.endswith(".zrc"):
+        return lang.load_compiled(path)
     with open(path) as f:
         return lang.load(f.read(), path)
 
@@ -250,12 +256,17 @@ if __name__ == "__main__":
     import time
 
     ap = argparse.ArgumentParser(description="Scan files with a rule set.")
-    ap.add_argument("rules")
-    ap.add_argument("paths", nargs="+")
+    ap.add_argument("rules", help="a rule set, or a compiled module of one (.zrc)")
+    ap.add_argument("paths", nargs="*")
     ap.add_argument("--threads", type=int, default=None)
+    ap.add_argument("--compile", metavar="OUT", help="compile the rule set to a module (OUT.zrc), loaded later without compiling")
     a = ap.parse_args()
     try:
         program = load(a.rules)
+        if a.compile:
+            program.save(a.compile)
+            print(f"compiled {a.rules} to {a.compile}", file=sys.stderr)
+            sys.exit(0)
         found = list(files(a.paths))
         t = time.perf_counter()
         n = 0

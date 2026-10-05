@@ -300,7 +300,7 @@ pub fn pyMethodType() ?*PyObject {
 
 /// Python source run in a fresh namespace: the namespace (a new reference),
 /// or null with the exception.
-fn runPython(src: [:0]const u8) ?*PyObject {
+pub fn runPython(src: [:0]const u8) ?*PyObject {
     const ns = py.c.PyDict_New() orelse return null;
     const builtins = py.c.PyEval_GetBuiltins() orelse return null;
     if (py.c.PyDict_SetItemString(ns, "__builtins__", builtins) != 0) {

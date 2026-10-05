@@ -30,6 +30,8 @@ const bytes_mod = @import("bytes.zig");
 const gil = @import("gil.zig");
 const pool = @import("pool.zig");
 const gc = @import("gc.zig");
+const aot = @import("aot.zig");
+const cache = @import("cache.zig");
 const value_mod = @import("value.zig");
 
 const allocator = std.heap.c_allocator;
@@ -507,6 +509,115 @@ const Language = struct {
         return prog;
     }
 
+    /// `lang.compile(source, output, path=None)`: the program compiled, saved
+    /// as a compiled module at `output` (program.save()); the Program.
+    pub fn compile(self: *Language, args: pyoz.Args(struct { source: *PyObject, output: *PyObject, path: ?*PyObject = null })) ?Program {
+        const v = args.value;
+        var prog = self.load(.{ .value = .{ .source = v.source, .path = v.path } }) orelse return null;
+        const r = prog.save(v.output) orelse {
+            prog.release();
+            return null;
+        };
+        py.Py_DecRef(r);
+        return prog;
+    }
+
+    /// `lang.load_compiled(path)`: a program saved as a compiled module
+    /// (program.save(), lang.compile()), loaded without compiling it again.
+    /// Refused if it was made for another definition of the language,
+    /// another zrun or another CPU.
+    pub fn load_compiled(self: *Language, path: *PyObject) ?Program {
+        const p = ph.utf8(path, "path") orelse return null;
+        const ca = std.heap.c_allocator;
+        var file = aot.read(ca, p) catch |e| {
+            switch (e) {
+                error.Io => ph.raise(py.PyExc_OSError(), "can't read the compiled module {s}", .{p}),
+                error.OutOfMemory => _ = py.c.PyErr_NoMemory(),
+                else => ph.raise(py.PyExc_ValueError(), "{s} isn't a compiled module of zrun's (or it's cut short)", .{p}),
+            }
+            return null;
+        };
+        defer file.deinit(ca);
+        if (!std.mem.eql(u8, file.zrun, aot.version)) {
+            ph.raise(py.PyExc_ValueError(), "{s} was compiled by zrun {s}, this is zrun {s}: compile it again", .{ p, file.zrun, aot.version });
+            return null;
+        }
+        const def = self.definitionHash() orelse return null;
+        // (LLVM's, for the salt: zgram's)
+        _ = @import("jit.zig").get() orelse return null;
+        if (!std.mem.eql(u8, &file.definition, &def)) {
+            ph.raise(py.PyExc_ValueError(), "{s} was compiled for another definition of the language (its grammar, semantics or host functions changed since): compile it again", .{p});
+            return null;
+        }
+        if (!std.mem.eql(u8, &file.salt, cache.salt())) {
+            ph.raise(py.PyExc_ValueError(), "{s} was compiled for another CPU (or another LLVM): compile it again", .{p});
+            return null;
+        }
+        // (its objects given to the cache's look-ups: owned there from now)
+        for (file.objects) |*o| {
+            cache.give(o.key, o.bytes);
+            o.bytes = &.{};
+        }
+        const source = ph.newString(file.source) orelse return null;
+        defer py.Py_DecRef(source);
+        const prog_path = if (file.path.len > 0) ph.newString(file.path) orelse return null else null;
+        defer if (prog_path) |x| py.Py_DecRef(x);
+        return self.load(.{ .value = .{ .source = source, .path = prog_path } });
+    }
+
+    /// The hash of the language's definition (aot.zig): what a compiled
+    /// module of it is made for.
+    fn definitionHash(self: *Language) ?[32]u8 {
+        const S = struct {
+            var func: ?*PyObject = null;
+        };
+        if (S.func == null) {
+            const ns = compile_mod.runPython(aot.definition_source) orelse return null;
+            defer py.Py_DecRef(ns);
+            const f = py.c.PyDict_GetItemString(ns, "definition") orelse return null;
+            py.Py_IncRef(f);
+            S.func = f;
+        }
+        // (the rest as text: the function kinds, the limits)
+        var text: std.ArrayListUnmanaged(u8) = .empty;
+        defer text.deinit(allocator);
+        for (self._functions, 0..) |spec, i| if (spec) |s| {
+            text.print(allocator, "{d}:{any};", .{ i, s }) catch {
+                _ = py.c.PyErr_NoMemory();
+                return null;
+            };
+        };
+        text.print(allocator, "max_depth={d};hot_calls={d}", .{ self._max_depth, self._hot_calls }) catch {
+            _ = py.c.PyErr_NoMemory();
+            return null;
+        };
+        const rest = py.c.PyTuple_New(2) orelse return null;
+        defer py.Py_DecRef(rest);
+        _ = py.c.PyTuple_SetItem(rest, 0, ph.newString(text.items) orelse return null);
+        _ = py.c.PyTuple_SetItem(rest, 1, ref(self._types orelse py.Py_None()));
+        const tables = py.c.PyTuple_New(2) orelse return null;
+        defer py.Py_DecRef(tables);
+        _ = py.c.PyTuple_SetItem(tables, 0, ref(self._evals.?));
+        _ = py.c.PyTuple_SetItem(tables, 1, ref(self._execs.?));
+        const call_args = py.c.PyTuple_New(4) orelse return null;
+        defer py.Py_DecRef(call_args);
+        _ = py.c.PyTuple_SetItem(call_args, 0, ref(self._parser.?));
+        _ = py.c.PyTuple_SetItem(call_args, 1, ref(tables));
+        _ = py.c.PyTuple_SetItem(call_args, 2, ref(self._hosts.?));
+        _ = py.c.PyTuple_SetItem(call_args, 3, ref(rest));
+        const r = py.c.PyObject_CallObject(S.func.?, call_args) orelse return null;
+        defer py.Py_DecRef(r);
+        var out: [32]u8 = undefined;
+        var buf: [*c]u8 = undefined;
+        var len: py.c.Py_ssize_t = 0;
+        if (py.c.PyBytes_AsStringAndSize(r, &buf, &len) != 0 or len != 32) {
+            if (py.c.PyErr_Occurred() == null) ph.raise(py.PyExc_RuntimeError(), "the language's definition hash isn't 32 bytes", .{});
+            return null;
+        }
+        @memcpy(&out, buf[0..32]);
+        return out;
+    }
+
     pub const __doc__: [*:0]const u8 = "Language(parser, rules=None, *, max_depth=1000): a language to run programs of: its zgram parser, its zrules rules (for names and their variables), and its semantics (eval, exec, function, host). load(source) parses and checks a program.";
     pub const eval__doc__: [*:0]const u8 = "@lang.eval(kind): the semantics of an expression kind (a -> class or rule name, or a list of them): fn(node, rt) -> value.";
     pub const eval__params__ = "kind";
@@ -832,6 +943,44 @@ const Program = struct {
     /// {"line N": kinds} (functions given a typed entry for the kinds their
     /// arguments have been)}. Which semantics run as Python:
     /// Language.python_semantics().
+    /// `program.save(path)`: the program as a compiled module (aot.zig):
+    /// its source and the objects of the code compiled for it so far (the
+    /// program compiled first if it isn't: save after running it, the code
+    /// compiled as it ran goes in too). lang.load_compiled(path) loads it.
+    pub fn save(self: *Program, path: *PyObject) ?*PyObject {
+        const p = ph.utf8(path, "path") orelse return null;
+        if (!self.ensureCompiled()) return null;
+        const def = self.language().definitionHash() orelse return null;
+        const c = self._compiled.?;
+        var objs: std.ArrayListUnmanaged(aot.Object) = .empty;
+        defer {
+            for (objs.items) |o| allocator.free(o.bytes);
+            objs.deinit(allocator);
+        }
+        for (c.keys.items) |key| {
+            for (objs.items) |o| {
+                if (std.mem.eql(u8, &o.key, &key)) break;
+            } else {
+                const bytes = c.objectOf(key) orelse {
+                    ph.raise(py.PyExc_RuntimeError(), "the compiled code of the program isn't at hand any more (the cache cleared?): load the program again, then save it", .{});
+                    return null;
+                };
+                objs.append(allocator, .{ .key = key, .bytes = bytes }) catch {
+                    allocator.free(bytes);
+                    return py.c.PyErr_NoMemory();
+                };
+            }
+        }
+        const source = ph.utf8(self._source.?, "source") orelse return null;
+        const prog_path = if (self._path) |x| ph.utf8(x, "path") orelse return null else "";
+        aot.write(allocator, p, def, prog_path, source, objs.items) catch |e| {
+            if (e == error.OutOfMemory) return py.c.PyErr_NoMemory();
+            ph.raise(py.PyExc_OSError(), "can't write the compiled module {s}", .{p});
+            return null;
+        };
+        return none();
+    }
+
     pub fn report(self: *Program) ?*PyObject {
         const out = py.c.PyDict_New() orelse return null;
         const crossings = if (self._crossings) |o| ref(o) else py.c.PyDict_New() orelse return null;

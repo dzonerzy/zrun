@@ -70,6 +70,11 @@ pub const Compiled = struct {
     /// Modules loaded from the cache, compiled and kept in it (report())
     cache_loaded: u64 = 0,
     cache_kept: u64 = 0,
+    /// The keys of the modules compiled (cache.zig), in order: what a
+    /// compiled module of the program has (aot.zig); and their objects when
+    /// there's no cache to have them from
+    keys: std.ArrayListUnmanaged(cache.Key) = .empty,
+    kept_objects: std.AutoHashMapUnmanaged(cache.Key, []u8) = .empty,
     /// Node attributes by name (attrOf), nodes' texts (textStr)
     attrs: std.AutoHashMapUnmanaged(*const value.Str, Attr) = .empty,
     texts: []?*value.Str = &.{},
@@ -146,9 +151,20 @@ pub const Compiled = struct {
         return self.compiler.objects.items;
     }
 
+    /// The object of a module compiled for the program (owned by the
+    /// caller): a compiled module's, the cache's, or kept here.
+    pub fn objectOf(self: *const Compiled, key: cache.Key) ?[]u8 {
+        if (self.kept_objects.get(key)) |b| return allocator.dupe(u8, b) catch null;
+        return cache.objectOf(allocator, key);
+    }
+
     pub fn destroy(self: *Compiled) void {
         for (self.modules.items) |*m| m.release();
         self.modules.deinit(allocator);
+        self.keys.deinit(allocator);
+        var it = self.kept_objects.valueIterator();
+        while (it.next()) |b| allocator.free(b.*);
+        self.kept_objects.deinit(allocator);
         self.thunks.deinit(allocator);
         if (self.runs.len > 0) allocator.free(self.runs);
         self.attrs.deinit(allocator);
@@ -369,11 +385,30 @@ pub const Compiled = struct {
     /// Null with the error in `err`.
     fn compileModule(self: *Compiled, err: []u8) ?llvm.Module {
         const m = &self.compiler.m;
-        const path = blk: {
+        const key = blk: {
             const text = jit_f("LLVMPrintModuleToString")(m.mod);
             defer jit_f("LLVMDisposeMessage")(text);
-            break :blk cache.pathFor(allocator, std.mem.span(text));
-        } orelse return llvm.compile(self.view, m.take(), 2, err) catch null;
+            break :blk cache.keyOf(std.mem.span(text));
+        };
+        // (kept: the program saved as a compiled module has them all)
+        self.keys.append(allocator, key) catch {};
+        // A compiled module's, loaded
+        if (cache.givenObject(key)) |bytes| {
+            // (the module isn't the JIT's: the compiler frees it)
+            if (llvm.loadObject(self.view, bytes, err)) |module| {
+                self.cache_loaded += 1;
+                return module;
+            } else |_| {}
+        }
+        const path = cache.pathFor(allocator, key) orelse {
+            // (no cache: the object kept here, for saving)
+            const bytes = llvm.emitObject(self.view, m.take(), 2, err) catch return null;
+            defer llvm.freeBytes(self.view, bytes);
+            if (allocator.dupe(u8, bytes)) |copy| {
+                self.kept_objects.put(allocator, key, copy) catch allocator.free(copy);
+            } else |_| {}
+            return llvm.loadObject(self.view, bytes, err) catch null;
+        };
         defer allocator.free(path);
         if (cache.read(allocator, path)) |bytes| {
             defer allocator.free(bytes);
