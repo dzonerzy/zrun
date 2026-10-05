@@ -106,6 +106,11 @@ pub const Dyn = struct {
     /// The language function it most likely is (a variable a function's
     /// definition binds): called directly, behind a check (directCall)
     func: u32 = NONE,
+    /// A variable's value read without a reference of its own (Gen.loadVar):
+    /// a slot (i64) saying, as the code runs, whether it's borrowed (0, the
+    /// variable's reference keeps it), owned (1: a reference taken since)
+    /// or given up (2). Null: an ordinary value, owned.
+    state: ir.Value = null,
 
     fn heapish(self: Dyn) bool {
         return switch (self.shape) {
@@ -1657,6 +1662,8 @@ const Gen = struct {
     var_slots: std.ArrayListUnmanaged(ir.Value) = .empty,
     /// The argument count (a language function)
     nargs: ir.Value = null,
+    /// Variables' values read borrowed (loadVar), by variable
+    borrows: std.ArrayListUnmanaged(struct { sym: u32, state: ir.Value, kept: ir.Value }) = .empty,
     /// A function's typed entry: its parameters are the LLVM function's,
     /// plain values of their declared kinds (Gen.typedParams)
     typed: bool = false,
@@ -2001,7 +2008,14 @@ const Gen = struct {
     /// A value's run-time form (an owned reference).
     fn materialize(self: *Gen, v: SVal, at: u32) Error!Dyn {
         return switch (v) {
-            .dyn => |d| d,
+            // (a borrowed one: owned, an ordinary value from here on)
+            .dyn => |d| blk: {
+                if (d.state == null) break :blk d;
+                try self.owned(d);
+                var out = d;
+                out.state = null;
+                break :blk out;
+            },
             .none => self.noneDyn(),
             .bool => |b| self.konst(1, @intFromBool(b), .bool),
             .int => |n| self.konst(2, n, .int),
@@ -2226,22 +2240,62 @@ const Gen = struct {
         return self.loadSlot(self.out, shape);
     }
 
-    /// Give up a dynamic value (decref it).
+    /// Give up a dynamic value (decref it; a borrowed one: given up).
     fn drop(self: *Gen, v: SVal) Error!void {
         switch (v) {
-            .dyn => |d| if (d.heapish()) try self.refcount(true, d.tag, d.bits),
+            .dyn => |d| if (d.heapish()) {
+                if (d.state) |state| {
+                    const f = &self.f;
+                    const is_owned = try f.label("borrow_owned");
+                    const given = try f.label("borrow_given");
+                    const done = try f.label("borrow_dropped");
+                    try f.condBr(f.icmp(jit_c.LLVMIntEQ, f.load(self.c.m.t.i64, state), self.k(1)), is_owned, given);
+                    try f.block(is_owned);
+                    try self.refcount(true, d.tag, d.bits);
+                    try f.br(done);
+                    try f.block(given);
+                    f.store(self.k(2), state);
+                    try f.br(done);
+                    try f.block(done);
+                } else try self.refcount(true, d.tag, d.bits);
+            },
             else => {},
         }
     }
 
     fn increfDyn(self: *Gen, d: Dyn) Error!void {
-        if (d.heapish()) try self.refcount(false, d.tag, d.bits);
+        if (!d.heapish()) return;
+        try self.owned(d);
+        try self.refcount(false, d.tag, d.bits);
+    }
+
+    /// A borrowed value made owned (its reference taken, if it hasn't
+    /// been): what the code may keep, whatever happens to the variable.
+    fn owned(self: *Gen, d: Dyn) Error!void {
+        const state = d.state orelse return;
+        const f = &self.f;
+        const take = try f.label("borrow_take");
+        const done = try f.label("borrow_taken");
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, f.load(self.c.m.t.i64, state), self.k(0)), take, done);
+        try f.block(take);
+        try self.refcount(false, d.tag, d.bits);
+        f.store(self.k(1), state);
+        try f.br(done);
+        try f.block(done);
+    }
+
+    /// A value to read and give up (drop), not keep: a variable's value
+    /// borrowed stays borrowed.
+    fn borrowed(self: *Gen, v: SVal, at: u32) Error!Dyn {
+        return if (v == .dyn) v.dyn else self.materialize(v, at);
     }
 
     /// A slot ({i64, i64}) of the stack: its pointer.
     fn storeSlot(self: *Gen, slot: ir.Value, d: Dyn) Error!void {
         const f = &self.f;
         const t = self.c.m.t;
+        // (a borrowed value kept in memory: owned)
+        try self.owned(d);
         f.store(d.tag, slot);
         f.store(d.bits, f.field(t.val, slot, 1));
     }
@@ -2438,7 +2492,22 @@ const Gen = struct {
         // (a variable of a type whose values' kind is declared: known, its
         // reference counted as one of the kind)
         var r = try self.typedValue(name_node, .{ .dyn = v });
-        try self.increfDyn(r.dyn);
+        // (an int a variable holds is an I64: stores make it one)
+        if (r.dyn.shape == .int) r.dyn.tag = self.k(@intFromEnum(value.Tag.int));
+        if (r.dyn.heapish() and try self.borrowable(si)) {
+            // (borrowed: the variable's reference keeps it until the
+            // variable's stored to; taken then, if it's still in use)
+            // (given up where it wasn't read; the value kept for the
+            // stores, which may be where it isn't known)
+            const state = try f.alloca(self.c.m.t.i64);
+            f.entryStore(self.k(2), state);
+            f.store(self.k(0), state);
+            const kept = try f.alloca(self.c.m.t.val);
+            f.store(r.dyn.tag, kept);
+            f.store(r.dyn.bits, f.field(self.c.m.t.val, kept, 1));
+            r.dyn.state = state;
+            try self.borrows.append(self.a(), .{ .sym = si, .state = state, .kept = kept });
+        } else try self.increfDyn(r.dyn);
         // (one a function's definition binds: that function, most likely)
         if (r == .dyn and sym.node != NONE) {
             const p = d.parents[sym.node];
@@ -2461,6 +2530,12 @@ const Gen = struct {
             try self.failAt(name_node, try std.fmt.allocPrint(self.a(), "can't assign to the builtin '{s}'", .{d.syms[si].name}));
             return;
         }
+        // (its values borrowed and still in use: owned first)
+        for (self.borrows.items) |b| if (b.sym == si) {
+            var bd = try self.loadSlot(b.kept, .any);
+            bd.state = b.state;
+            try self.owned(bd);
+        };
         // (stored as rt.store does: an int an I64)
         const v = try self.materialize(try self.checkedAt(value_, name_node), name_node);
         const slot = try self.varSlot(si);
@@ -2468,6 +2543,22 @@ const Gen = struct {
         try self.storeSlot(slot, v);
         try self.refcount(true, old.tag, old.bits);
     }
+
+    /// Whether a variable's value can be read borrowed: one of this
+    /// function's variables on the stack (only its own code stores to it:
+    /// storeVar), read borrowed in few places so far (each store checks
+    /// them).
+    fn borrowable(self: *Gen, si: u32) Error!bool {
+        if (self.frame != null or self.detached or self.thunk or self.helper_semantic != null or self.closure_root != null) return false;
+        if (self.c.data.homeOf(si) != self.fnode) return false;
+        var n: usize = 0;
+        for (self.borrows.items) |b| {
+            if (b.sym == si) n += 1;
+        }
+        return n < max_borrows;
+    }
+
+    const max_borrows = 16;
 
     fn notAVariable(self: *Gen, idx: u32) Error!SVal {
         const msg = if (self.c.lang.analysis == null)
@@ -2827,7 +2918,12 @@ const Gen = struct {
         try f.block(bad);
         try self.kindError(idx);
         try f.block(good);
-        return .{ .dyn = .{ .tag = d.tag, .bits = d.bits, .shape = kind.shape, .rtype = kind.rtype } };
+        var out = d;
+        out.shape = kind.shape;
+        out.rtype = kind.rtype;
+        // (a kind of one tag: that tag, known)
+        if (kind.shape != .int) out.tag = self.k(@intCast(@intFromEnum(shapeTag(kind.shape))));
+        return .{ .dyn = out };
     }
 
     /// The error of a value not of its type's kind (as the reference mode
@@ -4503,7 +4599,8 @@ const Gen = struct {
                 else => {},
             }
         }
-        const od = try self.materialize(obj, inst.node);
+        // (read, given up: a variable's value borrowed)
+        const od = try self.borrowed(obj, inst.node);
         const kd = try self.materialize(key, inst.node);
         if ((od.shape == .any or od.shape == .list or od.shape == .tuple) and canBeInt(kd)) return .{ .dyn = try self.indexInline(inst, od, kd) };
         return .{ .dyn = try self.getitemCall(inst, od, kd) };

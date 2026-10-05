@@ -168,6 +168,47 @@ def test_a_host_function_failing(capsys):
     assert err[0] == "print: ValueError: no output"
 
 
+def _keeping_lang():
+    """tiny whose assignments read the variable's old value, store the new
+    one, then use the old one: a value read while its variable changes."""
+    lang = zrun.Language(tiny.PARSER, tiny.RULES)
+    for kind, fn in (("While", tiny.while_), ("If", tiny.if_), ("Return", tiny.return_)):
+        lang.exec(kind)(fn)
+    for kind, fn in (("BinOp", tiny.binop), ("Call", tiny.call)):
+        lang.eval(kind)(fn)
+    lang.function("FuncDef")
+
+    @lang.exec(["Let", "Assign"])
+    def assign(node, rt):
+        if node.kind == "Let":
+            rt.store(node.name, rt.eval(node.value))
+            return
+        old = rt.load(node.name)
+        rt.store(node.name, rt.eval(node.value))
+        rt.store(node.name, rt.load(node.name) + old)
+
+    @lang.host
+    def print(*args):
+        builtins.print(*args)
+
+    return lang
+
+
+KEEPING = {
+    # (each a function's: its variables on the stack, read borrowed; the
+    # strings made at run time, the variable's the only reference)
+    "straight": 'fn f(a) { let s = a + "b"; s = a + "d"; s = s + "!"; print(s); }\nf("x"); f("y");\n',
+    "in_a_loop": 'fn g(n) { let s = "a" + "b"; let i = 0; while i < n { if i % 2 == 0 { s = s + "x"; } i = i + 1; } print(s); }\ng(5);\n',
+    "returned": 'fn h(a) { let s = a + "1"; s = a + "2"; return s; }\nprint(h("p"), h("q"));\n',
+}
+
+
+@pytest.mark.parametrize("name", sorted(KEEPING))
+def test_value_kept_while_its_variable_changes(name, capsys):
+    out, err = same_in_every_mode(_keeping_lang(), KEEPING[name], capsys)
+    assert err is None and out
+
+
 def _python_lang():
     """tiny with calls whose semantics use Python's loops, comprehensions,
     unpacking and item assignment on values known only at run time."""
