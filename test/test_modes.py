@@ -209,6 +209,36 @@ def test_value_kept_while_its_variable_changes(name, capsys):
     assert err is None and out
 
 
+# Loops reading values borrowed (a list's items, a record's fields, values
+# kept while their variable changes), run n times
+BORROWING_LOOPS = {
+    "typed": (
+        typed.lang,
+        "struct P {{ x: int; }}\n"
+        "fn f(n: int) -> int {{ let xs = [1, 2, 3]; let p = P(4); let t = 0; let i = 0;\n"
+        "  while i < n {{ t = t + xs[i % 3] + p.x; if i % 2 == 0 {{ xs = [i, i, i]; p = P(i); }} i = i + 1; }} return t; }}\n"
+        "print(f({}));\n",
+    ),
+    "keeping": (_keeping_lang(), 'fn g(n) {{ let s = "a" + "b"; let i = 0; while i < n {{ s = s + "x"; i = i + 1; }} print(s); }}\ng({});\n'),
+}
+
+
+@pytest.mark.parametrize("name", sorted(BORROWING_LOOPS))
+def test_borrowing_gives_back_what_it_takes(name, capsys):
+    # what a run keeps doesn't grow with the iterations (a run keeps its
+    # program's functions now: their cycle with its frame)
+    lang, src = BORROWING_LOOPS[name]
+    kept = []
+    for n in (10, 40):
+        program = lang.load(src.format(n), "prog")
+        program.run(mode="compiled")
+        before = zrun._blocks()
+        program.run(mode="compiled")
+        kept.append(zrun._blocks() - before)
+    capsys.readouterr()
+    assert kept[0] == kept[1] >= 0
+
+
 def _python_lang():
     """tiny with calls whose semantics use Python's loops, comprehensions,
     unpacking and item assignment on values known only at run time."""

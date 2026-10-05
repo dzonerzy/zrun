@@ -4123,10 +4123,7 @@ const Gen = struct {
     fn readLocal(self: *Gen, inst: *Inst, slot: u32, pos: front.Pos) Error!SVal {
         switch (inst.locals[slot]) {
             .unset => return self.c.unsupportedAt(inst.func, pos, "'{s}' may be read before it is assigned", .{inst.func.locals[slot]}),
-            .static => |v| {
-                if (v == .dyn) try self.increfDyn(v.dyn);
-                return v;
-            },
+            .static => |v| return self.copyOf(v),
             .slot => |s| {
                 const d = try self.loadSlot(s.ptr, s.shape);
                 try self.increfDyn(d);
@@ -5096,7 +5093,7 @@ const Gen = struct {
             try self.increfDyn(v);
             try self.storeSlot(result, v);
             // (the record: dropped, the field's taken)
-            try self.refcount(true, d.tag, d.bits);
+            try self.drop(.{ .dyn = d });
             try f.br(join);
             try f.block(no);
         }
@@ -5274,8 +5271,45 @@ const Gen = struct {
     /// A copy of a value read out of a known container (a reference of its
     /// own for a run-time one).
     fn copyOf(self: *Gen, v: SVal) Error!SVal {
-        if (v == .dyn) try self.increfDyn(v.dyn);
+        if (v != .dyn) return v;
+        // (a variable's value borrowed: borrowed again)
+        if (v.dyn.state) |state| for (self.borrows.items) |b| {
+            if (b.state == state) {
+                if (try self.borrowable(b.sym)) return .{ .dyn = try self.borrowAgain(v.dyn, b.sym) };
+                break;
+            }
+        };
+        try self.increfDyn(v.dyn);
         return v;
+    }
+
+    /// Another reference to a variable's value read borrowed: borrowed too
+    /// while the variable still has it (the first is borrowed), its own
+    /// reference taken if not.
+    fn borrowAgain(self: *Gen, d: Dyn, si: u32) Error!Dyn {
+        const f = &self.f;
+        const t = self.c.m.t;
+        const state = try f.alloca(t.i64);
+        f.entryStore(self.k(2), state);
+        const kept = try f.alloca(t.val);
+        f.store(d.tag, kept);
+        f.store(d.bits, f.field(t.val, kept, 1));
+        const still = try f.label("borrow_again");
+        const take = try f.label("borrow_own");
+        const done = try f.label("borrow_copied");
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, f.load(t.i64, d.state.?), self.k(0)), still, take);
+        try f.block(still);
+        f.store(self.k(0), state);
+        try f.br(done);
+        try f.block(take);
+        try self.refcount(false, d.tag, d.bits);
+        f.store(self.k(1), state);
+        try f.br(done);
+        try f.block(done);
+        try self.borrows.append(self.a(), .{ .sym = si, .state = state, .kept = kept });
+        var out = d;
+        out.state = state;
+        return out;
     }
 
     fn boxed(self: *Gen, v: SVal) Error!*const SVal {

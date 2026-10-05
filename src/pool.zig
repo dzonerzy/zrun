@@ -22,6 +22,9 @@ const slab_size = 64 * 1024;
 const Free = struct { next: ?*Free };
 
 var free_lists: [classes]?*Free = .{null} ** classes;
+/// Blocks handed out and not freed (the tests' check that compiled code
+/// gives back what it takes: zrun._blocks())
+pub var in_use: isize = 0;
 /// The slab being carved, per class, and how much of it is left
 var carve: [classes][]u8 = .{&.{}} ** classes;
 
@@ -34,6 +37,7 @@ fn small(len: usize, alignment: Alignment) bool {
 }
 
 fn alloc(_: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize) ?[*]u8 {
+    in_use += 1;
     if (!small(len, alignment)) return std.heap.c_allocator.rawAlloc(len, alignment, ret_addr);
     const c = classOf(len);
     if (free_lists[c]) |f| {
@@ -66,6 +70,7 @@ fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, re
 }
 
 fn free(_: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
+    in_use -= 1;
     if (!small(memory.len, alignment)) return std.heap.c_allocator.rawFree(memory, alignment, ret_addr);
     const c = classOf(memory.len);
     const f: *Free = @ptrCast(@alignCast(memory.ptr));

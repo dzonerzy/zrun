@@ -2083,6 +2083,12 @@ fn version() []const u8 {
     return @import("build_options").version;
 }
 
+/// zrun._blocks(): the values' blocks allocated and not freed (for the
+/// tests: compiled code gives back what it takes).
+fn blocks() i64 {
+    return @import("pool.zig").in_use;
+}
+
 /// zrun.configure(cache=None, perf_map=None): process-wide settings.
 fn configure(args: pyoz.Args(struct { cache: ?*PyObject = null, perf_map: ?*PyObject = null })) ?*PyObject {
     const v = args.value;
@@ -2122,6 +2128,7 @@ pub const Module = pyoz.module(.{
     .doc = "zrun - execution for languages defined with zgram and checked with zrules: semantics written as Python functions, run natively.",
     .funcs = &.{
         pyoz.func("version", version, "Return the zrun version string"),
+        pyoz.func("_blocks", blocks, "The values' blocks allocated and not freed (for tests)"),
         pyoz.kwfunc("configure", configure, "configure(cache=None, perf_map=None): process-wide settings (those not given stay). cache: True (the usual place: $XDG_CACHE_HOME/zrun or ~/.cache/zrun), False (no cache), or a directory; perf_map: name compiled functions for perf (/tmp/perf-<pid>.map)."),
     },
     .classes = &.{
