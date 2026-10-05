@@ -53,6 +53,35 @@ def test_values_outlive_their_program():
     assert S.ENV.vars["kind"] == "Call"
 
 
+def test_report(capsys):
+    # what's native and why not, where compiled code went through Python
+    p = S.lang.load(PROGRAM)
+    p.run(mode="compiled", report=True)
+    capsys.readouterr()
+    r = p.report()
+    state = r["module_state"]
+    # (what the program's code uses: lit() isn't called, ALIAS isn't read)
+    assert state["ENV"] == "native" and state["COUNTS"] == "native" and "ALIAS" not in state
+    assert "referred to from somewhere besides" in state["HELD"]
+    assert state["BY_KEY"] == "constant (only read)" and "attributes beyond its fields" in state["BOX"]
+    # (HELD, BOX: Python's; reading them goes through it)
+    assert r["python_crossings"] and all(isinstance(n, int) and n > 0 for n in r["python_crossings"].values())
+    assert set(r["cache"]) == {"loaded", "compiled"}
+    # (a run without report=True: counts nothing, the last report stays)
+    p.run(mode="compiled")
+    capsys.readouterr()
+    assert p.report()["python_crossings"] == r["python_crossings"]
+
+
+def test_settings():
+    with pytest.raises(ValueError):
+        S.zrun.Language(S.tiny.PARSER, hot_calls=0)
+    with pytest.raises(TypeError):
+        zrun.configure(cache=3)
+    # (unchanged: the usual place, no perf map)
+    zrun.configure(cache=True, perf_map=False)
+
+
 @pytest.mark.parametrize("mode", MODES)
 def test_another_programs_function(mode):
     first = S.lang.load("fn f(n) { return n + 1; } put(1, f); print(callk(1, 2));")

@@ -67,6 +67,9 @@ pub const Compiled = struct {
     runs: []Run = &.{},
     /// Specialized helpers' addresses, by name (specialize)
     special: std.StringHashMapUnmanaged(usize) = .empty,
+    /// Modules loaded from the cache, compiled and kept in it (report())
+    cache_loaded: u64 = 0,
+    cache_kept: u64 = 0,
     /// Node attributes by name (attrOf), nodes' texts (textStr)
     attrs: std.AutoHashMapUnmanaged(*const value.Str, Attr) = .empty,
     texts: []?*value.Str = &.{},
@@ -180,7 +183,6 @@ pub const Compiled = struct {
                     // (a semantic it reaches can't be compiled: as Python)
                     if (c.failed_semantic) |s| {
                         if (!self.python.contains(s)) {
-                            if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("thunk {d}: as Python: {s}\n", .{ node, self.failure.message.items });
                             if (!markPython(self.python, s, self.failure.message.items)) return oomT();
                             continue;
                         }
@@ -191,9 +193,7 @@ pub const Compiled = struct {
                 error.OutOfMemory => return oomT(),
                 error.Python => return null,
             };
-            const t0 = nowUs();
             const addr = self.add(name) orelse return null;
-            if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("thunk node={d} which={s} owner={d} llvm={d}us\n", .{ node, @tagName(which), owner, nowUs() - t0 });
             const t: Thunk = @ptrFromInt(addr);
             self.thunks.put(allocator, key, t) catch return oomT();
             return t;
@@ -214,29 +214,19 @@ pub const Compiled = struct {
         if (c.specialized >= compile_mod.max_specialized) return;
         c.failed_semantic = null;
         c.need_retry = false;
-        const t0 = nowUs();
-        const inlined0 = c.inlined;
-        const blocks0 = c.helper_blocks;
-        const name = c.compileSpecialized(site) catch |e| {
+        const name = c.compileSpecialized(site) catch {
             c.forgetModule();
-            if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("not specialized {s} for site {d}: {s} {s}\n", .{ c.sites.items[site].func.name, site, @errorName(e), self.failure.message.items });
             // (a Python error on the way: not the program's)
             py.c.PyErr_Clear();
             return;
         };
-        const inlined = c.inlined - inlined0;
         const addr = self.add(name) orelse {
             // (what it made isn't in the JIT)
             c.forgetModule();
-            if (std.c.getenv("ZRUN_STATS") != null) {
-                std.debug.print("not specialized {s} for site {d}: the JIT refused it\n", .{ c.sites.items[site].func.name, site });
-                py.c.PyErr_Print();
-            }
             py.c.PyErr_Clear();
             return;
         };
         self.special.put(allocator, name, addr) catch return;
-        if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("specialized {s} (size {d}, {d} bodies inline, {d} blocks) for site {d}: {d}us\n", .{ c.sites.items[site].func.name, c.sites.items[site].func.size, inlined, c.helper_blocks - blocks0, site, nowUs() - t0 });
         hot.code = addr;
     }
 
@@ -262,7 +252,6 @@ pub const Compiled = struct {
                 c.forgetModule();
                 // (a literal made at run time: again; anything else: Python)
                 if (e == error.Unsupported and c.need_retry) continue;
-                if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("not compiled: {s}\n", .{self.failure.message.items});
                 py.c.PyErr_Clear();
                 break;
             };
@@ -312,7 +301,6 @@ pub const Compiled = struct {
                         if (c.need_retry) continue :attempt;
                         if (c.failed_semantic) |s| {
                             if (!self.python.contains(s)) {
-                                if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("function {d}: as Python: {s}\n", .{ fnode, self.failure.message.items });
                                 if (!markPython(self.python, s, self.failure.message.items)) return oomA();
                                 continue :attempt;
                             }
@@ -339,12 +327,11 @@ pub const Compiled = struct {
             break :blk cache.pathFor(allocator, std.mem.span(text));
         } orelse return llvm.compile(self.view, m.take(), 2, err) catch null;
         defer allocator.free(path);
-        const stats = std.c.getenv("ZRUN_STATS") != null;
         if (cache.read(allocator, path)) |bytes| {
             defer allocator.free(bytes);
             // (the module isn't the JIT's: the compiler frees it)
             if (llvm.loadObject(self.view, bytes, err)) |module| {
-                if (stats) std.debug.print("  from the cache: {s}\n", .{path});
+                self.cache_loaded += 1;
                 return module;
             } else |_| {}
             // (one that won't load: compiled again)
@@ -352,11 +339,11 @@ pub const Compiled = struct {
         const bytes = llvm.emitObject(self.view, m.take(), 2, err) catch return null;
         defer llvm.freeBytes(self.view, bytes);
         cache.write(path, bytes);
-        if (stats) std.debug.print("  compiled, kept: {s}\n", .{path});
+        self.cache_kept += 1;
         return llvm.loadObject(self.view, bytes, err) catch null;
     }
 
-    /// ZRUN_PERFMAP: the module's functions named for perf
+    /// zrun.configure(perf_map=True): the module's functions named for perf
     /// (/tmp/perf-<pid>.map: each one's address, its size taken as up to
     /// the next one's).
     fn perfMap(self: *Compiled) void {
@@ -391,10 +378,6 @@ pub const Compiled = struct {
     fn add(self: *Compiled, name: [:0]const u8) ?usize {
         var err: [2048]u8 = undefined;
         @memset(&err, 0);
-        if (std.c.getenv("ZRUN_STATS") != null) {
-            std.debug.print("module {s}: {d} bodies inlined, {d} helpers out of line\n", .{ name, self.compiler.inlined, self.compiler.helper_fns.items.len });
-            self.compiler.inlined = 0;
-        }
         // The addresses the code names (ir.Module.ptrConst): defined first
         const m = &self.compiler.m;
         if (m.syms.items.len > 0) {
@@ -411,19 +394,17 @@ pub const Compiled = struct {
                 return null;
             };
         }
-        const t0 = nowUs();
         const module = self.compileModule(&err) orelse {
             ph.raise(py.PyExc_RuntimeError(), "zrun: LLVM rejected the compiled program (a zrun bug): {s}", .{std.mem.sliceTo(&err, 0)});
             return null;
         };
-        llvm_us += nowUs() - t0;
         self.modules.append(allocator, module) catch {
             var code = module;
             code.release();
             _ = py.c.PyErr_NoMemory();
             return null;
         };
-        if (std.c.getenv("ZRUN_PERFMAP") != null) self.perfMap();
+        if (perf_map) self.perfMap();
         const addr = llvm.lookup(self.view, name);
         if (addr == 0) {
             ph.raise(py.PyExc_RuntimeError(), "zrun: compiled code without its entry point {s}", .{name});
@@ -433,21 +414,15 @@ pub const Compiled = struct {
     }
 };
 
-fn nowUs() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * 1_000_000 + @divTrunc(@as(i64, ts.nsec), 1000);
-}
-
 fn types() type {
     return @import("types.zig");
 }
 
 var helpers_defined = false;
 var next_id: u64 = 0;
-/// Time in LLVM (optimizing, compiling) so far
-pub var llvm_us: i64 = 0;
-/// Compiled functions by address (ZRUN_PERFMAP)
+/// zrun.configure(perf_map=True): compiled functions named for perf
+pub var perf_map = false;
+/// Compiled functions by address (perf_map)
 var perf_syms: std.AutoArrayHashMapUnmanaged(usize, [:0]u8) = .empty;
 
 /// Give zgram's JIT the runtime helpers (once per process).
@@ -486,7 +461,6 @@ fn build(out: *Compiled, data: *program_mod.Data, lang: compile_mod.LangView, pr
             const failed = out.compiler.failed_semantic;
             const need_frames = out.compiler.need_frames;
             const need_retry = out.compiler.need_retry;
-            if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("build attempt: frames={} retry={} heap={} python={}: {s}\n", .{ need_frames, need_retry, force_heap, failed != null, out.failure.message.items });
             // (what this attempt kept)
             for (out.compiler.objects.items) |o| py.Py_DecRef(o);
             out.compiler.m.deinit();
@@ -525,8 +499,6 @@ fn build(out: *Compiled, data: *program_mod.Data, lang: compile_mod.LangView, pr
 pub fn compileProgram(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject) ?*Compiled {
     const view = llvm.get() orelse return null;
     if (!defineHelpers(view)) return null;
-    const t_start = nowUs();
-    const llvm_start = llvm_us;
 
     const out = allocator.create(Compiled) catch return oom();
     out.* = .{ .arena = std.heap.ArenaAllocator.init(allocator), .compiler = undefined, .python = python, .view = view, .main = undefined, .globals = 0 };
@@ -545,7 +517,6 @@ pub fn compileProgram(data: *program_mod.Data, lang: compile_mod.LangView, pytho
     };
     out.main = @ptrFromInt(addr);
     out.globals = if (out.compiler.layouts.get(program_mod.NONE)) |l| l.syms.items.len else 0;
-    if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("program compiled: {d}ms, LLVM {d}ms of it\n", .{ @divTrunc(nowUs() - t_start, 1000), @divTrunc(llvm_us - llvm_start, 1000) });
     return out;
 }
 

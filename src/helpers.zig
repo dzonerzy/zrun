@@ -145,14 +145,13 @@ fn failAs(ctx: *Ctx, node: u32, exc: *PyObject, py_msg: ?[]const u8, comptime fm
     return fail(ctx, node, fmt, args);
 }
 
-/// ZRUN_STATS: how many times compiled code went through Python, by what
-/// (printed when a run ends).
-var stats_on: ?bool = null;
+/// While a run is reported (Program.run(report=True)): how many times the
+/// compiled code went through Python, by what (Program.report()).
+pub var collecting: bool = false;
 var stats: std.StringHashMapUnmanaged(u64) = .empty;
 
 pub fn stat(comptime fmt: []const u8, args: anytype) void {
-    if (stats_on == null) stats_on = std.c.getenv("ZRUN_STATS") != null;
-    if (!stats_on.?) return;
+    if (!collecting) return;
     var buf: [128]u8 = undefined;
     const key = std.fmt.bufPrint(&buf, fmt, args) catch return;
     const e = stats.getOrPut(allocator, key) catch return;
@@ -182,24 +181,24 @@ pub fn statType(v: Value, buf: []u8) []const u8 {
     return buf[0..k];
 }
 
-/// The counts so far, most first (ZRUN_STATS), then forgotten.
-pub fn printStats() void {
-    if (stats_on != true or stats.count() == 0) return;
-    const Entry = struct { k: []const u8, v: u64 };
-    var list: std.ArrayListUnmanaged(Entry) = .empty;
-    defer list.deinit(allocator);
+/// The counts so far as {what: count} (a new reference; null with an
+/// exception), then forgotten.
+pub fn takeStats() ?*PyObject {
+    defer {
+        var it = stats.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        stats.clearRetainingCapacity();
+    }
+    const out = py.c.PyDict_New() orelse return null;
     var it = stats.iterator();
-    while (it.next()) |e| list.append(allocator, .{ .k = e.key_ptr.*, .v = e.value_ptr.* }) catch return;
-    std.mem.sort(Entry, list.items, {}, struct {
-        fn lt(_: void, a: Entry, b: Entry) bool {
-            return a.v > b.v;
-        }
-    }.lt);
-    std.debug.print("through Python:\n", .{});
-    for (list.items[0..@min(list.items.len, 25)]) |e| std.debug.print("  {d:>9}  {s}\n", .{ e.v, e.k });
-    var it2 = stats.keyIterator();
-    while (it2.next()) |k| allocator.free(k.*);
-    stats.clearRetainingCapacity();
+    while (it.next()) |e| {
+        const k = ph.newString(e.key_ptr.*) orelse return null;
+        defer py.Py_DecRef(k);
+        const v = py.c.PyLong_FromUnsignedLongLong(e.value_ptr.*) orelse return null;
+        defer py.Py_DecRef(v);
+        if (py.c.PyDict_SetItem(out, k, v) != 0) return null;
+    }
+    return out;
 }
 
 /// dataclasses.FrozenInstanceError (had once; null with an exception).
@@ -373,7 +372,7 @@ fn wideBinary(ctx: *Ctx, node: u32, op: Op, a: Value, b: Value, out: *Value) boo
 }
 
 fn pythonBinary(ctx: *Ctx, node: u32, op: Op, a: Value, b: Value, out: *Value) bool {
-    if (stats_on == true) {
+    if (collecting) {
         var b1: [64]u8 = undefined;
         var b2: [64]u8 = undefined;
         stat("binary {s} {s} {s}", .{ statType(a, &b1), @tagName(op), statType(b, &b2) });
@@ -623,7 +622,7 @@ export fn zr_compare(ctx: *Ctx, node: u32, cmp_code: u32, ta: u64, ba: u64, tb: 
         },
     }
     // Through Python
-    if (stats_on == true) {
+    if (collecting) {
         var b1: [64]u8 = undefined;
         var b2: [64]u8 = undefined;
         stat("compare {s} {s} {s}", .{ statType(a, &b1), @tagName(cmp), statType(b, &b2) });
@@ -848,7 +847,7 @@ pub export fn zr_call(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Val
             const callee: *PyObject = @ptrFromInt(f.bits);
             // (a Python function: by its compiled code, if it can have one)
             if (receiver == null) if (@import("bridge.zig").compiledMethod(ctx, node, callee, args[0..nargs], true, out)) |ok| return ok;
-            if (stats_on == true) {
+            if (collecting) {
                 var b: [64]u8 = undefined;
                 stat("call host {s}", .{statType(f, &b)});
             }
@@ -1025,7 +1024,7 @@ export fn zr_getattr(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value
         }
     }
     // Anything else (and the errors): Python's getattr
-    if (stats_on == true) {
+    if (collecting) {
         var b: [64]u8 = undefined;
         stat("getattr {s}.{s}", .{ statType(v, &b), name.bytes() });
     }
@@ -1102,7 +1101,7 @@ export fn zr_getitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
         else => {},
     }
     // Strings, slices of everything, the errors: Python's
-    if (stats_on == true) {
+    if (collecting) {
         var b1: [64]u8 = undefined;
         var b2: [64]u8 = undefined;
         stat("getitem {s}[{s}]", .{ statType(v, &b1), statType(k, &b2) });
@@ -1197,7 +1196,7 @@ export fn zr_items(ctx: *Ctx, node: u32, t: u64, bits: u64, out: *Value) callcon
         },
         else => {},
     }
-    if (stats_on == true) {
+    if (collecting) {
         var b: [64]u8 = undefined;
         stat("items {s}", .{statType(v, &b)});
     }
@@ -1413,7 +1412,7 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
             return true;
         }
     }
-    if (stats_on == true) {
+    if (collecting) {
         var b: [64]u8 = undefined;
         stat("method {s}.{s}", .{ statType(v, &b), name.bytes() });
     }
@@ -1609,7 +1608,7 @@ fn isPySpace(c: u8) bool {
 /// len(), zip()... of run-time values): a host object of the program.
 export fn zr_call_python(ctx: *Ctx, node: u32, callee_index: u64, args: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
     const callee = ctx.object(callee_index);
-    if (stats_on == true) {
+    if (collecting) {
         var b: [64]u8 = undefined;
         var b2: [64]u8 = undefined;
         const name = if (ph.attr(callee, "__name__")) |nm| blk: {

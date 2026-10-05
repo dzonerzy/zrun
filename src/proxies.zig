@@ -1122,9 +1122,28 @@ fn recordCompare(o: ?*PyObject, other: ?*PyObject, op: c_int) callconv(.c) ?*PyO
 
 fn recordHash(o: ?*PyObject) callconv(.c) isize {
     const r = record(asProxy(o));
-    if (r.rtype.value_eq) return py.c.PyObject_HashNotImplemented(o);
+    // (a frozen dataclass compared by value: its fields' tuple's, as the
+    // dataclass's __hash__; one not frozen: unhashable, as it is)
+    if (r.rtype.value_eq) {
+        if (!r.rtype.frozen) return py.c.PyObject_HashNotImplemented(o);
+        return valueHash(r) orelse -1;
+    }
     // (a plain object's: its identity, the native object's)
     return @bitCast(@intFromPtr(r) >> 4);
+}
+
+/// The hash Python gives a frozen dataclass's object compared by value:
+/// its fields' tuple's (null with an exception).
+pub fn valueHash(r: *value.Record) ?isize {
+    const fields = r.fields();
+    const t = py.c.PyTuple_New(@intCast(fields.len)) orelse return null;
+    defer py.Py_DecRef(t);
+    for (fields, 0..) |x, i| {
+        const o = value.toPython(x, @import("adopt.zig").shared_maker) orelse return null;
+        _ = py.c.PyTuple_SetItem(t, @intCast(i), o);
+    }
+    const h = py.c.PyObject_Hash(t);
+    return if (h == -1) null else h;
 }
 
 var record_slots = [_]py.c.PyType_Slot{

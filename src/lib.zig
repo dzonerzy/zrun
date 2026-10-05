@@ -66,6 +66,9 @@ const Language = struct {
     _exec_of: []?*PyObject = &.{},
     _resolved: bool = false,
     _max_depth: u32 = 1000,
+    /// Calls of a call site in compiled code before code of its own is
+    /// compiled for it (what it knows of its arguments)
+    _hot_calls: i64 = 1000,
     /// The semantics read by the compiler's front, by function object
     /// (each holds a reference to its function); those marked
     /// native=False aren't here
@@ -77,7 +80,7 @@ const Language = struct {
     /// run time (they escape where known ones can't follow)
     _escaping: std.AutoHashMapUnmanaged(compile_mod.EscapeKey, void) = .empty,
 
-    pub fn __new__(args: pyoz.Args(struct { parser: *PyObject, rules: ?*PyObject = null, max_depth: i64 = 1000 })) ?Language {
+    pub fn __new__(args: pyoz.Args(struct { parser: *PyObject, rules: ?*PyObject = null, max_depth: i64 = 1000, hot_calls: i64 = 1000 })) ?Language {
         const v = args.value;
         var lang = Language{};
         const g = allocator.create(grammar_mod.Grammar) catch return oom(Language);
@@ -102,6 +105,11 @@ const Language = struct {
             return lang.fail();
         }
         lang._max_depth = @intCast(@min(v.max_depth, 1_000_000));
+        if (v.hot_calls < 1) {
+            ph.raise(py.PyExc_ValueError(), "hot_calls must be at least 1", .{});
+            return lang.fail();
+        }
+        lang._hot_calls = v.hot_calls;
         return lang;
     }
 
@@ -578,11 +586,14 @@ const Program = struct {
     _state: ?*PyObject = null,
     /// The program compiled (once it ran compiled)
     _compiled: ?*driver.Compiled = null,
+    /// The last run with report=True: where its compiled code went through
+    /// Python, {what: times} (report())
+    _crossings: ?*PyObject = null,
 
     fn release(self: *Program) void {
         if (self._compiled) |c| c.destroy();
         self._compiled = null;
-        inline for (.{ "_state", "_lang", "_source", "_path" }) |f| {
+        inline for (.{ "_state", "_lang", "_source", "_path", "_crossings" }) |f| {
             if (@field(self, f)) |o| py.Py_DecRef(o);
             @field(self, f) = null;
         }
@@ -709,19 +720,70 @@ const Program = struct {
         return unwrap(Language, self._lang.?).?;
     }
 
-    /// `program.run(mode="python")`: run the program from its start, its
-    /// semantics as Python ("python") or compiled to native code
-    /// ("compiled"). Raises zrun.Error on a runtime error, the same in
-    /// every mode.
-    pub fn run(self: *Program, args: pyoz.Args(struct { mode: ?*PyObject = null })) ?*PyObject {
+    /// `program.run(mode="python", report=False)`: run the program from its
+    /// start, its semantics as Python ("python") or compiled to native
+    /// code ("compiled"). Raises zrun.Error on a runtime error, the same in
+    /// every mode. report=True: where the compiled code goes through
+    /// Python is counted (report(); a little slower).
+    pub fn run(self: *Program, args: pyoz.Args(struct { mode: ?*PyObject = null, report: bool = false })) ?*PyObject {
         const mode: []const u8 = if (optional(args.value.mode)) |m| ph.utf8(m, "mode") orelse return null else "python";
         if (std.mem.eql(u8, mode, "python")) return onBigStack(runHere, .{self}, self.language()._max_depth);
         if (std.mem.eql(u8, mode, "compiled")) {
             if (!self.ensureCompiled()) return null;
+            const reporting = args.value.report;
+            helpers.collecting = reporting;
+            defer if (reporting) {
+                helpers.collecting = false;
+                // (the run's error, if any, stays the one raised)
+                var t: ?*PyObject = null;
+                var v: ?*PyObject = null;
+                var tb: ?*PyObject = null;
+                py.c.PyErr_Fetch(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
+                if (self._crossings) |o| py.Py_DecRef(o);
+                self._crossings = helpers.takeStats();
+                if (self._crossings == null) py.c.PyErr_Clear();
+                py.c.PyErr_Restore(t, v, tb);
+            };
             return onBigStack(runCompiled, .{self}, self.language()._max_depth);
         }
         ph.raise(py.PyExc_ValueError(), "mode must be 'python' or 'compiled', not '{s}'", .{mode});
         return null;
+    }
+
+    /// `program.report()`: what to look at to make the compiled program
+    /// faster, as data. {"python_crossings": {what: times} (where compiled
+    /// code went through Python in the last run with report=True),
+    /// "module_state": {name: "native" or why Python keeps it} (the
+    /// module-level tables and records the semantics use), "cache":
+    /// {"loaded": n, "compiled": n} (modules of compiled code)}. Which
+    /// semantics run as Python: Language.python_semantics().
+    pub fn report(self: *Program) ?*PyObject {
+        const out = py.c.PyDict_New() orelse return null;
+        const crossings = if (self._crossings) |o| ref(o) else py.c.PyDict_New() orelse return null;
+        defer py.Py_DecRef(crossings);
+        if (py.c.PyDict_SetItemString(out, "python_crossings", crossings) != 0) return null;
+        const module_state = py.c.PyDict_New() orelse return null;
+        defer py.Py_DecRef(module_state);
+        const cache_d = py.c.PyDict_New() orelse return null;
+        defer py.Py_DecRef(cache_d);
+        if (self._compiled) |c| {
+            var it = c.compiler.module_state.iterator();
+            while (it.next()) |e| {
+                const v = ph.newString(e.value_ptr.*) orelse return null;
+                defer py.Py_DecRef(v);
+                const k = ph.newString(e.key_ptr.*) orelse return null;
+                defer py.Py_DecRef(k);
+                if (py.c.PyDict_SetItem(module_state, k, v) != 0) return null;
+            }
+        }
+        inline for (.{ .{ "loaded", "cache_loaded" }, .{ "compiled", "cache_kept" } }) |p| {
+            const n = py.c.PyLong_FromUnsignedLongLong(if (self._compiled) |c| @field(c, p[1]) else 0) orelse return null;
+            defer py.Py_DecRef(n);
+            if (py.c.PyDict_SetItemString(cache_d, p[0], n) != 0) return null;
+        }
+        if (py.c.PyDict_SetItemString(out, "module_state", module_state) != 0) return null;
+        if (py.c.PyDict_SetItemString(out, "cache", cache_d) != 0) return null;
+        return out;
     }
 
     /// What the compiler needs of the language (and of this program's tree).
@@ -742,6 +804,7 @@ const Program = struct {
             .path = path,
             .python = &lang._python,
             .escaping = &lang._escaping,
+            .hot_calls = lang._hot_calls,
         };
     }
 
@@ -802,7 +865,6 @@ const Program = struct {
             .link = @constCast(&link),
         };
         defer ectx.deinit();
-        defer helpers.printStats();
         // (the run rt values reaching Python belong to)
         const outer = bridge.current;
         bridge.current = &ectx;
@@ -1951,6 +2013,28 @@ fn version() []const u8 {
     return @import("build_options").version;
 }
 
+/// zrun.configure(cache=None, perf_map=None): process-wide settings.
+fn configure(args: pyoz.Args(struct { cache: ?*PyObject = null, perf_map: ?*PyObject = null })) ?*PyObject {
+    const v = args.value;
+    if (optional(v.cache)) |c| {
+        const s: @import("cache.zig").Setting = if (c == py.Py_True()) .default else if (c == py.Py_False()) .off else blk: {
+            const path = ph.utf8(c, "cache") orelse {
+                py.c.PyErr_Clear();
+                ph.raise(py.PyExc_TypeError(), "cache must be True, False or a directory (str)", .{});
+                return null;
+            };
+            break :blk .{ .dir = path };
+        };
+        @import("cache.zig").set(s) catch return py.c.PyErr_NoMemory();
+    }
+    if (optional(v.perf_map)) |p| {
+        const r = py.c.PyObject_IsTrue(p);
+        if (r < 0) return null;
+        driver.perf_map = r == 1;
+    }
+    return none();
+}
+
 fn moduleInit(module: *PyObject) callconv(.c) c_int {
     if (types.init(module) != 0) return -1;
     objects.init(module) catch return -1;
@@ -1968,6 +2052,7 @@ pub const Module = pyoz.module(.{
     .doc = "zrun - execution for languages defined with zgram and checked with zrules: semantics written as Python functions, run natively.",
     .funcs = &.{
         pyoz.func("version", version, "Return the zrun version string"),
+        pyoz.kwfunc("configure", configure, "configure(cache=None, perf_map=None): process-wide settings (those not given stay). cache: True (the usual place: $XDG_CACHE_HOME/zrun or ~/.cache/zrun), False (no cache), or a directory; perf_map: name compiled functions for perf (/tmp/perf-<pid>.map)."),
     },
     .classes = &.{
         pyoz.class("Language", Language),

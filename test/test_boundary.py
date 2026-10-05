@@ -51,6 +51,7 @@ BUILTINS = (
     "extends",
     "indexes",
     "bigcmp",
+    "frozenkeys",
 )
 
 
@@ -383,6 +384,17 @@ def make_lang():
             out.append(len("héllo".encode("utf-8")))
             out.append("ab".encode())
             return out
+        if name == "frozenkeys":
+            # frozen dataclasses compared by value as keys: made here or by
+            # Python, in dicts made here or by Python
+            pyd, pykey = rt.call(rt.load(node.name), [])
+            k1 = Frozen(1)
+            d = {k1: "native"}
+            out = [d.get(Frozen(1)), d.get(pykey), pyd.get(Frozen(1)), pyd.get(Frozen(2)), Frozen(1) in pyd, pykey in d,
+                   hash(Frozen(1)) == hash(pykey), Frozen(1) == pykey, k1 == Frozen(1)]
+            pyd[Frozen(3)] = "three"
+            out.append(pyd.get(Frozen(3)))
+            return out
         if name == "bigcmp":
             # `is True`/`is False` of every kind of value; ints of each
             # kind (and others) against constants beyond 64 bits
@@ -650,6 +662,10 @@ def make_lang():
         return 3
 
     @lang.host
+    def frozenkeys():
+        return ({Frozen(1): "python"}, Frozen(1))
+
+    @lang.host
     def bigcmp():
         return [1, True, 0, None, "s", Box(1), 2**62]
 
@@ -769,6 +785,7 @@ PROGRAMS = {
     "extends": "print(extends());\n",
     "indexes": "print(indexes());\n",
     "bigcmp": "print(bigcmp());\n",
+    "frozenkeys": "print(frozenkeys());\n",
 }
 
 
@@ -790,6 +807,7 @@ def test_shared_with_python(name, capsys):
         "slices": "([2, 3, 4], [5, 3, 1], [], (4, 5), 'ello', 'éllo', [1, 2], [1, 2, 3, 4])",
         "genexp": "(True, False, 12, 2, True, False, '123')",
         "defaults": "(6, 9, 7, 13, 2)",
+        "frozenkeys": "['native', 'native', 'python', None, True, True, True, True, True, 'three']",
         "extends": "([3, 3, 4, 7, 30, [1, 1], 8, 9], [3, 5], True, [0, 3, 'a'])",
         "indexes": "[10, 30, 30, 10, 2, 2, 'v', 'é', 'o', 20, 3, 3, 1, 5, 0, 2, 'list index out of range', 'list index out of range', 'tuple index out of range']",
         "folds": "[31, -1000, 42, -1, ['7', '-8'], ['x', 'b', 'y', 'x', 'y', '!'], ['x', 'b', 'y', 'x', 'y'], \"bad digit 'z' in '12z'\", 6, b'ab']",

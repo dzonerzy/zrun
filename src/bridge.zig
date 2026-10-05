@@ -198,10 +198,6 @@ pub export fn zr_py_semantic(ctx: *Ctx, which: u32, idx: u32, frame_slot: **valu
 pub export fn zr_run_value(ctx: *Ctx, which: u32, at: u32, tag: u64, bits: u64, frame_slot: **value.Frame, owner: u32, out: *Value) callconv(.c) i32 {
     out.* = Value.none_v;
     const v = Value{ .tag = tag, .bits = bits };
-    if (v.kind() == .node) {
-        const d = linkOf(ctx).data;
-        helpers.stat("run_value node {s} (at {s})", .{ d.grammar.kind_names[d.rule(@intCast(v.bits))], if (at < d.nodes.len) d.grammar.kind_names[d.rule(at)] else "-" });
-    } else helpers.stat("run_value {s}", .{@tagName(v.kind())});
     const loop = which == 2;
     const w: compile_mod.Which = if (which == 0) .eval else .exec;
     switch (v.kind()) {
@@ -534,7 +530,7 @@ pub fn compiledCall(ctx: *Ctx, node: u32, callee: *PyObject, args: []const Value
         n += 1;
     }
     const code = lk.compiled.calledCode(callee, args.len, mask, closure) orelse {
-        if (std.c.getenv("ZRUN_STATS") != null) {
+        if (helpers.collecting) {
             if (ph.attr(callee, "__qualname__")) |nm| {
                 defer py.Py_DecRef(nm);
                 helpers.stat("python function {s}", .{ph.utf8(nm, "name") orelse "?"});

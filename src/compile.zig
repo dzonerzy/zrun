@@ -59,6 +59,9 @@ pub const LangView = struct {
     /// one can't follow: learned while compiling), by the code they're in
     /// (Gen.unit: elsewhere, the same literal may stay known)
     escaping: *std.AutoHashMapUnmanaged(EscapeKey, void),
+    /// Calls of a call site before its helper is compiled for it (Site;
+    /// Language(hot_calls=...))
+    hot_calls: i64,
 };
 
 pub const EscapeKey = struct { origin: *const front.Expr, unit: u64 };
@@ -735,16 +738,6 @@ pub const Site = struct {
     pub const Hot = extern struct { code: u64 = 0, count: i64 = 0 };
 };
 
-/// Calls of a site before its helper is compiled for it (ZRUN_HOT_CALLS:
-/// another number, 1 to test the specializations)
-fn hotCalls() i64 {
-    if (hot_calls == 0) {
-        hot_calls = 1000;
-        if (std.c.getenv("ZRUN_HOT_CALLS")) |s| hot_calls = std.fmt.parseInt(i64, std.mem.span(s), 10) catch 1000;
-    }
-    return hot_calls;
-}
-var hot_calls: i64 = 0;
 /// The most specializations a program makes (compiling costs)
 pub const max_specialized = 256;
 /// The biggest specialization compiled (blocks of code, the helpers it
@@ -805,8 +798,6 @@ pub const Compiler = struct {
     helper_fns: std.ArrayListUnmanaged(*HelperSpec) = .empty,
     helper_queue: std.ArrayListUnmanaged(*HelperSpec) = .empty,
     helpers_kept: usize = 0,
-    /// Semantic and helper bodies run inline so far (ZRUN_STATS)
-    inlined: usize = 0,
     /// Record fields by module and name (Gen.fieldCandidates)
     field_cands: std.StringHashMapUnmanaged([]const Gen.FieldCandidate) = .empty,
     /// Call sites of helpers out of line that may get code of their own
@@ -817,6 +808,9 @@ pub const Compiler = struct {
     helper_blocks: usize = 0,
     /// Names given to addresses so far (ir.Module.ptrConst)
     ksyms: u32 = 0,
+    /// The module-level tables and records the semantics use: "native", or
+    /// why Python keeps them (adopt.zig; Program.report())
+    module_state: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
     /// By node: its kind's str (kindTable); by label, its child (fieldTable)
     kind_table: ?[]u64 = null,
     owner_table: ?[]u64 = null,
@@ -825,6 +819,13 @@ pub const Compiler = struct {
     /// In a field table: a node whose label isn't one child or none (a
     /// list of them, a value an action makes): zr_getattr's
     pub const field_other: i64 = @as(i64, NONE) - 1;
+
+    /// What became of module state named `name` (the last word on it).
+    pub fn noteState(self: *Compiler, name: []const u8, what: []const u8) !void {
+        const e = try self.module_state.getOrPut(self.a, name);
+        if (!e.found_existing) e.key_ptr.* = try self.a.dupe(u8, name);
+        e.value_ptr.* = what;
+    }
 
     /// Each node's owner (the scope whose frame its code runs in: ownerOf),
     /// by node: what code out of line walks frames by (zr_frame_of).
@@ -2933,14 +2934,6 @@ const Gen = struct {
             return null;
         };
         defer py.Py_DecRef(r);
-        if (std.c.getenv("ZRUN_STATS") != null) {
-            const ra = py.c.PyObject_Repr(tuple);
-            defer if (ra) |o| py.Py_DecRef(o);
-            const rr = py.c.PyObject_Repr(r);
-            defer if (rr) |o| py.Py_DecRef(o);
-            std.debug.print("known when compiling: {s}{s} = {s}\n", .{ func.name, if (ra) |o| ph.utf8(o, "repr") orelse "?" else "?", if (rr) |o| ph.utf8(o, "repr") orelse "?" else "?" });
-            py.c.PyErr_Clear();
-        }
         const v = try self.constant(r, self.atNode());
         if (!allConstant(v)) return null;
         return v;
@@ -3165,7 +3158,7 @@ const Gen = struct {
         try f.block(counted);
         const n = f.add(f.load(t.i64, count_ptr), self.k(1));
         f.store(n, count_ptr);
-        try f.condBr(f.icmp(jit_c.LLVMIntEQ, n, self.k(hotCalls())), now_hot, call_generic);
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, n, self.k(self.c.lang.hot_calls)), now_hot, call_generic);
         try f.block(now_hot);
         _ = self.call("zr_specialize", &.{ self.ctx, self.k(@intCast(site)) });
         try f.br(call_generic);
@@ -3184,8 +3177,6 @@ const Gen = struct {
     /// Run a front function inline with arguments.
     fn runFunction(self: *Gen, func: *const front.Function, at: u32, args: []const SVal) Error!SVal {
         if (self.insts.items.len > 200) return self.c.unsupported("semantics nest more than 200 deep (recursive helpers aren't compiled yet)", .{});
-        self.c.inlined += 1;
-        if (std.c.getenv("ZRUN_STATS") != null and self.c.inlined % 2000 == 0) std.debug.print("  inlined {d} bodies (depth {d}, {s})\n", .{ self.c.inlined, self.insts.items.len, func.name });
         const locals = try self.a().alloc(Local, func.locals.len);
         @memset(locals, .unset);
         if (args.len != func.param_count) return self.c.unsupportedAt(func, .{ .line = func.first_line }, "called with {d} arguments, takes {d}", .{ args.len, func.param_count });
@@ -3680,12 +3671,16 @@ const Gen = struct {
 
     /// obj.name = v (both taken)
     fn setAttr(self: *Gen, inst: *Inst, obj: SVal, name: []const u8, v: SVal, pos: front.Pos) Error!void {
-        if (obj != .dyn) {
+        // (a Python object the module keeps, an instance: as Python does it
+        // when the code runs; a module's or class's attributes are read
+        // when compiling, they can't change)
+        const py_instance = obj == .py and !try stablePy(obj.py);
+        if (obj != .dyn and !py_instance) {
             try self.drop(v);
             return self.c.unsupportedAt(inst.func, pos, "assigning to an attribute of a {s} isn't compiled", .{@tagName(obj)});
         }
         const vd = try self.materialize(v, inst.node);
-        const d = obj.dyn;
+        const d = if (py_instance) try self.materialize(obj, inst.node) else obj.dyn;
         const f = &self.f;
         const t = self.c.m.t;
         // A field of a record of the module's classes: stored where it is
@@ -4453,18 +4448,28 @@ const Gen = struct {
         }
         if (py.c.PyDict_GetItem(globals, key)) |v| {
             // (a table only read: known, as a constant)
-            if (py.c.PySequence_Contains(try frozenGlobals(globals), key) == 1) return self.frozenTable(v, inst.node);
+            if (py.c.PySequence_Contains(try frozenGlobals(globals), key) == 1) {
+                try self.c.noteState(name, "constant (only read)");
+                return self.frozenTable(v, inst.node);
+            }
             // (a table or record kept there that semantics change: native,
             // shared with Python (adopt.zig), its address a constant)
-            if (try adopt_mod.adopt(v, globals)) |nv| return .{ .dyn = .{
-                .tag = self.k(@intCast(nv.tag)),
-                .bits = self.c.m.addrInt(nv.bits),
-                .shape = switch (nv.kind()) {
-                    .list => .list,
-                    .dict => .dict,
-                    else => .record,
+            switch (try adopt_mod.adopt(self.c.a, v, globals)) {
+                .native => |nv| {
+                    try self.c.noteState(name, "native");
+                    return .{ .dyn = .{
+                        .tag = self.k(@intCast(nv.tag)),
+                        .bits = self.c.m.addrInt(nv.bits),
+                        .shape = switch (nv.kind()) {
+                            .list => .list,
+                            .dict => .dict,
+                            else => .record,
+                        },
+                    } };
                 },
-            } };
+                .refused => |why| try self.c.noteState(name, why),
+                .not_state => {},
+            }
             return self.constant(v, inst.node);
         }
         const builtins = py.c.PyImport_ImportModule("builtins") orelse return error.Python;

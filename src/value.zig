@@ -635,6 +635,17 @@ fn scalarOf(v: Value) Scalar {
     }
 }
 
+/// A record compared by value as Python sees it (its proxy; a new
+/// reference), or null.
+fn valueRecordObject(v: Value) ?*PyObject {
+    if (v.kind() != .record) return null;
+    if (!@as(*Record, @ptrCast(@alignCast(v.ptr()))).rtype.value_eq) return null;
+    return proxies.make(v, @import("adopt.zig").shared_maker) orelse {
+        py.c.PyErr_Clear();
+        return null;
+    };
+}
+
 fn hostEqual(a: Value, b: Value) bool {
     if (a.kind() == .host and b.kind() == .host and a.bits == b.bits) return true;
     const x = scalarOf(a);
@@ -653,11 +664,12 @@ fn hostEqual(a: Value, b: Value) bool {
         .str => |s| y == .str and std.mem.eql(u8, s, y.str),
         .other => unreachable,
     };
-    // (Python objects: by Python's ==; with a native scalar, as Python
+    // (Python objects: by Python's ==; with a native scalar, or a record
+    // compared by value (a dataclass's: through its proxy), as Python
     // compares them)
-    const pa = scalarObject(a) orelse return false;
+    const pa = scalarObject(a) orelse valueRecordObject(a) orelse return false;
     defer py.Py_DecRef(pa);
-    const pb = scalarObject(b) orelse return false;
+    const pb = scalarObject(b) orelse valueRecordObject(b) orelse return false;
     defer py.Py_DecRef(pb);
     const r = py.c.PyObject_RichCompareBool(pa, pb, py.c.Py_EQ);
     if (r < 0) {
@@ -823,6 +835,17 @@ fn hashOf(tag: u64, bits: u64) u64 {
             return h;
         },
         .host => return hostHash(@ptrFromInt(bits)),
+        // (a frozen dataclass's compared by value: Python's hash of it, as
+        // hostHash takes an equal Python object's)
+        .record => {
+            const r: *Record = @ptrCast(@alignCast(v.ptr()));
+            if (!r.rtype.value_eq) return std.hash.Wyhash.hash(4, std.mem.asBytes(&bits));
+            const h = proxies.valueHash(r) orelse blk: {
+                py.c.PyErr_Clear();
+                break :blk 0;
+            };
+            return std.hash.Wyhash.hash(5, std.mem.asBytes(&h));
+        },
         else => return std.hash.Wyhash.hash(4, std.mem.asBytes(&bits)),
     }
 }
@@ -847,8 +870,12 @@ pub fn hashable(v: Value) bool {
         // (a Python object: unless its type says it isn't, as a list's does)
         .host => py.c.PyType_GetSlot(ph.typeOf(@ptrFromInt(v.bits)), py.c.Py_tp_hash) != @as(?*anyopaque, @ptrCast(@constCast(&py.c.PyObject_HashNotImplemented))),
         .list, .dict => false,
-        // (a dataclass compared by value isn't; a plain object is, by identity)
-        .record => !@as(*Record, @ptrCast(@alignCast(v.ptr()))).rtype.value_eq,
+        // (a dataclass compared by value isn't, unless it's frozen (by its
+        // fields' values then); a plain object is, by identity)
+        .record => blk: {
+            const rt = @as(*Record, @ptrCast(@alignCast(v.ptr()))).rtype;
+            break :blk !rt.value_eq or rt.frozen;
+        },
         .tuple => for (@as(*Tuple, @ptrCast(@alignCast(v.ptr()))).slice()) |item| {
             if (!hashable(item)) break false;
         } else true,

@@ -9,8 +9,9 @@
 //! the code compiling this one would make. zrun still generates the IR
 //! each time (a small part of the time), the key needs it.
 //!
-//! Where: $ZRUN_CACHE_DIR, else $XDG_CACHE_HOME/zrun, else ~/.cache/zrun.
-//! ZRUN_CACHE=0: none (everything compiled each time).
+//! Where: $XDG_CACHE_HOME/zrun, else ~/.cache/zrun; or where
+//! zrun.configure(cache=path) says (cache=False: none, everything compiled
+//! each time).
 
 const std = @import("std");
 const jit = @import("jit.zig");
@@ -19,25 +20,47 @@ const L = jit.f;
 /// Bump when what the objects mean changes without the IR text showing it
 const format = "zrun-cache-1";
 
+/// Where the cache is (zrun.configure(cache=...)): the usual place
+/// ($XDG_CACHE_HOME/zrun, else ~/.cache/zrun), none, or a directory given
+pub const Setting = union(enum) { default, off, dir: []const u8 };
+
+var setting: Setting = .default;
 var resolved = false;
 var dir_path: ?[]const u8 = null;
 var salt: [32]u8 = undefined;
+
+/// The cache from now on (the directory given: the caller's, copied).
+pub fn set(s: Setting) !void {
+    const a = std.heap.c_allocator;
+    if (setting == .dir) a.free(setting.dir);
+    setting = switch (s) {
+        .dir => |d| .{ .dir = try a.dupe(u8, d) },
+        else => s,
+    };
+    resolved = false;
+    if (dir_path) |p| a.free(p);
+    dir_path = null;
+}
 
 /// The cache's directory (made if needed), or null: no cache.
 fn dir() ?[]const u8 {
     if (resolved) return dir_path;
     resolved = true;
     const a = std.heap.c_allocator;
-    if (std.c.getenv("ZRUN_CACHE")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return null;
-    const path = if (std.c.getenv("ZRUN_CACHE_DIR")) |d|
-        a.dupe(u8, std.mem.span(d)) catch return null
-    else if (std.c.getenv("XDG_CACHE_HOME")) |d|
-        std.fmt.allocPrint(a, "{s}/zrun", .{std.mem.span(d)}) catch return null
-    else if (std.c.getenv("HOME")) |h|
-        std.fmt.allocPrint(a, "{s}/.cache/zrun", .{std.mem.span(h)}) catch return null
-    else
+    const path = switch (setting) {
+        .off => return null,
+        .dir => |d| a.dupe(u8, d) catch return null,
+        .default => if (std.c.getenv("XDG_CACHE_HOME")) |d|
+            std.fmt.allocPrint(a, "{s}/zrun", .{std.mem.span(d)}) catch return null
+        else if (std.c.getenv("HOME")) |h|
+            std.fmt.allocPrint(a, "{s}/.cache/zrun", .{std.mem.span(h)}) catch return null
+        else
+            return null,
+    };
+    if (!makePath(path)) {
+        a.free(path);
         return null;
-    if (!makePath(path)) return null;
+    }
     // What the objects depend on besides their IR
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     h.update(format);

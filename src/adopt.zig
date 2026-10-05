@@ -45,20 +45,25 @@ const Entry = struct {
 /// A module's top-level name referring into the graph
 const Binding = struct { dict: *PyObject, key: *PyObject, obj: *PyObject };
 
-/// The native object for module state `o` (borrowed: immortal, as the
-/// module's), made now if it can be; null if it can't (Python keeps it).
-/// An object adopted before (a proxy of an immortal object): its object.
+/// What became of module state: not module state (a function, a constant...),
+/// native (its object: borrowed, immortal as the module's), or Python's
+/// still (why: Program.report()'s "module_state").
+pub const Outcome = union(enum) { not_state, native: Value, refused: []const u8 };
+
+/// The native object for module state `o`, made now if it can be (the
+/// outcome). An object adopted before (a proxy of an immortal object): its
+/// object.
 ///
 /// What's adopted with it: the objects connected to it, through each other
 /// and the other tables and records `globals` (its module's) holds (one
 /// another's state: a metatable the globals' table don't reach...).
-pub fn adopt(o: *PyObject, globals: *PyObject) Error!?Value {
+pub fn adopt(a: std.mem.Allocator, o: *PyObject, globals: *PyObject) Error!Outcome {
     if (proxies.objectOf(o)) |v| {
         // (a proxy of a native object compiled code made: not module state
         // that stays: Python's, through the proxy)
-        return if (v.ptr().rc >= value.IMMORTAL) v else null;
+        return if (v.ptr().rc >= value.IMMORTAL) .{ .native = v } else .not_state;
     }
-    if (try kindOf(o) == null) return null;
+    if (try kindOf(o) == null) return .not_state;
     var g = Graph{};
     defer g.deinit();
     try g.walk(o, globals);
@@ -66,10 +71,10 @@ pub fn adopt(o: *PyObject, globals: *PyObject) Error!?Value {
     const target = g.find(g.seen.getIndex(o).?);
     for (g.seen.keys(), g.seen.values(), 0..) |x, e, i| {
         if (g.find(i) != target) continue;
-        if (e.unfit) return notAdopted(o, "a {s} in it has a key native dicts can't hash, or attributes beyond its fields", .{ph.typeOf(x).tp_name});
+        if (e.unfit) return .{ .refused = try std.fmt.allocPrint(a, "a {s} in it has a key compiled code's dicts can't hash, or attributes beyond its fields", .{ph.typeOf(x).tp_name}) };
         const refs = ph.refcnt(x);
         const known = e.internal + e.module;
-        if (refs != known) return notAdopted(o, "a {s} in it has {d} references, {d} from it and modules", .{ ph.typeOf(x).tp_name, refs, known });
+        if (refs != known) return .{ .refused = try std.fmt.allocPrint(a, "a {s} in it is referred to from somewhere besides it and module names ({d} references, {d} of them those)", .{ ph.typeOf(x).tp_name, refs, known }) };
     }
     try g.build(target);
     // The module's names: the native objects' proxies (kept by them: they
@@ -81,20 +86,13 @@ pub fn adopt(o: *PyObject, globals: *PyObject) Error!?Value {
         const proxy = proxies.make(v, shared_maker) orelse return error.Python;
         defer py.Py_DecRef(proxy);
         if (py.c.PyDict_SetItem(b.dict, b.key, proxy) != 0) return error.Python;
-        if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("module state native: {s} ({s})\n", .{ ph.utf8(b.key, "name") orelse "?", ph.typeOf(proxy).tp_name });
     }
-    return g.seen.get(o).?.native.?;
-}
-
-/// (ZRUN_STATS: why module state stays Python's)
-fn notAdopted(o: *PyObject, comptime why: []const u8, args: anytype) ?Value {
-    if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("module state not native ({s}): " ++ why ++ "\n", .{ph.typeOf(o).tp_name} ++ args);
-    return null;
+    return .{ .native = g.seen.get(o).?.native.? };
 }
 
 /// What the proxies of module state make nodes with: the program running's
 /// maker (a node is an index into a program; module state outlives them).
-const shared_maker = helpers.NodeMaker{ .ctx = @ptrCast(@constCast(&shared_maker_tag)), .make_fn = &currentNode };
+pub const shared_maker = helpers.NodeMaker{ .ctx = @ptrCast(@constCast(&shared_maker_tag)), .make_fn = &currentNode };
 const shared_maker_tag: u8 = 0;
 
 fn currentNode(_: *anyopaque, idx: u32) ?*PyObject {

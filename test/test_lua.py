@@ -42,7 +42,12 @@ def test_all_native():
 SPECIALIZED = """
 import sys
 sys.path.insert(0, sys.argv[1])
-import contextlib, io, lua
+import contextlib, functools, io, zrun
+# (lua.py's language made with every call site hot at once; nothing from
+# the cache: all compiled here)
+zrun.Language = functools.partial(zrun.Language, hot_calls=1)
+zrun.configure(cache=False)
+import lua
 bad = []
 for name in sys.argv[2:]:
     path = sys.argv[1] + "/tests/" + name + ".lua"
@@ -59,14 +64,14 @@ print(bad)
 
 def test_specialized():
     # every call site of a helper compiled out of line hot at its first
-    # call: each compiled for what it knows (ZRUN_HOT_CALLS=1), the
+    # call: each compiled for what it knows (Language(hot_calls=1)), the
     # programs printing what real Lua does, the second run too (the
-    # specialized code then)
+    # specialized code then); in a process of its own (lua.py's language
+    # made so)
     import subprocess
 
-    env = dict(os.environ, ZRUN_HOT_CALLS="1")
     some = [p for p in ("funcs", "programs", "strings") if p in PROGRAMS]
-    r = subprocess.run([sys.executable, "-c", SPECIALIZED, LUA_DIR, *some], env=env, capture_output=True, text=True, timeout=1800)
+    r = subprocess.run([sys.executable, "-c", SPECIALIZED, LUA_DIR, *some], capture_output=True, text=True, timeout=1800)
     assert r.returncode == 0, r.stderr[-3000:]
     assert r.stdout.strip() == "[]"
 
