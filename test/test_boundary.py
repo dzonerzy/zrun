@@ -50,6 +50,7 @@ BUILTINS = (
     "typeis",
     "extends",
     "indexes",
+    "bigcmp",
 )
 
 
@@ -382,6 +383,17 @@ def make_lang():
             out.append(len("héllo".encode("utf-8")))
             out.append("ab".encode())
             return out
+        if name == "bigcmp":
+            # `is True`/`is False` of every kind of value; ints of each
+            # kind (and others) against constants beyond 64 bits
+            vals = rt.call(rt.load(node.name), [])
+            vals = vals + [len(vals), True, False, 0, 1.0, Holder(1)]
+            out = []
+            for v in vals:
+                out.append("".join("1" if x else "0" for x in (v is True, v is False, v is not True, v is not False)))
+            for v in vals[:3] + [vals[6], 2**62 + len(vals), -(2**62) - len(vals), True, 1.5, -1e30]:
+                out.append("".join("1" if x else "0" for x in (v < 2**63, v <= -(2**63) - 1, 2**64 > v, -(2**70) < v, v >= 2**63, v == 2**64, v != 2**64)))
+            return out
         if name == "indexes":
             # v[i] and len(v) of values of every kind, ints of each kind as
             # indexes, out of range ones
@@ -638,6 +650,10 @@ def make_lang():
         return 3
 
     @lang.host
+    def bigcmp():
+        return [1, True, 0, None, "s", Box(1), 2**62]
+
+    @lang.host
     def indexes():
         import collections
 
@@ -752,6 +768,7 @@ PROGRAMS = {
     "typeis": "print(typeis());\n",
     "extends": "print(extends());\n",
     "indexes": "print(indexes());\n",
+    "bigcmp": "print(bigcmp());\n",
 }
 
 

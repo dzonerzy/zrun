@@ -5949,6 +5949,20 @@ const Gen = struct {
             try self.drop(other);
             return self.boolDyn(t);
         }
+        // ... against True or False: its tag and bits
+        if ((op == .is or op == .is_not) and ((l == .bool and r == .dyn) or (r == .bool and l == .dyn))) {
+            const b = if (l == .bool) l.bool else r.bool;
+            const d = if (l == .dyn) l.dyn else r.dyn;
+            const f = &self.f;
+            const same = f.and_(f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.bool))), f.icmp(jit_c.LLVMIntEQ, d.bits, self.k(@intFromBool(b))));
+            try self.drop(.{ .dyn = d });
+            return self.boolDyn(if (op == .is) same else f.xor(same, self.c.m.k1(true)));
+        }
+        // An int against a constant beyond 64 bits: decided by its sign
+        // (for an int of either kind; anything else as Python says)
+        if (bigSide(l, r)) |side| if (op == .lt or op == .le or op == .gt or op == .ge or op == .eq or op == .ne) {
+            return self.intVersusBig(inst, op, l, r, side);
+        };
         // A run-time str against constant strs (`op == "+"`, `op in OPS`):
         // its bytes compared inline (no container made, no hashing)
         if (op == .eq or op == .ne or op == .in or op == .not_in) {
@@ -6066,6 +6080,59 @@ const Gen = struct {
         try f.br(join);
         try f.block(join);
         return dyn(self.k(1), f.phi(t.i64, res, fast_end, g.bits, slow_end), .bool);
+    }
+
+    /// Which side is a constant int beyond 64 bits (the other a run-time
+    /// value that may be an int): 0 left, 1 right; null: not that.
+    fn bigSide(l: SVal, r: SVal) ?u1 {
+        const isBig = struct {
+            fn f(v: SVal) bool {
+                return v == .py and ph.typeOf(v.py) == @as(*py.c.PyTypeObject, @ptrCast(py.types.typeObject("PyLong_Type")));
+            }
+        }.f;
+        if (isBig(l) and r == .dyn and canBeInt(r.dyn)) return 0;
+        if (isBig(r) and l == .dyn and canBeInt(l.dyn)) return 1;
+        return null;
+    }
+
+    /// `x < 2**63` and the like: for an int (of 64 bits, either kind) the
+    /// answer is the constant's sign's; anything else by zr_compare.
+    fn intVersusBig(self: *Gen, inst: *Inst, op: front.CmpOp, l: SVal, r: SVal, side: u1) Error!SVal {
+        const f = &self.f;
+        const t = self.c.m.t;
+        const big = if (side == 0) l.py else r.py;
+        const d = if (side == 0) r.dyn else l.dyn;
+        // (beyond 64 bits: positive, every int is below it; negative, above)
+        var overflow: c_int = 0;
+        _ = py.c.PyLong_AsLongLongAndOverflow(big, &overflow);
+        // (one that fits isn't .py: the constants beyond 64 bits are)
+        if (overflow == 0) return self.c.unsupported("an int constant of 64 bits as a Python object", .{});
+        const positive = overflow > 0;
+        // int OP big (int on the left), as it comes out
+        const int_left_lt = positive;
+        const answer: bool = switch (op) {
+            .lt, .le => if (side == 1) int_left_lt else !int_left_lt,
+            .gt, .ge => if (side == 1) !int_left_lt else int_left_lt,
+            .eq => false,
+            .ne => true,
+            else => unreachable,
+        };
+        const T = value.Tag;
+        const fast = try f.label("big_int");
+        const slow = try f.label("big_other");
+        const join = try f.label("big_cmp");
+        const is_int = f.or_(f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(T.int))), f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intCast(value.PINT_TAG))));
+        try f.condBr(is_int, fast, slow);
+        try f.block(fast);
+        try f.br(join);
+        try f.block(slow);
+        const ld = try self.materialize(l, inst.node);
+        const rd = try self.materialize(r, inst.node);
+        const g = try self.compareHelper(inst, op, ld, rd);
+        const slow_end = f.current;
+        try f.br(join);
+        try f.block(join);
+        return dyn(self.k(1), f.phi(t.i64, self.k(@intFromBool(answer)), fast, g.bits, slow_end), .bool);
     }
 
     fn compareHelper(self: *Gen, inst: *Inst, op: front.CmpOp, ld: Dyn, rd: Dyn) Error!Dyn {
