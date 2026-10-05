@@ -37,14 +37,18 @@ class Instance:
 
 # What the values of the language's types are (zrules works out each node's
 # type; compiled code knows the kind of its value then). Not said: float
-# (an int is a float where one's expected, unconverted: either), functions'
-# types (a builtin's value is a Python function, a fn's a zrun.Function).
+# (an int is a float where one's expected, unconverted: either), the types
+# of the builtins (their values are Python functions; a fn's is a
+# zrun.Function).
 SCALARS = {"int": int, "bool": bool, "str": str, "nil": type(None)}
+BUILTIN_TYPES = {"fn(...) -> void", "fn(unknown) -> int"}
 
 
 def value_type(t):
     if t in SCALARS:
         return SCALARS[t]
+    if t.startswith("fn(") and t not in BUILTIN_TYPES:
+        return zrun.Function
     if t.startswith("list["):
         return list
     if t.startswith("type["):

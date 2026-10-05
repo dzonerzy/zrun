@@ -2435,9 +2435,10 @@ const Gen = struct {
             try f.br(self.err_label);
             try f.block(good);
         }
-        try self.increfDyn(v);
-        // (a variable of a type whose values' kind is declared: known)
+        // (a variable of a type whose values' kind is declared: known, its
+        // reference counted as one of the kind)
         var r = try self.typedValue(name_node, .{ .dyn = v });
+        try self.increfDyn(r.dyn);
         // (one a function's definition binds: that function, most likely)
         if (r == .dyn and sym.node != NONE) {
             const p = d.parents[sym.node];
