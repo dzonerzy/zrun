@@ -239,6 +239,47 @@ def test_borrowing_gives_back_what_it_takes(name, capsys):
     assert kept[0] == kept[1] >= 0
 
 
+def _wrapping_lang():
+    """tiny whose + - * wrap around at 64 bits (rt.wrapping_add...)."""
+    lang = zrun.Language(tiny.PARSER, tiny.RULES)
+    lang.function("FuncDef")
+    lang.exec(["Let", "Assign"])(tiny.assign)
+    lang.exec("Return")(tiny.return_)
+    lang.eval("Call")(tiny.call)
+
+    @lang.eval("BinOp")
+    def binop(node, rt):
+        a = rt.eval(node.left)
+        b = rt.eval(node.right)
+        if node.op == "+":
+            return rt.wrapping_add(a, b)
+        if node.op == "-":
+            return rt.wrapping_sub(a, b)
+        return rt.wrapping_mul(a, b)
+
+    @lang.host
+    def print(*args):
+        builtins.print(*args)
+
+    return lang
+
+
+WRAPPING = {
+    "known": "print(9223372036854775807 + 1, 3 * 9223372036854775807, 0 - 9223372036854775807 - 2);\n",
+    "run_time": "fn f(a, b) { return a * b + a - b; }\nprint(f(9223372036854775807, 3), f(5, 7), f(0 - 4611686018427387904, 2));\n",
+    "not_ints": 'fn f(a, b) { return a + b; }\nprint(f("a", 1));\n',
+}
+
+
+@pytest.mark.parametrize("name", sorted(WRAPPING))
+def test_wrapping_arithmetic(name, capsys):
+    out, err = same_in_every_mode(_wrapping_lang(), WRAPPING[name], capsys)
+    if name == "not_ints":
+        assert err[0] == "rt.wrapping_add() takes ints of 64 bits"
+    else:
+        assert err is None and out
+
+
 def _python_lang():
     """tiny with calls whose semantics use Python's loops, comprehensions,
     unpacking and item assignment on values known only at run time."""

@@ -103,6 +103,7 @@ pub const Api = struct {
     BuildUnreachable: *const fn (Builder) callconv(.c) Value,
     BuildAdd: *const fn (Builder, Value, Value, Str) callconv(.c) Value,
     BuildSub: *const fn (Builder, Value, Value, Str) callconv(.c) Value,
+    BuildMul: *const fn (Builder, Value, Value, Str) callconv(.c) Value,
     BuildAnd: *const fn (Builder, Value, Value, Str) callconv(.c) Value,
     BuildOr: *const fn (Builder, Value, Value, Str) callconv(.c) Value,
     BuildXor: *const fn (Builder, Value, Value, Str) callconv(.c) Value,

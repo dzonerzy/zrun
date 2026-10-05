@@ -27,6 +27,7 @@ const L = @import("jit.zig").f;
 const program_mod = @import("program.zig");
 const grammar_mod = @import("grammar.zig");
 const helpers = @import("helpers.zig");
+const wrapping_mod = @import("wrapping.zig");
 const value = @import("value.zig");
 const objects_mod = @import("objects.zig");
 const types_mod = @import("types.zig");
@@ -120,7 +121,7 @@ pub const Dyn = struct {
     }
 };
 
-pub const RtMethod = enum { eval, exec, loop, load, store, function, call, @"error", kind, text, span, scope, symbol, type_of, node_at, fresh, Return, Break, Continue };
+pub const RtMethod = enum { eval, exec, loop, load, store, function, call, @"error", kind, text, span, scope, symbol, type_of, node_at, fresh, wrapping_add, wrapping_sub, wrapping_mul, Return, Break, Continue };
 
 /// A list known at compile time (its items may be dynamic): mutable, with
 /// identity (aliases see changes)
@@ -1254,6 +1255,7 @@ pub const Compiler = struct {
         .{ "zr_getattr", "bpillpp" },
         .{ "zr_setattr", "bpillpll" },
         .{ "zr_getitem", "bpillllp" },
+        .{ "zr_wrapping", "bpiillllp" },
         .{ "zr_setitem", "bpillllll" },
         .{ "zr_items", "bpillp" },
         .{ "zr_list_len", "lll" },
@@ -5424,7 +5426,7 @@ const Gen = struct {
         const c = self.c;
         const want: usize = switch (m) {
             .eval, .exec, .loop, .load, .function, .kind, .text, .span, .scope, .symbol, .type_of, .node_at, .fresh => 1,
-            .store, .call => 2,
+            .store, .call, .wrapping_add, .wrapping_sub, .wrapping_mul => 2,
             .@"error" => 2,
             .Return => if (args.len == 0) 0 else 1,
             .Break, .Continue => 0,
@@ -5461,6 +5463,9 @@ const Gen = struct {
                 return .none;
             },
             .call => return self.dynCall(inst, args[0], args[1], receiver),
+            .wrapping_add => return self.wrapping(inst, .add, args[0], args[1]),
+            .wrapping_sub => return self.wrapping(inst, .sub, args[0], args[1]),
+            .wrapping_mul => return self.wrapping(inst, .mul, args[0], args[1]),
             .@"error" => {
                 const n = switch (args[0]) {
                     .node => |x| x,
@@ -5508,6 +5513,54 @@ const Gen = struct {
             .Return => return .{ .control = .{ .kind = .Return, .value = if (args.len == 1) try self.boxed(args[0]) else null } },
             .Break, .Continue => return .{ .control = .{ .kind = m, .value = null } },
         }
+    }
+
+    /// rt.wrapping_add(a, b) and the others: of two ints of 64 bits, the
+    /// result wrapped around (a plain int); anything else by zr_wrapping
+    /// (its error, as the reference mode's).
+    fn wrapping(self: *Gen, inst: *Inst, op: wrapping_mod.Op, a_: SVal, b_: SVal) Error!SVal {
+        const f = &self.f;
+        const t = self.c.m.t;
+        const known = struct {
+            fn int(x: SVal) ?i64 {
+                return switch (x) {
+                    .int, .pint => |n| n,
+                    else => null,
+                };
+            }
+        };
+        if (known.int(a_)) |x| if (known.int(b_)) |y| return .{ .pint = wrapping_mod.apply(op, x, y) };
+        const ad = try self.materialize(a_, inst.node);
+        const bd = try self.materialize(b_, inst.node);
+        // (an int: tag 2 or 18, both 18 with bit 4 set)
+        const is_int = struct {
+            fn check(g: *Gen, d: Dyn) ir.Value {
+                return g.f.icmp(jit_c.LLVMIntEQ, g.f.or_(d.tag, g.k(16)), g.k(@intCast(value.PINT_TAG)));
+            }
+        }.check;
+        const fast = try f.label("wrap_ints");
+        const slow = try f.label("wrap_other");
+        const join = try f.label("wrap_done");
+        try f.condBr(f.and_(is_int(self, ad), is_int(self, bd)), fast, slow);
+        try f.block(fast);
+        const r = switch (op) {
+            .add => f.add(ad.bits, bd.bits),
+            .sub => f.sub(ad.bits, bd.bits),
+            .mul => f.mul(ad.bits, bd.bits),
+        };
+        const fast_end = f.current;
+        try f.br(join);
+        try f.block(slow);
+        const ok = self.call("zr_wrapping", &.{ self.ctx, self.k32(inst.node), self.k32(@intFromEnum(op)), ad.tag, ad.bits, bd.tag, bd.bits, self.out });
+        try self.check(ok);
+        const g = try self.loadOut(.int);
+        const slow_end = f.current;
+        try f.br(join);
+        try f.block(join);
+        const out = Dyn{ .tag = f.phi(t.i64, self.k(@intCast(value.PINT_TAG)), fast_end, g.tag, slow_end), .bits = f.phi(t.i64, r, fast_end, g.bits, slow_end), .shape = .int };
+        try self.drop(.{ .dyn = ad });
+        try self.drop(.{ .dyn = bd });
+        return .{ .dyn = out };
     }
 
     fn nodeArg(self: *Gen, inst: *Inst, v: SVal, pos: front.Pos) Error!u32 {

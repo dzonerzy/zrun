@@ -1121,6 +1121,16 @@ export fn zr_getitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
     return fromResult(ctx, node, py.c.PyObject_GetItem(objs[0], objs[1]), out);
 }
 
+/// rt.wrapping_add(a, b) and the others (wrapping.zig) of anything but two
+/// ints of 64 bits (compiled code does those): as the reference mode does
+/// it, its error the same.
+export fn zr_wrapping(ctx: *Ctx, node: u32, op: u32, at: u64, ab: u64, bt: u64, bb: u64, out: *Value) callconv(.c) bool {
+    var objs: [2]*PyObject = undefined;
+    if (!objects(ctx, &.{ .{ .tag = at, .bits = ab }, .{ .tag = bt, .bits = bb } }, &objs)) return failPython(ctx, node);
+    defer for (objs) |o| py.Py_DecRef(o);
+    return fromResult(ctx, node, @import("wrapping.zig").ofPython(@enumFromInt(op), objs[0], objs[1]), out);
+}
+
 /// v[k] = x
 export fn zr_setitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, xt: u64, xb: u64) callconv(.c) bool {
     const v = Value{ .tag = t, .bits = bits };
@@ -2066,6 +2076,7 @@ const helper_names = [_][]const u8{
     "zr_call",     "zr_object",     "zr_frame_new",  "zr_frame_release", "zr_free",
     "zr_list",     "zr_tuple",      "zr_dict",       "zr_record",        "zr_is_record",
     "zr_getattr",  "zr_setattr",    "zr_getitem",    "zr_setitem",       "zr_items",
+    "zr_wrapping",
     "zr_list_len", "zr_list_at",    "zr_append",     "zr_call_method",   "zr_call_python",
     "zr_is_type",  "zr_global",     "zr_format",     "zr_concat",        "zr_unpack",
     "zr_varargs",  "zr_record_new", "zr_isinstance", "zr_call_seq",      "zr_slice",

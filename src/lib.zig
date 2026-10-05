@@ -1717,6 +1717,23 @@ const Runtime = struct {
         return ph.newString(self.data().text(idx));
     }
 
+    /// `rt.wrapping_add(a, b)`, `rt.wrapping_sub`, `rt.wrapping_mul`: 64-bit
+    /// arithmetic wrapping around (wrapping.zig).
+    pub fn wrapping_add(self: *Runtime, a: *PyObject, b: *PyObject) ?*PyObject {
+        _ = self;
+        return @import("wrapping.zig").ofPython(.add, a, b);
+    }
+
+    pub fn wrapping_sub(self: *Runtime, a: *PyObject, b: *PyObject) ?*PyObject {
+        _ = self;
+        return @import("wrapping.zig").ofPython(.sub, a, b);
+    }
+
+    pub fn wrapping_mul(self: *Runtime, a: *PyObject, b: *PyObject) ?*PyObject {
+        _ = self;
+        return @import("wrapping.zig").ofPython(.mul, a, b);
+    }
+
     pub fn span(self: *Runtime, n: *PyObject) ?*PyObject {
         const idx = self.nodeIndex(n, "node") orelse return null;
         const nd = self.data().nodes[idx];

@@ -962,6 +962,19 @@ fn rtNodeAt(self: ?*PyObject, x: ?*PyObject) callconv(.c) ?*PyObject {
     return r.ctx.?.node_maker.make(@intCast(i));
 }
 
+/// rt.wrapping_add(a, b) and the others (wrapping.zig)
+fn rtWrapping(comptime op: @import("wrapping.zig").Op) fn (?*PyObject, ?*PyObject) callconv(.c) ?*PyObject {
+    return struct {
+        fn f(self: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+            _ = live(self) orelse return null;
+            var a: ?*PyObject = null;
+            var b: ?*PyObject = null;
+            if (py.c.PyArg_UnpackTuple(args, "wrapping_" ++ @tagName(op), 2, 2, &a, &b) == 0) return null;
+            return @import("wrapping.zig").ofPython(op, a.?, b.?);
+        }
+    }.f;
+}
+
 fn rtFresh(self: ?*PyObject, x: ?*PyObject) callconv(.c) ?*PyObject {
     const r = live(self) orelse return null;
     const idx = nodeIndex(r, x.?, "node") orelse return null;
@@ -1067,6 +1080,9 @@ var methods = [_]py.c.PyMethodDef{
     method("type_of", rtTypeOf, py.c.METH_O),
     method("node_at", rtNodeAt, py.c.METH_O),
     method("fresh", rtFresh, py.c.METH_O),
+    method("wrapping_add", rtWrapping(.add), py.c.METH_VARARGS),
+    method("wrapping_sub", rtWrapping(.sub), py.c.METH_VARARGS),
+    method("wrapping_mul", rtWrapping(.mul), py.c.METH_VARARGS),
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 

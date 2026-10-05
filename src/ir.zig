@@ -334,6 +334,12 @@ pub const Function = struct {
         return L("LLVMBuildSub")(self.b, a, b, "");
     }
 
+    /// a * b, wrapping around
+    pub fn mul(self: *Function, a: Value, b: Value) Value {
+        self.open();
+        return L("LLVMBuildMul")(self.b, a, b, "");
+    }
+
     pub fn and_(self: *Function, a: Value, b: Value) Value {
         self.open();
         return L("LLVMBuildAnd")(self.b, a, b, "");

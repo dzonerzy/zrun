@@ -927,14 +927,15 @@ def string_arith(event):
 
 def arith_numbers(rt, node, op, x, y):
     if is_int(x) and is_int(y):
+        # (64 bits, wrapping around, as Lua's)
+        if op == "+":
+            return rt.wrapping_add(x, y)
+        if op == "-":
+            return rt.wrapping_sub(x, y)
+        if op == "*":
+            return rt.wrapping_mul(x, y)
         xi = int(x)
         yi = int(y)
-        if op == "+":
-            return wrap(xi + yi)
-        if op == "-":
-            return wrap(xi - yi)
-        if op == "*":
-            return wrap(xi * yi)
         if op == "//":
             if yi == 0:
                 lua_error(rt, node, "attempt to divide by zero")
