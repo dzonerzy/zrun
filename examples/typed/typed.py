@@ -35,6 +35,28 @@ class Instance:
     values: dict
 
 
+# What the values of the language's types are (zrules works out each node's
+# type; compiled code knows the kind of its value then). Not said: float
+# (an int is a float where one's expected, unconverted: either), functions'
+# types (a builtin's value is a Python function, a fn's a zrun.Function).
+SCALARS = {"int": int, "bool": bool, "str": str, "nil": type(None)}
+
+
+def value_type(t):
+    if t in SCALARS:
+        return SCALARS[t]
+    if t.startswith("list["):
+        return list
+    if t.startswith("type["):
+        return Struct
+    if t[:1].isupper() and t.isidentifier():
+        return Instance
+    return None
+
+
+lang.types(value_type)
+
+
 # ----------------------------------------------------------------------
 # Statements
 # ----------------------------------------------------------------------

@@ -62,6 +62,8 @@ pub const LangView = struct {
     /// Calls of a call site before its helper is compiled for it (Site;
     /// Language(hot_calls=...))
     hot_calls: i64,
+    /// Language.types(): a dict by type name or a function of a type's text
+    types: ?*PyObject = null,
 };
 
 pub const EscapeKey = struct { origin: *const front.Expr, unit: u64 };
@@ -99,6 +101,8 @@ pub const Dyn = struct {
     tag: ir.Value,
     bits: ir.Value,
     shape: Shape,
+    /// A record's type, when known (its type's kind: Language.types())
+    rtype: ?*value.RecordType = null,
 
     fn heapish(self: Dyn) bool {
         return switch (self.shape) {
@@ -647,6 +651,30 @@ var not_records: std.AutoHashMapUnmanaged(*PyObject, void) = .empty;
 
 var rebound_scanner: ?*PyObject = null;
 var pure_checker: ?*PyObject = null;
+
+/// The Python type Language.types() says node `idx`'s values are (from its
+/// type's text, zrules'), or null: none said. (Borrowed: types live long.)
+pub fn declaredClass(mapping: *PyObject, analysis: *PyObject, idx: u32) error{Python}!?*PyObject {
+    const text = py.c.PyObject_CallMethod(analysis, "type_of", "I", @as(c_uint, idx)) orelse {
+        py.c.PyErr_Clear();
+        return null;
+    };
+    defer py.Py_DecRef(text);
+    if (text == py.Py_None()) return null;
+    if (py.PyDict_Check(mapping)) {
+        if (py.c.PyDict_GetItem(mapping, text)) |o| return o;
+        // (a generic's name: 'list' for 'list[int]', 'fn' for a function's
+        // type)
+        const s = ph.utf8(text, "type") orelse return error.Python;
+        const end = std.mem.indexOfAny(u8, s, "[(") orelse return null;
+        const head = ph.newString(s[0..end]) orelse return error.Python;
+        defer py.Py_DecRef(head);
+        return py.c.PyDict_GetItem(mapping, head);
+    }
+    const r = py.c.PyObject_CallFunctionObjArgs(mapping, text, @as(?*PyObject, null)) orelse return error.Python;
+    py.Py_DecRef(r);
+    return if (r == py.Py_None()) null else r;
+}
 /// Modules' tables only read, native (Gen.frozenConst), by the table
 var frozen_natives: std.AutoHashMapUnmanaged(*PyObject, Value) = .empty;
 var readonly_checker: ?*PyObject = null;
@@ -811,6 +839,8 @@ pub const Compiler = struct {
     /// The module-level tables and records the semantics use: "native", or
     /// why Python keeps them (adopt.zig; Program.report())
     module_state: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+    /// Nodes' kinds of values, worked out (kindOfNode)
+    kinds: std.AutoHashMapUnmanaged(u32, ?Kind) = .empty,
     /// By node: its kind's str (kindTable); by label, its child (fieldTable)
     kind_table: ?[]u64 = null,
     owner_table: ?[]u64 = null,
@@ -819,6 +849,46 @@ pub const Compiler = struct {
     /// In a field table: a node whose label isn't one child or none (a
     /// list of them, a value an action makes): zr_getattr's
     pub const field_other: i64 = @as(i64, NONE) - 1;
+
+    /// The kind of value the nodes of a type evaluate to (Language.types()):
+    /// its shape (and a record's type)
+    pub const Kind = struct { shape: Shape, rtype: ?*value.RecordType = null };
+
+    /// The kind of value node `idx` evaluates to, from its type (zrules'
+    /// types(), what Language.types() says its values are), or null: not
+    /// known. Worked out once per node.
+    pub fn kindOfNode(self: *Compiler, idx: u32) Error!?Kind {
+        const mapping = self.lang.types orelse return null;
+        const analysis = self.lang.analysis orelse return null;
+        if (self.kinds.get(idx)) |k| return k;
+        const k = kindFrom(mapping, analysis, idx) catch |e| return e;
+        try self.kinds.put(self.a, idx, k);
+        return k;
+    }
+
+    fn kindFrom(mapping: *PyObject, analysis: *PyObject, idx: u32) error{Python}!?Kind {
+        const cls = try declaredClass(mapping, analysis, idx) orelse return null;
+        return kindOfClass(cls);
+    }
+
+    /// The kind of a Python type's values, for the types whose values are
+    /// native in compiled code wherever they come from (scalars, the
+    /// language's functions); null for any other (a list, a record a host
+    /// function made, stays a Python object: its kind not one tag).
+    pub fn kindOfClass(cls: *PyObject) ?Kind {
+        const is = struct {
+            fn t(x: *PyObject, comptime name: [:0]const u8) bool {
+                return x == @as(*PyObject, @ptrCast(@alignCast(py.types.typeObject(name))));
+            }
+        };
+        if (is.t(cls, "PyLong_Type")) return .{ .shape = .int };
+        if (is.t(cls, "PyFloat_Type")) return .{ .shape = .float };
+        if (is.t(cls, "PyBool_Type")) return .{ .shape = .bool };
+        if (is.t(cls, "PyUnicode_Type")) return .{ .shape = .str };
+        if (cls == @as(*PyObject, @ptrCast(@alignCast(ph.typeOf(py.Py_None()))))) return .{ .shape = .none };
+        if (cls == objects_mod.FunctionType) return .{ .shape = .function };
+        return null;
+    }
 
     /// What became of module state named `name` (the last word on it).
     pub fn noteState(self: *Compiler, name: []const u8, what: []const u8) !void {
@@ -2181,7 +2251,10 @@ const Gen = struct {
                 const t = switch (d.shape) {
                     .bool, .int => f.icmp(jit_c.LLVMIntNE, d.bits, self.k(0)),
                     .none => m.k1(false),
+                    .function => m.k1(true),
                     .float => f.fcmp(jit_c.LLVMRealUNE, f.bitcast(d.bits, m.t.f64), L("LLVMConstNull")(m.t.f64)),
+                    // (its length: in the same place for each)
+                    .str, .list, .tuple, .dict => f.icmp(jit_c.LLVMIntNE, f.load(m.t.i64, f.offset(f.intToPtr(d.bits), @offsetOf(value.List, "len"))), self.k(0)),
                     else => self.call("zr_truthy", &.{ d.tag, d.bits }),
                 };
                 try self.drop(v);
@@ -2328,7 +2401,8 @@ const Gen = struct {
         try f.br(self.err_label);
         try f.block(good);
         try self.increfDyn(v);
-        return .{ .dyn = v };
+        // (a variable of a type whose values' kind is declared: known)
+        return self.typedValue(name_node, .{ .dyn = v });
     }
 
     /// rt.store(name, value), taking the value.
@@ -2615,11 +2689,80 @@ const Gen = struct {
 
     /// rt.eval of a node (a block scope with frames: in a new one).
     fn evalNode(self: *Gen, idx: u32) Error!SVal {
-        if (!self.c.data.hasFrame(idx)) return self.evalHere(idx);
+        if (!self.c.data.hasFrame(idx)) return self.typedValue(idx, try self.evalHere(idx));
         try self.enterScope(idx);
         const v = try self.evalHere(idx);
         try self.leaveScope();
-        return v;
+        return self.typedValue(idx, v);
+    }
+
+    /// A node's value of a type whose values' kind is declared
+    /// (Language.types()): its kind checked here, once (anything else: the
+    /// error the reference mode raises too), known from then on.
+    fn typedValue(self: *Gen, idx: u32, v: SVal) Error!SVal {
+        if (v == .dyn and v.dyn.shape != .any) return v;
+        const kind = try self.c.kindOfNode(idx) orelse return v;
+        const f = &self.f;
+        // A value known here: checked now (one not of the kind: the error,
+        // when the code gets here)
+        if (v != .dyn) {
+            if (!staticKind(kind.shape, v)) try self.kindError(idx);
+            return v;
+        }
+        const d = v.dyn;
+        const T = value.Tag;
+        const ok = switch (kind.shape) {
+            // (an int of either kind)
+            .int => f.or_(f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(T.int))), f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intCast(value.PINT_TAG)))),
+            else => f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intCast(@intFromEnum(shapeTag(kind.shape))))),
+        };
+        const good = try f.label("kind_ok");
+        const bad = try f.label("kind_wrong");
+        try f.condBr(ok, good, bad);
+        try f.block(bad);
+        try self.kindError(idx);
+        try f.block(good);
+        return .{ .dyn = .{ .tag = d.tag, .bits = d.bits, .shape = kind.shape, .rtype = kind.rtype } };
+    }
+
+    /// The error of a value not of its type's kind (as the reference mode
+    /// words it), at node `idx`: to the error exit.
+    fn kindError(self: *Gen, idx: u32) Error!void {
+        const text = py.c.PyObject_CallMethod(self.c.lang.analysis.?, "type_of", "I", @as(c_uint, idx)) orelse return error.Python;
+        defer py.Py_DecRef(text);
+        const msg = try std.fmt.allocPrint(self.a(), "the value isn't what types() says the type {s} is", .{ph.utf8(text, "type") orelse "?"});
+        _ = self.call("zr_fail", &.{ self.ctx, self.k32(idx), try self.c.m.string(msg) });
+        try self.f.br(self.err_label);
+    }
+
+    /// Whether a value known when compiling is of a kind (as the reference
+    /// mode's check takes it).
+    fn staticKind(shape: Shape, v: SVal) bool {
+        return switch (shape) {
+            .int => v == .int or v == .pint,
+            .float => v == .float,
+            .bool => v == .bool,
+            .str => v == .str,
+            .none => v == .none,
+            .function => v == .py and objects_mod.asFunction(v.py) != null,
+            else => false,
+        };
+    }
+
+    /// The tag of a shape's values (one tag only: not int's, record's).
+    fn shapeTag(s: Shape) value.Tag {
+        return switch (s) {
+            .none => .none,
+            .bool => .bool,
+            .float => .float,
+            .str => .str,
+            .list => .list,
+            .tuple => .tuple,
+            .dict => .dict,
+            .function => .function,
+            .node => .node,
+            else => unreachable,
+        };
     }
 
     fn evalHere(self: *Gen, idx: u32) Error!SVal {
@@ -5476,6 +5619,23 @@ const Gen = struct {
     /// zr_is_type's): its tag, inline; a Python object's type by
     /// zr_is_type (subclasses...). The value dropped.
     fn isType(self: *Gen, d: Dyn, code: u32) Error!SVal {
+        // (a value of a known kind: known)
+        if (d.shape != .any) {
+            const s = d.shape;
+            const known = switch (code) {
+                0 => s == .int or s == .bool,
+                1 => s == .float,
+                2 => s == .str,
+                3 => s == .bool,
+                4 => s == .list,
+                5 => s == .tuple,
+                6 => s == .dict,
+                8 => s == .function,
+                else => false,
+            };
+            try self.drop(.{ .dyn = d });
+            return .{ .bool = known };
+        }
         const f = &self.f;
         const T = value.Tag;
         const tags: []const u64 = switch (code) {
@@ -5511,6 +5671,12 @@ const Gen = struct {
     /// exactly it, inline; one of another type (a subclass?) or a Python
     /// object by zr_is_record; anything else isn't. The value dropped.
     fn isRecord(self: *Gen, d: Dyn, rtype: *const value.RecordType) Error!SVal {
+        // (a value of a known kind: known)
+        if (d.shape != .any and (d.shape != .record or d.rtype != null)) {
+            const known = d.shape == .record and d.rtype.?.isA(rtype);
+            try self.drop(.{ .dyn = d });
+            return .{ .bool = known };
+        }
         const f = &self.f;
         const t = self.c.m.t;
         const T = value.Tag;
@@ -5624,6 +5790,13 @@ const Gen = struct {
         const f = &self.f;
         const t = self.c.m.t;
         const T = value.Tag;
+        // (a value of a known kind: its key known; an int's is its tag's,
+        // an I64's or a plain int's)
+        switch (d.shape) {
+            .any, .int => {},
+            .record => if (d.rtype) |rt| return .{ .key = self.c.m.addrInt(@intFromPtr(rt)), .host = self.c.m.k1(false) },
+            else => return .{ .key = self.k(@intCast(@intFromEnum(shapeTag(d.shape)))), .host = self.c.m.k1(false) },
+        }
         const low = f.and_(d.tag, self.k(0xffff_ffff));
         const key0 = f.select(f.icmp(jit_c.LLVMIntEQ, low, self.k(@intFromEnum(T.big))), self.k(@intCast(value.PINT_TAG)), low);
         const rec = try f.label("key_record");

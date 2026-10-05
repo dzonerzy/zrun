@@ -86,3 +86,54 @@ def test_receiver_outside_a_method():
 
     lang.load("let a = 1;\n").run()
     assert got == [None]
+
+
+class TestTypes:
+    """Language.types(): what the values of the language's types are. Compiled
+    code knows a node's value's kind from it; a value not of the kind said
+    is an error at the node, in every mode."""
+
+    PROGRAM = "fn half(x: float) -> float { return x; }\nprint(half(4), 1 + 2);\n"
+
+    def outcomes(self, source):
+        from test_modes import outcome
+
+        out = {}
+        for mode in ("python", "compiled"):
+            program = typed.lang.load(source, "prog")
+            try:
+                program.run(mode=mode)
+                out[mode] = None
+            except zrun.Error as e:
+                out[mode] = e.diagnostic.message
+        return out
+
+    def test_declared_right(self, capsys):
+        # (the example's own: int, bool, str, nil; not float, an int's one too)
+        assert self.outcomes(self.PROGRAM) == {"python": None, "compiled": None}
+        assert capsys.readouterr().out == "4 3\n4 3\n"
+
+    def test_declared_wrong(self, capsys):
+        # float said to be float, but an int where a float's expected stays one
+        try:
+            typed.lang.types(dict(typed.SCALARS, float=float))
+            outs = self.outcomes(self.PROGRAM)
+        finally:
+            typed.lang.types(typed.value_type)
+        assert outs["python"] == outs["compiled"] == "the value isn't what types() says the type float is"
+
+    def test_by_name_and_generic_name(self, capsys):
+        # a dict: 'int' by name; 'list' for 'list[int]' (lists aren't checked:
+        # their kind isn't one tag)
+        try:
+            typed.lang.types({"int": int, "list": list, "fn": zrun.Function})
+            outs = self.outcomes("let xs = [1, 2];\nfn f(n: int) -> int { return n * 2; }\nprint(f(xs[1]));\n")
+        finally:
+            typed.lang.types(typed.value_type)
+        # (fn: a builtin's value (print) isn't a zrun.Function: an error, in
+        # both modes)
+        assert outs["python"] == outs["compiled"] == "the value isn't what types() says the type fn(...) -> void is"
+
+    def test_not_a_mapping(self):
+        with pytest.raises(TypeError):
+            typed.lang.types(3)

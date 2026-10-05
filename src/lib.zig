@@ -15,7 +15,7 @@ const pyoz = @import("PyOZ");
 const ph = @import("pyhelp.zig");
 const py = ph.py;
 const PyObject = ph.PyObject;
-const types = @import("types.zig");
+const ztypes = @import("types.zig");
 const objects = @import("objects.zig");
 const grammar_mod = @import("grammar.zig");
 const program_mod = @import("program.zig");
@@ -69,6 +69,9 @@ const Language = struct {
     /// Calls of a call site in compiled code before code of its own is
     /// compiled for it (what it knows of its arguments)
     _hot_calls: i64 = 1000,
+    /// What values the nodes of the language's types evaluate to
+    /// (types()): a dict by type name, or a function of the type's text
+    _types: ?*PyObject = null,
     /// The semantics read by the compiler's front, by function object
     /// (each holds a reference to its function); those marked
     /// native=False aren't here
@@ -120,7 +123,7 @@ const Language = struct {
     }
 
     fn release(self: *Language) void {
-        inline for (.{ "_parser", "_rules", "_evals", "_execs", "_hosts" }) |f| {
+        inline for (.{ "_parser", "_rules", "_evals", "_execs", "_hosts", "_types" }) |f| {
             if (@field(self, f)) |o| py.Py_DecRef(o);
             @field(self, f) = null;
         }
@@ -145,6 +148,26 @@ const Language = struct {
         self._python = .empty;
         self._escaping.deinit(allocator);
         self._escaping = .empty;
+    }
+
+    /// `lang.types(mapping)`: what the nodes of each of the language's
+    /// types (zrules' types(): their texts, 'int', 'list[int]', 'fn(int) ->
+    /// int', a struct's name) evaluate to, as Python types: int, float,
+    /// bool, str, type(None), list, tuple, dict, zrun.Function, a record
+    /// class (a dataclass or one with __slots__). A dict by name ('int', or
+    /// a generic's name: 'list' for 'list[int]', 'fn' for a function's
+    /// type), or a function of the type's text returning one (or None: not
+    /// known). Compiled code knows the kind of a node's value from its type
+    /// then: no checks of its kind after the one where it's made (a value
+    /// not of the kind declared is an error there).
+    pub fn types(self: *Language, mapping: *PyObject) ?*PyObject {
+        if (!py.PyDict_Check(mapping) and !py.PyCallable_Check(mapping)) {
+            ph.raise(py.PyExc_TypeError(), "types() takes a dict of type names, or a function of a type's text", .{});
+            return null;
+        }
+        if (self._types) |o| py.Py_DecRef(o);
+        self._types = ref(mapping);
+        return none();
     }
 
     /// `lang.python_semantics()`: the semantics compiled programs run as
@@ -282,7 +305,7 @@ const Language = struct {
         if (!native) {
             if (!self.markPython(func, "native=False")) return false;
         } else if (!self.readSemantic(func)) {
-            if (py.c.PyErr_ExceptionMatches(types.CompileError) == 0) return false;
+            if (py.c.PyErr_ExceptionMatches(ztypes.CompileError) == 0) return false;
             // (outside the compilable subset: run as Python, saying why)
             var t: ?*PyObject = null;
             var v: ?*PyObject = null;
@@ -506,7 +529,7 @@ fn raiseCompileError(func: *PyObject, failure: *const front.Failure) void {
     const msg = std.fmt.bufPrint(&buf, "{s}:{d}:{d}: in {s}(): {s}", .{ file, line, failure.pos.col, name, failure.text() }) catch buf[0..];
     const text = ph.newString(msg) orelse return;
     defer py.Py_DecRef(text);
-    const exc = py.c.PyObject_CallFunctionObjArgs(types.CompileError, text, @as(?*PyObject, null)) orelse return;
+    const exc = py.c.PyObject_CallFunctionObjArgs(ztypes.CompileError, text, @as(?*PyObject, null)) orelse return;
     defer py.Py_DecRef(exc);
     const attrs = .{
         .{ "file", ph.newString(file) },
@@ -520,7 +543,7 @@ fn raiseCompileError(func: *PyObject, failure: *const front.Failure) void {
             py.Py_DecRef(v);
         }
     }
-    py.c.PyErr_SetObject(types.CompileError, exc);
+    py.c.PyErr_SetObject(ztypes.CompileError, exc);
 }
 
 /// parser.parse_tree(source, recover=True)
@@ -589,10 +612,15 @@ const Program = struct {
     /// The last run with report=True: where its compiled code went through
     /// Python, {what: times} (report())
     _crossings: ?*PyObject = null,
+    /// The Python type Language.types() says each node's values are
+    /// (checked in the reference mode), by node: worked out once
+    _declared: std.AutoHashMapUnmanaged(u32, ?*PyObject) = .empty,
 
     fn release(self: *Program) void {
         if (self._compiled) |c| c.destroy();
         self._compiled = null;
+        self._declared.deinit(allocator);
+        self._declared = .empty;
         inline for (.{ "_state", "_lang", "_source", "_path", "_crossings" }) |f| {
             if (@field(self, f)) |o| py.Py_DecRef(o);
             @field(self, f) = null;
@@ -709,10 +737,10 @@ const Program = struct {
         defer py.Py_DecRef(nl);
         const message = py.c.PyUnicode_Join(nl, lines) orelse return false;
         defer py.Py_DecRef(message);
-        const exc = py.c.PyObject_CallFunctionObjArgs(types.LoadError, message, @as(?*PyObject, null)) orelse return false;
+        const exc = py.c.PyObject_CallFunctionObjArgs(ztypes.LoadError, message, @as(?*PyObject, null)) orelse return false;
         defer py.Py_DecRef(exc);
         if (py.c.PyObject_SetAttrString(exc, "diagnostics", diags) != 0) return false;
-        py.c.PyErr_SetObject(types.LoadError, exc);
+        py.c.PyErr_SetObject(ztypes.LoadError, exc);
         return false;
     }
 
@@ -805,19 +833,20 @@ const Program = struct {
             .python = &lang._python,
             .escaping = &lang._escaping,
             .hot_calls = lang._hot_calls,
+            .types = lang._types,
         };
     }
 
     fn ensureCompiled(self: *Program) bool {
         if (self._compiled != null) return true;
-        self._compiled = driver.compileProgram(self.ctx().data, self.langView(), &self.language()._python, types.CompileError) orelse return false;
+        self._compiled = driver.compileProgram(self.ctx().data, self.langView(), &self.language()._python, ztypes.CompileError) orelse return false;
         return true;
     }
 
     /// `program.compiled_ir()`: the LLVM IR the program compiles to (before
     /// LLVM optimizes it), as text.
     pub fn compiled_ir(self: *Program) ?*PyObject {
-        return driver.irText(self.ctx().data, self.langView(), &self.language()._python, types.CompileError);
+        return driver.irText(self.ctx().data, self.langView(), &self.language()._python, ztypes.CompileError);
     }
 
     /// bridge.Link: a node's semantic (borrowed).
@@ -897,7 +926,7 @@ const Program = struct {
         for (ectx.err_stack.items) |e| entries.append(allocator, .{ .name = e.name.bytes(), .call = e.node }) catch return null;
         const exc = Runtime.errorObject(self, ectx.err_node, ectx.err_msg.items, "runtime", entries.items) orelse return null;
         defer py.Py_DecRef(exc);
-        py.c.PyErr_SetObject(types.Error, exc);
+        py.c.PyErr_SetObject(ztypes.Error, exc);
         return null;
     }
 
@@ -918,7 +947,7 @@ const Program = struct {
     /// A run ended by an exception: a rt.Throw nothing caught becomes the
     /// zrun.Error it is (made where it was raised); null.
     fn uncaught() ?*PyObject {
-        if (py.c.PyErr_ExceptionMatches(types.Throw) == 0) return null;
+        if (py.c.PyErr_ExceptionMatches(ztypes.Throw) == 0) return null;
         var t: ?*PyObject = null;
         var v: ?*PyObject = null;
         var tb: ?*PyObject = null;
@@ -927,7 +956,7 @@ const Program = struct {
         const err = if (v) |exc| py.c.PyObject_GetAttrString(exc, "_zrun_error") else null;
         if (err) |e| {
             inline for (.{ t, v, tb }) |o| if (o) |x| py.Py_DecRef(x);
-            py.c.PyErr_SetObject(types.Error, e);
+            py.c.PyErr_SetObject(ztypes.Error, e);
             py.Py_DecRef(e);
         } else {
             py.c.PyErr_Clear();
@@ -1204,14 +1233,55 @@ const Runtime = struct {
             }
             return out;
         }
-        return types.wrap(x);
+        return ztypes.wrap(x);
     }
 
     fn evalNode(self: *Runtime, idx: u32) ?*PyObject {
-        if (!self.data().hasFrame(idx)) return self.evalHere(idx);
+        if (!self.data().hasFrame(idx)) return self.checkKind(idx, self.evalHere(idx) orelse return null);
         const saved = self.enterScope(idx) orelse return null;
         defer self.leaveScope(saved);
-        return self.evalHere(idx);
+        return self.checkKind(idx, self.evalHere(idx) orelse return null);
+    }
+
+    /// A node's value checked against what Language.types() says its
+    /// type's values are, as compiled code checks it: the value (taken),
+    /// or null with the error.
+    fn checkKind(self: *Runtime, idx: u32, v: *PyObject) ?*PyObject {
+        const mapping = self._lang.?._types orelse return v;
+        const p = self._p.?;
+        const analysis = p.state().analysis orelse return v;
+        const e = p._declared.getOrPut(allocator, idx) catch {
+            py.Py_DecRef(v);
+            return py.c.PyErr_NoMemory();
+        };
+        if (!e.found_existing) {
+            e.value_ptr.* = compile_mod.declaredClass(mapping, analysis, idx) catch {
+                _ = p._declared.remove(idx);
+                py.Py_DecRef(v);
+                return null;
+            };
+        }
+        const cls = e.value_ptr.* orelse return v;
+        const declared = compile_mod.Compiler.kindOfClass(cls) orelse return v;
+        const t = ph.typeOf(v);
+        const ok = switch (declared.shape) {
+            // (an int of 64 bits, or an I64: compiled code's ints)
+            .int => blk: {
+                if (@as(*PyObject, @ptrCast(@alignCast(t))) == ztypes.I64) break :blk true;
+                if (t != @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyLong_Type"))))) break :blk false;
+                var overflow: c_int = 0;
+                _ = py.c.PyLong_AsLongLongAndOverflow(v, &overflow);
+                break :blk overflow == 0;
+            },
+            .none => v == py.Py_None(),
+            .function => objects.asFunction(v) != null,
+            else => @as(*PyObject, @ptrCast(@alignCast(t))) == cls,
+        };
+        if (ok) return v;
+        py.Py_DecRef(v);
+        const type_text = py.c.PyObject_CallMethod(analysis, "type_of", "I", @as(c_uint, idx)) orelse return null;
+        defer py.Py_DecRef(type_text);
+        return self.fail(idx, "the value isn't what types() says the type {s} is", .{ph.utf8(type_text, "type") orelse "?"});
     }
 
     /// A block scope with frames of its own, entered: its frame (a new
@@ -1263,7 +1333,7 @@ const Runtime = struct {
                 const n = self.node(idx) orelse return null;
                 defer py.Py_DecRef(n);
                 const r = py.c.PyObject_CallFunctionObjArgs(f, n, self.obj(), @as(?*PyObject, null)) orelse return self.raised(idx);
-                return types.wrapOwned(r) orelse self.raised(idx);
+                return ztypes.wrapOwned(r) orelse self.raised(idx);
             }
         }
         return self.defaultEval(idx);
@@ -1351,7 +1421,7 @@ const Runtime = struct {
     /// `rt.loop(body)`: run a loop's body once; False if it broke out.
     pub fn loop(self: *Runtime, body: *PyObject) ?*PyObject {
         if (self.execObj(body)) return ref(py.Py_True());
-        switch (types.pendingControl()) {
+        switch (ztypes.pendingControl()) {
             .brk => {
                 py.c.PyErr_Clear();
                 return ref(py.Py_False());
@@ -1388,7 +1458,7 @@ const Runtime = struct {
         }
         const f = self.frameFor(si, idx) orelse return null;
         const v = f.slots.?.get(si) orelse return self.fail(idx, "'{s}' has no value yet", .{sym.name});
-        return ref(v);
+        return self.checkKind(idx, ref(v));
     }
 
     /// `rt.store(name, value)`: set the variable a name node refers to.
@@ -1409,7 +1479,7 @@ const Runtime = struct {
             return false;
         }
         const f = self.frameFor(si, idx) orelse return false;
-        const v = types.wrap(value) orelse {
+        const v = ztypes.wrap(value) orelse {
             _ = self.raised(idx);
             return false;
         };
@@ -1503,16 +1573,16 @@ const Runtime = struct {
             const wrapped = wrapAll(all) orelse return null;
             defer py.Py_DecRef(wrapped);
             const r = py.c.PyObject_CallObject(f, wrapped) orelse return self.hostFailed(f);
-            return types.wrapOwned(r) orelse self.raised(self._at);
+            return ztypes.wrapOwned(r) orelse self.raised(self._at);
         }
         const tname = typeName(f);
         return self.fail(self._at, "'{s}' value is not callable", .{tname});
     }
 
     fn hostFailed(self: *Runtime, f: *PyObject) ?*PyObject {
-        if (types.pendingControl() != .none or py.c.PyErr_ExceptionMatches(types.Error) != 0) return null;
+        if (ztypes.pendingControl() != .none or py.c.PyErr_ExceptionMatches(ztypes.Error) != 0) return null;
         // (a host function can throw an error of the language too)
-        if (py.c.PyErr_ExceptionMatches(types.Throw) != 0) {
+        if (py.c.PyErr_ExceptionMatches(ztypes.Throw) != 0) {
             self.recordThrow(self._at);
             return null;
         }
@@ -1596,8 +1666,8 @@ const Runtime = struct {
             none();
         defer py.Py_DecRef(body);
         if (self.execObj(body)) return none();
-        if (types.pendingControl() == .ret) return types.takeReturn();
-        if (types.pendingControl() != .none) {
+        if (ztypes.pendingControl() == .ret) return ztypes.takeReturn();
+        if (ztypes.pendingControl() != .none) {
             // Break or Continue outside a loop: an error of the language
             py.c.PyErr_Clear();
             return self.fail(self._at, "break or continue outside a loop", .{});
@@ -1732,22 +1802,22 @@ const Runtime = struct {
 
     /// raise rt.Return(value)
     pub fn get_Return(_: *const Runtime) ?*PyObject {
-        return ref(types.Return);
+        return ref(ztypes.Return);
     }
 
     /// raise rt.Break()
     pub fn get_Break(_: *const Runtime) ?*PyObject {
-        return ref(types.Break);
+        return ref(ztypes.Break);
     }
 
     /// raise rt.Continue()
     pub fn get_Continue(_: *const Runtime) ?*PyObject {
-        return ref(types.Continue);
+        return ref(ztypes.Continue);
     }
 
     /// raise rt.Throw(value, message=None)
     pub fn get_Throw(_: *const Runtime) ?*PyObject {
-        return ref(types.Throw);
+        return ref(ztypes.Throw);
     }
 
     // ------------------------------------------------------------------
@@ -1766,8 +1836,8 @@ const Runtime = struct {
     /// at the node. Null.
     fn raised(self: *Runtime, idx: u32) ?*PyObject {
         if (py.c.PyErr_Occurred() == null) return null;
-        if (types.pendingControl() != .none or py.c.PyErr_ExceptionMatches(types.Error) != 0) return null;
-        if (py.c.PyErr_ExceptionMatches(types.Throw) != 0) {
+        if (ztypes.pendingControl() != .none or py.c.PyErr_ExceptionMatches(ztypes.Error) != 0) return null;
+        if (py.c.PyErr_ExceptionMatches(ztypes.Throw) != 0) {
             self.recordThrow(idx);
             return null;
         }
@@ -1818,7 +1888,7 @@ const Runtime = struct {
     fn raiseError(self: *Runtime, idx: u32, message: []const u8, code: []const u8) ?*PyObject {
         const exc = self.makeError(idx, message, code) orelse return null;
         defer py.Py_DecRef(exc);
-        py.c.PyErr_SetObject(types.Error, exc);
+        py.c.PyErr_SetObject(ztypes.Error, exc);
         return null;
     }
 
@@ -1862,7 +1932,7 @@ const Runtime = struct {
         }
         const rendered = renderError(p, diag, stack) orelse return null;
         defer py.Py_DecRef(rendered);
-        const exc = py.c.PyObject_CallFunctionObjArgs(types.Error, rendered, @as(?*PyObject, null)) orelse return null;
+        const exc = py.c.PyObject_CallFunctionObjArgs(ztypes.Error, rendered, @as(?*PyObject, null)) orelse return null;
         if (py.c.PyObject_SetAttrString(exc, "diagnostic", diag) != 0 or py.c.PyObject_SetAttrString(exc, "stack", stack) != 0) {
             py.Py_DecRef(exc);
             return null;
@@ -1943,7 +2013,7 @@ fn pythonMessage() ?*PyObject {
             return py.c.PyErr_GivenExceptionMatches(exc_type, base) != 0;
         }
     }.f;
-    if (is(typ, types.IntegerOverflow)) return ph.newString("integer overflow");
+    if (is(typ, ztypes.IntegerOverflow)) return ph.newString("integer overflow");
     if (is(typ, py.PyExc_ZeroDivisionError())) return ph.newString("division by zero");
     if (is(typ, py.c.PyExc_RecursionError)) return ph.newString("call stack too deep");
     if (is(typ, py.PyExc_KeyError())) {
@@ -1996,7 +2066,7 @@ fn wrapAll(args: *PyObject) ?*PyObject {
     const n = py.c.PyTuple_Size(args);
     const out = py.c.PyTuple_New(n) orelse return null;
     for (0..@intCast(n)) |i| {
-        const v = types.wrap(py.c.PyTuple_GetItem(args, @intCast(i)).?) orelse {
+        const v = ztypes.wrap(py.c.PyTuple_GetItem(args, @intCast(i)).?) orelse {
             py.Py_DecRef(out);
             return null;
         };
@@ -2036,7 +2106,7 @@ fn configure(args: pyoz.Args(struct { cache: ?*PyObject = null, perf_map: ?*PyOb
 }
 
 fn moduleInit(module: *PyObject) callconv(.c) c_int {
-    if (types.init(module) != 0) return -1;
+    if (ztypes.init(module) != 0) return -1;
     objects.init(module) catch return -1;
     bridge.init(module) catch return -1;
     @import("proxies.zig").init(module) catch return -1;
