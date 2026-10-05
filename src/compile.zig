@@ -942,7 +942,7 @@ pub const Compiler = struct {
     /// reported at node `at`, the caller's receiver and varargs given.
     fn genHelper(self: *Compiler, h: *HelperSpec) Error!void {
         const fun = try self.helperFn(h.name);
-        var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = NONE, .layout = try self.layoutOf(NONE), .thunk = true, .detached = true, .helper_semantic = h.semantic, .unit = std.hash.Wyhash.hash(1, h.name) };
+        var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = NONE, .layout = try self.layoutOf(NONE), .thunk = true, .detached = true, .helper_semantic = h.semantic, .unit = std.hash.Wyhash.hash(1, h.name), .specialized = h.layout != null };
         // (one that can't be compiled: its semantic runs as Python)
         errdefer if (self.failed_semantic == null) {
             self.failed_semantic = h.semantic;
@@ -1603,6 +1603,8 @@ const Gen = struct {
     base_scopes: usize = 0,
     /// While loops being unrolled around the code
     unrolling: u32 = 0,
+    /// A helper's code made for a call site that ran often (Site): hot
+    specialized: bool = false,
     /// What code this is (a language function's, a helper's, a thunk's: the
     /// same each time it's compiled again): literals escaping here are
     /// built at run time here only (EscapeKey)
@@ -1612,7 +1614,7 @@ const Gen = struct {
     /// counts inline. (Elsewhere, calls: each inline one is blocks for
     /// LLVM to compile.)
     fn hot(self: *const Gen) bool {
-        return self.fnode != NONE or self.loop_level > 0;
+        return self.fnode != NONE or self.loop_level > 0 or self.specialized;
     }
 
     /// A value's count up (or down): inline in hot code; else a call,
