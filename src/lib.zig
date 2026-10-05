@@ -2459,51 +2459,50 @@ const Runtime = struct {
         return ph.newString(self.data().text(idx));
     }
 
-    /// `rt.u8(data, i)`, `rt.i8`, `rt.u16le`... `rt.i64be`: the int at
-    /// offset i of data (a zrun.Bytes, or any data), bounds checked
-    /// (bytes.zig's readers: functions, properties here, as PyOZ makes
-    /// fewer methods than it would need)
-    pub fn get_u8(_: *const Runtime) ?*PyObject {
-        return bytes_mod.reader(.u8);
+    /// `rt.u8(data, i)`: the int at offset i of data (a zrun.Bytes, or any
+    /// data), bounds checked; `rt.i8`, `rt.u16le`... `rt.i64be` the same
+    /// for their widths, signs and byte orders.
+    pub fn @"u8"(_: *Runtime, buf: *PyObject, i: *PyObject) ?*PyObject {
+        return bytes_mod.read(.u8, buf, i);
     }
-    pub fn get_i8(_: *const Runtime) ?*PyObject {
-        return bytes_mod.reader(.i8);
+    pub fn @"i8"(_: *Runtime, buf: *PyObject, i: *PyObject) ?*PyObject {
+        return bytes_mod.read(.i8, buf, i);
     }
-    pub fn get_u16le(_: *const Runtime) ?*PyObject {
-        return bytes_mod.reader(.u16le);
+    pub fn u16le(_: *Runtime, buf: *PyObject, i: *PyObject) ?*PyObject {
+        return bytes_mod.read(.u16le, buf, i);
     }
-    pub fn get_u16be(_: *const Runtime) ?*PyObject {
-        return bytes_mod.reader(.u16be);
+    pub fn u16be(_: *Runtime, buf: *PyObject, i: *PyObject) ?*PyObject {
+        return bytes_mod.read(.u16be, buf, i);
     }
-    pub fn get_i16le(_: *const Runtime) ?*PyObject {
-        return bytes_mod.reader(.i16le);
+    pub fn i16le(_: *Runtime, buf: *PyObject, i: *PyObject) ?*PyObject {
+        return bytes_mod.read(.i16le, buf, i);
     }
-    pub fn get_i16be(_: *const Runtime) ?*PyObject {
-        return bytes_mod.reader(.i16be);
+    pub fn i16be(_: *Runtime, buf: *PyObject, i: *PyObject) ?*PyObject {
+        return bytes_mod.read(.i16be, buf, i);
     }
-    pub fn get_u32le(_: *const Runtime) ?*PyObject {
-        return bytes_mod.reader(.u32le);
+    pub fn u32le(_: *Runtime, buf: *PyObject, i: *PyObject) ?*PyObject {
+        return bytes_mod.read(.u32le, buf, i);
     }
-    pub fn get_u32be(_: *const Runtime) ?*PyObject {
-        return bytes_mod.reader(.u32be);
+    pub fn u32be(_: *Runtime, buf: *PyObject, i: *PyObject) ?*PyObject {
+        return bytes_mod.read(.u32be, buf, i);
     }
-    pub fn get_i32le(_: *const Runtime) ?*PyObject {
-        return bytes_mod.reader(.i32le);
+    pub fn i32le(_: *Runtime, buf: *PyObject, i: *PyObject) ?*PyObject {
+        return bytes_mod.read(.i32le, buf, i);
     }
-    pub fn get_i32be(_: *const Runtime) ?*PyObject {
-        return bytes_mod.reader(.i32be);
+    pub fn i32be(_: *Runtime, buf: *PyObject, i: *PyObject) ?*PyObject {
+        return bytes_mod.read(.i32be, buf, i);
     }
-    pub fn get_u64le(_: *const Runtime) ?*PyObject {
-        return bytes_mod.reader(.u64le);
+    pub fn u64le(_: *Runtime, buf: *PyObject, i: *PyObject) ?*PyObject {
+        return bytes_mod.read(.u64le, buf, i);
     }
-    pub fn get_u64be(_: *const Runtime) ?*PyObject {
-        return bytes_mod.reader(.u64be);
+    pub fn u64be(_: *Runtime, buf: *PyObject, i: *PyObject) ?*PyObject {
+        return bytes_mod.read(.u64be, buf, i);
     }
-    pub fn get_i64le(_: *const Runtime) ?*PyObject {
-        return bytes_mod.reader(.i64le);
+    pub fn i64le(_: *Runtime, buf: *PyObject, i: *PyObject) ?*PyObject {
+        return bytes_mod.read(.i64le, buf, i);
     }
-    pub fn get_i64be(_: *const Runtime) ?*PyObject {
-        return bytes_mod.reader(.i64be);
+    pub fn i64be(_: *Runtime, buf: *PyObject, i: *PyObject) ?*PyObject {
+        return bytes_mod.read(.i64be, buf, i);
     }
 
     /// `rt.wrapping_add(a, b)`, `rt.wrapping_sub`, `rt.wrapping_mul`: 64-bit
@@ -2799,6 +2798,40 @@ const Runtime = struct {
     pub const text__params__ = "node";
     pub const span__doc__: [*:0]const u8 = "A node's (start, end) byte offsets.";
     pub const span__params__ = "node";
+    pub const wrapping_add__doc__: [*:0]const u8 = "a + b in 64 bits, wrapping around (signed).";
+    pub const wrapping_add__params__ = "a, b";
+    pub const wrapping_sub__doc__: [*:0]const u8 = "a - b in 64 bits, wrapping around (signed).";
+    pub const wrapping_sub__params__ = "a, b";
+    pub const wrapping_mul__doc__: [*:0]const u8 = "a * b in 64 bits, wrapping around (signed).";
+    pub const wrapping_mul__params__ = "a, b";
+    pub const u8__doc__: [*:0]const u8 = "The unsigned byte at offset i of data (a zrun.Bytes, bytes, or any buffer); IndexError past the end.";
+    pub const u8__params__ = "data, i";
+    pub const i8__doc__: [*:0]const u8 = "The signed byte at offset i of data; IndexError past the end.";
+    pub const i8__params__ = "data, i";
+    pub const u16le__doc__: [*:0]const u8 = "The unsigned 16-bit little-endian int at offset i of data; IndexError past the end.";
+    pub const u16le__params__ = "data, i";
+    pub const u16be__doc__: [*:0]const u8 = "The unsigned 16-bit big-endian int at offset i of data; IndexError past the end.";
+    pub const u16be__params__ = "data, i";
+    pub const i16le__doc__: [*:0]const u8 = "The signed 16-bit little-endian int at offset i of data; IndexError past the end.";
+    pub const i16le__params__ = "data, i";
+    pub const i16be__doc__: [*:0]const u8 = "The signed 16-bit big-endian int at offset i of data; IndexError past the end.";
+    pub const i16be__params__ = "data, i";
+    pub const u32le__doc__: [*:0]const u8 = "The unsigned 32-bit little-endian int at offset i of data; IndexError past the end.";
+    pub const u32le__params__ = "data, i";
+    pub const u32be__doc__: [*:0]const u8 = "The unsigned 32-bit big-endian int at offset i of data; IndexError past the end.";
+    pub const u32be__params__ = "data, i";
+    pub const i32le__doc__: [*:0]const u8 = "The signed 32-bit little-endian int at offset i of data; IndexError past the end.";
+    pub const i32le__params__ = "data, i";
+    pub const i32be__doc__: [*:0]const u8 = "The signed 32-bit big-endian int at offset i of data; IndexError past the end.";
+    pub const i32be__params__ = "data, i";
+    pub const u64le__doc__: [*:0]const u8 = "The unsigned 64-bit little-endian int at offset i of data; IndexError past the end.";
+    pub const u64le__params__ = "data, i";
+    pub const u64be__doc__: [*:0]const u8 = "The unsigned 64-bit big-endian int at offset i of data; IndexError past the end.";
+    pub const u64be__params__ = "data, i";
+    pub const i64le__doc__: [*:0]const u8 = "The signed 64-bit little-endian int at offset i of data; IndexError past the end.";
+    pub const i64le__params__ = "data, i";
+    pub const i64be__doc__: [*:0]const u8 = "The signed 64-bit big-endian int at offset i of data; IndexError past the end.";
+    pub const i64be__params__ = "data, i";
 };
 
 /// The message of the Python exception being raised, as the program's

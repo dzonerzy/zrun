@@ -387,29 +387,6 @@ pub fn readAt(r: Read, data: []const u8, at: i64) ?Got {
     return .{ .value = @bitCast(x), .big = !r.signed() and w == 8 and x >> 63 != 0 };
 }
 
-/// `rt.u8` and the others for the reference mode's rt: a function (a new
-/// reference), made once.
-pub fn reader(comptime r: Read) ?*PyObject {
-    const S = struct {
-        var def = py.c.PyMethodDef{
-            .ml_name = @tagName(r),
-            .ml_meth = @ptrCast(@constCast(&f)),
-            .ml_flags = py.c.METH_VARARGS,
-            .ml_doc = "rt." ++ @tagName(r) ++ "(data, i): the int at offset i of data (a zrun.Bytes, or any data), bounds checked.",
-        };
-        var made: ?*PyObject = null;
-
-        fn f(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
-            var data: ?*PyObject = null;
-            var at: ?*PyObject = null;
-            if (py.c.PyArg_UnpackTuple(args, @tagName(r), 2, 2, &data, &at) == 0) return null;
-            return read(r, data.?, at.?);
-        }
-    };
-    if (S.made == null) S.made = py.c.PyCFunction_NewEx(&S.def, null, null) orelse return null;
-    return ref(S.made.?);
-}
-
 /// rt.u8(data, i) and the others of Python objects: an int; IndexError past
 /// the end, TypeError for what isn't data.
 pub fn read(r: Read, data: *PyObject, at_obj: *PyObject) ?*PyObject {
