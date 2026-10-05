@@ -769,10 +769,23 @@ pub const FunctionFlags = struct {
     }
 };
 
+var empty_tuple: ?*value.Tuple = null;
+
 /// The arguments beyond a function's parameters, as a tuple (their own
 /// references), in `out` (extra="keep": rt.varargs).
 export fn zr_varargs(ctx: *Ctx, node: u32, args: [*]const Value, nargs: u64, nparams: u64, out: *Value) callconv(.c) bool {
     const n = if (nargs > nparams) nargs - nparams else 0;
+    // (none: the empty tuple, one for all, as Python's ())
+    if (n == 0) {
+        const e = empty_tuple orelse blk: {
+            const t = value.newTuple(0) orelse return oomFail(ctx, node);
+            t.head.rc = value.IMMORTAL;
+            empty_tuple = t;
+            break :blk t;
+        };
+        out.* = Value.obj(.tuple, &e.head);
+        return true;
+    }
     const t = value.newTuple(n) orelse return oomFail(ctx, node);
     for (t.slice(), 0..) |*slot, i| {
         // (arguments as rt.call hands them over: ints I64s)
@@ -813,7 +826,9 @@ pub export fn zr_call(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Val
                 return fail(ctx, node, "{s}() takes {d} argument{s}, {d} given", .{ fo.name.bytes(), nparams, if (nparams == 1) "" else "s", nargs });
             }
             if (ctx.calls.items.len >= ctx.max_depth) return fail(ctx, node, "call stack too deep (more than {d} calls)", .{ctx.max_depth});
-            ctx.calls.append(allocator, .{ .name = fo.name, .node = node }) catch return fail(ctx, node, "out of memory", .{});
+            // (room for the deepest stack made once: a call just stores)
+            if (ctx.calls.capacity < ctx.max_depth) ctx.calls.ensureTotalCapacityPrecise(allocator, ctx.max_depth) catch return fail(ctx, node, "out of memory", .{});
+            ctx.calls.appendAssumeCapacity(.{ .name = fo.name, .node = node });
             defer _ = ctx.calls.pop();
             const code: Code = @ptrCast(@alignCast(fo.code.?));
             // (its result as rt.call gives it: an int an I64; its

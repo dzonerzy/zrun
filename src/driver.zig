@@ -356,6 +356,37 @@ pub const Compiled = struct {
         return llvm.loadObject(self.view, bytes, err) catch null;
     }
 
+    /// ZRUN_PERFMAP: the module's functions named for perf
+    /// (/tmp/perf-<pid>.map: each one's address, its size taken as up to
+    /// the next one's).
+    fn perfMap(self: *Compiled) void {
+        var it = self.compiler.m.fns.keyIterator();
+        while (it.next()) |k| {
+            if (!std.mem.startsWith(u8, k.*, self.compiler.m.prefix)) continue;
+            const z = allocator.dupeZ(u8, k.*) catch return;
+            const addr = llvm.lookup(self.view, z);
+            if (addr == 0) {
+                allocator.free(z);
+                continue;
+            }
+            perf_syms.put(allocator, addr, z) catch return;
+        }
+        const addrs = allocator.dupe(usize, perf_syms.keys()) catch return;
+        defer allocator.free(addrs);
+        std.mem.sort(usize, addrs, {}, std.sort.asc(usize));
+        var path: [64]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&path, "/tmp/perf-{d}.map", .{std.c.getpid()}) catch return;
+        const fd = std.c.open(p.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        if (fd < 0) return;
+        defer _ = std.c.close(fd);
+        for (addrs, 0..) |a, i| {
+            const size = if (i + 1 < addrs.len) @min(addrs[i + 1] - a, 1 << 20) else 4096;
+            var line: [512]u8 = undefined;
+            const s = std.fmt.bufPrint(&line, "{x} {x} {s}\n", .{ a, size, perf_syms.get(a).? }) catch continue;
+            _ = std.c.write(fd, s.ptr, s.len);
+        }
+    }
+
     /// The compiler's module into the JIT: the address of `name` in it.
     fn add(self: *Compiled, name: [:0]const u8) ?usize {
         var err: [2048]u8 = undefined;
@@ -392,6 +423,7 @@ pub const Compiled = struct {
             _ = py.c.PyErr_NoMemory();
             return null;
         };
+        if (std.c.getenv("ZRUN_PERFMAP") != null) self.perfMap();
         const addr = llvm.lookup(self.view, name);
         if (addr == 0) {
             ph.raise(py.PyExc_RuntimeError(), "zrun: compiled code without its entry point {s}", .{name});
@@ -413,8 +445,10 @@ fn types() type {
 
 var helpers_defined = false;
 var next_id: u64 = 0;
-/// Time in LLVM (optimizing, compiling) so far (zrun.llvm_time())
+/// Time in LLVM (optimizing, compiling) so far
 pub var llvm_us: i64 = 0;
+/// Compiled functions by address (ZRUN_PERFMAP)
+var perf_syms: std.AutoArrayHashMapUnmanaged(usize, [:0]u8) = .empty;
 
 /// Give zgram's JIT the runtime helpers (once per process).
 fn defineHelpers(view: *const llvm.LlvmView) bool {

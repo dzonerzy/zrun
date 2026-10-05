@@ -47,6 +47,7 @@ BUILTINS = (
     "matches",
     "isinst",
     "folds",
+    "typeis",
 )
 
 
@@ -379,6 +380,18 @@ def make_lang():
             out.append(len("héllo".encode("utf-8")))
             out.append("ab".encode())
             return out
+        if name == "typeis":
+            # type(a) is type(b), type(a) is C, of values of every kind
+            # (an I64 and an int differ; a big int is an int)
+            vals = rt.call(rt.load(node.name), [])
+            vals = vals + [Slot3(1, 2), Holder(3), Slot2(4), 2**70 + len(vals), 7, len(vals), True, 1.5, "s", None, rt.load(node.name)]
+            out = []
+            for v in vals:
+                row = [type(v) is int, type(v) is not float, type(v) is str, type(v) is bool, type(v) is list, type(v) is tuple,
+                       type(v) is dict, type(v) is Holder, type(v) is Slot2, type(v) is Slot3, type(v) is Point, type(v) is type(None)]
+                row.append("".join("1" if type(v) is type(w) else "0" for w in vals))
+                out.append("".join("1" if x is True else "0" if x is False else x for x in row))
+            return out
         if name == "isinst":
             # isinstance() of values of every kind: Python's, natively made
             # ones (records of a class, of a subclass)
@@ -585,6 +598,10 @@ def make_lang():
         return 3
 
     @lang.host
+    def typeis():
+        return [1, True, 2**70, 2**200, 2.0, "s", MyStr("x"), [1], (1,), {}, None, Color.RED, Point(1, 2), Holder(1), Slot3(1, 2), Box(1)]
+
+    @lang.host
     def folds():
         return 0
 
@@ -680,6 +697,7 @@ PROGRAMS = {
     "matches": "print(matches());\n",
     "isinst": "print(isinst());\n",
     "folds": "print(folds());\n",
+    "typeis": "print(typeis());\n",
 }
 
 

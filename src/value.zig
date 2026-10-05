@@ -361,8 +361,9 @@ pub fn free(tag: Tag, o: *Obj) void {
         .list => {
             const l: *List = @ptrCast(o);
             for (l.slice()) |item| decref(item);
-            if (l.items) |p| allocator.free(p[0..l.cap]);
-            allocator.destroy(l);
+            freeListItems(l);
+            const block: []align(@alignOf(List)) u8 = @as([*]align(@alignOf(List)) u8, @ptrCast(l))[0..list_block];
+            allocator.free(block);
         },
         .tuple => {
             const t: *Tuple = @ptrCast(@alignCast(o));
@@ -440,12 +441,23 @@ pub fn bigLiteral(v: i128) ?*Big {
 
 var big_literals: std.AutoHashMapUnmanaged(i128, *Big) = .empty;
 
+/// Items a list has room for in its own allocation (most lists are small:
+/// one allocation, none more until it grows past them)
+const list_inline = 4;
+const list_block = @sizeOf(List) + list_inline * @sizeOf(Value);
+
+/// A list's own room for items (after it, in its allocation).
+fn listInline(l: *List) [*]Value {
+    return @ptrCast(@alignCast(@as([*]u8, @ptrCast(l)) + @sizeOf(List)));
+}
+
 pub fn newList(cap: usize) ?*List {
-    const l = allocator.create(List) catch return null;
-    l.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.list) }, .len = 0, .cap = 0, .items = null };
-    if (cap > 0) {
+    const mem = allocator.alignedAlloc(u8, .of(List), list_block) catch return null;
+    const l: *List = @ptrCast(mem.ptr);
+    l.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.list) }, .len = 0, .cap = list_inline, .items = listInline(l) };
+    if (cap > list_inline) {
         const items = allocator.alloc(Value, cap) catch {
-            allocator.destroy(l);
+            allocator.free(mem);
             return null;
         };
         l.items = items.ptr;
@@ -454,12 +466,19 @@ pub fn newList(cap: usize) ?*List {
     return l;
 }
 
+/// A list's items, given up (its own room isn't allocated apart).
+fn freeListItems(l: *List) void {
+    const p = l.items orelse return;
+    if (p != listInline(l)) allocator.free(p[0..l.cap]);
+}
+
 /// Append, taking the reference.
 pub fn listPush(l: *List, v: Value) bool {
     if (l.len == l.cap) {
-        const cap = @max(4, l.cap * 2);
-        const old = if (l.items) |p| p[0..l.cap] else &[_]Value{};
-        const items = allocator.realloc(@constCast(old), cap) catch return false;
+        const cap = @max(list_inline * 2, l.cap * 2);
+        const items = allocator.alloc(Value, cap) catch return false;
+        @memcpy(items[0..l.len], l.slice());
+        freeListItems(l);
         l.items = items.ptr;
         l.cap = cap;
     }

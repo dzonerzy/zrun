@@ -4063,6 +4063,10 @@ const Gen = struct {
                 return self.unary(inst, x.op, v);
             },
             .compare => |x| {
+                // type(a) is type(b), type(a) is C: their classes' keys
+                if (x.ops.len == 1 and (x.ops[0] == .is or x.ops[0] == .is_not)) {
+                    if (try self.typeIs(inst, x.ops[0], x.first, x.rest[0], e.pos)) |v| return v;
+                }
                 // a < b < c: each pair, and-ed (each operand once)
                 var left = try self.expr(inst, x.first);
                 if (x.ops.len == 1) {
@@ -5381,6 +5385,125 @@ const Gen = struct {
         const res = f.phiN(t.i64, &.{ self.k(0), self.k(1), r }, &.{ start, rec, slow_end });
         try self.drop(.{ .dyn = d });
         return dyn(self.k(1), res, .bool);
+    }
+
+    /// `type(a) is type(b)`, `type(a) is C` (`is not`): for values of the
+    /// compiled code, a key for each one's class from its tag (a record's:
+    /// its type), compared inline (no class objects made); a Python
+    /// object's class by type() itself. Null: not that.
+    fn typeIs(self: *Gen, inst: *Inst, op: front.CmpOp, l_e: *const front.Expr, r_e: *const front.Expr, pos: front.Pos) Error!?SVal {
+        const f = &self.f;
+        const t = self.c.m.t;
+        var a_e = try self.typeArg(inst, l_e);
+        var other = r_e;
+        if (a_e == null) {
+            a_e = try self.typeArg(inst, r_e);
+            other = l_e;
+        }
+        const ae = a_e orelse return null;
+        const type_obj = (try self.typeArgCallee(inst, if (other == r_e) l_e else r_e)).?;
+        const be = try self.typeArg(inst, other);
+        // (the other: type(b), or a class's name (nothing to run))
+        var cls: ?*PyObject = null;
+        var cls_key: ?ir.Value = null;
+        if (be == null) {
+            if (other.kind != .global) return null;
+            const cv = try self.global(inst, other.kind.global, other.pos);
+            if (cv != .py) return null;
+            cls_key = try self.classKey(cv.py) orelse return null;
+            cls = cv.py;
+        }
+        // (in Python's order: the left one first)
+        var va: SVal = undefined;
+        var vb: ?SVal = null;
+        if (other == r_e) {
+            va = try self.expr(inst, ae);
+            if (be) |x| vb = try self.expr(inst, x);
+        } else {
+            if (be) |x| vb = try self.expr(inst, x);
+            va = try self.expr(inst, ae);
+        }
+        // Known values: as type() and `is` do it
+        if (va != .dyn or (vb != null and vb.? != .dyn)) {
+            const ta = (try self.builtinCall(inst, type_obj, &.{va}, pos)).?;
+            const tb = if (vb) |bv| (try self.builtinCall(inst, type_obj, &.{bv}, pos)).? else SVal{ .py = cls.? };
+            return try self.compare(inst, op, ta, tb);
+        }
+        const ka = try self.typeKey(va.dyn);
+        const kb = if (vb) |bv| try self.typeKey(bv.dyn) else TypeKey{ .key = cls_key.?, .host = self.c.m.k1(false) };
+        const fast = try f.label("type_fast");
+        const slow = try f.label("type_python");
+        const join = try f.label("type_is");
+        try f.condBr(f.or_(ka.host, kb.host), slow, fast);
+        try f.block(fast);
+        const same = f.icmp(if (op == .is) jit_c.LLVMIntEQ else jit_c.LLVMIntNE, ka.key, kb.key);
+        const res_fast = f.zext64(same);
+        try self.drop(va);
+        if (vb) |bv| try self.drop(bv);
+        const fast_end = f.current;
+        try f.br(join);
+        try f.block(slow);
+        const ta = (try self.builtinCall(inst, type_obj, &.{va}, pos)).?;
+        const tb = if (vb) |bv| (try self.builtinCall(inst, type_obj, &.{bv}, pos)).? else SVal{ .py = cls.? };
+        const r = try self.materialize(try self.compare(inst, op, ta, tb), inst.node);
+        const slow_end = f.current;
+        try f.br(join);
+        try f.block(join);
+        return dyn(self.k(1), f.phi(t.i64, res_fast, fast_end, r.bits, slow_end), .bool);
+    }
+
+    /// The argument of `type(x)` (the builtin, one argument), or null.
+    fn typeArg(self: *Gen, inst: *Inst, e: *const front.Expr) Error!?*const front.Expr {
+        _ = try self.typeArgCallee(inst, e) orelse return null;
+        return e.kind.call.args[0];
+    }
+
+    fn typeArgCallee(self: *Gen, inst: *Inst, e: *const front.Expr) Error!?*PyObject {
+        if (e.kind != .call) return null;
+        const ce = e.kind.call;
+        if (ce.args.len != 1 or ce.keywords.len != 0 or ce.func.kind != .global) return null;
+        const callee = try self.global(inst, ce.func.kind.global, ce.func.pos);
+        if (callee != .py or !isBuiltin(callee.py, "type")) return null;
+        return callee.py;
+    }
+
+    const TypeKey = struct { key: ir.Value, host: ir.Value };
+
+    /// A value's class as a key (typeIs): its tag (a Big's a plain int's,
+    /// both `int`), a record's type; `host`: a Python object (its class
+    /// Python's to say).
+    fn typeKey(self: *Gen, d: Dyn) Error!TypeKey {
+        const f = &self.f;
+        const t = self.c.m.t;
+        const T = value.Tag;
+        const low = f.and_(d.tag, self.k(0xffff_ffff));
+        const key0 = f.select(f.icmp(jit_c.LLVMIntEQ, low, self.k(@intFromEnum(T.big))), self.k(@intCast(value.PINT_TAG)), low);
+        const rec = try f.label("key_record");
+        const done = try f.label("key_done");
+        const start = f.current;
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, low, self.k(@intFromEnum(T.record))), rec, done);
+        try f.block(rec);
+        const kr = self.recordTypeOf(d);
+        try f.br(done);
+        try f.block(done);
+        return .{ .key = f.phi(t.i64, key0, start, kr, rec), .host = f.icmp(jit_c.LLVMIntEQ, low, self.k(@intFromEnum(T.host))) };
+    }
+
+    /// The key (typeKey's) of a class known when compiling, or null: one
+    /// only Python objects are of.
+    fn classKey(self: *Gen, o: *PyObject) Error!?ir.Value {
+        const T = value.Tag;
+        const is = struct {
+            fn t(x: *PyObject, comptime name: [:0]const u8) bool {
+                return x == @as(*PyObject, @ptrCast(@alignCast(py.types.typeObject(name))));
+            }
+        };
+        const tag: ?i64 = if (is.t(o, "PyLong_Type")) @intCast(value.PINT_TAG) else if (o == types_mod.I64) @intFromEnum(T.int) else if (is.t(o, "PyFloat_Type")) @intFromEnum(T.float) else if (is.t(o, "PyUnicode_Type")) @intFromEnum(T.str) else if (is.t(o, "PyBool_Type")) @intFromEnum(T.bool) else if (is.t(o, "PyList_Type")) @intFromEnum(T.list) else if (is.t(o, "PyTuple_Type")) @intFromEnum(T.tuple) else if (is.t(o, "PyDict_Type")) @intFromEnum(T.dict) else if (o == @as(*PyObject, @ptrCast(@alignCast(ph.typeOf(py.Py_None()))))) @intFromEnum(T.none) else if (o == objects_mod.FunctionType) @intFromEnum(T.function) else if (o == objects_mod.NodeType) @intFromEnum(T.node) else null;
+        if (tag) |n| return self.k(n);
+        if (try isInstanceOf(o, @ptrCast(@alignCast(py.types.typeObject("PyType_Type"))))) {
+            if (try self.c.recordType(o)) |rt| return self.c.m.addrInt(@intFromPtr(rt));
+        }
+        return null;
     }
 
     fn orValues(self: *Gen, inst: *Inst, a_: SVal, b: SVal) Error!SVal {
