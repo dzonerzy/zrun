@@ -1349,14 +1349,16 @@ export fn zr_extend_items(ctx: *Ctx, node: u32, t: u64, bits: u64, items: [*]con
     const v = Value{ .tag = t, .bits = bits };
     if (v.kind() == .list) {
         const l: *value.List = @ptrCast(@alignCast(v.ptr()));
-        for (items[0..n]) |x| {
+        for (0..n) |i| {
+            const x = given(&items[i]);
             value.incref(x);
             if (!value.listPush(l, x)) return oomFail(ctx, node);
         }
         return true;
     }
     const l = value.newList(n) orelse return oomFail(ctx, node);
-    for (items[0..n]) |x| {
+    for (0..n) |i| {
+        const x = given(&items[i]);
         value.incref(x);
         _ = value.listPush(l, x);
     }

@@ -67,7 +67,10 @@ pub const LangView = struct {
     types: ?*PyObject = null,
 };
 
-pub const EscapeKey = struct { origin: *const front.Expr, unit: u64 };
+/// A literal built at run time: where it is (its expression), the code it's
+/// compiled in, and the node it was made for there (each run of a helper's
+/// literal its own)
+pub const EscapeKey = struct { origin: *const front.Expr, unit: u64, at: u32 };
 
 /// Semantics run as Python, by their function: why (the compiler's
 /// message, owned by c_allocator)
@@ -131,6 +134,8 @@ pub const SList = struct {
     /// run time instead once it's known to escape where a known one can't
     /// follow (Compiler.escaping)
     origin: ?*const front.Expr = null,
+    /// The node it was made for (EscapeKey)
+    made_at: u32 = NONE,
     /// A module's table only read (frozenTable): the object it is
     frozen: ?*PyObject = null,
 };
@@ -140,6 +145,8 @@ pub const SDict = struct {
     keys: std.ArrayListUnmanaged(SVal) = .empty,
     values: std.ArrayListUnmanaged(SVal) = .empty,
     origin: ?*const front.Expr = null,
+    /// The node it was made for (EscapeKey)
+    made_at: u32 = NONE,
     /// A module's table only read (frozenTable): the object it is
     frozen: ?*PyObject = null,
 
@@ -852,6 +859,10 @@ pub const Compiler = struct {
     kinds: std.AutoHashMapUnmanaged(u32, ?Kind) = .empty,
     /// Symbols always set where they're read (Gen.alwaysSet), worked out
     always_set: std.AutoHashMapUnmanaged(u32, bool) = .empty,
+    /// By variable: the language function its stores compiled so far store
+    /// (rt.store(name, rt.function(node))), NONE when they store others:
+    /// what a read of it most likely is (Dyn.func)
+    sym_func: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     /// Helpers' first `if` to run inline, the rest out of line (headOf)
     heads: std.AutoHashMapUnmanaged(*const front.Function, ?[]const front.Stmt) = .empty,
     /// By semantic or helper read: the reads of its locals that move their
@@ -1148,8 +1159,7 @@ pub const Compiler = struct {
         self.specialized += 1;
         const blocks0 = self.helper_blocks;
         const h = try self.a.create(HelperSpec);
-        h.* = .{ .func = s.func, .args = s.args, .name = try std.fmt.allocPrintSentinel(self.a, "{s}_s{d}", .{ self.m.prefix, self.helper_fns.items.len }, 0), .semantic = s.semantic, .layout = s.layout };
-        try self.helper_fns.append(self.a, h);
+        h.* = .{ .func = s.func, .args = s.args, .name = try std.fmt.allocPrintSentinel(self.a, "{s}_s{d}", .{ self.m.prefix, self.helper_fns.items.len }, 0), .semantic = s.semantic, .layout = s.layout };        try self.helper_fns.append(self.a, h);
         try self.helper_queue.append(self.a, h);
         try self.drainQueues();
         // (code too big to be worth compiling: LLVM's time grows with it,
@@ -2097,11 +2107,17 @@ const Gen = struct {
     /// follow (then built at run time).
     fn literal(self: *Gen, v: SVal, e: *const front.Expr, at: u32) Error!SVal {
         switch (v) {
-            .list => |l| l.origin = e,
-            .dict => |d| d.origin = e,
+            .list => |l| {
+                l.origin = e;
+                l.made_at = at;
+            },
+            .dict => |d| {
+                d.origin = e;
+                d.made_at = at;
+            },
             else => return v,
         }
-        if (!self.c.lang.escaping.contains(.{ .origin = e, .unit = self.unit })) return v;
+        if (!self.c.lang.escaping.contains(.{ .origin = e, .unit = self.unit, .at = at })) return v;
         return .{ .dyn = try self.materialize(v, at) };
     }
 
@@ -2118,8 +2134,12 @@ const Gen = struct {
             // (one no literal made: a copy, for reading (one changed is
             // refused: materializeToChange))
             const origin = originOf(old) orelse return;
-            try self.c.lang.escaping.put(std.heap.c_allocator, .{ .origin = origin, .unit = self.unit }, {});
-            self.c.need_retry = true;
+            const made_at = switch (old) {
+                .list => |l| l.made_at,
+                .dict => |x| x.made_at,
+                else => NONE,
+            };
+            try self.c.lang.escaping.put(std.heap.c_allocator, .{ .origin = origin, .unit = self.unit, .at = made_at }, {});            self.c.need_retry = true;
             return self.c.unsupported("a list or dict escapes inside run-time control flow: compiled again, made at run time", .{});
         }
         for (self.insts.items) |inst| {
@@ -2545,6 +2565,10 @@ const Gen = struct {
                 r.dyn.func = p;
             };
         }
+        // (one the stores compiled so far store a function in: that one)
+        if (r == .dyn and r.dyn.func == NONE) if (c.sym_func.get(si)) |fnode| {
+            r.dyn.func = fnode;
+        };
         return r;
     }
 
@@ -2560,6 +2584,10 @@ const Gen = struct {
             try self.failAt(name_node, try std.fmt.allocPrint(self.a(), "can't assign to the builtin '{s}'", .{d.syms[si].name}));
             return;
         }
+        // (the function it holds, if every store stores the same)
+        const func: u32 = if (value_ == .dyn) value_.dyn.func else NONE;
+        const e = try c.sym_func.getOrPut(c.a, si);
+        if (!e.found_existing) e.value_ptr.* = func else if (e.value_ptr.* != func) e.value_ptr.* = NONE;
         // (its values borrowed and still in use: owned first)
         for (self.borrows.items) |b| if (b.sym == si) {
             var bd = try self.loadSlot(b.kept, .any);
@@ -2630,7 +2658,9 @@ const Gen = struct {
             },
         };
         try self.callCheck("zr_function", &.{ self.ctx, code, env, self.k32(fnode), name, self.k(flags.word()), self.out });
-        return .{ .dyn = try self.loadOut(.function) };
+        var d = try self.loadOut(.function);
+        d.func = fnode;
+        return .{ .dyn = d };
     }
 
     /// A function node's parameters: the nodes their values are stored
@@ -3295,8 +3325,7 @@ const Gen = struct {
             // (its first `if` small with what's known: that inline, the
             // rest out of line)
             if (try self.headOf(func)) |head| if (try self.foldedSizeOf(func, head, args) <= folded_inline_size)
-                return self.runBody(func, head, at, args);
-            return self.outOfLine(func, at, args);
+                return self.runBody(func, head, at, args);            return self.outOfLine(func, at, args);
         }
         return self.runFunction(func, at, args);
     }
@@ -3310,11 +3339,32 @@ const Gen = struct {
     /// had another node.
     fn otherNode(run: *const Inst, args: []const SVal) bool {
         for (args, 0..) |x, i| {
-            if (x != .node or i >= run.args.len) continue;
-            const was = run.args[i];
-            if (was == .node and was.node != x.node) return true;
+            if (i >= run.args.len) continue;
+            if (otherNodes(run.args[i], x)) return true;
         }
         return false;
+    }
+
+    /// Whether two values are nodes (or known lists of nodes: a node's
+    /// children) and not the same ones.
+    fn otherNodes(was: SVal, x: SVal) bool {
+        if (was == .node and x == .node) return was.node != x.node;
+        const a_ = nodeItems(was) orelse return false;
+        const b_ = nodeItems(x) orelse return false;
+        if (a_.len != b_.len) return true;
+        for (a_, b_) |p, q| if (p.node != q.node) return true;
+        return false;
+    }
+
+    fn nodeItems(v: SVal) ?[]const SVal {
+        const items: []const SVal = switch (v) {
+            .list => |l| l.items.items,
+            .tuple => |t| t,
+            else => return null,
+        };
+        if (items.len == 0) return null;
+        for (items) |item| if (item != .node) return null;
+        return items;
     }
 
     /// A helper's first `if` whose body ends in a return (its common case,
@@ -3326,8 +3376,10 @@ const Gen = struct {
         const c = self.c;
         if (c.heads.get(func)) |h| return h;
         const result: ?[]const front.Stmt = blk: {
-            if (func.body.len < 2 or func.body[0].kind != .if_) break :blk null;
-            const first = func.body[0];
+            // (after its docstring)
+            const body = if (func.body.len > 0 and func.body[0].kind == .expr and func.body[0].kind.expr.kind == .str) func.body[1..] else func.body;
+            if (body.len < 2 or body[0].kind != .if_) break :blk null;
+            const first = body[0];
             const x = first.kind.if_;
             if (x.else_.len != 0 or x.body.len == 0) break :blk null;
             switch (x.body[x.body.len - 1].kind) {
@@ -4569,8 +4621,17 @@ const Gen = struct {
             // (the helper being run, out of line, with its arguments: its
             // parameters' values, unchanged by its first `if`'s test)
             .outline => {
+                // (moved out: the helper returns right after, done with
+                // them; a known list only its now made a run-time one
+                // without escaping)
                 const args = try self.a().alloc(SVal, inst.func.param_count);
-                for (args, 0..) |*x, i| x.* = try self.readLocal(inst, @intCast(i), e.pos);
+                for (args, 0..) |*x, i| x.* = switch (inst.locals[i]) {
+                    .static => |v| blk: {
+                        inst.locals[i] = .unset;
+                        break :blk v;
+                    },
+                    else => try self.readLocal(inst, @intCast(i), e.pos),
+                };
                 return self.outOfLine(inst.func, inst.node, args);
             },
             .local => |slot| {

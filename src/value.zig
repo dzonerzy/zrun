@@ -473,7 +473,9 @@ fn freeListItems(l: *List) void {
 }
 
 /// Append, taking the reference.
-pub fn listPush(l: *List, v: Value) bool {
+/// (inline: the value stays in registers, not written to the stack and read
+/// back 16 bytes at once, which stalls after two 8-byte writes)
+pub inline fn listPush(l: *List, v: Value) bool {
     if (l.len == l.cap) {
         const cap = @max(list_inline * 2, l.cap * 2);
         const items = allocator.alloc(Value, cap) catch return false;

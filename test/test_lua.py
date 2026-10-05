@@ -92,6 +92,27 @@ def test_closures_keep_their_iteration():
     lua.run(src)
 
 
+def test_function_variables_rebound(capsys):
+    # calls of a variable that held one function (called directly, behind a
+    # check) and then another: each call the one it holds then
+    src = (
+        "local function f(x) return x + 1 end\n"
+        "local g = f\n"
+        "local out = {}\n"
+        "for i = 1, 4 do\n"
+        "  out[#out + 1] = f(i) + g(i)\n"
+        "  if i == 2 then f = function(x) return x * 10 end end\n"
+        "  if i == 3 then f = 'not a function' end\n"
+        "  if i == 3 then f = g end\n"
+        "end\n"
+        "print(table.concat(out, ' '))\n"
+    )
+    for mode in ("python", "compiled"):
+        lua.lang.load(src, "rebind.lua").run(mode=mode)
+    # 2+2, 3+3, 30+4, 5+5
+    assert capsys.readouterr().out == "4 6 34 10\n" * 2
+
+
 def test_arguments(capsys):
     lua.run("print(#arg, arg[0], arg[1], ...)\n", "script.lua", args=["a", "b"])
     assert capsys.readouterr().out == "2\tscript.lua\ta\n"
