@@ -43,10 +43,8 @@ SPECIALIZED = """
 import sys
 sys.path.insert(0, sys.argv[1])
 import contextlib, functools, io, zrun
-# (lua.py's language made with every call site hot at once; nothing from
-# the cache: all compiled here)
+# (lua.py's language made with every call site hot at once)
 zrun.Language = functools.partial(zrun.Language, hot_calls=1)
-zrun.configure(cache=False)
 import lua
 bad = []
 for name in sys.argv[2:]:
@@ -62,12 +60,14 @@ print(bad)
 """
 
 
+@pytest.mark.slow
 def test_specialized():
     # every call site of a helper compiled out of line hot at its first
     # call: each compiled for what it knows (Language(hot_calls=1)), the
     # programs printing what real Lua does, the second run too (the
     # specialized code then); in a process of its own (lua.py's language
-    # made so)
+    # made so). (The cache keeps the code compiled for the IR it is: the
+    # same code; compiling it all is slow, after a change of the compiler)
     import subprocess
 
     some = [p for p in ("funcs", "programs", "strings") if p in PROGRAMS]
