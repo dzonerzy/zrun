@@ -13,7 +13,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Daniele Linguaglossa" }]
-dependencies = ["zgram-py>=0.3.5", "zrules-py>=0.1.5"]
+dependencies = ["zgram-py>=0.4.0", "zrules-py>=0.1.5"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
