@@ -302,6 +302,13 @@ pub const Function = struct {
         self.current = blk;
     }
 
+    /// Code from here on at the end of `blk` (no jump to it added: one
+    /// made elsewhere, or to come)
+    pub fn positionAt(self: *Function, blk: Block) void {
+        L("LLVMPositionBuilderAtEnd")(self.b, blk);
+        self.current = blk;
+    }
+
     pub fn br(self: *Function, blk: Block) error{OutOfMemory}!void {
         self.open();
         _ = L("LLVMBuildBr")(self.b, blk);

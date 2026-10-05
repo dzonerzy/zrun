@@ -21,6 +21,7 @@ const objects = @import("objects.zig");
 const proxies = @import("proxies.zig");
 const bytes_mod = @import("bytes.zig");
 const gil = @import("gil.zig");
+const gc = @import("gc.zig");
 
 /// What values are made with (and freed with: anything making one
 /// elsewhere uses it too)
@@ -415,13 +416,60 @@ pub fn increfObj(o: *Obj) void {
 pub fn decrefFrame(f: *Frame) void {
     if (f.head.rc >= IMMORTAL) return;
     f.head.rc -= 1;
-    if (f.head.rc == 0) freeFrame(f);
+    if (f.head.rc == 0) {
+        dropReferences(&f.head);
+        freeBlock(&f.head);
+    }
 }
 
-fn freeFrame(f: *Frame) void {
-    for (f.slots()) |s| decref(s);
-    if (f.parent) |p| decrefFrame(p);
-    allocator.free(@as([*]u8, @ptrCast(f))[0 .. @sizeOf(Frame) + f.len * @sizeOf(Value)]);
+/// A container's references dropped (its memory kept: freeBlock())
+fn dropReferences(o: *Obj) void {
+    switch (o.kind) {
+        @intFromEnum(Tag.list) => for (@as(*List, @ptrCast(@alignCast(o))).slice()) |item| decref(item),
+        @intFromEnum(Tag.tuple) => for (@as(*Tuple, @ptrCast(@alignCast(o))).slice()) |item| decref(item),
+        @intFromEnum(Tag.dict) => {
+            const d: *Dict = @ptrCast(@alignCast(o));
+            if (d.entries) |es| for (es[0..d.used]) |e| {
+                if (e.key.tag == DELETED) continue;
+                decref(e.key);
+                decref(e.value);
+            };
+        },
+        @intFromEnum(Tag.record) => for (@as(*Record, @ptrCast(@alignCast(o))).fields()) |f| decref(f),
+        @intFromEnum(Tag.function) => {
+            const f: *Function = @ptrCast(@alignCast(o));
+            if (f.env) |e| decrefFrame(e);
+            decref(Value.obj(.str, &f.name.head));
+        },
+        KIND_FRAME => {
+            const f: *Frame = @ptrCast(@alignCast(o));
+            for (f.slots()) |s| decref(s);
+            if (f.parent) |p| decrefFrame(p);
+        },
+        else => {},
+    }
+}
+
+/// A container's memory freed (its references dropped already, or taken
+/// care of by the cycle collector)
+pub fn freeBlock(o: *Obj) void {
+    switch (o.kind) {
+        @intFromEnum(Tag.list) => {
+            freeListItems(@ptrCast(@alignCast(o)));
+            gc.free(o, list_block);
+        },
+        @intFromEnum(Tag.tuple) => gc.free(o, @sizeOf(Tuple) + @as(*Tuple, @ptrCast(@alignCast(o))).len * @sizeOf(Value)),
+        @intFromEnum(Tag.dict) => {
+            const d: *Dict = @ptrCast(@alignCast(o));
+            if (d.entries) |es| allocator.free(es[0..d.cap]);
+            if (d.index) |ix| allocator.free(ix[0 .. d.cap * 2]);
+            gc.free(o, @sizeOf(Dict));
+        },
+        @intFromEnum(Tag.record) => gc.free(o, @sizeOf(Record) + @as(*Record, @ptrCast(@alignCast(o))).rtype.fields.len * @sizeOf(Value)),
+        @intFromEnum(Tag.function) => gc.free(o, @sizeOf(Function)),
+        KIND_FRAME => gc.free(o, @sizeOf(Frame) + @as(*Frame, @ptrCast(@alignCast(o))).len * @sizeOf(Value)),
+        else => {},
+    }
 }
 
 pub fn free(tag: Tag, o: *Obj) void {
@@ -432,42 +480,16 @@ pub fn free(tag: Tag, o: *Obj) void {
             const s: *Str = @ptrCast(o);
             allocator.free(@as([*]u8, @ptrCast(s))[0 .. @sizeOf(Str) + s.len]);
         },
+        // (a list, most freed: inline)
         .list => {
             const l: *List = @ptrCast(o);
             for (l.slice()) |item| decref(item);
             freeListItems(l);
-            const block: []align(@alignOf(List)) u8 = @as([*]align(@alignOf(List)) u8, @ptrCast(l))[0..list_block];
-            allocator.free(block);
+            gc.free(o, list_block);
         },
-        .tuple => {
-            const t: *Tuple = @ptrCast(@alignCast(o));
-            for (t.slice()) |item| decref(item);
-            allocator.free(@as([*]align(8) u8, @ptrCast(t))[0 .. @sizeOf(Tuple) + t.len * @sizeOf(Value)]);
-        },
-        .dict => {
-            const d: *Dict = @ptrCast(@alignCast(o));
-            if (d.entries) |es| {
-                for (es[0..d.used]) |e| {
-                    if (e.key.tag == DELETED) continue;
-                    decref(e.key);
-                    decref(e.value);
-                }
-                allocator.free(es[0..d.cap]);
-            }
-            if (d.index) |ix| allocator.free(ix[0 .. d.cap * 2]);
-            allocator.destroy(d);
-        },
-        .record => {
-            const r: *Record = @ptrCast(@alignCast(o));
-            for (r.fields()) |f| decref(f);
-            const n = r.rtype.fields.len;
-            allocator.free(@as([*]align(8) u8, @ptrCast(r))[0 .. @sizeOf(Record) + n * @sizeOf(Value)]);
-        },
-        .function => {
-            const f: *Function = @ptrCast(@alignCast(o));
-            if (f.env) |e| decrefFrame(e);
-            decref(Value.obj(.str, &f.name.head));
-            allocator.destroy(f);
+        .tuple, .dict, .record, .function => {
+            dropReferences(o);
+            freeBlock(o);
         },
         .big => allocator.destroy(@as(*Big, @ptrCast(@alignCast(o)))),
         .bytes => {
@@ -481,7 +503,7 @@ pub fn free(tag: Tag, o: *Obj) void {
 }
 
 /// A tag for deleted dict entries
-const DELETED: u64 = 0xFFFF_FFFF;
+pub const DELETED: u64 = 0xFFFF_FFFF;
 
 // ----------------------------------------------------------------------
 // Making objects
@@ -536,12 +558,11 @@ fn listInline(l: *List) [*]Value {
 }
 
 pub fn newList(cap: usize) ?*List {
-    const mem = allocator.alignedAlloc(u8, .of(List), list_block) catch return null;
-    const l: *List = @ptrCast(mem.ptr);
+    const l: *List = @ptrCast(@alignCast(gc.alloc(list_block) orelse return null));
     l.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.list) }, .len = 0, .cap = list_inline, .items = listInline(l) };
     if (cap > list_inline) {
         const items = allocator.alloc(Value, cap) catch {
-            allocator.free(mem);
+            gc.free(&l.head, list_block);
             return null;
         };
         l.items = items.ptr;
@@ -574,8 +595,7 @@ pub inline fn listPush(l: *List, v: Value) bool {
 }
 
 pub fn newTuple(n: usize) ?*Tuple {
-    const mem = allocator.alignedAlloc(u8, .of(Tuple), @sizeOf(Tuple) + n * @sizeOf(Value)) catch return null;
-    const t: *Tuple = @ptrCast(mem.ptr);
+    const t: *Tuple = @ptrCast(@alignCast(gc.alloc(@sizeOf(Tuple) + n * @sizeOf(Value)) orelse return null));
     t.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.tuple) }, .len = n };
     @memset(t.slice(), Value.none_v);
     return t;
@@ -583,8 +603,7 @@ pub fn newTuple(n: usize) ?*Tuple {
 
 pub fn newRecord(rtype: *const RecordType) ?*Record {
     const n = rtype.fields.len;
-    const mem = allocator.alignedAlloc(u8, .of(Record), @sizeOf(Record) + n * @sizeOf(Value)) catch return null;
-    const r: *Record = @ptrCast(mem.ptr);
+    const r: *Record = @ptrCast(@alignCast(gc.alloc(@sizeOf(Record) + n * @sizeOf(Value)) orelse return null));
     r.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.record) }, .rtype = rtype };
     @memset(r.fields(), if (rtype.slots) unset else Value.none_v);
     return r;
@@ -593,8 +612,7 @@ pub fn newRecord(rtype: *const RecordType) ?*Record {
 /// A frame of n slots, each `fill` (a word pattern, not a byte's: a loop
 /// writing it, not a call of memset, compiler_rt's going a byte at a time).
 pub fn newFrame(parent: ?*Frame, n: usize, fill: Value) ?*Frame {
-    const mem = allocator.alignedAlloc(u8, .of(Frame), @sizeOf(Frame) + n * @sizeOf(Value)) catch return null;
-    const f: *Frame = @ptrCast(mem.ptr);
+    const f: *Frame = @ptrCast(@alignCast(gc.alloc(@sizeOf(Frame) + n * @sizeOf(Value)) orelse return null));
     if (parent) |p| increfObj(&p.head);
     f.* = .{ .head = .{ .rc = 1, .kind = KIND_FRAME }, .parent = parent, .len = n };
     for (f.slots()) |*s| s.* = fill;
@@ -602,7 +620,7 @@ pub fn newFrame(parent: ?*Frame, n: usize, fill: Value) ?*Frame {
 }
 
 pub fn newDict() ?*Dict {
-    const d = allocator.create(Dict) catch return null;
+    const d: *Dict = @ptrCast(@alignCast(gc.alloc(@sizeOf(Dict)) orelse return null));
     d.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.dict) }, .len = 0, .used = 0, .cap = 0, .entries = null, .index = null };
     return d;
 }

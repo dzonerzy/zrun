@@ -130,6 +130,15 @@ pub fn objectOf(o: *PyObject) ?Value {
     return Value.obj(kind, asProxy(o).obj);
 }
 
+/// Python holds the proxy of an object that has one (not only the object
+/// itself): the cycle collector's root (the GIL held).
+pub fn heldByPython(o: *value.Obj) bool {
+    const proxy = by_obj.get(o) orelse return false;
+    // (a proxy owning its object: only Python has it; else the object holds
+    // one reference itself)
+    return asProxy(proxy).owns or ph.refcnt(proxy) > 1;
+}
+
 /// Compiled code let go of an object that has a proxy: true if it's to be
 /// freed now (Python doesn't have the proxy either), else the proxy owns
 /// it from now on.

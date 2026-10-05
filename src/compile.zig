@@ -229,6 +229,19 @@ pub const SVal = union(enum) {
     }
 };
 
+/// A known tuple holding references (dynamic items, its own: a value's,
+/// copied with it (Gen.copyOf), dropped with it, moved into the run-time
+/// tuple materializing makes)
+fn ownsReferences(v: SVal) bool {
+    return switch (v) {
+        .dyn => |d| d.heapish(),
+        .tuple => |t| for (t) |x| {
+            if (ownsReferences(x)) break true;
+        } else false,
+        else => false,
+    };
+}
+
 // ======================================================================
 // Python objects known when compiling
 // ======================================================================
@@ -1693,8 +1706,14 @@ const TryFrame = struct {
     /// else or finally, only its finally runs on the way out)
     catching: bool = true,
     finally: []const front.Stmt,
-    /// Where errors went before it
+    /// The locals its body assigns that only it reads (released as it
+    /// ends, and as an error leaves it)
+    body_locals: []const u32,
+    /// Where its body's errors go
+    catcher: ir.Block = null,
+    /// Where errors went before it (and Gen.err_keep then)
     outer_err: ir.Block,
+    outer_keep: usize,
     /// Each handler's code, and the exception it caught (a slot: None when
     /// it caught a jump)
     handler_blocks: []ir.Block,
@@ -1753,6 +1772,10 @@ const Gen = struct {
     out: ir.Value = null,
     /// Where errors go (return false), and returns (rt.Return)
     err_label: ir.Block = null,
+    /// The semantics an error going to err_label leaves running (the
+    /// first err_keep: a try's catching it, in its own); the others' values
+    /// are released on the way (errorTarget)
+    err_keep: usize = 0,
     ret_label: ir.Block = null,
     /// rt.loop targets, innermost last
     loops: std.ArrayListUnmanaged(LoopTarget) = .empty,
@@ -1763,6 +1786,9 @@ const Gen = struct {
     caught: std.ArrayListUnmanaged(ir.Value) = .empty,
     /// Semantics running inline, innermost last
     insts: std.ArrayListUnmanaged(*Inst) = .empty,
+    /// The release blocks of error sites made last (errorTarget), by what
+    /// they release: shared by the sites releasing the same
+    release_blocks: std.ArrayListUnmanaged(struct { sig: []const usize, block: ir.Block }) = .empty,
     /// Loops being compiled (of the semantics or rt.loop): code in one
     /// runs many times
     loop_level: u32 = 0,
@@ -2013,15 +2039,150 @@ const Gen = struct {
     /// After a helper that can fail: on false, to the error exit.
     fn check(self: *Gen, ok: ir.Value) Error!void {
         const cont = try self.f.label("ok");
-        try self.f.condBr(ok, cont, self.err_label);
+        try self.f.condBr(ok, cont, try self.errorTarget());
         try self.f.block(cont);
+    }
+
+    /// Where an error here goes: the error label, through the release of
+    /// what the semantics it leaves hold (those past err_keep: they don't
+    /// run on; else a caught error leaks them).
+    fn errorTarget(self: *Gen) Error!ir.Block {
+        const leaving = self.insts.items[@min(self.err_keep, self.insts.items.len)..];
+        // (to a try's handlers from its body: the locals only its body reads
+        // too)
+        const try_fr: ?*TryFrame = if (self.tries.items.len > 0 and self.tries.items[self.tries.items.len - 1].catching and self.err_label == self.tries.items[self.tries.items.len - 1].catcher) self.tries.items[self.tries.items.len - 1] else null;
+        // A chain of blocks, the innermost semantic's first, each to the next
+        // (the outer ones' change least: their blocks shared by more sites);
+        // made from its end
+        var target = self.err_label;
+        if (try_fr) |fr| for (fr.body_locals) |slot| {
+            if (localHolds(fr.inst.locals[slot])) {
+                target = try self.releaseBlock(fr.inst, fr.body_locals, target);
+                break;
+            }
+        };
+        for (leaving) |inst| if (holdsValues(inst)) {
+            target = try self.releaseBlock(inst, null, target);
+        };
+        return target;
+    }
+
+    /// A block releasing a semantic's locals (`only`: those) as they are
+    /// here, then to `next`: one made before for the same (the values it
+    /// drops are the ones here, defined before both sites), else made.
+    fn releaseBlock(self: *Gen, inst: *Inst, only: ?[]const u32, next: ir.Block) Error!ir.Block {
+        var sig: std.ArrayListUnmanaged(usize) = .empty;
+        try sig.append(self.a(), @intFromPtr(next));
+        try self.releaseSignature(&sig, inst, only);
+        for (self.release_blocks.items) |r| if (std.mem.eql(usize, r.sig, sig.items)) return r.block;
+        const f = &self.f;
+        const here = f.current;
+        const release = try f.label("error_release");
+        if (self.release_blocks.items.len >= 64) _ = self.release_blocks.orderedRemove(0);
+        try self.release_blocks.append(self.a(), .{ .sig = sig.items, .block = release });
+        f.positionAt(release);
+        if (only) |slots| {
+            for (slots) |slot| {
+                // (as they are here; the handlers see them unset)
+                const saved = inst.locals[slot];
+                try self.releaseLocal(inst, slot);
+                inst.locals[slot] = saved;
+            }
+        } else try self.releaseLocals(inst);
+        try f.br(next);
+        f.positionAt(here);
+        return release;
+    }
+
+    /// What releasing a semantic's locals (`only`: those) emits depends on,
+    /// as words: the slots, the values (the IR values they are), known
+    /// lists and whether they'd be released (releaseList), the temporaries.
+    fn releaseSignature(self: *Gen, sig: *std.ArrayListUnmanaged(usize), inst: *Inst, only: ?[]const u32) Error!void {
+        try sig.append(self.a(), @intFromPtr(inst));
+        const Sig = struct {
+            fn of(g: *Gen, s: *std.ArrayListUnmanaged(usize), in: *Inst, v: SVal, depth: u32) Error!void {
+                if (depth == 0) return;
+                switch (v) {
+                    .dyn => |d| if (d.heapish()) try s.appendSlice(g.a(), &.{ 1, @intFromPtr(d.tag), @intFromPtr(d.bits), @intFromPtr(d.state) }),
+                    .tuple => |t| {
+                        try s.appendSlice(g.a(), &.{ 2, t.len });
+                        for (t) |x| try of(g, s, in, x, depth - 1);
+                    },
+                    .list => |l| {
+                        try s.appendSlice(g.a(), &.{ 3, @intFromPtr(l), @intFromBool(g.wouldRelease(in, l)), l.items.items.len });
+                        for (l.items.items) |x| try of(g, s, in, x, depth - 1);
+                    },
+                    else => {},
+                }
+            }
+        };
+        if (only) |slots| {
+            for (slots) |slot| switch (inst.locals[slot]) {
+                .static => |sv| try Sig.of(self, sig, inst, sv, 4),
+                else => {},
+            };
+            return;
+        }
+        for (inst.locals, 0..) |l, i| switch (l) {
+            .slot => |s| try sig.appendSlice(self.a(), &.{ 4, i, @intFromPtr(s.ptr) }),
+            .static => |sv| {
+                try sig.appendSlice(self.a(), &.{ 5, i });
+                try Sig.of(self, sig, inst, sv, 4);
+            },
+            .unset => {},
+        };
+        for (inst.temps.items) |t| try sig.appendSlice(self.a(), &.{ 6, @intFromPtr(t) });
+    }
+
+    /// Whether releaseList would give up a known list's items now
+    fn wouldRelease(self: *Gen, inst: *Inst, l: *SList) bool {
+        if (l.taken or l.frozen != null) return false;
+        if (inst.result) |r| if (refersTo(r, l, 4)) return false;
+        for (self.insts.items) |other| {
+            if (other == inst) continue;
+            for (other.locals) |x| switch (x) {
+                .static => |sv| if (refersTo(sv, l, 4)) return false,
+                else => {},
+            };
+        }
+        return true;
+    }
+
+    fn localHolds(l: Local) bool {
+        return switch (l) {
+            .slot => true,
+            .static => |sv| ownsReferences(sv) or (sv == .list and !sv.list.taken and sv.list.frozen == null),
+            .unset => false,
+        };
+    }
+
+    /// A local given up: its value dropped (a known list's items, if
+    /// nothing else refers to it), unset from here.
+    fn releaseLocal(self: *Gen, inst: *Inst, slot: u32) Error!void {
+        switch (inst.locals[slot]) {
+            .slot => |s| try self.dropTemp(s.ptr),
+            .static => |sv| {
+                inst.locals[slot] = .unset;
+                try self.drop(sv);
+                if (sv == .list) try self.releaseList(inst, sv.list);
+            },
+            .unset => {},
+        }
+        inst.locals[slot] = .unset;
+    }
+
+    /// A semantic holds values its release drops (releaseLocals)
+    fn holdsValues(inst: *const Inst) bool {
+        if (inst.temps.items.len > 0) return true;
+        for (inst.locals) |l| if (localHolds(l)) return true;
+        return false;
     }
 
     /// A runtime error at a node with a fixed message: to the error exit.
     fn failAt(self: *Gen, node: u32, message: []const u8) Error!void {
         const s = try self.c.m.string(message);
         _ = self.call("zr_fail", &.{ self.ctx, self.k32(node), s });
-        try self.f.br(self.err_label);
+        try self.f.br(try self.errorTarget());
         // (the code after it is unreachable: a fresh block keeps it valid)
         try self.f.block(try self.f.label("dead"));
     }
@@ -2347,6 +2508,9 @@ const Gen = struct {
                     try f.block(done);
                 } else try self.refcount(true, d.tag, d.bits);
             },
+            // (a known tuple: the references its items hold; a list's are
+            // the list's, released with it: releaseList)
+            .tuple => |t| for (t) |item| try self.drop(item),
             else => {},
         }
     }
@@ -2575,7 +2739,7 @@ const Gen = struct {
             try f.block(bad);
             const name = try c.m.string(sym.name);
             _ = self.call("zr_unset", &.{ self.ctx, self.k32(name_node), name });
-            try f.br(self.err_label);
+            try f.br(try self.errorTarget());
             try f.block(good);
         }
         // (a variable of a type whose values' kind is declared: known, its
@@ -3143,7 +3307,7 @@ const Gen = struct {
         defer py.Py_DecRef(text);
         const msg = try std.fmt.allocPrint(self.a(), "the value isn't what types() says the type {s} is", .{ph.utf8(text, "type") orelse "?"});
         _ = self.call("zr_fail", &.{ self.ctx, self.k32(idx), try self.c.m.string(msg) });
-        try self.f.br(self.err_label);
+        try self.f.br(try self.errorTarget());
     }
 
     /// Whether a value known when compiling is of a kind (as the reference
@@ -3390,7 +3554,7 @@ const Gen = struct {
         const control = try f.label("control");
         try f.condBr(f.icmp(jit_c.LLVMIntEQ, status, self.c.m.k32(0)), err, control);
         try f.block(err);
-        try f.br(self.err_label);
+        try f.br(try self.errorTarget());
         try f.block(control);
         const is_return = try f.label("raised_return");
         const loop_ctl = try f.label("raised_loop");
@@ -3449,10 +3613,13 @@ const Gen = struct {
         const fr = self.tries.items[i];
         const saved = try self.a().dupe(*TryFrame, self.tries.items);
         const saved_err = self.err_label;
+        const saved_keep = self.err_keep;
         self.tries.shrinkRetainingCapacity(i);
         self.err_label = fr.outer_err;
+        self.err_keep = fr.outer_keep;
         try self.stmts(fr.inst, fr.finally);
         self.err_label = saved_err;
+        self.err_keep = saved_keep;
         self.tries.clearRetainingCapacity();
         try self.tries.appendSlice(self.a(), saved);
     }
@@ -4223,16 +4390,25 @@ const Gen = struct {
         collectAssigned(t.body, &assigned, self.a()) catch return error.OutOfMemory;
         var read = std.AutoHashMapUnmanaged(u32, void).empty;
         collectReads(inst.func.body, t.body, &read, self.a()) catch return error.OutOfMemory;
+        // (the others: read in the body only, given up as it ends, or as an
+        // error leaves it: their values there (body_locals))
+        var body_locals: std.ArrayListUnmanaged(u32) = .empty;
         var it = assigned.keyIterator();
-        while (it.next()) |slot| if (read.contains(slot.*)) try self.toSlot(inst, slot.*);
+        while (it.next()) |slot| {
+            if (read.contains(slot.*)) {
+                try self.toSlot(inst, slot.*);
+            } else try body_locals.append(self.a(), slot.*);
+        }
 
         const fr = try self.a().create(TryFrame);
         fr.* = .{
+            .body_locals = body_locals.items,
             .inst = inst,
             .depth = self.insts.items.len,
             .scope_depth = self.scopes.items.len,
             .finally = t.finally,
             .outer_err = self.err_label,
+            .outer_keep = self.err_keep,
             .handler_blocks = try self.a().alloc(ir.Block, t.handlers.len),
             .caught = try self.a().alloc(ir.Value, t.handlers.len),
         };
@@ -4243,6 +4419,9 @@ const Gen = struct {
         for (t.handlers, 0..) |h, i| {
             fr.handler_blocks[i] = try f.label("handler");
             fr.caught[i] = try self.noneSlot();
+            // (a temporary of the semantic: given up however it's left (a
+            // return in the handler, an error), not only as the handler ends)
+            try inst.temps.append(self.a(), fr.caught[i]);
             classes[i] = null;
             const te = h.type_ orelse {
                 if (fr.catch_return == null) fr.catch_return = i;
@@ -4278,6 +4457,7 @@ const Gen = struct {
             if (py.c.PyErr_Occurred() != null) return error.Python;
         }
         const catcher = try f.label("except");
+        fr.catcher = catcher;
         const handled = try f.label("handled");
         const done = try f.label("endtry");
         // (errors in the handlers and the else: the finally, then on)
@@ -4286,9 +4466,14 @@ const Gen = struct {
         // The body (run straight through): its errors to the handlers
         try self.tries.append(self.a(), fr);
         self.err_label = catcher;
+        // (the semantic with the try runs on in its handlers)
+        self.err_keep = fr.depth;
         inst.in_try += 1;
         try self.stmts(inst, t.body);
         inst.in_try -= 1;
+        // (its own locals, done with: what follows doesn't see them, nor
+        // values made in the body, which an error may have skipped)
+        for (fr.body_locals) |slot| try self.releaseLocal(inst, slot);
         // (a jump in it: the rest of it dead, not what follows it)
         inst.done = false;
         fr.catching = false;
@@ -4296,6 +4481,7 @@ const Gen = struct {
         inst.dyn_depth += 1;
         defer inst.dyn_depth -= 1;
         self.err_label = fin_err;
+        self.err_keep = if (t.finally.len > 0) fr.depth else fr.outer_keep;
         try self.stmts(inst, t.else_);
         try f.br(handled);
 
@@ -4314,7 +4500,7 @@ const Gen = struct {
             try f.block(next);
         }
         // (none: the error goes on, after the finally)
-        try f.br(fin_err);
+        try f.br(try self.errorTarget());
 
         // The handlers (reached from an error, or a jump they catch)
         for (t.handlers, 0..) |h, i| {
@@ -4334,13 +4520,14 @@ const Gen = struct {
 
         // Every way out: the finally
         self.err_label = fr.outer_err;
+        self.err_keep = fr.outer_keep;
         try f.block(handled);
         try self.stmts(inst, t.finally);
         try f.br(done);
         if (t.finally.len > 0) {
             try f.block(fin_err);
             try self.stmts(inst, t.finally);
-            try f.br(fr.outer_err);
+            try f.br(try self.errorTarget());
         }
         try f.block(done);
     }
@@ -4375,6 +4562,10 @@ const Gen = struct {
             },
             .static => |v| {
                 const d = try self.materialize(v, inst.node);
+                // (a known list or dict made at run time: promote gave this
+                // variable, as every one referring to it, a reference of its
+                // own, the slot's from now; materialize's is extra)
+                if (v != .dyn and inst.locals[slot] == .static and inst.locals[slot].static == .dyn) try self.drop(.{ .dyn = d });
                 const p = try self.noneSlot();
                 try self.storeSlot(p, d);
                 inst.locals[slot] = .{ .slot = .{ .ptr = p, .shape = .any } };
@@ -4415,8 +4606,10 @@ const Gen = struct {
                     else => null,
                 };
                 if (known) |items| if (items.len == ts.len) {
-                    // (a known container keeps its items)
+                    // (a known container keeps its items; a tuple, dropped
+                    // then, its own references)
                     for (ts, items) |x, item| try self.assign(inst, x, try self.copyOf(item), pos);
+                    if (v == .tuple) try self.drop(v);
                     return;
                 };
                 // At run time (and the errors, as Python words them)
@@ -4567,7 +4760,7 @@ const Gen = struct {
                 const d = try self.materialize(v, inst.node);
                 _ = self.call("zr_raise", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits });
                 try self.drop(.{ .dyn = d });
-                try self.f.br(self.err_label);
+                try self.f.br(try self.errorTarget());
                 if (inst.dyn_depth == 0) inst.done = true;
                 try self.f.block(try self.f.label("after_raise"));
                 return;
@@ -4598,10 +4791,11 @@ const Gen = struct {
     }
 
     fn forLoop(self: *Gen, inst: *Inst, target: front.Target, iter_e: *const front.Expr, body: []const front.Stmt, else_: []const front.Stmt, pos: front.Pos) Error!void {
-        const items: []const SVal = switch (try self.iteration(inst, iter_e)) {
+        const known = switch (try self.iteration(inst, iter_e)) {
             .known => |x| x,
             .runtime => |it| return self.runtimeFor(inst, target, it, body, else_, pos),
         };
+        const items = known.items;
         // Known items: unrolled (break / continue jump within it)
         const exit = try self.f.label("endfor");
         var broke = false;
@@ -4620,10 +4814,31 @@ const Gen = struct {
         }
         if (!broke) try self.stmts(inst, else_);
         try self.f.block(exit);
+        try self.releaseIterated(inst, known.of);
     }
 
-    /// What a loop goes over: items known now, or lists at run time
-    const Iteration = union(enum) { known: []const SVal, runtime: RtIter };
+    /// What a loop goes over: items known now (and the value they're of,
+    /// given up after: releaseIterated), or lists at run time
+    const Iteration = union(enum) { known: Known, runtime: RtIter };
+    const Known = struct { items: []const SVal, of: SVal = .none };
+
+    /// A known list or tuple a loop went over, done with: a tuple's
+    /// references dropped, a list's items given up if nothing else refers
+    /// to it (a temporary: `for x in [a, b]`, a helper's result)
+    fn releaseIterated(self: *Gen, inst: *Inst, v: SVal) Error!void {
+        switch (v) {
+            .tuple => try self.drop(v),
+            .list => |l| {
+                for (inst.locals) |x| switch (x) {
+                    .static => |sv| if (refersTo(sv, l, 4)) return,
+                    else => {},
+                };
+                try self.releaseList(inst, l);
+                l.taken = true;
+            },
+            else => {},
+        }
+    }
 
     /// Lists iterated at run time (held in temporary slots): one, or
     /// several in step (zip), or one with its indexes (enumerate)
@@ -4663,7 +4878,7 @@ const Gen = struct {
                 for (args, x.args) |*slot, ae| slot.* = try self.expr(inst, ae);
                 // (known bounds, few values: unrolled)
                 if (allScalar(args)) if (try self.builtinCall(inst, callee.py, args, e.pos)) |v| {
-                    if (v == .list) return .{ .known = v.list.items.items };
+                    if (v == .list) return .{ .known = .{ .items = v.list.items.items } };
                     try self.drop(v);
                 };
                 return self.rangeIteration(inst, args);
@@ -4692,8 +4907,8 @@ const Gen = struct {
 
     fn iterationOf(self: *Gen, inst: *Inst, v: SVal) Error!Iteration {
         switch (v) {
-            .list => |l| return .{ .known = l.items.items },
-            .tuple => |t| return .{ .known = t },
+            .list => |l| return .{ .known = .{ .items = l.items.items, .of = v } },
+            .tuple => |t| return .{ .known = .{ .items = t, .of = v } },
             else => {
                 const slots = try self.a().alloc(ir.Value, 1);
                 slots[0] = try self.tempSlot(inst);
@@ -5033,7 +5248,12 @@ const Gen = struct {
                 .tuple => |t| if (intOf(key)) |ki| {
                     const n: i64 = @intCast(t.len);
                     const i = if (ki < 0) ki + n else ki;
-                    if (i >= 0 and i < n) return self.copyOf(t[@intCast(i)]);
+                    if (i >= 0 and i < n) {
+                        // (the tuple read, given up: its references)
+                        const item = try self.copyOf(t[@intCast(i)]);
+                        try self.drop(obj);
+                        return item;
+                    }
                 },
                 .dict => |d| if (d.find(key)) |i| return self.copyOf(d.values.items[i]),
                 .str => {
@@ -5745,6 +5965,12 @@ const Gen = struct {
     /// A copy of a value read out of a known container (a reference of its
     /// own for a run-time one).
     fn copyOf(self: *Gen, v: SVal) Error!SVal {
+        // (a known tuple holding references: its own, as a value's)
+        if (v == .tuple and ownsReferences(v)) {
+            const items = try self.a().alloc(SVal, v.tuple.len);
+            for (items, v.tuple) |*x, item| x.* = try self.copyOf(item);
+            return .{ .tuple = items };
+        }
         if (v != .dyn) return v;
         // (a variable's value borrowed: borrowed again)
         if (v.dyn.state) |state| for (self.borrows.items) |b| {
@@ -6365,7 +6591,7 @@ const Gen = struct {
         try f.condBr(f.icmp(jit_c.LLVMIntEQ, code, m.k32(0)), done_direct, failed);
         try f.block(failed);
         _ = self.call("zr_native_fail", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), code });
-        try f.br(self.err_label);
+        try f.br(try self.errorTarget());
         try f.block(done_direct);
         const bits = f.load(t.i64, result);
         const r: Dyn = switch (n.result) {
@@ -6996,7 +7222,7 @@ const Gen = struct {
         try f.condBr(f.icmp(jit_c.LLVMIntEQ, tag, self.k(@intCast(value.PINT_TAG))), big, checked);
         try f.block(checked);
         _ = self.call("zr_overflow", &.{ self.ctx, self.k32(inst.node) });
-        try f.br(self.err_label);
+        try f.br(try self.errorTarget());
         try f.block(good);
         return res;
     }
@@ -7487,12 +7713,13 @@ const Gen = struct {
         if (level == gens.len) return self.compEmit(inst, sink);
         const g = gens[level];
         var it = switch (try self.iteration(inst, g.iter)) {
-            .known => |items| {
-                for (items) |item| {
+            .known => |known| {
+                for (known.items) |item| {
                     if (item == .dyn) try self.increfDyn(item.dyn);
                     try self.assign(inst, g.target, item, pos);
                     try self.compFiltered(inst, gens, level, g.ifs, pos, sink);
                 }
+                try self.releaseIterated(inst, known.of);
                 return;
             },
             .runtime => |x| x,

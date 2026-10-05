@@ -14,6 +14,7 @@ const PyObject = ph.PyObject;
 const types = @import("types.zig");
 const value = @import("value.zig");
 const gil = @import("gil.zig");
+const gc = @import("gc.zig");
 
 const Value = value.Value;
 const Tag = value.Tag;
@@ -281,7 +282,6 @@ export fn zr_decref(tag: u64, bits: u64) callconv(.c) void {
 export fn zr_free(tag: u64, bits: u64) callconv(.c) void {
     value.free(@enumFromInt(tag), @ptrFromInt(bits));
 }
-
 // ======================================================================
 // Errors
 // ======================================================================
@@ -814,8 +814,8 @@ export fn zr_varargs(ctx: *Ctx, node: u32, args: [*]const Value, nargs: u64, npa
 /// A function value: its code, the frame it's made in, its node, its name
 /// and parameter count, in `out`.
 pub export fn zr_function(ctx: *Ctx, code: Code, env: ?*value.Frame, node: u32, name: *value.Str, flags: u64, out: *Value) callconv(.c) bool {
-    // (value.zig frees it: its allocator)
-    const f = value.allocator.create(value.Function) catch return fail(ctx, node, "out of memory", .{});
+    // (a container: tracked by the cycle collector; value.zig frees it)
+    const f: *value.Function = @ptrCast(@alignCast(gc.alloc(@sizeOf(value.Function)) orelse return fail(ctx, node, "out of memory", .{})));
     if (env) |e| value.increfObj(&e.head);
     value.increfObj(&name.head);
     // (flags: FunctionFlags.word())

@@ -29,6 +29,7 @@ const helpers = @import("helpers.zig");
 const bytes_mod = @import("bytes.zig");
 const gil = @import("gil.zig");
 const pool = @import("pool.zig");
+const gc = @import("gc.zig");
 const value_mod = @import("value.zig");
 
 const allocator = std.heap.c_allocator;
@@ -958,7 +959,11 @@ const Program = struct {
             _ = py.c.PyErr_NoMemory();
             return null;
         };
-        defer value_mod.decrefFrame(globals);
+        defer {
+            value_mod.decrefFrame(globals);
+            // (the run's cycles: the globals and the functions in them)
+            _ = gc.collectHere();
+        }
         // (the GIL released, as for program.call(): the code takes it back
         // if it touches Python)
         const takes = gil.takes;
@@ -1232,6 +1237,8 @@ const Program = struct {
                 } else job.keep(i, &own);
                 gil.done();
             }
+            // (its calls' cycles, while their thread's here)
+            _ = gc.collectParallel();
             own.deinit();
             gil.done();
             _ = job.gil_takes.fetchAdd(gil.takes, .monotonic);
@@ -2612,6 +2619,11 @@ fn version() []const u8 {
     return @import("build_options").version;
 }
 
+/// zrun.collect(): this thread's cycle collection (gc.zig), now.
+fn collect() i64 {
+    return @intCast(gc.collectHere());
+}
+
 /// zrun._blocks(): the values' blocks allocated and not freed (for the
 /// tests: compiled code gives back what it takes).
 fn blocks() i64 {
@@ -2661,6 +2673,7 @@ pub const Module = pyoz.module(.{
     .funcs = &.{
         pyoz.func("version", version, "Return the zrun version string"),
         pyoz.func("_blocks", blocks, "The values' blocks allocated and not freed (for tests)"),
+        pyoz.func("collect", collect, "collect(): free the compiled code's values that only reference one another (reference cycles); how many were freed. Runs by itself as values are made, and at the end of a run."),
         pyoz.kwfunc("configure", configure, "configure(cache=None, perf_map=None): process-wide settings (those not given stay). cache: True (the usual place: $XDG_CACHE_HOME/zrun or ~/.cache/zrun), False (no cache), or a directory; perf_map: name compiled functions for perf (/tmp/perf-<pid>.map)."),
     },
     .classes = &.{

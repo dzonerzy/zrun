@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const gc_mod = @import("gc.zig");
 
 const Alignment = std.mem.Alignment;
 
@@ -34,7 +35,7 @@ const Free = struct { next: ?*Free };
 const Batch = struct { first: Free, next_batch: ?*Batch };
 
 /// A thread's blocks
-const Lists = struct {
+pub const Lists = struct {
     /// The free ones, per class (their heads only: counting them would
     /// cost the hot path)
     free: [classes]?*Free = .{null} ** classes,
@@ -43,6 +44,13 @@ const Lists = struct {
     /// Blocks handed out and not freed by this thread (the tests' check
     /// that compiled code gives back what it takes: zrun._blocks())
     in_use: isize = 0,
+    /// The cycle collector's buffer (as cheap to reach as the lists)
+    gc: gc_mod.State = .{},
+    /// Given to the shared pool as the thread ends (watch(): any thread
+    /// with blocks, carved or freed by it)
+    watched: bool = false,
+    /// Blocks freed since the lists were trimmed (trim())
+    frees: u32 = 0,
 
     /// All its free blocks (its slabs' too) to the shared pool: the thread
     /// is gone
@@ -80,14 +88,13 @@ var shared_lock: std.atomic.Mutex = .unlocked;
 /// (its destructor runs as a thread that took blocks ends)
 var exit_key: std.c.pthread_key_t = undefined;
 var have_key = false;
-threadlocal var watched = false;
 
 /// A word naming this thread, read with an instruction (Linux's thread
 /// pointer: its TCB's address); 0: not known here (no home lists)
 pub inline fn threadPointer() usize {
     if (builtin.os.tag != .linux) return 0;
     return switch (builtin.cpu.arch) {
-        .x86_64 => asm ("mov %%fs:0, %[ret]"
+        .x86_64 => asm ("movq %%fs:0, %[ret]"
             : [ret] "=r" (-> usize),
         ),
         .aarch64 => asm ("mrs %[ret], tpidr_el0"
@@ -104,7 +111,20 @@ inline fn lists() *Lists {
     return mineLists();
 }
 
+/// (no thread has the home lists: this one's from now, as theirs went to
+/// the shared pool)
 noinline fn mineLists() *Lists {
+    const tp = threadPointer();
+    if (tp != 0 and @atomicLoad(usize, &home_owner, .acquire) == 0) {
+        if (!mine.watched) watch();
+        if (@cmpxchgStrong(usize, &home_owner, 0, tp, .acquire, .monotonic) == null) {
+            // (the counts this thread's: carried over)
+            home.in_use = mine.in_use;
+            mine.in_use = 0;
+            home.watched = true;
+            return &home;
+        }
+    }
     return &mine;
 }
 
@@ -120,6 +140,18 @@ pub fn restoreHome(owner: usize) void {
     @atomicStore(usize, &home_owner, owner, .monotonic);
 }
 
+/// This thread's cycle collector buffer (given on when it ends)
+pub inline fn gcState() *gc_mod.State {
+    const l = lists();
+    if (l == &home) return &home.gc;
+    return otherGcState();
+}
+
+noinline fn otherGcState() *gc_mod.State {
+    if (!mine.watched) watch();
+    return &lists().gc;
+}
+
 /// Blocks this thread has and hasn't freed (zrun._blocks())
 pub fn inUse() isize {
     return lists().in_use;
@@ -130,9 +162,9 @@ fn lockShared() void {
 }
 
 /// This thread's blocks given to the shared pool when it ends (and the
-/// home lists when no thread has them: this one's from now)
-fn watch() void {
-    watched = true;
+/// home lists, if it has them)
+noinline fn watch() void {
+    mine.watched = true;
     lockShared();
     defer shared_lock.unlock();
     if (!have_key) {
@@ -140,22 +172,20 @@ fn watch() void {
         have_key = true;
     }
     _ = std.c.pthread_setspecific(exit_key, @ptrFromInt(1));
-    const tp = threadPointer();
-    if (tp != 0 and home_owner == 0) {
-        // (the counts this thread's: carried over)
-        home.in_use = mine.in_use;
-        mine.in_use = 0;
-        @atomicStore(usize, &home_owner, tp, .monotonic);
-    }
 }
 
 fn threadGone(_: *anyopaque) callconv(.c) void {
+    // (the buffer first: freeing its dead objects later gives blocks to
+    // another thread's lists)
+    gc_mod.orphan(&mine.gc);
     mine.give();
     const tp = threadPointer();
     if (tp != 0 and @atomicLoad(usize, &home_owner, .monotonic) == tp) {
+        gc_mod.orphan(&home.gc);
         home.give();
         home.in_use = 0;
-        @atomicStore(usize, &home_owner, 0, .monotonic);
+        home.watched = false;
+        @atomicStore(usize, &home_owner, 0, .release);
     }
 }
 
@@ -186,7 +216,7 @@ fn alloc(_: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize) ?[*]u
 /// A block of a class with no free ones and the slab carved: the shared
 /// pool's, else a new slab's
 noinline fn carved(c: usize, ret_addr: usize) ?[*]u8 {
-    if (!watched) watch();
+    if (!lists().watched) watch();
     const l = lists();
     // (a gone thread's list, the others left to other threads)
     lockShared();
@@ -222,10 +252,71 @@ fn free(_: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void
     const l = lists();
     l.in_use -= 1;
     if (!small(memory.len, alignment)) return std.heap.c_allocator.rawFree(memory, alignment, ret_addr);
-    const c = classOf(memory.len);
-    const f: *Free = @ptrCast(@alignCast(memory.ptr));
+    // (a thread that only frees (another's results) gives them on too:
+    // push())
+    push(l, classOf(memory.len), @ptrCast(@alignCast(memory.ptr)));
+}
+
+/// This thread's lists (the cycle collector's state with them: its
+/// containers made and freed with one look-up)
+pub const current = lists;
+
+/// A block of `len` bytes (16-byte aligned) from `l` (this thread's),
+/// inline (the cycle collector's containers)
+pub inline fn allocIn(l: *Lists, len: usize) ?[*]u8 {
+    l.in_use += 1;
+    if (len > max_small) return std.heap.c_allocator.rawAlloc(len, .@"16", 0);
+    const c = classOf(len);
+    if (l.free[c]) |f| {
+        l.free[c] = f.next;
+        return @ptrCast(f);
+    }
+    const size = (c + 1) * granule;
+    if (l.carve[c].len < size) return carved(c, 0);
+    const block = l.carve[c][0..size];
+    l.carve[c] = l.carve[c][size..];
+    return block.ptr;
+}
+
+pub inline fn freeIn(l: *Lists, p: [*]u8, len: usize) void {
+    l.in_use -= 1;
+    if (len > max_small) return std.heap.c_allocator.rawFree(p[0..len], .@"16", 0);
+    push(l, classOf(len), @ptrCast(@alignCast(p)));
+}
+
+/// A free block on a thread's list
+inline fn push(l: *Lists, c: usize, f: *Free) void {
     f.next = l.free[c];
     l.free[c] = f;
+    l.frees +%= 1;
+    if (l.frees >= trim_every or !l.watched) freed(l);
+}
+
+/// Every so many blocks freed: the lists trimmed (a thread freeing blocks
+/// it doesn't make, as many as another thread makes: Python freeing
+/// map()'s results, made by its workers)
+const trim_every = 16384;
+/// The bytes of free blocks of a class a thread keeps
+const kept_bytes = 64 * 1024;
+
+noinline fn freed(l: *Lists) void {
+    if (!l.watched) watch();
+    if (l.frees < trim_every) return;
+    l.frees = 0;
+    for (0..classes) |c| {
+        // (the first ones kept; the rest a batch of the shared pool's)
+        var at = l.free[c] orelse continue;
+        var n: usize = 1;
+        const keep = kept_bytes / ((c + 1) * granule);
+        while (n < keep) : (n += 1) at = at.next orelse break;
+        const rest = at.next orelse continue;
+        at.next = null;
+        const b: *Batch = @ptrCast(rest);
+        lockShared();
+        b.next_batch = shared[c];
+        shared[c] = b;
+        shared_lock.unlock();
+    }
 }
 
 const vtable = std.mem.Allocator.VTable{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
