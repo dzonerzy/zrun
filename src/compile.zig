@@ -1274,6 +1274,7 @@ pub const Compiler = struct {
         .{ "zr_call", "bpillplpp" },
         .{ "zr_specialize", "vpl" },
         .{ "zr_speculate", "vpl" },
+        .{ "zr_context", "bpp" },
         .{ "zr_frame_of", "ppiip" },
         .{ "zr_object", "vplp" },
         .{ "zr_frame_new", "ppl" },
@@ -5313,6 +5314,11 @@ const Gen = struct {
                     const p = self.c.lang.path orelse return .none;
                     return .{ .str = p };
                 }
+                // (program.call()'s context: when the code runs)
+                if (eq(u8, name, "context")) {
+                    try self.callCheck("zr_context", &.{ self.ctx, self.out });
+                    return .{ .dyn = try self.loadOut(.any) };
+                }
                 // (the class: raised, caught by Python)
                 if (eq(u8, name, "Throw")) return .{ .py = @import("types.zig").Throw };
                 return c.unsupportedAt(inst.func, pos, "rt has no '{s}' in compiled code", .{name});
@@ -6029,9 +6035,12 @@ const Gen = struct {
         const depth_p = f.offset(ctx, @offsetOf(helpers.Ctx, "depth"));
         const depth = f.load(t.i64, depth_p);
         const room = f.load(t.i64, f.offset(ctx, @offsetOf(helpers.Ctx, "calls_room")));
-        // (the stack's room is max_depth: below it, a call is allowed)
+        // (the stack's room is max_depth: below it, a call is allowed; and
+        // the native stack's, above stack_low: else zr_call refuses it)
         const same = f.icmp(jit_c.LLVMIntEQ, its_code, f.ptrToInt(code));
-        try f.condBr(f.and_(same, f.icmp(jit_c.LLVMIntULT, depth, room)), direct, slow);
+        const frame_at = f.ptrToInt(f.call(m.intrinsic("llvm.frameaddress", &.{t.ptr}), &.{m.k32(0)}));
+        const stack_ok = f.icmp(jit_c.LLVMIntUGT, frame_at, f.load(t.i64, f.offset(ctx, @offsetOf(helpers.Ctx, "stack_low"))));
+        try f.condBr(f.and_(f.and_(same, f.icmp(jit_c.LLVMIntULT, depth, room)), stack_ok), direct, slow);
         try f.block(direct);
         const calls = f.load(t.ptr, f.offset(ctx, @offsetOf(helpers.Ctx, "calls")));
         const entry = f.offset(calls, 0);

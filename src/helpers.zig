@@ -41,6 +41,10 @@ pub const Ctx = struct {
     calls_room: u64 = 0,
     depth: u64 = 0,
     max_depth: u32,
+    /// Where the native stack ends, with room to spare (0: a stack made
+    /// for the run, room enough): a call with less left is refused as too
+    /// deep, not run over its end
+    stack_low: u64 = 0,
     /// The error, once one happened: its node, its message
     failed: bool = false,
     err_node: u32 = 0,
@@ -829,7 +833,8 @@ pub export fn zr_call(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Val
             if ((nargs < nparams and !policy.missing_none) or (nargs > nparams and policy.extra == .@"error")) {
                 return fail(ctx, node, "{s}() takes {d} argument{s}, {d} given", .{ fo.name.bytes(), nparams, if (nparams == 1) "" else "s", nargs });
             }
-            if (ctx.depth >= ctx.max_depth) return fail(ctx, node, "call stack too deep (more than {d} calls)", .{ctx.max_depth});
+            if (ctx.depth >= ctx.max_depth or @frameAddress() < ctx.stack_low)
+                return fail(ctx, node, "call stack too deep (more than {d} calls)", .{ctx.max_depth});
             // (room for the deepest stack made once: a call just stores)
             if (ctx.calls_room == 0) {
                 ctx.calls = (allocator.alloc(CallEntry, ctx.max_depth) catch return fail(ctx, node, "out of memory", .{})).ptr;

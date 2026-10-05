@@ -615,8 +615,15 @@ const Program = struct {
     /// The Python type Language.types() says each node's values are
     /// (checked in the reference mode), by node: worked out once
     _declared: std.AutoHashMapUnmanaged(u32, ?*PyObject) = .empty,
+    /// The compiled program's variables, kept for program.call() after its
+    /// top level ran (the first call's)
+    _cglobals: ?*value_mod.Frame = null,
+    /// The mode it last ran in (program.call()'s, unless said)
+    _ran_compiled: ?bool = null,
 
     fn release(self: *Program) void {
+        if (self._cglobals) |g| value_mod.decrefFrame(g);
+        self._cglobals = null;
         if (self._compiled) |c| c.destroy();
         self._compiled = null;
         self._declared.deinit(allocator);
@@ -755,8 +762,12 @@ const Program = struct {
     /// Python is counted (report(); a little slower).
     pub fn run(self: *Program, args: pyoz.Args(struct { mode: ?*PyObject = null, report: bool = false })) ?*PyObject {
         const mode: []const u8 = if (optional(args.value.mode)) |m| ph.utf8(m, "mode") orelse return null else "python";
-        if (std.mem.eql(u8, mode, "python")) return onBigStack(runHere, .{self}, self.language()._max_depth);
+        if (std.mem.eql(u8, mode, "python")) {
+            self._ran_compiled = false;
+            return onBigStack(runHere, .{self}, self.language()._max_depth);
+        }
         if (std.mem.eql(u8, mode, "compiled")) {
+            self._ran_compiled = true;
             if (!self.ensureCompiled()) return null;
             const reporting = args.value.report;
             helpers.collecting = reporting;
@@ -772,7 +783,13 @@ const Program = struct {
                 if (self._crossings == null) py.c.PyErr_Clear();
                 py.c.PyErr_Restore(t, v, tb);
             };
-            return onBigStack(runCompiled, .{self}, self.language()._max_depth);
+            // (on this thread when it can: as program.call())
+            const max_depth = self.language()._max_depth;
+            if (!self._compiled.?.compiler.uses_python) if (stackLow()) |low| {
+                if (@frameAddress() > low + @as(usize, max_depth) * stack_per_call + stack_spare)
+                    return self.withCompiled(null, low + stack_spare, runMain, {});
+            };
+            return onBigStack(runCompiled, .{self}, max_depth);
         }
         ph.raise(py.PyExc_ValueError(), "mode must be 'python' or 'compiled', not '{s}'", .{mode});
         return null;
@@ -902,6 +919,23 @@ const Program = struct {
     }
 
     fn runCompiled(self: *Program) ?*PyObject {
+        return self.withCompiled(null, 0, runMain, {});
+    }
+
+    fn runMain(self: *Program, ectx: *helpers.Ctx, _: void) ?*PyObject {
+        const c = self._compiled.?;
+        const globals = helpers.zr_frame_new(null, c.globals) orelse {
+            _ = py.c.PyErr_NoMemory();
+            return null;
+        };
+        defer value_mod.decrefFrame(globals);
+        if (c.main(ectx, globals)) return none();
+        return self.compiledError(ectx);
+    }
+
+    /// Run `body` with the context compiled code runs with (the bridge's
+    /// link, rt.context: `context`; the native stack's end: Ctx.stack_low).
+    fn withCompiled(self: *Program, context: ?*PyObject, stack_low: usize, comptime body: anytype, extra: anytype) ?*PyObject {
         const c = self._compiled.?;
         const st = self.state();
         const link = bridge.Link{
@@ -911,7 +945,7 @@ const Program = struct {
             .hosts = self.language()._hosts.?,
             .analysis = st.analysis,
             .path = self._path,
-            .context = null,
+            .context = context,
             .semantic = &linkSemantic,
             .error_object = &linkErrorObject,
         };
@@ -920,6 +954,7 @@ const Program = struct {
             .objects = &c.compiler.objects,
             .program = c.id,
             .max_depth = self.language()._max_depth,
+            .stack_low = stack_low,
             .link = @constCast(&link),
         };
         defer ectx.deinit();
@@ -933,12 +968,59 @@ const Program = struct {
         const want: c_int = @intCast(@min(@as(u64, ectx.max_depth) * 40 + 1000, std.math.maxInt(c_int)));
         if (want > saved_limit) py.c.Py_SetRecursionLimit(want);
         defer py.c.Py_SetRecursionLimit(saved_limit);
-        const globals = helpers.zr_frame_new(null, c.globals) orelse {
-            _ = py.c.PyErr_NoMemory();
+        return body(self, &ectx, extra);
+    }
+
+    /// `program.call(name, *args)` compiled: the program's top level run
+    /// the first time (its variables kept for the calls after), then the
+    /// function the name holds there called with the arguments.
+    const CallArgs = struct { name: []const u8, args: *PyObject };
+
+    fn callCompiledIn(self: *Program, ectx: *helpers.Ctx, a: CallArgs) ?*PyObject {
+        const c = self._compiled.?;
+        const data = self.ctx().data;
+        const slot = for (data.syms, 0..) |s, i| {
+            if (s.builtin or !std.mem.eql(u8, s.name, a.name) or data.homeOf(@intCast(i)) != NONE) continue;
+            break c.compiler.slot_of.get(@intCast(i)).?;
+        } else {
+            ph.raise(py.PyExc_KeyError(), "the program defines no function '{s}'", .{a.name});
             return null;
         };
-        defer value_mod.decrefFrame(globals);
-        if (c.main(&ectx, globals)) return none();
+        if (self._cglobals == null) {
+            const globals = helpers.zr_frame_new(null, c.globals) orelse {
+                _ = py.c.PyErr_NoMemory();
+                return null;
+            };
+            if (!c.main(ectx, globals)) {
+                value_mod.decrefFrame(globals);
+                return self.compiledError(ectx);
+            }
+            self._cglobals = globals;
+        }
+        const fv = self._cglobals.?.slots()[slot];
+        if (fv.tag == helpers.UNSET) {
+            ph.raise(py.PyExc_KeyError(), "the program defines no function '{s}'", .{a.name});
+            return null;
+        }
+        // (the arguments as values: the call borrows them)
+        const n: usize = @intCast(py.c.PyTuple_Size(a.args));
+        const vals = allocator.alloc(value_mod.Value, n) catch return py.c.PyErr_NoMemory();
+        defer allocator.free(vals);
+        var made: usize = 0;
+        defer for (vals[0..made]) |v| value_mod.decref(v);
+        for (vals, 0..) |*v, i| {
+            v.* = value_mod.fromPython(py.c.PyTuple_GetItem(a.args, @intCast(i)).?) orelse return null;
+            made += 1;
+        }
+        var out = value_mod.Value.none_v;
+        if (!helpers.zr_call(ectx, 0, fv.tag, fv.bits, vals.ptr, n, null, &out)) return self.compiledError(ectx);
+        defer value_mod.decref(out);
+        return value_mod.toPython(out, ectx.node_maker);
+    }
+
+    /// A compiled run's or call's error, raised as the reference mode
+    /// raises it; null.
+    fn compiledError(self: *Program, ectx: *helpers.Ctx) ?*PyObject {
         // An exception from Python going out of the run: itself (a Throw
         // nothing caught: the zrun.Error it is)
         if (ectx.pending) |p| {
@@ -994,13 +1076,38 @@ const Program = struct {
         return null;
     }
 
-    /// `program.call(name, *args)`: call a function the program defines at
-    /// its top level (running the program first if it hasn't run).
-    fn callEntry(self: *Program, name: *PyObject, args: *PyObject) ?*PyObject {
-        return onBigStack(callHere, .{ self, name, args }, self.language()._max_depth);
+    /// `program.call(name, *args, mode=None, context=None)`: call a
+    /// function the program defines at its top level (running the program
+    /// first if it hasn't run), in a mode ("python" or "compiled"; none
+    /// said: the one it last ran in, "compiled" if it hasn't run), with
+    /// rt.context the context.
+    fn callEntry(self: *Program, name: *PyObject, args: *PyObject, mode_obj: ?*PyObject, context: ?*PyObject) ?*PyObject {
+        const compiled = if (mode_obj) |m| blk: {
+            const mode = ph.utf8(m, "mode") orelse return null;
+            if (std.mem.eql(u8, mode, "compiled")) break :blk true;
+            if (std.mem.eql(u8, mode, "python")) break :blk false;
+            ph.raise(py.PyExc_ValueError(), "mode must be 'python' or 'compiled', not '{s}'", .{mode});
+            return null;
+        } else self._ran_compiled orelse true;
+        if (compiled) {
+            if (!self.ensureCompiled()) return null;
+            const wanted = ph.utf8(name, "name") orelse return null;
+            const call_args = CallArgs{ .name = wanted, .args = args };
+            // (on this thread when its stack has room for the deepest calls
+            // and no semantic runs as Python, recursing through Python:
+            // no thread made for the call)
+            const max_depth = self.language()._max_depth;
+            if (!self._compiled.?.compiler.uses_python) if (stackLow()) |low| {
+                const here = @frameAddress();
+                if (here > low + @as(usize, max_depth) * stack_per_call + stack_spare)
+                    return self.withCompiled(context, low + stack_spare, callCompiledIn, call_args);
+            };
+            return onBigStack(withCompiled, .{ self, context, @as(usize, 0), callCompiledIn, call_args }, max_depth);
+        }
+        return onBigStack(callHere, .{ self, name, args, context }, self.language()._max_depth);
     }
 
-    fn callHere(self: *Program, name: *PyObject, args: *PyObject) ?*PyObject {
+    fn callHere(self: *Program, name: *PyObject, args: *PyObject, context: ?*PyObject) ?*PyObject {
         const st = self.state();
         if (st.globals == null) {
             const r = self.runHere() orelse return null;
@@ -1016,6 +1123,7 @@ const Program = struct {
             var rt = Runtime.begin(self) orelse return null;
             defer rt.end();
             rt.self()._frame = ref(st.globals.?);
+            if (context) |x| rt.self()._context = ref(x);
             return rt.self().callValue(f, args, null) orelse uncaught();
         }
         ph.raise(py.PyExc_KeyError(), "the program defines no function '{s}'", .{wanted});
@@ -1098,6 +1206,34 @@ fn onBigStack(comptime f: anytype, args: anytype, max_depth: u32) ?*PyObject {
     return ctx.result;
 }
 
+extern "c" fn pthread_getattr_np(thread: std.c.pthread_t, attr: *std.c.pthread_attr_t) c_int;
+extern "c" fn pthread_attr_getstack(attr: *const std.c.pthread_attr_t, addr: *?*anyopaque, size: *usize) c_int;
+extern "c" fn pthread_attr_destroy(attr: *std.c.pthread_attr_t) c_int;
+
+/// Where this thread's stack ends (its lowest address), or null: not known
+/// here (another system than Linux).
+fn stackLow() ?usize {
+    const S = struct {
+        threadlocal var low: usize = 0;
+    };
+    if (S.low != 0) return S.low;
+    if (@import("builtin").os.tag != .linux) return null;
+    var attr: std.c.pthread_attr_t = undefined;
+    if (pthread_getattr_np(std.c.pthread_self(), &attr) != 0) return null;
+    defer _ = pthread_attr_destroy(&attr);
+    var addr: ?*anyopaque = null;
+    var size: usize = 0;
+    if (pthread_attr_getstack(&attr, &addr, &size) != 0) return null;
+    S.low = @intFromPtr(addr);
+    return S.low;
+}
+
+/// The stack per language call compiled code is given running on the
+/// caller's thread (well over what a call takes; zr_call refuses one going
+/// past the end anyway), and what's kept spare at the end
+const stack_per_call = 4096;
+const stack_spare = 256 * 1024;
+
 /// `program.call`: a callable taking `(name, *args)` (PyOZ methods take
 /// fixed arguments, and its types can't get methods added: the property
 /// returns this)
@@ -1110,9 +1246,23 @@ var CallerType: *PyObject = undefined;
 
 fn callerCall(self_obj: ?*PyObject, args: ?*PyObject, kwargs: ?*PyObject) callconv(.c) ?*PyObject {
     const c: *CallerObject = @ptrCast(@alignCast(self_obj.?));
-    if (kwargs != null and py.c.PyDict_Size(kwargs) != 0) {
-        ph.raise(py.PyExc_TypeError(), "call(name, *args) takes no keyword arguments", .{});
-        return null;
+    var mode: ?*PyObject = null;
+    var context: ?*PyObject = null;
+    if (kwargs) |kw| {
+        var pos: py.c.Py_ssize_t = 0;
+        var k: ?*PyObject = null;
+        var v: ?*PyObject = null;
+        while (py.c.PyDict_Next(kw, &pos, @ptrCast(&k), @ptrCast(&v)) != 0) {
+            const key = ph.utf8(k.?, "keyword") orelse return null;
+            if (std.mem.eql(u8, key, "mode")) {
+                if (v.? != py.Py_None()) mode = v;
+            } else if (std.mem.eql(u8, key, "context")) {
+                if (v.? != py.Py_None()) context = v;
+            } else {
+                ph.raise(py.PyExc_TypeError(), "call() got an unexpected keyword argument '{s}'", .{key});
+                return null;
+            }
+        }
     }
     const n = py.c.PyTuple_Size(args);
     if (n < 1) {
@@ -1122,7 +1272,7 @@ fn callerCall(self_obj: ?*PyObject, args: ?*PyObject, kwargs: ?*PyObject) callco
     const self = unwrap(Program, c.program.?) orelse return null;
     const rest = py.c.PyTuple_GetSlice(args, 1, n) orelse return null;
     defer py.Py_DecRef(rest);
-    return self.callEntry(py.c.PyTuple_GetItem(args, 0).?, rest);
+    return self.callEntry(py.c.PyTuple_GetItem(args, 0).?, rest, mode, context);
 }
 
 fn callerDealloc(obj: ?*PyObject) callconv(.c) void {

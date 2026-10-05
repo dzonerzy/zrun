@@ -1135,6 +1135,14 @@ pub export fn zr_specialize(ctx: *Ctx, site: u64) callconv(.c) void {
     linkOf(ctx).compiled.specialize(@intCast(site));
 }
 
+/// rt.context in compiled code: the object program.call() was given (None:
+/// none), as a value.
+pub export fn zr_context(ctx: *Ctx, out: *Value) callconv(.c) bool {
+    const o = linkOf(ctx).context orelse py.Py_None();
+    out.* = value.fromPython(o) orelse return pythonFailure(ctx, 0) != 0;
+    return true;
+}
+
 /// A hot language function's typed entry, for the kinds its arguments have
 /// always been (driver's speculate)
 pub export fn zr_speculate(ctx: *Ctx, fnode: u64) callconv(.c) void {
@@ -1142,10 +1150,11 @@ pub export fn zr_speculate(ctx: *Ctx, fnode: u64) callconv(.c) void {
 }
 
 /// The bridge's helpers, by name (for the JIT)
-pub fn symbols() [8]struct { []const u8, usize } {
+pub fn symbols() [9]struct { []const u8, usize } {
     return .{
         .{ "zr_specialize", @intFromPtr(&zr_specialize) },
         .{ "zr_speculate", @intFromPtr(&zr_speculate) },
+        .{ "zr_context", @intFromPtr(&zr_context) },
         .{ "zr_py_semantic", @intFromPtr(&zr_py_semantic) },
         .{ "zr_run_value", @intFromPtr(&zr_run_value) },
         .{ "zr_runtime", @intFromPtr(&zr_runtime) },
