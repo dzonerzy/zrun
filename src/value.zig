@@ -20,6 +20,7 @@ const types = @import("types.zig");
 const objects = @import("objects.zig");
 const proxies = @import("proxies.zig");
 const bytes_mod = @import("bytes.zig");
+const gil = @import("gil.zig");
 
 /// What values are made with (and freed with: anything making one
 /// elsewhere uses it too)
@@ -346,6 +347,7 @@ pub fn incref(v: Value) void {
         const o = v.ptr();
         if (o.rc < IMMORTAL) o.rc += 1;
     } else if (v.tag == @intFromEnum(Tag.host)) {
+        gil.ensure();
         py.Py_IncRef(@ptrFromInt(v.bits));
     }
 }
@@ -357,9 +359,54 @@ pub fn decref(v: Value) void {
         o.rc -= 1;
         if (o.rc == 0) free(@enumFromInt(v.tag), o);
     } else if (v.tag == @intFromEnum(Tag.host)) {
+        gil.ensure();
         py.Py_DecRef(@ptrFromInt(v.bits));
     }
 }
+
+/// Every object reachable from some values and frames made immortal: its
+/// count never changes again (shared by threads running compiled code at
+/// once, no count raced; they live as long as the program that has them).
+/// Into objects immortal already too (a table adopted from module state:
+/// what's stored in it since isn't).
+pub const Freezer = struct {
+    seen: std.AutoHashMapUnmanaged(*Obj, void) = .empty,
+
+    pub fn deinit(self: *Freezer) void {
+        self.seen.deinit(allocator);
+    }
+
+    pub fn value(self: *Freezer, v: Value) error{OutOfMemory}!void {
+        if (!counted(v.tag)) return;
+        try self.obj(@enumFromInt(v.tag), v.ptr());
+    }
+
+    pub fn frame(self: *Freezer, f: *Frame) error{OutOfMemory}!void {
+        if ((try self.seen.getOrPut(allocator, &f.head)).found_existing) return;
+        f.head.rc = IMMORTAL;
+        if (f.parent) |p| try self.frame(p);
+        for (f.slots()) |s| if (s.tag != UNSET_TAG) try self.value(s);
+    }
+
+    fn obj(self: *Freezer, tag: Tag, o: *Obj) error{OutOfMemory}!void {
+        if ((try self.seen.getOrPut(allocator, o)).found_existing) return;
+        o.rc = IMMORTAL;
+        switch (tag) {
+            .list => for (@as(*List, @ptrCast(@alignCast(o))).slice()) |x| try self.value(x),
+            .tuple => for (@as(*Tuple, @ptrCast(@alignCast(o))).slice()) |x| try self.value(x),
+            .dict => {
+                const d: *Dict = @ptrCast(@alignCast(o));
+                if (d.entries) |es| for (es[0..d.used]) |e| {
+                    try self.value(e.key);
+                    try self.value(e.value);
+                };
+            },
+            .record => for (@as(*Record, @ptrCast(@alignCast(o))).fields()) |x| if (x.tag != UNSET_TAG) try self.value(x),
+            .function => if (@as(*Function, @ptrCast(@alignCast(o))).env) |e| try self.frame(e),
+            else => {},
+        }
+    }
+};
 
 pub fn increfObj(o: *Obj) void {
     if (o.rc < IMMORTAL) o.rc += 1;
@@ -425,6 +472,7 @@ pub fn free(tag: Tag, o: *Obj) void {
         .big => allocator.destroy(@as(*Big, @ptrCast(@alignCast(o)))),
         .bytes => {
             const b: *Bytes = @ptrCast(@alignCast(o));
+            gil.ensure();
             py.Py_DecRef(b.py);
             allocator.destroy(b);
         },
@@ -451,15 +499,19 @@ pub fn newStr(bytes: []const u8) ?*Str {
 /// one per content, immortal, for the process. (Not the program's memory:
 /// a str stored in module state outlives the program that made it.)
 pub fn literal(bytes: []const u8) ?*Str {
+    // (made by compiled code on several threads at once too)
+    while (!literals_lock.tryLock()) std.atomic.spinLoopHint();
+    defer literals_lock.unlock();
     if (literals.get(bytes)) |s| return s;
     const s = newStr(bytes) orelse return null;
     s.head.rc = IMMORTAL;
     s.hash = strHash(bytes);
-    literals.put(allocator, s.bytes(), s) catch return null;
+    literals.put(std.heap.c_allocator, s.bytes(), s) catch return null;
     return s;
 }
 
 var literals: std.StringHashMapUnmanaged(*Str) = .empty;
+var literals_lock: std.atomic.Mutex = .unlocked;
 
 /// The Big of a literal beyond 64 bits (as literal()'s strs: one per
 /// value, immortal, for the process).
@@ -593,7 +645,10 @@ pub fn truthy(v: Value) bool {
         .list => @as(*List, @ptrCast(@alignCast(v.ptr()))).len != 0,
         .tuple => @as(*Tuple, @ptrCast(@alignCast(v.ptr()))).len != 0,
         .dict => @as(*Dict, @ptrCast(@alignCast(v.ptr()))).len != 0,
-        .host => py.c.PyObject_IsTrue(@ptrFromInt(v.bits)) == 1,
+        .host => blk: {
+            gil.ensure();
+            break :blk py.c.PyObject_IsTrue(@ptrFromInt(v.bits)) == 1;
+        },
         else => true,
     };
 }
@@ -626,6 +681,7 @@ fn intEqualsFloat(i: i64, f: f64) bool {
 const HostKind = enum { identity, int, float, str, own };
 
 fn hostKind(o: *PyObject) HostKind {
+    gil.ensure();
     const t = ph.typeOf(o);
     if (py.c.PyType_IsSubtype(t, exact.int) != 0) return .int;
     if (py.c.PyType_IsSubtype(t, exact.float) != 0) return .float;
@@ -675,6 +731,7 @@ fn scalarOf(v: Value) Scalar {
 /// A record compared by value as Python sees it (its proxy; a new
 /// reference), or null.
 fn valueRecordObject(v: Value) ?*PyObject {
+    gil.ensure();
     if (v.kind() != .record) return null;
     if (!@as(*Record, @ptrCast(@alignCast(v.ptr()))).rtype.value_eq) return null;
     return proxies.make(v, @import("adopt.zig").shared_maker) orelse {
@@ -684,6 +741,7 @@ fn valueRecordObject(v: Value) ?*PyObject {
 }
 
 fn hostEqual(a: Value, b: Value) bool {
+    gil.ensure();
     if (a.kind() == .host and b.kind() == .host and a.bits == b.bits) return true;
     const x = scalarOf(a);
     const y = scalarOf(b);
@@ -721,6 +779,7 @@ fn hostEqual(a: Value, b: Value) bool {
 /// A Python int of an i128 (a new reference; null with an exception):
 /// from its decimal digits.
 pub fn bigObject(x: i128) ?*PyObject {
+    gil.ensure();
     var buf: [48]u8 = undefined;
     const s = std.fmt.bufPrintZ(&buf, "{d}", .{x}) catch unreachable;
     return py.c.PyLong_FromString(s.ptr, null, 10);
@@ -878,6 +937,7 @@ fn hashOf(tag: u64, bits: u64) u64 {
         .record => {
             const r: *Record = @ptrCast(@alignCast(v.ptr()));
             if (!r.rtype.value_eq) return std.hash.Wyhash.hash(4, std.mem.asBytes(&bits));
+            gil.ensure();
             const h = proxies.valueHash(r) orelse blk: {
                 py.c.PyErr_Clear();
                 break :blk 0;
@@ -890,6 +950,7 @@ fn hashOf(tag: u64, bits: u64) u64 {
 
 /// A Python object's hash, alike for the values it equals (hostEqual).
 fn hostHash(o: *PyObject) u64 {
+    gil.ensure();
     const bits = @intFromPtr(o);
     switch (scalarOf(.{ .tag = @intFromEnum(Tag.host), .bits = bits })) {
         .int => |i| return hashOf(@intFromEnum(Tag.int), @bitCast(i)),
@@ -1029,6 +1090,7 @@ pub fn isDeleted(e: Dict.Entry) bool {
 /// A value as a Python object (new reference), or null with an exception.
 /// Ints become zrun's checked ints, as the reference mode gives them.
 pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
+    gil.ensure();
     switch (v.kind()) {
         .none => {
             py.Py_IncRef(py.Py_None());
@@ -1114,6 +1176,7 @@ const exact = struct {
 /// (`unique`: the reference given is the only one, the containers it's
 /// in included)
 fn convert(o: *PyObject, unique: bool) ?Value {
+    gil.ensure();
     if (o == py.Py_None()) return Value.none_v;
     // (a proxy: the compiled object itself)
     if (proxies.unwrap(o)) |v| return v;

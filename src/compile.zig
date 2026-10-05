@@ -892,6 +892,9 @@ pub const Compiler = struct {
     /// By semantic or helper read: the reads of its locals that move their
     /// value out (localMoves), worked out
     local_moves: std.AutoHashMapUnmanaged(*const front.Function, *std.AutoHashMapUnmanaged(*const front.Expr, void)) = .empty,
+    /// The module state the code refers to, adopted natively (adopt.zig):
+    /// shared by every run (frozen before runs on several threads)
+    adopted: std.ArrayListUnmanaged(value.Value) = .empty,
     /// Language functions' speculations (Speculation), by node
     speculations: std.AutoHashMapUnmanaged(u32, *Speculation) = .empty,
     /// Functions' typed entries (Gen.typedParams), worked out
@@ -5250,6 +5253,7 @@ const Gen = struct {
             switch (try adopt_mod.adopt(self.c.a, v, globals)) {
                 .native => |nv| {
                     try self.c.noteState(name, "native");
+                    try self.c.adopted.append(self.c.a, nv);
                     return .{ .dyn = .{
                         .tag = self.k(@intCast(nv.tag)),
                         .bits = self.c.m.addrInt(nv.bits),

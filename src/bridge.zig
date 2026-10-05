@@ -21,6 +21,7 @@ const py = ph.py;
 const PyObject = ph.PyObject;
 const helpers = @import("helpers.zig");
 const value = @import("value.zig");
+const gil = @import("gil.zig");
 const types = @import("types.zig");
 const program_mod = @import("program.zig");
 const grammar_mod = @import("grammar.zig");
@@ -165,6 +166,7 @@ fn linkOf(ctx: *Ctx) *const Link {
 /// `frame_slot` (the frame of `owner`): its status (0 error, 1 done: the
 /// value in `out`, 2 Return: its value in `out`, 3 Break, 4 Continue).
 pub export fn zr_py_semantic(ctx: *Ctx, which: u32, idx: u32, frame_slot: **value.Frame, owner: u32, out: *Value) callconv(.c) i32 {
+    gil.ensure();
     out.* = Value.none_v;
     helpers.stat("py_semantic", .{});
     const link = linkOf(ctx);
@@ -196,6 +198,7 @@ pub export fn zr_py_semantic(ctx: *Ctx, which: u32, idx: u32, frame_slot: **valu
 /// anything else is itself (eval). A status as zr_py_semantic's (rt.loop:
 /// 1 with True or False in `out`, its Break and Continue taken).
 pub export fn zr_run_value(ctx: *Ctx, which: u32, at: u32, tag: u64, bits: u64, frame_slot: **value.Frame, owner: u32, out: *Value) callconv(.c) i32 {
+    gil.ensure();
     out.* = Value.none_v;
     const v = Value{ .tag = tag, .bits = bits };
     const loop = which == 2;
@@ -445,6 +448,7 @@ fn newRuntime(ctx: *Ctx, frame_slot: **value.Frame, owner: u32, at: u32) ?*PyObj
 /// goes up to whoever catches it, anything else is the run's error, worded
 /// as the reference mode does). Always false.
 pub export fn zr_raise(ctx: *Ctx, at: u32, t: u64, bits: u64) callconv(.c) bool {
+    gil.ensure();
     const v = Value{ .tag = t, .bits = bits };
     const o = value.toPython(v, ctx.node_maker) orelse return pythonFailure(ctx, at) != 0;
     defer py.Py_DecRef(o);
@@ -464,6 +468,7 @@ pub export fn zr_raise(ctx: *Ctx, at: u32, t: u64, bits: u64) callconv(.c) bool 
 /// (objects[cls_index]: a class or a tuple of them). An error of the
 /// compiled code itself is a zrun.Error, as Python code above would see it.
 pub export fn zr_exc_matches(ctx: *Ctx, cls_index: u64) callconv(.c) bool {
+    gil.ensure();
     const cls = ctx.object(cls_index);
     const r = if (ctx.pending orelse ctx.exc) |e|
         py.c.PyObject_IsInstance(e, cls)
@@ -476,6 +481,7 @@ pub export fn zr_exc_matches(ctx: *Ctx, cls_index: u64) callconv(.c) bool {
 /// The error being raised, caught (`except ... as e`): the exception
 /// object in `out` (a host value), the error cleared.
 pub export fn zr_exc_catch(ctx: *Ctx, at: u32, out: *Value) callconv(.c) bool {
+    gil.ensure();
     var exc: *PyObject = undefined;
     if (ctx.pending != null or ctx.exc != null or ctx.exc_class != null) {
         exc = ctx.exceptionOf() orelse {
@@ -586,7 +592,7 @@ pub fn compiledMethod(ctx: *Ctx, node: u32, m: *PyObject, args: []const Value, c
 
 /// The compiled run going on (the innermost): what an rt value reaching
 /// Python runs in
-pub var current: ?*Ctx = null;
+pub threadlocal var current: ?*Ctx = null;
 
 /// An rt value as Python sees it: an rt object over its frames (a new
 /// reference; null with an exception).
@@ -618,6 +624,7 @@ pub fn runtimeValue(o: *PyObject) ?Value {
 /// `rt` as a value compiled code passes (to a Python function: f(rt,
 /// node...)): an rt over the frames of the code there, holding its frame.
 pub export fn zr_runtime(ctx: *Ctx, at: u32, frame: *value.Frame, owner: u32, out: *Value) callconv(.c) bool {
+    gil.ensure();
     var slot: *value.Frame = frame;
     const obj = newRuntime(ctx, &slot, owner, at) orelse {
         py.c.PyErr_Clear();
@@ -1159,12 +1166,14 @@ pub fn init(module: *PyObject) !void {
 /// what the site calls from now on. Nothing (the site keeps calling the
 /// generic code) if that can't be done.
 pub export fn zr_specialize(ctx: *Ctx, site: u64) callconv(.c) void {
+    gil.ensure();
     linkOf(ctx).compiled.specialize(@intCast(site));
 }
 
 /// rt.context in compiled code: the object program.call() was given (None:
 /// none), as a value.
 pub export fn zr_context(ctx: *Ctx, out: *Value) callconv(.c) bool {
+    gil.ensure();
     const o = linkOf(ctx).context orelse py.Py_None();
     out.* = value.fromPython(o) orelse return pythonFailure(ctx, 0) != 0;
     return true;
@@ -1173,6 +1182,7 @@ pub export fn zr_context(ctx: *Ctx, out: *Value) callconv(.c) bool {
 /// A hot language function's typed entry, for the kinds its arguments have
 /// always been (driver's speculate)
 pub export fn zr_speculate(ctx: *Ctx, fnode: u64) callconv(.c) void {
+    gil.ensure();
     linkOf(ctx).compiled.speculate(@intCast(fnode));
 }
 

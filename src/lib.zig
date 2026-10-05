@@ -27,6 +27,8 @@ const compile_mod = @import("compile.zig");
 const bridge = @import("bridge.zig");
 const helpers = @import("helpers.zig");
 const bytes_mod = @import("bytes.zig");
+const gil = @import("gil.zig");
+const pool = @import("pool.zig");
 const value_mod = @import("value.zig");
 
 const allocator = std.heap.c_allocator;
@@ -638,6 +640,9 @@ const Program = struct {
     _cglobals: ?*value_mod.Frame = null,
     /// The mode it last ran in (program.call()'s, unless said)
     _ran_compiled: ?bool = null,
+    /// Its variables and module state made immortal (shared by calls
+    /// without the GIL, on several threads at once: freezeShared)
+    _frozen: bool = false,
 
     fn release(self: *Program) void {
         if (self._cglobals) |g| value_mod.decrefFrame(g);
@@ -947,8 +952,14 @@ const Program = struct {
             return null;
         };
         defer value_mod.decrefFrame(globals);
-        if (c.main(ectx, globals)) return none();
+        // (the GIL released, as for program.call(): the code takes it back
+        // if it touches Python)
+        if (gil.without(runMainCode, .{ c, ectx, globals })) return none();
         return self.compiledError(ectx);
+    }
+
+    fn runMainCode(c: *driver.Compiled, ectx: *helpers.Ctx, globals: *value_mod.Frame) bool {
+        return c.main(ectx, globals);
     }
 
     /// Run `body` with the context compiled code runs with (the bridge's
@@ -994,14 +1005,17 @@ const Program = struct {
     /// function the name holds there called with the arguments.
     const CallArgs = struct { name: []const u8, args: *PyObject };
 
-    fn callCompiledIn(self: *Program, ectx: *helpers.Ctx, a: CallArgs) ?*PyObject {
+    /// The function a name holds at the program's top level (its top level
+    /// run the first time, its variables kept), compiled; null with an
+    /// exception.
+    fn entryFunction(self: *Program, ectx: *helpers.Ctx, name: []const u8) ?value_mod.Value {
         const c = self._compiled.?;
         const data = self.ctx().data;
         const slot = for (data.syms, 0..) |s, i| {
-            if (s.builtin or !std.mem.eql(u8, s.name, a.name) or data.homeOf(@intCast(i)) != NONE) continue;
+            if (s.builtin or !std.mem.eql(u8, s.name, name) or data.homeOf(@intCast(i)) != NONE) continue;
             break c.compiler.slot_of.get(@intCast(i)).?;
         } else {
-            ph.raise(py.PyExc_KeyError(), "the program defines no function '{s}'", .{a.name});
+            ph.raise(py.PyExc_KeyError(), "the program defines no function '{s}'", .{name});
             return null;
         };
         if (self._cglobals == null) {
@@ -1011,15 +1025,45 @@ const Program = struct {
             };
             if (!c.main(ectx, globals)) {
                 value_mod.decrefFrame(globals);
-                return self.compiledError(ectx);
+                _ = self.compiledError(ectx);
+                return null;
             }
             self._cglobals = globals;
         }
         const fv = self._cglobals.?.slots()[slot];
         if (fv.tag == helpers.UNSET) {
-            ph.raise(py.PyExc_KeyError(), "the program defines no function '{s}'", .{a.name});
+            ph.raise(py.PyExc_KeyError(), "the program defines no function '{s}'", .{name});
             return null;
         }
+        if (!self.freezeShared()) return null;
+        return fv;
+    }
+
+    /// The program's variables and module state made immortal, once: calls
+    /// run without the GIL, on several threads at once, share them, their
+    /// counts not raced (they live as long as the program does).
+    fn freezeShared(self: *Program) bool {
+        if (self._frozen) return true;
+        var fz = value_mod.Freezer{};
+        defer fz.deinit();
+        fz.frame(self._cglobals.?) catch {
+            _ = py.c.PyErr_NoMemory();
+            return false;
+        };
+        for (self._compiled.?.compiler.adopted.items) |v| fz.value(v) catch {
+            _ = py.c.PyErr_NoMemory();
+            return false;
+        };
+        self._frozen = true;
+        return true;
+    }
+
+    fn callFunction(ectx: *helpers.Ctx, fv: value_mod.Value, vals: []const value_mod.Value, out: *value_mod.Value) bool {
+        return helpers.zr_call(ectx, 0, fv.tag, fv.bits, vals.ptr, vals.len, null, out);
+    }
+
+    fn callCompiledIn(self: *Program, ectx: *helpers.Ctx, a: CallArgs) ?*PyObject {
+        const fv = self.entryFunction(ectx, a.name) orelse return null;
         // (the arguments as values: the call borrows them)
         const n: usize = @intCast(py.c.PyTuple_Size(a.args));
         const vals = allocator.alloc(value_mod.Value, n) catch return py.c.PyErr_NoMemory();
@@ -1031,10 +1075,175 @@ const Program = struct {
             made += 1;
         }
         var out = value_mod.Value.none_v;
-        if (!helpers.zr_call(ectx, 0, fv.tag, fv.bits, vals.ptr, n, null, &out)) return self.compiledError(ectx);
+        // (the GIL released: Python threads run meanwhile, and calls on
+        // them; the code takes it back if it touches Python)
+        if (!gil.without(callFunction, .{ ectx, fv, vals, &out })) return self.compiledError(ectx);
         defer value_mod.decref(out);
         return value_mod.toPython(out, ectx.node_maker);
     }
+
+    const MapArgs = struct { name: []const u8, items: *PyObject, threads: usize };
+
+    /// `program.map(name, items, threads=None, context=None)` (get_map):
+    /// on `threads` native threads (none said: one per CPU). An item
+    /// failing: the error of the first one failing in the items' order, as
+    /// one thread calling them in order raises it (the others run all the
+    /// same). The calls share the program's variables and module state:
+    /// they mustn't change them.
+    fn mapEntry(self: *Program, name: *PyObject, items: *PyObject, threads_obj: ?*PyObject, context: ?*PyObject) ?*PyObject {
+        if (!self.ensureCompiled()) return null;
+        const wanted = ph.utf8(name, "name") orelse return null;
+        var threads: usize = std.Thread.getCpuCount() catch 1;
+        if (threads_obj) |t| {
+            const n = py.c.PyLong_AsLongLong(t);
+            if (n == -1 and py.c.PyErr_Occurred() != null) return null;
+            if (n < 1) {
+                ph.raise(py.PyExc_ValueError(), "map() needs at least one thread, not {d}", .{n});
+                return null;
+            }
+            threads = @intCast(n);
+        }
+        // (the top level, run the first time, on a stack as deep as a run's;
+        // its allocator lists not this thread's: the workers' results it
+        // frees would stay in them)
+        const map_args = MapArgs{ .name = wanted, .items = items, .threads = threads };
+        return onBigStackLending(withCompiled, .{ self, context, @as(usize, 0), mapIn, map_args }, self.language()._max_depth, false);
+    }
+
+    fn mapIn(self: *Program, ectx: *helpers.Ctx, a: MapArgs) ?*PyObject {
+        const fv = self.entryFunction(ectx, a.name) orelse return null;
+        const seq = py.c.PySequence_Fast(a.items, "map()'s items must be a sequence") orelse return null;
+        defer py.Py_DecRef(seq);
+        const n: usize = @intCast(py.c.PySequence_Size(seq));
+        const ca = std.heap.c_allocator;
+        // The items' arguments as values, made here (with the GIL): the
+        // calls borrow them
+        const args = ca.alloc([]value_mod.Value, n) catch return py.c.PyErr_NoMemory();
+        var made: usize = 0;
+        defer {
+            for (args[0..made]) |xs| {
+                for (xs) |v| value_mod.decref(v);
+                ca.free(xs);
+            }
+            ca.free(args);
+        }
+        for (0..n) |i| {
+            const item = py.c.PySequence_GetItem(seq, @intCast(i)) orelse return null;
+            defer py.Py_DecRef(item);
+            const is_tuple = ph.typeOf(item) == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyTuple_Type"))));
+            const k: usize = if (is_tuple) @intCast(py.c.PyTuple_Size(item)) else 1;
+            const xs = ca.alloc(value_mod.Value, k) catch return py.c.PyErr_NoMemory();
+            var got: usize = 0;
+            for (xs, 0..) |*slot, j| {
+                const x = if (is_tuple) py.c.PyTuple_GetItem(item, @intCast(j)).? else item;
+                const conv = if (bytes_mod.isData(x)) bytes_mod.of(x) else ref(x);
+                const v = if (conv) |o| blk: {
+                    defer py.Py_DecRef(o);
+                    break :blk value_mod.fromPython(o);
+                } else null;
+                slot.* = v orelse {
+                    for (xs[0..got]) |w| value_mod.decref(w);
+                    ca.free(xs);
+                    return null;
+                };
+                got += 1;
+            }
+            args[i] = xs;
+            made += 1;
+        }
+        const results = ca.alloc(value_mod.Value, n) catch return py.c.PyErr_NoMemory();
+        defer ca.free(results);
+        @memset(results, value_mod.Value.none_v);
+        defer for (results) |v| value_mod.decref(v);
+        var job = MapJob{ .fv = fv, .args = args, .results = results, .template = ectx };
+        defer if (job.failed) |f| {
+            f.deinit();
+            ca.destroy(f);
+        };
+        // The threads (as deep a stack as a run's), waited for without the
+        // GIL
+        const count = @max(@min(a.threads, n), 1);
+        const stack: usize = @min(@as(usize, ectx.max_depth) * 64 * 1024 + 16 * 1024 * 1024, 8 * 1024 * 1024 * 1024);
+        const handles = ca.alloc(std.Thread, count) catch return py.c.PyErr_NoMemory();
+        defer ca.free(handles);
+        var spawned: usize = 0;
+        for (handles) |*h| {
+            h.* = std.Thread.spawn(.{ .stack_size = stack }, MapJob.work, .{&job}) catch break;
+            spawned += 1;
+        }
+        gil.without(MapJob.join, .{handles[0..spawned]});
+        if (spawned == 0) return py.c.PyErr_NoMemory();
+        if (job.failed) |f| return self.compiledError(f);
+        const list = py.c.PyList_New(@intCast(n)) orelse return null;
+        for (results, 0..) |v, i| {
+            const o = value_mod.toPython(v, ectx.node_maker) orelse {
+                py.Py_DecRef(list);
+                return null;
+            };
+            _ = py.c.PyList_SetItem(list, @intCast(i), o);
+        }
+        return list;
+    }
+
+    /// program.map()'s calls: each thread takes the next item until none is
+    /// left, with a context of its own; the first failing item's (in the
+    /// items' order) kept.
+    const MapJob = struct {
+        fv: value_mod.Value,
+        args: []const []value_mod.Value,
+        results: []value_mod.Value,
+        template: *const helpers.Ctx,
+        next: std.atomic.Value(usize) = .init(0),
+        lock: std.atomic.Mutex = .unlocked,
+        failed_at: usize = std.math.maxInt(usize),
+        failed: ?*helpers.Ctx = null,
+
+        fn fresh(job: *const MapJob) helpers.Ctx {
+            const t = job.template;
+            return .{ .node_maker = t.node_maker, .objects = t.objects, .program = t.program, .max_depth = t.max_depth, .link = t.link };
+        }
+
+        fn work(job: *MapJob) void {
+            gil.worker();
+            var own = job.fresh();
+            bridge.current = &own;
+            while (true) {
+                const i = job.next.fetchAdd(1, .monotonic);
+                if (i >= job.args.len) break;
+                var out = value_mod.Value.none_v;
+                if (helpers.zr_call(&own, 0, job.fv.tag, job.fv.bits, job.args[i].ptr, job.args[i].len, null, &out)) {
+                    job.results[i] = out;
+                } else job.keep(i, &own);
+                gil.done();
+            }
+            own.deinit();
+            gil.done();
+        }
+
+        /// A call failed: its context kept if it's the first failing item
+        /// so far, the thread going on with a new one.
+        fn keep(job: *MapJob, i: usize, own: *helpers.Ctx) void {
+            while (!job.lock.tryLock()) std.atomic.spinLoopHint();
+            defer job.lock.unlock();
+            if (i < job.failed_at) if (std.heap.c_allocator.create(helpers.Ctx)) |kept| {
+                if (job.failed) |old| {
+                    old.deinit();
+                    std.heap.c_allocator.destroy(old);
+                }
+                kept.* = own.*;
+                job.failed = kept;
+                job.failed_at = i;
+                own.* = job.fresh();
+                return;
+            } else |_| {};
+            own.deinit();
+            own.* = job.fresh();
+        }
+
+        fn join(handles: []std.Thread) void {
+            for (handles) |h| h.join();
+        }
+    };
 
     /// A compiled run's or call's error, raised as the reference mode
     /// raises it; null.
@@ -1159,10 +1368,23 @@ const Program = struct {
     /// `program.call(name, *args)`: call a function the program defines
     /// at its top level (running the program first if it hasn't run)
     pub fn get_call(self: *const Program) ?*PyObject {
+        return self.caller(false);
+    }
+
+    /// `program.map(name, items, threads=None, context=None)`: the function
+    /// `name` called with each item (a tuple: its arguments; anything else:
+    /// the one argument), compiled, on native threads at once, without the
+    /// GIL nor Python between items: the results, in the items' order
+    pub fn get_map(self: *const Program) ?*PyObject {
+        return self.caller(true);
+    }
+
+    fn caller(self: *const Program, map: bool) ?*PyObject {
         const alloc: py.c.allocfunc = @ptrCast(py.c.PyType_GetSlot(@ptrCast(CallerType), py.c.Py_tp_alloc));
         const o = alloc.?(@ptrCast(CallerType), 0) orelse return null;
         const c: *CallerObject = @ptrCast(@alignCast(o));
         c.program = ref(Module.selfObject(Program, self));
+        c.map = map;
         return o;
     }
 
@@ -1203,21 +1425,30 @@ var name_program: ?*PyObject = null;
 /// Windows). The calling thread waits without the GIL; the result and any
 /// exception come back to it.
 fn onBigStack(comptime f: anytype, args: anytype, max_depth: u32) ?*PyObject {
+    return onBigStackLending(f, args, max_depth, true);
+}
+
+/// onBigStack(), the values' allocator's lists of this thread (waiting) the
+/// new one's while it runs when `lend` (theirs are slower to reach: pool.zig)
+fn onBigStackLending(comptime f: anytype, args: anytype, max_depth: u32, lend: bool) ?*PyObject {
     const Ctx = struct {
         args: @TypeOf(args),
+        owner: usize,
         result: ?*PyObject = null,
         t: ?*PyObject = null,
         v: ?*PyObject = null,
         tb: ?*PyObject = null,
 
         fn work(c: *@This()) void {
+            const lent = pool.borrowHome(c.owner);
+            defer if (lent) pool.restoreHome(c.owner);
             const g = py.c.PyGILState_Ensure();
             c.result = @call(.auto, f, c.args);
             if (c.result == null) py.c.PyErr_Fetch(@ptrCast(&c.t), @ptrCast(&c.v), @ptrCast(&c.tb));
             py.c.PyGILState_Release(g);
         }
     };
-    var ctx = Ctx{ .args = args };
+    var ctx = Ctx{ .args = args, .owner = if (lend) pool.threadPointer() else 0 };
     // About 64 KB per call leaves room for deep semantics and debug builds
     const stack: usize = @min(@as(usize, max_depth) * 64 * 1024 + 16 * 1024 * 1024, 8 * 1024 * 1024 * 1024);
     const ts = py.c.PyEval_SaveThread();
@@ -1266,6 +1497,8 @@ const stack_spare = 256 * 1024;
 const CallerObject = extern struct {
     ob_base: py.c.PyObject,
     program: ?*PyObject,
+    /// program.map rather than program.call
+    map: bool,
 };
 
 var CallerType: *PyObject = undefined;
@@ -1274,28 +1507,38 @@ fn callerCall(self_obj: ?*PyObject, args: ?*PyObject, kwargs: ?*PyObject) callco
     const c: *CallerObject = @ptrCast(@alignCast(self_obj.?));
     var mode: ?*PyObject = null;
     var context: ?*PyObject = null;
+    var threads: ?*PyObject = null;
     if (kwargs) |kw| {
         var pos: py.c.Py_ssize_t = 0;
         var k: ?*PyObject = null;
         var v: ?*PyObject = null;
         while (py.c.PyDict_Next(kw, &pos, @ptrCast(&k), @ptrCast(&v)) != 0) {
             const key = ph.utf8(k.?, "keyword") orelse return null;
-            if (std.mem.eql(u8, key, "mode")) {
+            if (std.mem.eql(u8, key, "mode") and !c.map) {
                 if (v.? != py.Py_None()) mode = v;
+            } else if (std.mem.eql(u8, key, "threads") and c.map) {
+                if (v.? != py.Py_None()) threads = v;
             } else if (std.mem.eql(u8, key, "context")) {
                 if (v.? != py.Py_None()) context = v;
             } else {
-                ph.raise(py.PyExc_TypeError(), "call() got an unexpected keyword argument '{s}'", .{key});
+                ph.raise(py.PyExc_TypeError(), "{s}() got an unexpected keyword argument '{s}'", .{ if (c.map) "map" else "call", key });
                 return null;
             }
         }
     }
     const n = py.c.PyTuple_Size(args);
+    const self = unwrap(Program, c.program.?) orelse return null;
+    if (c.map) {
+        if (n != 2) {
+            ph.raise(py.PyExc_TypeError(), "map(name, items, threads=None, context=None) takes a name and items", .{});
+            return null;
+        }
+        return self.mapEntry(py.c.PyTuple_GetItem(args, 0).?, py.c.PyTuple_GetItem(args, 1).?, threads, context);
+    }
     if (n < 1) {
         ph.raise(py.PyExc_TypeError(), "call(name, *args) needs the function's name", .{});
         return null;
     }
-    const self = unwrap(Program, c.program.?) orelse return null;
     const rest = py.c.PyTuple_GetSlice(args, 1, n) orelse return null;
     defer py.Py_DecRef(rest);
     return self.callEntry(py.c.PyTuple_GetItem(args, 0).?, rest, mode, context);
@@ -2355,7 +2598,7 @@ fn version() []const u8 {
 /// zrun._blocks(): the values' blocks allocated and not freed (for the
 /// tests: compiled code gives back what it takes).
 fn blocks() i64 {
-    return @import("pool.zig").in_use;
+    return pool.inUse();
 }
 
 /// zrun.configure(cache=None, perf_map=None): process-wide settings.
@@ -2387,6 +2630,7 @@ fn moduleInit(module: *PyObject) callconv(.c) c_int {
     @import("proxies.zig").init(module) catch return -1;
     @import("bytes.zig").init(module) catch return -1;
     @import("native.zig").init(module) catch return -1;
+    helpers.init() catch return -1;
     name_program = ph.newString("<program>") orelse return -1;
     CallerType = py.c.PyType_FromSpec(&caller_spec) orelse return -1;
     // (compiled code words Python's errors as the reference mode does)

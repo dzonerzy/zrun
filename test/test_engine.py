@@ -264,6 +264,75 @@ def test_native_host():
     assert "takes an int" in results["compiled"][3]
 
 
+MAPPED = """
+let base = 100;
+fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); }
+fn score(d, k) { return u8(d, 0) * k + base; }
+fn tag(x) { return context() + x; }
+fn div(a, b) { return a / b; }
+"""
+
+
+@pytest.mark.parametrize("threads", [1, 8, None])
+def test_map(threads):
+    program = lang.load(MAPPED, "mapped")
+    ns = list(range(20))
+    assert program.map("fib", ns, threads=threads) == [program.call("fib", n) for n in ns]
+    items = [(bytes([k]), k) for k in range(50)] + [(bytearray(b"\x02"), 3), (zrun.Bytes(b"\x05"), 1)]
+    assert program.map("score", items, threads=threads) == [d[0] * k + 100 for d, k in items]
+    assert program.map("tag", ["a", "b"], threads=threads, context="x-") == ["x-a", "x-b"]
+    assert program.map("fib", [], threads=threads) == []
+
+
+@pytest.mark.parametrize("threads", [1, 8])
+def test_map_errors(threads):
+    program = lang.load(MAPPED, "mapped")
+    # (the first failing item's error, as calling them in order raises it)
+    items = [(1, 1)] * 30 + [(1, 0), ("a", 1)] + [(1, 1)] * 30 + [(2, 0)]
+    with pytest.raises(zrun.Error) as e:
+        program.map("div", items, threads=threads)
+    assert e.value.diagnostic.message == "division by zero"
+    assert program.map("div", [(6, 3)] * 5, threads=threads) == [2] * 5
+    with pytest.raises(KeyError):
+        program.map("nothing", [1], threads=threads)
+    with pytest.raises(ValueError):
+        program.map("fib", [1], threads=0)
+    with pytest.raises(TypeError):
+        program.map("fib", [1], mode="python")
+
+
+def test_map_runs_threads_at_once():
+    import time
+
+    program = lang.load(MAPPED, "mapped")
+    work = [24] * 16
+    program.map("fib", work[:1])
+    t = time.perf_counter()
+    one = program.map("fib", work, threads=1)
+    alone = time.perf_counter() - t
+    t = time.perf_counter()
+    many = program.map("fib", work, threads=4)
+    together = time.perf_counter() - t
+    assert one == many
+    import os
+
+    if (os.cpu_count() or 1) >= 4:
+        assert together < alone * 0.7, (alone, together)
+
+
+def test_map_native_host():
+    def count(args, out):
+        data, byte = args[0].b, args[1].i
+        out[0].i = sum(1 for k in range(data.len) if data.ptr[k] == byte)
+        return 0
+
+    native_lang = _engine_lang(("count",))
+    native_lang.native_host("count", _native("bi:i", count))
+    program = native_lang.load("fn n(d, b) { return count(d, b); }\n", "native")
+    items = [(b"abcabca" * k, 97) for k in range(40)]
+    assert program.map("n", items, threads=4) == [3 * k for k in range(40)]
+
+
 def test_the_mode_last_run():
     program = lang.load(SOURCE, "engine")
     # (never run: compiled)
