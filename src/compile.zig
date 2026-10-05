@@ -29,6 +29,7 @@ const grammar_mod = @import("grammar.zig");
 const helpers = @import("helpers.zig");
 const wrapping_mod = @import("wrapping.zig");
 const bytes_mod = @import("bytes.zig");
+const native_mod = @import("native.zig");
 const value = @import("value.zig");
 const objects_mod = @import("objects.zig");
 const types_mod = @import("types.zig");
@@ -1296,6 +1297,7 @@ pub const Compiler = struct {
         .{ "zr_getitem", "bpillllp" },
         .{ "zr_wrapping", "bpiillllp" },
         .{ "zr_read", "bpiillllp" },
+        .{ "zr_native_fail", "bpili" },
         .{ "zr_setitem", "bpillllll" },
         .{ "zr_items", "bpillp" },
         .{ "zr_list_len", "lll" },
@@ -6081,6 +6083,8 @@ const Gen = struct {
             .tuple => |t| t,
             else => return self.seqCall(inst, fv, args_v, receiver),
         };
+        // (a native library's function known here: called directly)
+        if (fv == .py and receiver == null and native_mod.isNative(fv.py)) return self.nativeCall(inst, fv.py, items);
         const fd = try self.materialize(fv, inst.node);
         // The arguments, in a stack array
         const n = items.len;
@@ -6289,9 +6293,95 @@ const Gen = struct {
             return .{ .dyn = rec };
         };
         if (try self.builtinCall(inst, o, args, pos)) |v| return v;
+        // A native library's function: called directly
+        if (native_mod.isNative(o)) return self.nativeCall(inst, o, args);
         // Anything else: called as Python does (its arguments as Python
         // objects)
         return self.callPython(inst, o, args);
+    }
+
+    /// A native host function (native.zig): given arguments of the kinds
+    /// it takes (ints, floats, bools, a Bytes' memory), called directly, no
+    /// Python; any other, through Python (its conversions, its errors). Its
+    /// failure: as the reference mode raises it (zr_native_fail).
+    fn nativeCall(self: *Gen, inst: *Inst, o: *PyObject, args: []const SVal) Error!SVal {
+        const c = self.c;
+        const f = &self.f;
+        const m = &c.m;
+        const t = m.t;
+        const n = native_mod.as(o);
+        if (args.len != n.nargs) return self.callPython(inst, o, args);
+        const idx = try c.objectIndex(o);
+        const ds = try self.a().alloc(Dyn, args.len);
+        for (args, ds) |x, *d| d.* = try self.materialize(x, inst.node);
+        // (the kinds it takes, when the code runs)
+        var ok = m.k1(true);
+        for (n.args(), ds) |kind, d| ok = f.and_(ok, switch (kind) {
+            .int => f.icmp(jit_c.LLVMIntEQ, f.or_(d.tag, self.k(16)), self.k(@intCast(value.PINT_TAG))),
+            .float => f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.float))),
+            .bool => f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.bool))),
+            .bytes => f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.bytes))),
+            .none => unreachable,
+        });
+        const direct = try f.label("native_call");
+        const failed = try f.label("native_failed");
+        const done_direct = try f.label("native_done");
+        const through = try f.label("native_python");
+        const join = try f.label("native_joined");
+        try f.condBr(ok, direct, through);
+        try f.block(direct);
+        const arr = try self.valueSlots(@max(args.len, 1));
+        for (n.args(), ds, 0..) |kind, d, i| {
+            const slot = self.elem(arr, i);
+            switch (kind) {
+                .bytes => {
+                    const p = f.intToPtr(d.bits);
+                    f.store(f.load(t.i64, f.offset(p, @offsetOf(value.Bytes, "ptr"))), slot);
+                    f.store(f.load(t.i64, f.offset(p, @offsetOf(value.Bytes, "len"))), f.offset(slot, 8));
+                },
+                else => f.store(d.bits, slot),
+            }
+        }
+        const result = try self.valSlot();
+        const fn_ty = m.fnType(t.i32, &.{ t.ptr, t.ptr, t.i64, t.ptr });
+        const state = if (n.native.state) |s| self.ptrConst(s) else m.nullPtr();
+        const code = f.call(.{ .v = self.ptrConst(n.native.call), .ty = fn_ty }, &.{ state, arr, self.k(@intCast(args.len)), result });
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, code, m.k32(0)), done_direct, failed);
+        try f.block(failed);
+        _ = self.call("zr_native_fail", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), code });
+        try f.br(self.err_label);
+        try f.block(done_direct);
+        const bits = f.load(t.i64, result);
+        const r: Dyn = switch (n.result) {
+            .int => .{ .tag = self.k(@intCast(value.PINT_TAG)), .bits = bits, .shape = .int },
+            .float => .{ .tag = self.k(@intFromEnum(value.Tag.float)), .bits = bits, .shape = .float },
+            .bool => .{ .tag = self.k(1), .bits = f.zext64(f.icmp(jit_c.LLVMIntNE, bits, self.k(0))), .shape = .bool },
+            else => self.noneDyn(),
+        };
+        const direct_end = f.current;
+        try f.br(join);
+        try f.block(through);
+        const g = try self.callPythonDyns(inst, idx, ds);
+        const through_end = f.current;
+        try f.br(join);
+        try f.block(join);
+        const out = Dyn{ .tag = f.phi(t.i64, r.tag, direct_end, g.tag, through_end), .bits = f.phi(t.i64, r.bits, direct_end, g.bits, through_end), .shape = .any };
+        for (ds) |d| try self.drop(.{ .dyn = d });
+        return .{ .dyn = out };
+    }
+
+    /// A host object of the program called as a host function (zr_call: its
+    /// failure worded as the reference mode words a host function's), its
+    /// arguments made dynamic already (borrowed).
+    fn callPythonDyns(self: *Gen, inst: *Inst, idx: usize, ds: []const Dyn) Error!Dyn {
+        const arr = try self.valueSlots(@max(ds.len, 1));
+        for (ds, 0..) |d, i| try self.storeSlot(self.elem(arr, i), d);
+        _ = self.call("zr_object", &.{ self.ctx, self.k(@intCast(idx)), self.out });
+        const h = try self.loadOut(.any);
+        const ok = self.call("zr_call", &.{ self.ctx, self.k32(inst.node), h.tag, h.bits, arr, self.k(@intCast(ds.len)), self.c.m.nullPtr(), self.out });
+        try self.drop(.{ .dyn = h });
+        try self.check(ok);
+        return self.loadOut(.any);
     }
 
     /// A pointer known when compiling, as an IR constant.

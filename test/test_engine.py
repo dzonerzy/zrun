@@ -10,7 +10,7 @@ from conftest import tiny
 MODES = ["python", "compiled"]
 
 
-def _engine_lang():
+def _engine_lang(more_builtins=()):
     """tiny whose `context()` is the call's context (rt.context)."""
     from zrules import Rules, scopes
 
@@ -24,7 +24,7 @@ def _engine_lang():
                 use="Name",
                 hoist="FuncDef > .name",
                 after="Let > .name",
-                builtins=("print", "context", "u8", "u32le", "u32be", "i16le", "u64le", "size", "at", "part"),
+                builtins=("print", "context", "u8", "u32le", "u32be", "i16le", "u64le", "size", "at", "part") + tuple(more_builtins),
             ),
         ],
     )
@@ -189,6 +189,79 @@ def test_bytes_in_python():
     assert (len(b), b[1], b[-1], bytes(b[1:3]), b[1:3] == b"el", b == bytearray(b"hello"), hash(b) == hash(b"hello")) == (5, 101, 111, b"el", True, True, True)
     with pytest.raises(IndexError):
         b[5]
+
+
+def _native(signature, fn, error=None):
+    """A zrun.native.v1 capsule over a Python function (through ctypes: a
+    native library's would be C)."""
+    import ctypes
+
+    class Data(ctypes.Structure):
+        _fields_ = [("ptr", ctypes.POINTER(ctypes.c_uint8)), ("len", ctypes.c_uint64)]
+
+    class Arg(ctypes.Union):
+        _fields_ = [("i", ctypes.c_int64), ("f", ctypes.c_double), ("b", Data)]
+
+    CALL = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(Arg), ctypes.c_uint64, ctypes.POINTER(Arg))
+    # (the message's address: a buffer kept here, as a library's static text)
+    ERROR = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int)
+
+    class Native(ctypes.Structure):
+        _fields_ = [("abi", ctypes.c_uint32), ("signature", ctypes.c_char_p), ("call", CALL), ("state", ctypes.c_void_p), ("error", ERROR)]
+
+    def call(state, args, n, out):
+        return fn(args, out)
+
+    messages = {}
+
+    def message(state, code):
+        text = (error or (lambda c: b"failed"))(code)
+        messages[code] = ctypes.create_string_buffer(text)
+        return ctypes.addressof(messages[code])
+
+    keep = [CALL(call), ERROR(message), messages]
+    native = Native(1, signature.encode(), keep[0], None, keep[1])
+    ctypes.pythonapi.PyCapsule_New.restype = ctypes.py_object
+    ctypes.pythonapi.PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+    capsule = ctypes.pythonapi.PyCapsule_New(ctypes.addressof(native), b"zrun.native.v1", None)
+    # (alive as long as the capsule's used: the test's)
+    _native.kept.append((native, keep))
+    return capsule
+
+
+_native.kept = []
+
+
+def test_native_host():
+    def count(args, out):
+        data, byte = args[0].b, args[1].i
+        out[0].i = sum(1 for k in range(data.len) if data.ptr[k] == byte)
+        return 0
+
+    def checked(args, out):
+        if args[0].i < 0:
+            return 7
+        out[0].i = args[0].i * 2
+        return 0
+
+    native_lang = _engine_lang(("count", "checked"))
+    native_lang.native_host("count", _native("bi:i", count))
+    native_lang.native_host("checked", _native("i:i", checked, lambda c: b"negative input (code %d)" % c))
+    src = "fn n(d, b) { return count(d, b); }\nfn twice(x) { return checked(x); }\n"
+    results = {}
+    for mode in MODES:
+        program = native_lang.load(src, "native")
+        got = [program.call("n", b"abcabca", 97, mode=mode), program.call("twice", 21, mode=mode)]
+        for args in ((-1,), ("x",)):
+            try:
+                program.call("twice", *args, mode=mode)
+            except zrun.Error as e:
+                got.append(e.diagnostic.message)
+        results[mode] = got
+    assert results["python"] == results["compiled"]
+    assert results["compiled"][:2] == [3, 42]
+    assert "negative input (code 7)" in results["compiled"][2]
+    assert "takes an int" in results["compiled"][3]
 
 
 def test_the_mode_last_run():

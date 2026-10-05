@@ -1154,6 +1154,15 @@ export fn zr_read(ctx: *Ctx, node: u32, r: u32, dt: u64, db: u64, at: u64, ab: u
     return fromResult(ctx, node, @import("bytes.zig").read(read, objs[0], objs[1]), out);
 }
 
+/// A native host function's failure (native.zig, code its call returned):
+/// the error a call through Python gives, RuntimeError(its message).
+export fn zr_native_fail(ctx: *Ctx, node: u32, idx: u64, code: i32) callconv(.c) bool {
+    const o = ctx.objects.items[idx];
+    const n = @import("native.zig").as(o);
+    ph.raise(py.PyExc_RuntimeError(), "{s}", .{@import("native.zig").errorText(n, code)});
+    return hostFailed(ctx, node, o);
+}
+
 /// v[k] = x
 export fn zr_setitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, xt: u64, xb: u64) callconv(.c) bool {
     const v = Value{ .tag = t, .bits = bits };
@@ -2101,7 +2110,7 @@ const helper_names = [_][]const u8{
     "zr_call",     "zr_object",     "zr_frame_new",  "zr_frame_release", "zr_free",
     "zr_list",     "zr_tuple",      "zr_dict",       "zr_record",        "zr_is_record",
     "zr_getattr",  "zr_setattr",    "zr_getitem",    "zr_setitem",       "zr_items",
-    "zr_wrapping", "zr_read",
+    "zr_wrapping", "zr_read", "zr_native_fail",
     "zr_list_len", "zr_list_at",    "zr_append",     "zr_call_method",   "zr_call_python",
     "zr_is_type",  "zr_global",     "zr_format",     "zr_concat",        "zr_unpack",
     "zr_varargs",  "zr_record_new", "zr_isinstance", "zr_call_seq",      "zr_slice",

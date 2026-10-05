@@ -433,6 +433,23 @@ const Language = struct {
         return ref(v.func);
     }
 
+    /// `lang.native_host(name, capsule)`: a native library's function (a
+    /// "zrun.native.v1" capsule, native.zig) as the host function `name`:
+    /// compiled code calls it directly, without Python. The callable made
+    /// for it (zrun.NativeHost).
+    pub fn native_host(self: *Language, name: *PyObject, capsule: *PyObject) ?*PyObject {
+        if (!py.PyUnicode_Check(name)) {
+            ph.raise(py.PyExc_TypeError(), "a host function's name must be a str", .{});
+            return null;
+        }
+        const h = @import("native.zig").make(name, capsule) orelse return null;
+        if (!self.addHost(name, h)) {
+            py.Py_DecRef(h);
+            return null;
+        }
+        return h;
+    }
+
     fn addHost(self: *Language, name: *PyObject, func: *PyObject) bool {
         if (!py.PyUnicode_Check(name)) {
             ph.raise(py.PyExc_TypeError(), "a host function's name must be a str", .{});
@@ -2369,6 +2386,7 @@ fn moduleInit(module: *PyObject) callconv(.c) c_int {
     bridge.init(module) catch return -1;
     @import("proxies.zig").init(module) catch return -1;
     @import("bytes.zig").init(module) catch return -1;
+    @import("native.zig").init(module) catch return -1;
     name_program = ph.newString("<program>") orelse return -1;
     CallerType = py.c.PyType_FromSpec(&caller_spec) orelse return -1;
     // (compiled code words Python's errors as the reference mode does)
