@@ -103,6 +103,9 @@ pub const Dyn = struct {
     shape: Shape,
     /// A record's type, when known (its type's kind: Language.types())
     rtype: ?*value.RecordType = null,
+    /// The language function it most likely is (a variable a function's
+    /// definition binds): called directly, behind a check (directCall)
+    func: u32 = NONE,
 
     fn heapish(self: Dyn) bool {
         return switch (self.shape) {
@@ -2402,7 +2405,15 @@ const Gen = struct {
         try f.block(good);
         try self.increfDyn(v);
         // (a variable of a type whose values' kind is declared: known)
-        return self.typedValue(name_node, .{ .dyn = v });
+        var r = try self.typedValue(name_node, .{ .dyn = v });
+        // (one a function's definition binds: that function, most likely)
+        if (r == .dyn and sym.node != NONE) {
+            const p = d.parents[sym.node];
+            if (p != NONE and c.isFunctionNode(p)) if (c.specOf(p)) |spec| if (program_mod.labelled(d, p, spec.name) == sym.node) {
+                r.dyn.func = p;
+            };
+        }
+        return r;
     }
 
     /// rt.store(name, value), taking the value.
@@ -2607,7 +2618,9 @@ const Gen = struct {
         if (d.shape != .int and d.shape != .any) return d;
         const f = &self.f;
         const plain = f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intCast(value.PINT_TAG)));
-        return .{ .tag = f.select(plain, self.k(2), d.tag), .bits = d.bits, .shape = d.shape };
+        var out = d;
+        out.tag = f.select(plain, self.k(2), d.tag);
+        return out;
     }
 
     /// A Python constant as a value known here.
@@ -5302,13 +5315,70 @@ const Gen = struct {
             try self.storeSlot(p, recv_d.?);
             recv_ptr = p;
         }
-        const ok = self.call("zr_call", &.{ self.ctx, self.k32(inst.node), fd.tag, fd.bits, arr, self.k(@intCast(n)), recv_ptr, self.out });
+        const ok = if (fd.func != NONE and n == try self.paramCount(fd.func))
+            try self.directCall(inst, fd, arr, n, recv_ptr)
+        else
+            self.call("zr_call", &.{ self.ctx, self.k32(inst.node), fd.tag, fd.bits, arr, self.k(@intCast(n)), recv_ptr, self.out });
         // (the call borrowed them)
         for (ds) |d| try self.drop(.{ .dyn = d });
         if (recv_d) |r| try self.drop(.{ .dyn = r });
         try self.drop(.{ .dyn = fd });
         try self.check(ok);
         return .{ .dyn = try self.loadOut(.any) };
+    }
+
+    /// The parameters a language function takes.
+    fn paramCount(self: *Gen, fnode: u32) Error!usize {
+        const spec = self.c.specOf(fnode) orelse return std.math.maxInt(usize);
+        return self.paramNodes(fnode, spec).len;
+    }
+
+    /// A call of a function value that is most likely language function
+    /// `fd.func` given all its parameters: its code called directly, the
+    /// language's call stack kept inline, when the value's code is that
+    /// function's and the stack has room; anything else by zr_call. The
+    /// call's status (an i1).
+    fn directCall(self: *Gen, inst: *Inst, fd: Dyn, arr: ir.Value, n: usize, recv_ptr: ir.Value) Error!ir.Value {
+        const f = &self.f;
+        const m = &self.c.m;
+        const t = m.t;
+        const code = try self.c.functionCode(fd.func);
+        const is_fn = try f.label("call_is_fn");
+        const direct = try f.label("call_direct");
+        const slow = try f.label("call_generic");
+        const join = try f.label("call_done");
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, fd.tag, self.k(@intFromEnum(value.Tag.function))), is_fn, slow);
+        try f.block(is_fn);
+        const fo = f.intToPtr(fd.bits);
+        const its_code = f.load(t.i64, f.offset(fo, @offsetOf(value.Function, "code")));
+        const ctx = self.ctx;
+        const depth_p = f.offset(ctx, @offsetOf(helpers.Ctx, "depth"));
+        const depth = f.load(t.i64, depth_p);
+        const room = f.load(t.i64, f.offset(ctx, @offsetOf(helpers.Ctx, "calls_room")));
+        // (the stack's room is max_depth: below it, a call is allowed)
+        const same = f.icmp(jit_c.LLVMIntEQ, its_code, f.ptrToInt(code));
+        try f.condBr(f.and_(same, f.icmp(jit_c.LLVMIntULT, depth, room)), direct, slow);
+        try f.block(direct);
+        const calls = f.load(t.ptr, f.offset(ctx, @offsetOf(helpers.Ctx, "calls")));
+        const entry = f.offset(calls, 0);
+        const at = f.at(L("LLVMArrayType2")(t.i8, @sizeOf(helpers.CallEntry)), entry, depth);
+        f.store(f.load(t.ptr, f.offset(fo, @offsetOf(value.Function, "name"))), at);
+        f.store(self.k32(inst.node), f.offset(at, @offsetOf(helpers.CallEntry, "node")));
+        f.store(f.add(depth, self.k(1)), depth_p);
+        const env = f.load(t.ptr, f.offset(fo, @offsetOf(value.Function, "env")));
+        const st = f.call(.{ .v = code, .ty = (try self.c.llvmFunction(fd.func)).ty }, &.{ ctx, env, arr, self.k(@intCast(n)), recv_ptr, self.out });
+        f.store(depth, depth_p);
+        // (its result as rt.call gives it: an int an I64)
+        const out_tag = f.load(t.i64, self.out);
+        f.store(f.select(f.icmp(jit_c.LLVMIntEQ, out_tag, self.k(@intCast(value.PINT_TAG))), self.k(@intFromEnum(value.Tag.int)), out_tag), self.out);
+        const direct_end = f.current;
+        try f.br(join);
+        try f.block(slow);
+        const st2 = self.call("zr_call", &.{ self.ctx, self.k32(inst.node), fd.tag, fd.bits, arr, self.k(@intCast(n)), recv_ptr, self.out });
+        const slow_end = f.current;
+        try f.br(join);
+        try f.block(join);
+        return f.phi(t.i1, st, direct_end, st2, slow_end);
     }
 
     /// rt.call(f, args) with args only known at run time (all taken).

@@ -19,7 +19,7 @@ const Tag = value.Tag;
 const allocator = std.heap.c_allocator;
 
 /// A frame of the language's call stack: the function called, where
-pub const CallEntry = struct { name: *value.Str, node: u32 };
+pub const CallEntry = extern struct { name: *value.Str, node: u32 };
 
 /// The execution context of a run (or a call) of compiled code
 pub const Ctx = struct {
@@ -34,8 +34,12 @@ pub const Ctx = struct {
     /// The compiled program running (driver.Compiled.id): its functions'
     /// code is the only code that runs here
     program: u64 = 0,
-    /// The language's calls being run, outermost first
-    calls: std.ArrayListUnmanaged(CallEntry) = .empty,
+    /// The language's calls being run, outermost first: calls[0..depth]
+    /// (room for max_depth of them, made at the first call; compiled code
+    /// pushes and pops them inline too)
+    calls: [*]CallEntry = undefined,
+    calls_room: u64 = 0,
+    depth: u64 = 0,
     max_depth: u32,
     /// The error, once one happened: its node, its message
     failed: bool = false,
@@ -66,7 +70,8 @@ pub const Ctx = struct {
     }
 
     pub fn deinit(self: *Ctx) void {
-        self.calls.deinit(allocator);
+        if (self.calls_room > 0) allocator.free(self.calls[0..self.calls_room]);
+        self.calls_room = 0;
         self.clearError();
         self.exc_msg.deinit(allocator);
         self.err_msg.deinit(allocator);
@@ -122,10 +127,10 @@ pub fn fail(ctx: *Ctx, node: u32, comptime fmt: []const u8, args: anytype) bool 
     ctx.err_msg.clearRetainingCapacity();
     ctx.err_msg.print(allocator, fmt, args) catch {};
     // The stack, innermost first
-    var i = ctx.calls.items.len;
+    var i = ctx.depth;
     while (i > 0) {
         i -= 1;
-        const e = ctx.calls.items[i];
+        const e = ctx.calls[i];
         value.incref(Value.obj(.str, &e.name.head));
         ctx.err_stack.append(allocator, e) catch {};
     }
@@ -824,11 +829,15 @@ pub export fn zr_call(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Val
             if ((nargs < nparams and !policy.missing_none) or (nargs > nparams and policy.extra == .@"error")) {
                 return fail(ctx, node, "{s}() takes {d} argument{s}, {d} given", .{ fo.name.bytes(), nparams, if (nparams == 1) "" else "s", nargs });
             }
-            if (ctx.calls.items.len >= ctx.max_depth) return fail(ctx, node, "call stack too deep (more than {d} calls)", .{ctx.max_depth});
+            if (ctx.depth >= ctx.max_depth) return fail(ctx, node, "call stack too deep (more than {d} calls)", .{ctx.max_depth});
             // (room for the deepest stack made once: a call just stores)
-            if (ctx.calls.capacity < ctx.max_depth) ctx.calls.ensureTotalCapacityPrecise(allocator, ctx.max_depth) catch return fail(ctx, node, "out of memory", .{});
-            ctx.calls.appendAssumeCapacity(.{ .name = fo.name, .node = node });
-            defer _ = ctx.calls.pop();
+            if (ctx.calls_room == 0) {
+                ctx.calls = (allocator.alloc(CallEntry, ctx.max_depth) catch return fail(ctx, node, "out of memory", .{})).ptr;
+                ctx.calls_room = ctx.max_depth;
+            }
+            ctx.calls[ctx.depth] = .{ .name = fo.name, .node = node };
+            ctx.depth += 1;
+            defer ctx.depth -= 1;
             const code: Code = @ptrCast(@alignCast(fo.code.?));
             // (its result as rt.call gives it: an int an I64; its
             // parameters are made I64s by its code)

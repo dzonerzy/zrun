@@ -51,6 +51,8 @@ while i < 15 { print(fib(i)); i = i + 1; }
     "loop_in_function": "fn sum(n) { let s = 0; let i = 0; while i < n { s = s + i; i = i + 1; } return s; }\nprint(sum(100));\n",
     "shadow_params": "let n = 10;\nfn f(n) { return n + 1; }\nprint(f(1), n);\n",
     "early_return_in_loop": "fn first(n) { let i = 0; while 1 { if i * i > n { return i; } i = i + 1; } }\nprint(first(50));\n",
+    # (a function's name bound to another function: called as that one)
+    "rebound_function": "fn a(x) { return x + 1; }\nfn b(x) { return x * 2; }\nprint(a(1));\na = b;\nprint(a(3));\n",
 }
 
 TINY_ERRORS = {
@@ -65,6 +67,7 @@ TINY_ERRORS = {
     "too_deep": "fn f(n) { return f(n + 1); }\nf(0);\n",
     "deep_in_loop": "fn f(n) { let i = 0; while i < 3 { if n > 2 { return 1 / 0; } f(n + 1); i = i + 1; } }\nf(0);\n",
     "big_literal": "let x = 99999999999999999999;\n",
+    "rebound_to_a_value": "fn a(x) { return x; }\nprint(a(1));\na = 5;\na(2);\n",
 }
 
 

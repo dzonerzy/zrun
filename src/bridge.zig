@@ -369,9 +369,9 @@ fn recordThrow(ctx: *Ctx, idx: u32, exc: *PyObject) void {
 
 /// The calls being run, innermost first.
 fn callStack(ctx: *Ctx) ?[]helpers.CallEntry {
-    const n = ctx.calls.items.len;
+    const n = ctx.depth;
     const out = allocator.alloc(helpers.CallEntry, n) catch return null;
-    for (ctx.calls.items, 0..) |e, i| out[n - 1 - i] = e;
+    for (ctx.calls[0..n], 0..) |e, i| out[n - 1 - i] = e;
     return out;
 }
 
