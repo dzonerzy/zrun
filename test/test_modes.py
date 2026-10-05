@@ -330,6 +330,63 @@ def test_common_case_inline(name, capsys):
     assert err is None and out
 
 
+def store_twice(rt, node, value):
+    """Big: its common case (a negative int) inline, the rest out of line,
+    which reads the variable, stores the value, then the old one joined to
+    it."""
+    if isinstance(value, int) and value < 0:
+        return rt.store(node.name, value)
+    old = rt.load(node.name)
+    rt.store(node.name, value)
+    if isinstance(old, str) and isinstance(value, str):
+        joined = value + "<" + old
+        if len(joined) > 40:
+            joined = joined[:20] + "~" + joined[-19:]
+        rt.store(node.name, joined)
+    elif isinstance(old, int) and isinstance(value, int):
+        rt.store(node.name, value * 100 + old % 100 + len(str(value)) * 0 + len(str(old)) * 0)
+    else:
+        rt.store(node.name, value)
+
+
+def _spill_lang():
+    """tiny whose assignments run a helper out of line that reads and
+    stores the function's variables (on the stack: moved into a frame for
+    the call, back after)."""
+    lang = zrun.Language(tiny.PARSER, tiny.RULES)
+    lang.function("FuncDef")
+    lang.exec("Return")(tiny.return_)
+    lang.exec("While")(tiny.while_)
+    lang.eval("Call")(tiny.call)
+    lang.eval("BinOp")(tiny.binop)
+
+    @lang.exec(["Let", "Assign"])
+    def assign(node, rt):
+        if node.kind == "Let":
+            rt.store(node.name, rt.eval(node.value))
+        else:
+            store_twice(rt, node, rt.eval(node.value))
+
+    @lang.host
+    def print(*args):
+        builtins.print(*args)
+
+    return lang
+
+
+SPILL = {
+    "strs": 'fn f(a) { let s = a + "1"; let t = s; s = a + "2"; s = s + "3"; print(s, t); return s; }\nprint(f("x"));\n',
+    "ints_in_a_loop": "fn g(n) { let i = 0; let acc = 7; while i < n { acc = i + 1; i = i + 1; } return acc; }\nprint(g(5), g(0));\n",
+    "both_paths": "fn h(n) { let a = 5; a = 0 - n; let b = a; a = n; return a + b; }\nprint(h(3), h(0 - 2));\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(SPILL))
+def test_variables_moved_into_a_frame(name, capsys):
+    out, err = same_in_every_mode(_spill_lang(), SPILL[name], capsys)
+    assert err is None and out
+
+
 def _python_lang():
     """tiny with calls whose semantics use Python's loops, comprehensions,
     unpacking and item assignment on values known only at run time."""

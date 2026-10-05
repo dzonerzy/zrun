@@ -131,8 +131,19 @@ pub const Module = struct {
         const v = L("LLVMAddFunction")(self.mod, try self.z(name), ty);
         if (!external) L("LLVMSetLinkage")(v, c.LLVMInternalLinkage);
         const f = Fn{ .v = v, .ty = ty };
+        // (values, 16 bytes, written and read as two words: never as one
+        // vector, whose read after two word writes waits for them to reach
+        // the cache, as the runtime's helpers write theirs; floats explicit
+        // still use their registers)
+        self.attribute(f, "noimplicitfloat");
         try self.fns.put(self.gpa, name, f);
         return f;
+    }
+
+    fn attribute(self: *Module, f: Fn, name: []const u8) void {
+        const kind = L("LLVMGetEnumAttributeKindForName")(name.ptr, name.len);
+        const attr = L("LLVMCreateEnumAttribute")(self.ctx, kind, 0);
+        L("LLVMAddAttributeAtIndex")(f.v, std.math.maxInt(c_uint), attr); // (LLVMAttributeFunctionIndex)
     }
 
     pub fn get(self: *Module, name: []const u8) Fn {

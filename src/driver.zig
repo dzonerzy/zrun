@@ -453,13 +453,18 @@ fn defineHelpers(view: *const llvm.LlvmView) bool {
 /// even so).
 fn build(out: *Compiled, data: *program_mod.Data, lang: compile_mod.LangView, prefix: []const u8, compile_error: *PyObject) bool {
     var force_heap = false;
+    // (functions whose code needs their frame: theirs on the heap)
+    var heap_fns: std.ArrayListUnmanaged(u32) = .empty;
+    defer heap_fns.deinit(allocator);
     while (true) {
         out.failure = .{};
         out.compiler = compile_mod.Compiler.init(out.arena.allocator(), data, lang, prefix, &out.failure);
         out.compiler.force_heap = force_heap;
+        out.compiler.heap_fns = heap_fns.items;
         out.compiler.compileProgram() catch |e| {
             const failed = out.compiler.failed_semantic;
             const need_frames = out.compiler.need_frames;
+            const need_frames_of = out.compiler.need_frames_of;
             const need_retry = out.compiler.need_retry;
             // (what this attempt kept)
             for (out.compiler.objects.items) |o| py.Py_DecRef(o);
@@ -467,7 +472,15 @@ fn build(out: *Compiled, data: *program_mod.Data, lang: compile_mod.LangView, pr
             out.compiler.deinit(allocator);
             switch (e) {
                 error.Unsupported => {
-                    // (compiled again with its variables in frames)
+                    // (compiled again with the function's variables in a
+                    // frame; every function's if that wasn't enough)
+                    if (need_frames and need_frames_of != program_mod.NONE and std.mem.indexOfScalar(u32, heap_fns.items, need_frames_of) == null) {
+                        heap_fns.append(allocator, need_frames_of) catch {
+                            _ = py.c.PyErr_NoMemory();
+                            return false;
+                        };
+                        continue;
+                    }
                     if (need_frames and !force_heap) {
                         force_heap = true;
                         continue;

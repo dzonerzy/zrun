@@ -831,6 +831,10 @@ pub const Compiler = struct {
     /// was found
     force_heap: bool = false,
     need_frames: bool = false,
+    /// The function whose code needed its frame (NONE: code that isn't a
+    /// function's own); the driver's list of those, with their frames
+    need_frames_of: u32 = NONE,
+    heap_fns: []const u32 = &.{},
     /// Every layout is on the heap (those made later too)
     all_heap: bool = false,
     /// A literal was marked to be built at run time: compile again
@@ -1404,6 +1408,8 @@ pub const Compiler = struct {
                 if (up == NONE or self.isFunctionNode(up)) break;
             }
         }
+        // Functions whose code needs their frame (an rt handed over...)
+        for (self.heap_fns) |fnode| try self.heapFunction(fnode);
         // Semantics run as Python (and nodes run through the bridge) see the
         // variables through the frames: every function's on the heap
         if (self.force_heap or self.anyPython()) {
@@ -1699,6 +1705,9 @@ const Gen = struct {
     var_slots: std.ArrayListUnmanaged(ir.Value) = .empty,
     /// The argument count (a language function)
     nargs: ir.Value = null,
+    /// Compiling the uncommon rest of a helper (headOf): code calling it a
+    /// function without a frame makes one for (frameForCall)
+    uncommon: u32 = 0,
     /// Variables' values read borrowed (loadVar), by variable
     borrows: std.ArrayListUnmanaged(struct { sym: u32, state: ir.Value, kept: ir.Value }) = .empty,
     /// A function's typed entry: its parameters are the LLVM function's,
@@ -2088,11 +2097,8 @@ const Gen = struct {
             // (handed over: an rt value of the frames here, their scope in
             // the tag's upper word)
             .rt => blk: {
-                const c = self.c;
-                if (!c.allHeap()) {
-                    c.need_frames = true;
-                    return c.unsupported("rt is handed over here: the program needs its variables in frames", .{});
-                }
+                // (the frames here: a function without one gets one,
+                // compiled again: currentFrame)
                 const f = &self.f;
                 const owner = f.zext64(self.k32(self.currentOwner()));
                 const tag = f.or_(self.k(@intFromEnum(value.Tag.rt)), f.shl(owner, self.k(32)));
@@ -2453,9 +2459,10 @@ const Gen = struct {
     fn currentFrame(self: *Gen) Error!ir.Value {
         if (self.scopes.items.len > 0) return self.f.load(self.c.m.t.ptr, self.scopes.items[self.scopes.items.len - 1].slot);
         return self.frame orelse {
-            // (the code here needs its frame: compiled again with every
-            // function's variables in frames)
+            // (the code here needs its frame: compiled again with this
+            // function's variables in a frame)
             self.c.need_frames = true;
+            self.c.need_frames_of = self.fnode;
             return self.c.unsupported("code here needs the frame of a function without one (node {d}): compiled again with frames", .{self.fnode});
         };
     }
@@ -3068,23 +3075,69 @@ const Gen = struct {
     fn runValue(self: *Gen, which: u32, v: SVal, at: u32) Error!SVal {
         const c = self.c;
         const f = &self.f;
-        // (the code it runs sees this code's variables through the frames)
-        if (!c.allHeap()) {
-            c.need_frames = true;
-            return c.unsupported("a node only known at run time is run here: the program needs its variables in frames", .{});
-        }
         c.uses_python = true;
         const d = try self.materialize(v, at);
         const owner = self.currentOwner();
+        // (the code it runs sees this code's variables through the frames)
+        var made: ?ir.Value = null;
         const slot = if (self.scopes.items.len > 0) self.scopes.items[self.scopes.items.len - 1].slot else blk: {
             const s = try f.alloca(c.m.t.ptr);
-            f.store(try self.currentFrame(), s);
+            const fr = try self.frameForCall();
+            if (fr.made) made = fr.frame;
+            f.store(fr.frame, s);
             break :blk s;
         };
         const status = self.call("zr_run_value", &.{ self.ctx, self.k32(which), self.k32(at), d.tag, d.bits, slot, self.k32(owner), self.out });
+        if (made) |fr| try self.reloadFrame(fr);
         try self.drop(.{ .dyn = d });
         try self.statusJumps(status, at);
         return .{ .dyn = try self.loadOut(if (which == 2) .bool else .any) };
+    }
+
+    /// The frame of the code here, for a call of code that sees the
+    /// variables through frames (a helper out of line, a thunk, a semantic
+    /// run as Python): the function's own; one keeping its variables on the
+    /// stack, a frame made for the call, its variables moved into it
+    /// (reloadFrame moves them back: `made`).
+    fn frameForCall(self: *Gen) Error!struct { frame: ir.Value, made: bool } {
+        // (made only for calls on an uncommon path, the rest of a helper out
+        // of line: a function calling such code commonly has a frame of its
+        // own, one made per call of it, not per call of the code)
+        if (self.scopes.items.len > 0 or self.frame != null or self.fnode == NONE or self.detached or self.thunk or self.uncommon == 0)
+            return .{ .frame = try self.currentFrame(), .made = false };
+        const f = &self.f;
+        const t = self.c.m.t;
+        // (borrowed values owned: the code called may store to their
+        // variables)
+        for (self.borrows.items) |b| {
+            var bd = try self.loadSlot(b.kept, .any);
+            bd.state = b.state;
+            try self.owned(bd);
+        }
+        const n = self.layout.syms.items.len;
+        const fr = self.call("zr_frame_new", &.{ self.env, self.k(@intCast(n + 2)) });
+        // (the hidden slots after the variables, as a frame has them)
+        for (self.var_slots.items, 0..) |slot, i| {
+            const p = f.offset(fr, 32 + 16 * @as(i64, @intCast(i)));
+            f.store(f.load(t.i64, slot), p);
+            f.store(f.load(t.i64, f.field(t.val, slot, 1)), f.offset(p, 8));
+        }
+        return .{ .frame = fr, .made = true };
+    }
+
+    /// After a call frameForCall made a frame for: the variables moved back
+    /// (as the code called left them), the frame given up.
+    fn reloadFrame(self: *Gen, fr: ir.Value) Error!void {
+        const f = &self.f;
+        const t = self.c.m.t;
+        for (self.var_slots.items, 0..) |slot, i| {
+            const p = f.offset(fr, 32 + 16 * @as(i64, @intCast(i)));
+            f.store(f.load(t.i64, p), slot);
+            f.store(f.load(t.i64, f.offset(p, 8)), f.field(t.val, slot, 1));
+            // (moved: the frame no longer has it)
+            f.store(self.k(@bitCast(helpers.UNSET)), p);
+        }
+        _ = self.call("zr_frame_release", &.{fr});
     }
 
     /// rt.exec of a node (a block scope with frames: in a new one).
@@ -3318,9 +3371,9 @@ const Gen = struct {
         // tree, which ends)
         for (self.insts.items) |i| if (i.func == func and !(self.insts.items.len < max_tree_depth and otherNode(i, args)))
             return self.outOfLine(func, at, args);
-        // (out of line needs the variables in frames: without them, big
-        // helpers stay inline; one small with what's known here, inline)
-        if (func.size > inline_size and self.c.allHeap() and try self.foldedSize(func, args) > folded_inline_size) {
+        // (big with what's known here: out of line, its code seeing the
+        // variables here through frames, made for the call if need be)
+        if (func.size > inline_size and try self.foldedSize(func, args) > folded_inline_size) {
             if (try self.foldCall(func, args)) |v| return v;
             // (its first `if` small with what's known: that inline, the
             // rest out of line)
@@ -3579,11 +3632,6 @@ const Gen = struct {
     /// here, the first time: HelperSpec); the arguments are taken.
     fn outOfLine(self: *Gen, func: *const front.Function, at: u32, args: []const SVal) Error!SVal {
         const c = self.c;
-        // (its code sees the variables here through the frames)
-        if (!c.allHeap()) {
-            c.need_frames = true;
-            return c.unsupported("a recursive helper is called here: the program needs its variables in frames", .{});
-        }
         if (args.len != func.param_count) return c.unsupportedAt(func, .{ .line = func.first_line }, "called with {d} arguments, takes {d}", .{ args.len, func.param_count });
         // What it's made for: rt, Python objects, None, bools (its code
         // depends on them most, and they're few); nodes, strs and values
@@ -3626,11 +3674,14 @@ const Gen = struct {
         const recv = if (self.detached or fn_here) self.recv_slot else null_ptr;
         const varargs = if (self.detached or (fn_here and c.specOf(self.fnode).?.extra == .keep)) self.varargs_slot else null_ptr;
         const fun = try c.helperFn(spec.name);
-        const call_args = [_]ir.Value{ self.ctx, try self.currentFrame(), arr, self.k32(at), self.k32(self.currentOwner()), recv, varargs, self.out };
+        // (its code sees the variables here through the frames)
+        const fr = try self.frameForCall();
+        const call_args = [_]ir.Value{ self.ctx, fr.frame, arr, self.k32(at), self.k32(self.currentOwner()), recv, varargs, self.out };
         const status = if (try self.siteOf(func, args, key, spec.semantic)) |site|
             try self.siteCall(site, fun, &call_args)
         else
             self.f.call(fun, &call_args);
+        if (fr.made) try self.reloadFrame(fr.frame);
         for (ds) |d| try self.drop(.{ .dyn = d });
         try self.statusJumps(status, at);
         return .{ .dyn = try self.loadOut(.any) };
@@ -4632,6 +4683,8 @@ const Gen = struct {
                     },
                     else => try self.readLocal(inst, @intCast(i), e.pos),
                 };
+                self.uncommon += 1;
+                defer self.uncommon -= 1;
                 return self.outOfLine(inst.func, inst.node, args);
             },
             .local => |slot| {
@@ -5404,7 +5457,7 @@ const Gen = struct {
         // semantics' module having it (the record's type checked); else
         // as Python does it
         const cands = try self.methodCandidates(inst, name, args.len + 1);
-        if (cands.len > 0 and c.allHeap()) return self.recordMethodCall(inst, d, name, args, cands);
+        if (cands.len > 0) return self.recordMethodCall(inst, d, name, args, cands);
         return self.genericMethodCall(inst, d, name, args);
     }
 
