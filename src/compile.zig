@@ -851,6 +851,9 @@ pub const Compiler = struct {
     kinds: std.AutoHashMapUnmanaged(u32, ?Kind) = .empty,
     /// Symbols always set where they're read (Gen.alwaysSet), worked out
     always_set: std.AutoHashMapUnmanaged(u32, bool) = .empty,
+    /// By semantic or helper read: the reads of its locals that move their
+    /// value out (localMoves), worked out
+    local_moves: std.AutoHashMapUnmanaged(*const front.Function, *std.AutoHashMapUnmanaged(*const front.Expr, void)) = .empty,
     /// Functions' typed entries (Gen.typedParams), worked out
     typed_params: std.AutoHashMapUnmanaged(u32, ?[]const Shape) = .empty,
     /// By node: its kind's str (kindTable); by label, its child (fieldTable)
@@ -1458,14 +1461,15 @@ pub const Compiler = struct {
         }
         // (external: modules compiled later, thunks, call them by name)
         if (fnode & TYPED != 0) {
-            // (`<prefix>_t<node>(ctx, env, recv, result, params...)`: its
-            // parameters plain values, of the kinds declared)
+            // (`<prefix>_t<node>(ctx, env, recv, params...)`: its parameters
+            // plain values, of the kinds declared; its result returned, its
+            // tag typed_error for an error)
             const n = self.typed_params.get(fnode & ~TYPED).?.?.len;
-            const params = try self.a.alloc(ir.Type, 4 + n);
-            @memcpy(params[0..4], &[_]ir.Type{ t.ptr, t.ptr, t.ptr, t.ptr });
-            @memset(params[4..], t.i64);
+            const params = try self.a.alloc(ir.Type, typed_first + n);
+            @memcpy(params[0..typed_first], &[_]ir.Type{ t.ptr, t.ptr, t.ptr });
+            @memset(params[typed_first..], t.i64);
             const name = try std.fmt.allocPrint(self.a, "{s}_t{d}", .{ self.m.prefix, fnode & ~TYPED });
-            return self.m.function(name, t.i1, params, true);
+            return self.m.function(name, t.val, params, true);
         }
         const name = try std.fmt.allocPrint(self.a, "{s}_f{d}", .{ self.m.prefix, fnode });
         return self.m.function(name, t.i1, &.{ t.ptr, t.ptr, t.ptr, t.i64, t.ptr, t.ptr }, true);
@@ -1474,6 +1478,10 @@ pub const Compiler = struct {
     /// A function node's typed entry, in the queue and the compiled
     /// functions: the node with this bit.
     pub const TYPED: u32 = 1 << 30;
+    /// A typed entry's first parameter of the function's own
+    const typed_first = 3;
+    /// The tag a typed entry's result has when it failed (no value's)
+    pub const typed_error: i64 = 0xFFFF0001;
 
     /// The code of a language function (`fnode | TYPED`: its typed entry),
     /// compiled (queued if it isn't yet).
@@ -1484,6 +1492,18 @@ pub const Compiler = struct {
             try self.queue.append(self.a, fnode);
         }
         return (try self.llvmFunction(fnode)).v;
+    }
+
+    /// Whether a read of a local moves its value out (localMoves).
+    fn isMove(self: *Compiler, func: *const front.Function, e: *const front.Expr) !bool {
+        const moves = self.local_moves.get(func) orelse blk: {
+            const m = try self.a.create(std.AutoHashMapUnmanaged(*const front.Expr, void));
+            m.* = .empty;
+            try localMoves(func.body, m, self.a);
+            try self.local_moves.put(self.a, func, m);
+            break :blk m;
+        };
+        return moves.contains(e);
     }
 
     /// The record type of a class, if its objects are records (recordOf).
@@ -1515,7 +1535,8 @@ pub const Compiler = struct {
             g.args = self.m.nullPtr();
             g.nargs = g.k(@intCast(self.typed_params.get(fnode).?.?.len));
             g.recv = g.f.param(2);
-            g.result = g.f.param(3);
+            // (its result returned: kept here till then)
+            g.result = try g.f.alloca(self.m.t.val);
         } else {
             g.env = g.f.param(1);
             g.args = g.f.param(2);
@@ -1905,10 +1926,13 @@ const Gen = struct {
         try f.br(self.ret_label);
         try f.block(self.ret_label);
         try self.releaseFrame();
-        try f.ret(self.c.m.k1(true));
+        if (self.typed) try f.ret(f.load(self.c.m.t.val, self.result)) else try f.ret(self.c.m.k1(true));
         try f.block(self.err_label);
         try self.releaseFrame();
-        try f.ret(self.c.m.k1(false));
+        if (self.typed) {
+            try self.storeSlot(self.result, .{ .tag = self.k(Compiler.typed_error), .bits = self.k(0), .shape = .any });
+            try f.ret(f.load(self.c.m.t.val, self.result));
+        } else try f.ret(self.c.m.k1(false));
     }
 
     /// Drop the function's variables (its heap frame, or its stack slots'
@@ -2634,7 +2658,7 @@ const Gen = struct {
             const shapes = (try self.typedParams(fnode)).?;
             for (self.paramNodes(fnode, spec), shapes, 0..) |p, s, i| {
                 const tag: value.Tag = if (s == .int) .int else shapeTag(s);
-                try self.storeVar(p, dyn(self.k(@intCast(@intFromEnum(tag))), self.f.param(@intCast(4 + i)), s));
+                try self.storeVar(p, dyn(self.k(@intCast(@intFromEnum(tag))), self.f.param(@intCast(Compiler.typed_first + i)), s));
             }
             return;
         }
@@ -4413,7 +4437,15 @@ const Gen = struct {
             .str => |s| return .{ .str = s },
             .bool => |b| return .{ .bool = b },
             .none => return .none,
-            .local => |slot| return self.readLocal(inst, slot, e.pos),
+            .local => |slot| {
+                // (its last read: its value moved out, the local done with)
+                if (inst.locals[slot] == .static and inst.dyn_depth == 0 and try self.c.isMove(inst.func, e)) {
+                    const v = inst.locals[slot].static;
+                    inst.locals[slot] = .unset;
+                    return v;
+                }
+                return self.readLocal(inst, slot, e.pos);
+            },
             .global => |name| return self.global(inst, name, e.pos),
             .attr => |x| {
                 const obj = try self.expr(inst, x.obj);
@@ -5596,10 +5628,16 @@ const Gen = struct {
         const env = f.load(t.ptr, f.offset(fo, @offsetOf(value.Function, "env")));
         const st = if (typed) blk: {
             const entry_code = try self.c.functionCode(fd.func | Compiler.TYPED);
-            const params = try self.a().alloc(ir.Value, 4 + n);
-            @memcpy(params[0..4], &[_]ir.Value{ ctx, env, recv_ptr, self.out });
-            for (params[4..], ds) |*p, d| p.* = d.bits;
-            break :blk f.call(.{ .v = entry_code, .ty = (try self.c.llvmFunction(fd.func | Compiler.TYPED)).ty }, params);
+            const first = Compiler.typed_first;
+            const params = try self.a().alloc(ir.Value, first + n);
+            @memcpy(params[0..first], &[_]ir.Value{ ctx, env, recv_ptr });
+            for (params[first..], ds) |*p, d| p.* = d.bits;
+            const r = f.call(.{ .v = entry_code, .ty = (try self.c.llvmFunction(fd.func | Compiler.TYPED)).ty }, params);
+            // (its result where rt.call's goes)
+            const rtag = f.extract(r, 0);
+            f.store(rtag, self.out);
+            f.store(f.extract(r, 1), f.field(t.val, self.out, 1));
+            break :blk f.icmp(jit_c.LLVMIntNE, rtag, self.k(Compiler.typed_error));
         } else f.call(.{ .v = code, .ty = (try self.c.llvmFunction(fd.func)).ty }, &.{ ctx, env, arr, self.k(@intCast(n)), recv_ptr, self.out });
         f.store(depth, depth_p);
         // (its result as rt.call gives it: an int an I64)
@@ -6961,6 +6999,164 @@ fn collectReads(body: []const front.Stmt, skip: []const front.Stmt, set: *std.Au
         },
         .break_, .continue_, .pass => {},
     };
+}
+
+/// A read of a local: where (null: a target's, an augmented assignment's),
+/// and whether it's always evaluated once its statement runs (not in a
+/// branch of a condition, a comprehension, a short-circuit)
+const LocalRead = struct { slot: u32, e: ?*const front.Expr, plain: bool };
+
+/// The reads of locals whose value can be moved out (no reference of
+/// their own, the local done with): in a simple statement of the
+/// function's body itself, the only read of its local there, none after.
+fn localMoves(body: []const front.Stmt, moves: *std.AutoHashMapUnmanaged(*const front.Expr, void), a: Allocator) !void {
+    var reads = try a.alloc(std.ArrayListUnmanaged(LocalRead), body.len);
+    var last: std.AutoHashMapUnmanaged(u32, usize) = .empty;
+    for (body, 0..) |s, i| {
+        reads[i] = .empty;
+        try stmtLocalReads(s, true, &reads[i], a);
+        for (reads[i].items) |r| try last.put(a, r.slot, i);
+    }
+    for (body, 0..) |s, i| {
+        switch (s.kind) {
+            .assign, .expr, .return_ => {},
+            else => continue,
+        }
+        for (reads[i].items) |r| {
+            const e = r.e orelse continue;
+            if (!r.plain or last.get(r.slot).? != i) continue;
+            var n: usize = 0;
+            for (reads[i].items) |o| {
+                if (o.slot == r.slot) n += 1;
+            }
+            if (n == 1) try moves.put(a, e, {});
+        }
+    }
+}
+
+fn stmtLocalReads(s: front.Stmt, plain: bool, out: *std.ArrayListUnmanaged(LocalRead), a: Allocator) Allocator.Error!void {
+    switch (s.kind) {
+        .assign => |x| {
+            try localReads(x.value, plain, out, a);
+            for (x.targets) |t| try targetLocalReads(t, out, a);
+        },
+        .aug => |x| {
+            try targetLocalReads(x.target, out, a);
+            if (x.target == .local) try out.append(a, .{ .slot = x.target.local, .e = null, .plain = false });
+            try localReads(x.value, false, out, a);
+        },
+        .expr => |e| try localReads(e, plain, out, a),
+        .return_, .raise_ => |e| if (e) |x| try localReads(x, plain, out, a),
+        .assert_ => |x| {
+            try localReads(x.test_, false, out, a);
+            if (x.msg) |m| try localReads(m, false, out, a);
+        },
+        .if_ => |x| {
+            try localReads(x.test_, false, out, a);
+            for (x.body) |y| try stmtLocalReads(y, false, out, a);
+            for (x.else_) |y| try stmtLocalReads(y, false, out, a);
+        },
+        .while_ => |x| {
+            try localReads(x.test_, false, out, a);
+            for (x.body) |y| try stmtLocalReads(y, false, out, a);
+            for (x.else_) |y| try stmtLocalReads(y, false, out, a);
+        },
+        .for_ => |x| {
+            try targetLocalReads(x.target, out, a);
+            try localReads(x.iter, false, out, a);
+            for (x.body) |y| try stmtLocalReads(y, false, out, a);
+            for (x.else_) |y| try stmtLocalReads(y, false, out, a);
+        },
+        .try_ => |x| {
+            for (x.body) |y| try stmtLocalReads(y, false, out, a);
+            for (x.else_) |y| try stmtLocalReads(y, false, out, a);
+            for (x.finally) |y| try stmtLocalReads(y, false, out, a);
+            for (x.handlers) |h| {
+                if (h.type_) |e| try localReads(e, false, out, a);
+                for (h.body) |y| try stmtLocalReads(y, false, out, a);
+            }
+        },
+        .break_, .continue_, .pass => {},
+    }
+}
+
+fn targetLocalReads(t: front.Target, out: *std.ArrayListUnmanaged(LocalRead), a: Allocator) Allocator.Error!void {
+    switch (t) {
+        .local => {},
+        .tuple => |ts| for (ts) |x| try targetLocalReads(x, out, a),
+        .attr => |x| try localReads(x.obj, false, out, a),
+        .index => |x| {
+            try localReads(x.obj, false, out, a);
+            try localReads(x.index, false, out, a);
+        },
+    }
+}
+
+fn localReads(e: *const front.Expr, plain: bool, out: *std.ArrayListUnmanaged(LocalRead), a: Allocator) Allocator.Error!void {
+    switch (e.kind) {
+        .local => |slot| try out.append(a, .{ .slot = slot, .e = e, .plain = plain }),
+        .int, .big, .float, .str, .bool, .none, .global => {},
+        .attr => |x| try localReads(x.obj, plain, out, a),
+        .index => |x| {
+            try localReads(x.obj, plain, out, a);
+            try localReads(x.index, plain, out, a);
+        },
+        .slice => |x| {
+            try localReads(x.obj, plain, out, a);
+            inline for (.{ x.lo, x.hi, x.step }) |p| if (p) |y| try localReads(y, plain, out, a);
+        },
+        .call => |x| {
+            try localReads(x.func, plain, out, a);
+            for (x.args) |y| try localReads(y, plain, out, a);
+            for (x.keywords) |k| try localReads(k.value, plain, out, a);
+        },
+        .binary => |x| {
+            try localReads(x.left, plain, out, a);
+            try localReads(x.right, plain, out, a);
+        },
+        .unary => |x| try localReads(x.operand, plain, out, a),
+        .list, .tuple => |xs| for (xs) |y| try localReads(y, plain, out, a),
+        .and_, .or_ => |xs| for (xs) |y| try localReads(y, false, out, a),
+        .compare => |x| {
+            try localReads(x.first, plain, out, a);
+            for (x.rest) |y| try localReads(y, false, out, a);
+        },
+        .cond => |x| {
+            try localReads(x.test_, false, out, a);
+            try localReads(x.then, false, out, a);
+            try localReads(x.else_, false, out, a);
+        },
+        .dict => |x| {
+            for (x.keys) |y| try localReads(y, plain, out, a);
+            for (x.values) |y| try localReads(y, plain, out, a);
+        },
+        .list_comp, .gen_exp => |c| {
+            try localReads(c.elt, false, out, a);
+            for (c.generators) |g| {
+                try localReads(g.iter, false, out, a);
+                for (g.ifs) |y| try localReads(y, false, out, a);
+            }
+        },
+        .dict_comp => |c| {
+            try localReads(c.key, false, out, a);
+            try localReads(c.value, false, out, a);
+            for (c.generators) |g| {
+                try localReads(g.iter, false, out, a);
+                for (g.ifs) |y| try localReads(y, false, out, a);
+            }
+        },
+        .fstring => |parts| for (parts) |p| try fpartLocalReads(p, out, a),
+    }
+}
+
+fn fpartLocalReads(p: front.FPart, out: *std.ArrayListUnmanaged(LocalRead), a: Allocator) Allocator.Error!void {
+    switch (p) {
+        .text => {},
+        .value => |v| {
+            try localReads(v.expr, false, out, a);
+            for (v.spec) |s| try fpartLocalReads(s, out, a);
+        },
+    }
 }
 
 /// (a target's reads: an attribute's or item's object and index)

@@ -158,7 +158,7 @@ print(fib(15), pick(3, 4, false), pick(xs[0], 2, false), pick(1, xs[1], true), a
         assert capsys.readouterr().out == "610 4 2 1 12\n610 4 2 1 12\n"
         ir = typed.lang.load(src, "prog").compiled_ir()
         # (fib's and pick's typed entries)
-        assert ir.count("define i1 @zr_ir_t") == 2
+        assert ir.count("define { i64, i64 } @zr_ir_t") == 2
 
     def test_not_a_mapping(self):
         with pytest.raises(TypeError):
