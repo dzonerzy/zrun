@@ -1592,6 +1592,8 @@ pub const Compiler = struct {
 /// A semantic running inline: its function, node, locals
 const Inst = struct {
     func: *const front.Function,
+    /// The arguments it started with
+    args: []const SVal = &.{},
     /// The node it runs for (errors are reported at it)
     node: u32,
     locals: []Local,
@@ -3279,14 +3281,54 @@ const Gen = struct {
     /// big helpers would make code without end.)
     fn callHelper(self: *Gen, func: *const front.Function, at: u32, given: []const SVal) Error!SVal {
         const args = try self.withDefaults(func, given);
-        for (self.insts.items) |i| if (i.func == func) return self.outOfLine(func, at, args);
+        // (one already running here, called again: out of line, unless it's
+        // called for another node than each run of it here, a walk down the
+        // tree, which ends)
+        for (self.insts.items) |i| if (i.func == func and !(self.insts.items.len < max_tree_depth and otherNode(i, args)))
+            return self.outOfLine(func, at, args);
         // (out of line needs the variables in frames: without them, big
-        // helpers stay inline)
-        if (func.size > inline_size and self.c.allHeap()) {
-            if (try self.foldCall(func, args)) |v| return v;
+        // helpers stay inline; one small with what's known here, inline)
+        if (func.size > inline_size and self.c.allHeap() and try self.foldedSize(func, args) > folded_inline_size) {            if (try self.foldCall(func, args)) |v| return v;
             return self.outOfLine(func, at, args);
         }
         return self.runFunction(func, at, args);
+    }
+
+    /// The biggest helper run inline as what's known makes it (FoldedSize)
+    const folded_inline_size = 40;
+    /// How deep helpers run inline walking down the tree (otherNode)
+    const max_tree_depth = 64;
+
+    /// Whether a helper's arguments have a node, known, where a run of it
+    /// had another node.
+    fn otherNode(run: *const Inst, args: []const SVal) bool {
+        for (args, 0..) |x, i| {
+            if (x != .node or i >= run.args.len) continue;
+            const was = run.args[i];
+            if (was == .node and was.node != x.node) return true;
+        }
+        return false;
+    }
+
+    /// A helper's size run inline with these arguments (FoldedSize).
+    fn foldedSize(self: *Gen, func: *const front.Function, args: []const SVal) Error!usize {
+        const globals = ph.attr(func.py_function, "__globals__") orelse return error.Python;
+        defer py.Py_DecRef(globals);
+        const known = try self.a().alloc(FoldedSize.Known, func.locals.len);
+        @memset(known, .unknown);
+        var fs = FoldedSize{ .data = self.c.data, .globals = globals, .known = known, .a = self.a() };
+        defer fs.deinit();
+        for (args, 0..) |x, i| known[i] = switch (x) {
+            .node => |n| .{ .node = n },
+            .str => |s| fs.keep(ph.newString(s)) orelse .unknown,
+            .int, .pint => |n| fs.keep(py.c.PyLong_FromLongLong(n)) orelse .unknown,
+            .none => .{ .obj = py.Py_None() },
+            .bool => |b| .{ .obj = if (b) py.Py_True() else py.Py_False() },
+            .py => |o| .{ .obj = o },
+            else => .unknown,
+        };
+        _ = try fs.stmts(func.body);
+        return fs.n;
     }
 
     /// A pure helper (pureFunction) given constants (a literal's text...):
@@ -3552,7 +3594,7 @@ const Gen = struct {
         if (args.len != func.param_count) return self.c.unsupportedAt(func, .{ .line = func.first_line }, "called with {d} arguments, takes {d}", .{ args.len, func.param_count });
         for (args, 0..) |arg, i| locals[i] = .{ .static = arg };
         const inst = try self.a().create(Inst);
-        inst.* = .{ .func = func, .node = at, .locals = locals, .exit_label = try self.f.label("ret"), .loop_level0 = self.loop_level };
+        inst.* = .{ .func = func, .args = args, .node = at, .locals = locals, .exit_label = try self.f.label("ret"), .loop_level0 = self.loop_level };
         try self.insts.append(self.a(), inst);
         defer _ = self.insts.pop();
 
@@ -6514,6 +6556,13 @@ const Gen = struct {
                 const same = l.node == r.node;
                 return .{ .bool = if (op == .eq) same else !same };
             }
+            // (a str in constant strs: `op in OPS`)
+            if ((op == .in or op == .not_in) and l == .str) if (try self.staticStrs(op, r)) |keys| {
+                const found = for (keys) |key| {
+                    if (std.mem.eql(u8, key, l.str)) break true;
+                } else false;
+                return .{ .bool = found == (op == .in) };
+            };
         }
         // A run-time value against None: its tag
         if ((op == .is or op == .is_not) and (l == .none or r == .none)) {
@@ -7053,6 +7102,275 @@ fn collectReads(body: []const front.Stmt, skip: []const front.Stmt, set: *std.Au
         .break_, .continue_, .pass => {},
     };
 }
+
+/// A helper's size (its expressions) as running it inline with known
+/// arguments makes it: an `if` whose test they decide (an operator's text
+/// compared, a node's kind looked up in a table of the module) counts only
+/// the side taken, nothing after a `return` taken counts. An estimate, for
+/// whether to run it inline: what it gets wrong costs speed or compiling,
+/// never results.
+const FoldedSize = struct {
+    data: *const program_mod.Data,
+    globals: *PyObject,
+    known: []Known,
+    /// Objects made here (released at the end)
+    made: std.ArrayListUnmanaged(*PyObject) = .empty,
+    a: Allocator,
+    n: usize = 0,
+
+    const Known = union(enum) { unknown, node: u32, obj: *PyObject };
+
+    fn deinit(self: *FoldedSize) void {
+        for (self.made.items) |o| py.Py_DecRef(o);
+    }
+
+    fn keep(self: *FoldedSize, o: ?*PyObject) ?Known {
+        const x = o orelse {
+            py.c.PyErr_Clear();
+            return null;
+        };
+        self.made.append(self.a, x) catch {
+            py.Py_DecRef(x);
+            return null;
+        };
+        return .{ .obj = x };
+    }
+
+    /// The statements' size; whether they surely return (or raise).
+    fn stmts(self: *FoldedSize, body: []const front.Stmt) Allocator.Error!bool {
+        for (body) |s| if (try self.stmt(s)) return true;
+        return false;
+    }
+
+    fn stmt(self: *FoldedSize, s: front.Stmt) Allocator.Error!bool {
+        switch (s.kind) {
+            .assign => |x| {
+                self.count(x.value);
+                const v = self.eval(x.value);
+                for (x.targets) |t| try self.forget(t);
+                if (x.targets.len == 1 and x.targets[0] == .local) self.known[x.targets[0].local] = v orelse .unknown;
+            },
+            .aug => |x| {
+                self.count(x.value);
+                try self.forget(x.target);
+            },
+            .expr => |e| self.count(e),
+            .return_, .raise_ => |e| {
+                if (e) |x| self.count(x);
+                return true;
+            },
+            .if_ => |x| {
+                self.count(x.test_);
+                if (self.truth(x.test_)) |b| return self.stmts(if (b) x.body else x.else_);
+                // (both sides: what either assigns isn't known after)
+                const saved = try self.a.dupe(Known, self.known);
+                const r1 = try self.stmts(x.body);
+                @memcpy(self.known, saved);
+                const r2 = try self.stmts(x.else_);
+                @memcpy(self.known, saved);
+                try self.forgetAssigned(&.{s});
+                return r1 and r2;
+            },
+            else => {
+                // (loops, try: all of it, their assignments not known after)
+                self.n += countStmt(s);
+                try self.forgetAssigned(&.{s});
+            },
+        }
+        return false;
+    }
+
+    fn forget(self: *FoldedSize, t: front.Target) Allocator.Error!void {
+        switch (t) {
+            .local => |slot| self.known[slot] = .unknown,
+            .tuple => |ts| for (ts) |x| try self.forget(x),
+            .attr, .index => {},
+        }
+    }
+
+    fn forgetAssigned(self: *FoldedSize, body: []const front.Stmt) Allocator.Error!void {
+        var set: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        try collectAssigned(body, &set, self.a);
+        var it = set.keyIterator();
+        while (it.next()) |slot| self.known[slot.*] = .unknown;
+    }
+
+    fn count(self: *FoldedSize, e: *const front.Expr) void {
+        self.n += countExpr(e);
+    }
+
+    fn truth(self: *FoldedSize, e: *const front.Expr) ?bool {
+        const v = self.eval(e) orelse return null;
+        return switch (v) {
+            .unknown => null,
+            .node => true,
+            .obj => |o| blk: {
+                const r = py.c.PyObject_IsTrue(o);
+                if (r < 0) {
+                    py.c.PyErr_Clear();
+                    break :blk null;
+                }
+                break :blk r == 1;
+            },
+        };
+    }
+
+    fn eval(self: *FoldedSize, e: *const front.Expr) ?Known {
+        switch (e.kind) {
+            .str => |s| return self.keep(ph.newString(s)),
+            .int => |n| return self.keep(py.c.PyLong_FromLongLong(n)),
+            .bool => |b| return .{ .obj = if (b) py.Py_True() else py.Py_False() },
+            .none => return .{ .obj = py.Py_None() },
+            .local => |slot| return switch (self.known[slot]) {
+                .unknown => null,
+                else => self.known[slot],
+            },
+            .global => |name| {
+                const key = ph.newString(name) orelse {
+                    py.c.PyErr_Clear();
+                    return null;
+                };
+                defer py.Py_DecRef(key);
+                return .{ .obj = py.c.PyDict_GetItem(self.globals, key) orelse return null };
+            },
+            .attr => |x| {
+                const o = self.eval(x.obj) orelse return null;
+                if (o != .node) return null;
+                if (std.mem.eql(u8, x.name, "kind")) return self.keep(ph.newString(self.data.grammar.kind_names[self.data.rule(o.node)]));
+                if (std.mem.eql(u8, x.name, "text")) return self.keep(ph.newString(self.data.text(o.node)));
+                return null;
+            },
+            .unary => |x| {
+                if (x.op != .not_) return null;
+                const b = self.truth(x.operand) orelse return null;
+                return .{ .obj = if (b) py.Py_False() else py.Py_True() };
+            },
+            .and_, .or_ => |xs| {
+                const is_and = e.kind == .and_;
+                for (xs) |y| {
+                    const b = self.truth(y) orelse return null;
+                    if (b != is_and) return .{ .obj = if (b) py.Py_True() else py.Py_False() };
+                }
+                return .{ .obj = if (is_and) py.Py_True() else py.Py_False() };
+            },
+            .compare => |x| {
+                if (x.ops.len != 1) return null;
+                const l = self.eval(x.first) orelse return null;
+                const r = self.eval(x.rest[0]) orelse return null;
+                if (l != .obj or r != .obj) return null;
+                const result: c_int = switch (x.ops[0]) {
+                    .eq => py.c.PyObject_RichCompareBool(l.obj, r.obj, py.c.Py_EQ),
+                    .ne => py.c.PyObject_RichCompareBool(l.obj, r.obj, py.c.Py_NE),
+                    .is => @intFromBool(l.obj == r.obj),
+                    .is_not => @intFromBool(l.obj != r.obj),
+                    .in => py.c.PySequence_Contains(r.obj, l.obj),
+                    .not_in => blk: {
+                        const c = py.c.PySequence_Contains(r.obj, l.obj);
+                        break :blk if (c < 0) c else 1 - c;
+                    },
+                    else => return null,
+                };
+                if (result < 0) {
+                    py.c.PyErr_Clear();
+                    return null;
+                }
+                return .{ .obj = if (result == 1) py.Py_True() else py.Py_False() };
+            },
+            else => return null,
+        }
+    }
+
+    fn countStmt(s: front.Stmt) usize {
+        var n: usize = 0;
+        switch (s.kind) {
+            .assign => |x| n += countExpr(x.value),
+            .aug => |x| n += countExpr(x.value),
+            .expr => |e| n += countExpr(e),
+            .return_, .raise_ => |e| if (e) |x| {
+                n += countExpr(x);
+            },
+            .assert_ => |x| n += countExpr(x.test_),
+            .if_ => |x| {
+                n += countExpr(x.test_);
+                for (x.body) |y| n += countStmt(y);
+                for (x.else_) |y| n += countStmt(y);
+            },
+            .while_ => |x| {
+                n += countExpr(x.test_);
+                for (x.body) |y| n += countStmt(y);
+                for (x.else_) |y| n += countStmt(y);
+            },
+            .for_ => |x| {
+                n += countExpr(x.iter);
+                for (x.body) |y| n += countStmt(y);
+                for (x.else_) |y| n += countStmt(y);
+            },
+            .try_ => |x| {
+                for (x.body) |y| n += countStmt(y);
+                for (x.else_) |y| n += countStmt(y);
+                for (x.finally) |y| n += countStmt(y);
+                for (x.handlers) |h| for (h.body) |y| {
+                    n += countStmt(y);
+                };
+            },
+            .break_, .continue_, .pass => {},
+        }
+        return n;
+    }
+
+    fn countExpr(e: *const front.Expr) usize {
+        var n: usize = 1;
+        switch (e.kind) {
+            .int, .big, .float, .str, .bool, .none, .global, .local => {},
+            .attr => |x| n += countExpr(x.obj),
+            .index => |x| n += countExpr(x.obj) + countExpr(x.index),
+            .slice => |x| {
+                n += countExpr(x.obj);
+                inline for (.{ x.lo, x.hi, x.step }) |p| if (p) |y| {
+                    n += countExpr(y);
+                };
+            },
+            .call => |x| {
+                n += countExpr(x.func);
+                for (x.args) |y| n += countExpr(y);
+                for (x.keywords) |k| n += countExpr(k.value);
+            },
+            .binary => |x| n += countExpr(x.left) + countExpr(x.right),
+            .unary => |x| n += countExpr(x.operand),
+            .and_, .or_, .list, .tuple => |xs| for (xs) |y| {
+                n += countExpr(y);
+            },
+            .compare => |x| {
+                n += countExpr(x.first);
+                for (x.rest) |y| n += countExpr(y);
+            },
+            .cond => |x| n += countExpr(x.test_) + countExpr(x.then) + countExpr(x.else_),
+            .dict => |x| {
+                for (x.keys) |y| n += countExpr(y);
+                for (x.values) |y| n += countExpr(y);
+            },
+            .list_comp, .gen_exp => |c| {
+                n += countExpr(c.elt);
+                for (c.generators) |g| {
+                    n += countExpr(g.iter);
+                    for (g.ifs) |y| n += countExpr(y);
+                }
+            },
+            .dict_comp => |c| {
+                n += countExpr(c.key) + countExpr(c.value);
+                for (c.generators) |g| {
+                    n += countExpr(g.iter);
+                    for (g.ifs) |y| n += countExpr(y);
+                }
+            },
+            .fstring => |parts| for (parts) |p| switch (p) {
+                .text => {},
+                .value => |v| n += countExpr(v.expr),
+            },
+        }
+        return n;
+    }
+};
 
 /// A read of a local: where (null: a target's, an augmented assignment's),
 /// and whether it's always evaluated once its statement runs (not in a

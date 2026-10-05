@@ -504,12 +504,14 @@ pub fn newRecord(rtype: *const RecordType) ?*Record {
     return r;
 }
 
-pub fn newFrame(parent: ?*Frame, n: usize) ?*Frame {
+/// A frame of n slots, each `fill` (a word pattern, not a byte's: a loop
+/// writing it, not a call of memset, compiler_rt's going a byte at a time).
+pub fn newFrame(parent: ?*Frame, n: usize, fill: Value) ?*Frame {
     const mem = allocator.alignedAlloc(u8, .of(Frame), @sizeOf(Frame) + n * @sizeOf(Value)) catch return null;
     const f: *Frame = @ptrCast(mem.ptr);
     if (parent) |p| increfObj(&p.head);
     f.* = .{ .head = .{ .rc = 1, .kind = KIND_FRAME }, .parent = parent, .len = n };
-    @memset(f.slots(), Value.none_v);
+    for (f.slots()) |*s| s.* = fill;
     return f;
 }
 

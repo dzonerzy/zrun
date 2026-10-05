@@ -920,9 +920,7 @@ export fn zr_frame_of(frame: *value.Frame, owner: u32, home: u32, owners: [*]con
 }
 
 pub export fn zr_frame_new(parent: ?*value.Frame, n: u64) callconv(.c) ?*value.Frame {
-    const f = value.newFrame(parent, n) orelse return null;
-    for (f.slots()) |*s| s.tag = UNSET;
-    return f;
+    return value.newFrame(parent, n, .{ .tag = UNSET, .bits = 0 });
 }
 
 export fn zr_frame_release(f: *value.Frame) callconv(.c) void {
@@ -943,15 +941,25 @@ fn oomFail(ctx: *Ctx, node: u32) bool {
 /// A new list of n items (taking the references).
 export fn zr_list(ctx: *Ctx, node: u32, items: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
     const l = value.newList(n) orelse return oomFail(ctx, node);
-    for (items[0..n]) |v| _ = value.listPush(l, v);
+    // (room for n made: the items written in place)
+    for (0..n) |i| l.items.?[i] = given(&items[i]);
+    l.len = n;
     out.* = Value.obj(.list, &l.head);
     return true;
+}
+
+/// A value compiled code just stored (its tag and bits, 8 bytes each), read
+/// as it was stored: a 16-byte read of them waits for the stores to
+/// reach the cache.
+fn given(p: *const Value) Value {
+    const words: *const volatile [2]u64 = @ptrCast(p);
+    return .{ .tag = words[0], .bits = words[1] };
 }
 
 /// A new tuple of n items (taking the references).
 export fn zr_tuple(ctx: *Ctx, node: u32, items: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
     const t = value.newTuple(n) orelse return oomFail(ctx, node);
-    @memcpy(t.slice(), items[0..n]);
+    for (t.slice(), 0..) |*slot, i| slot.* = given(&items[i]);
     out.* = Value.obj(.tuple, &t.head);
     return true;
 }
@@ -973,7 +981,7 @@ export fn zr_dict(ctx: *Ctx, node: u32, keys: [*]const Value, vals: [*]const Val
 /// A new record of a type with its fields (taking the references).
 export fn zr_record(ctx: *Ctx, node: u32, rtype: *const value.RecordType, fields: [*]const Value, out: *Value) callconv(.c) bool {
     const r = value.newRecord(rtype) orelse return oomFail(ctx, node);
-    @memcpy(r.fields(), fields[0..rtype.fields.len]);
+    for (r.fields(), 0..) |*slot, i| slot.* = given(&fields[i]);
     out.* = Value.obj(.record, &r.head);
     return true;
 }
