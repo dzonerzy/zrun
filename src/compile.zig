@@ -5066,6 +5066,8 @@ const Gen = struct {
         const sized = try f.label("len_sized");
         const str = try f.label("len_str");
         const other = try f.label("len_other");
+        const not_str = try f.label("len_not_str");
+        const data = try f.label("len_bytes");
         const slow = try f.label("len_call");
         const join = try f.label("len_got");
         const tag = d.tag;
@@ -5078,11 +5080,20 @@ const Gen = struct {
         const sized_end = f.current;
         try f.br(join);
         try f.block(other);
-        try f.condBr(f.icmp(jit_c.LLVMIntEQ, tag, self.k(@intFromEnum(T.str))), str, slow);
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, tag, self.k(@intFromEnum(T.str))), str, not_str);
         try f.block(str);
         const n2 = f.load(t.i64, f.offset(f.intToPtr(d.bits), @offsetOf(value.Str, "chars")));
         try self.drop(.{ .dyn = d });
         const str_end = f.current;
+        try f.br(join);
+        // (data: not through Python, which a call without the GIL would
+        // take it for)
+        try f.block(not_str);
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, tag, self.k(@intFromEnum(T.bytes))), data, slow);
+        try f.block(data);
+        const n3 = f.load(t.i64, f.offset(f.intToPtr(d.bits), @offsetOf(value.Bytes, "len")));
+        try self.drop(.{ .dyn = d });
+        const data_end = f.current;
         try f.br(join);
         try f.block(slow);
         const idx = try self.c.objectIndex(len_obj);
@@ -5093,8 +5104,9 @@ const Gen = struct {
         const slow_end = f.current;
         try f.br(join);
         try f.block(join);
-        const n = f.phiN(t.i64, &.{ n1, n2, g.bits }, &.{ sized_end, str_end, slow_end });
-        const tg = f.phiN(t.i64, &.{ self.k(@intCast(value.PINT_TAG)), self.k(@intCast(value.PINT_TAG)), g.tag }, &.{ sized_end, str_end, slow_end });
+        const pint = self.k(@intCast(value.PINT_TAG));
+        const n = f.phiN(t.i64, &.{ n1, n2, n3, g.bits }, &.{ sized_end, str_end, data_end, slow_end });
+        const tg = f.phiN(t.i64, &.{ pint, pint, pint, g.tag }, &.{ sized_end, str_end, data_end, slow_end });
         return .{ .tag = tg, .bits = n, .shape = .int };
     }
 

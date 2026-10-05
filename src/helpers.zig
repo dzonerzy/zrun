@@ -1959,6 +1959,10 @@ export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64,
                 out.* = Value.pint(@intCast(@as(*value.Str, @ptrCast(v.ptr())).chars));
                 return true;
             },
+            .bytes => {
+                out.* = Value.pint(@intCast(@as(*value.Bytes, @ptrCast(@alignCast(v.ptr()))).len));
+                return true;
+            },
             else => {},
         },
         .abs => switch (v.kind()) {

@@ -643,6 +643,8 @@ const Program = struct {
     /// Its variables and module state made immortal (shared by calls
     /// without the GIL, on several threads at once: freezeShared)
     _frozen: bool = false,
+    /// The times its compiled runs and calls took the GIL back
+    _gil_taken: u64 = 0,
 
     fn release(self: *Program) void {
         if (self._cglobals) |g| value_mod.decrefFrame(g);
@@ -823,7 +825,9 @@ const Program = struct {
     /// code went through Python in the last run with report=True),
     /// "module_state": {name: "native" or why Python keeps it} (the
     /// module-level tables and records the semantics use), "cache":
-    /// {"loaded": n, "compiled": n} (modules of compiled code), "speculated":
+    /// {"loaded": n, "compiled": n} (modules of compiled code), "gil_taken":
+    /// n (the times compiled runs, calls and map()'s took the GIL back to
+    /// touch Python: calls that didn't run in parallel), "speculated":
     /// {"line N": kinds} (functions given a typed entry for the kinds their
     /// arguments have been)}. Which semantics run as Python:
     /// Language.python_semantics().
@@ -853,6 +857,9 @@ const Program = struct {
         }
         if (py.c.PyDict_SetItemString(out, "module_state", module_state) != 0) return null;
         if (py.c.PyDict_SetItemString(out, "cache", cache_d) != 0) return null;
+        const taken = py.c.PyLong_FromUnsignedLongLong(self._gil_taken) orelse return null;
+        defer py.Py_DecRef(taken);
+        if (py.c.PyDict_SetItemString(out, "gil_taken", taken) != 0) return null;
         // (the functions given a typed entry for what their arguments have
         // been: "line N": their kinds)
         const speculated = py.c.PyDict_New() orelse return null;
@@ -954,7 +961,10 @@ const Program = struct {
         defer value_mod.decrefFrame(globals);
         // (the GIL released, as for program.call(): the code takes it back
         // if it touches Python)
-        if (gil.without(runMainCode, .{ c, ectx, globals })) return none();
+        const takes = gil.takes;
+        const ok = gil.without(runMainCode, .{ c, ectx, globals });
+        self._gil_taken += gil.takes - takes;
+        if (ok) return none();
         return self.compiledError(ectx);
     }
 
@@ -1077,7 +1087,10 @@ const Program = struct {
         var out = value_mod.Value.none_v;
         // (the GIL released: Python threads run meanwhile, and calls on
         // them; the code takes it back if it touches Python)
-        if (!gil.without(callFunction, .{ ectx, fv, vals, &out })) return self.compiledError(ectx);
+        const takes = gil.takes;
+        const ok = gil.without(callFunction, .{ ectx, fv, vals, &out });
+        self._gil_taken += gil.takes - takes;
+        if (!ok) return self.compiledError(ectx);
         defer value_mod.decref(out);
         return value_mod.toPython(out, ectx.node_maker);
     }
@@ -1172,6 +1185,7 @@ const Program = struct {
             spawned += 1;
         }
         gil.without(MapJob.join, .{handles[0..spawned]});
+        self._gil_taken += job.gil_takes.load(.monotonic);
         if (spawned == 0) return py.c.PyErr_NoMemory();
         if (job.failed) |f| return self.compiledError(f);
         const list = py.c.PyList_New(@intCast(n)) orelse return null;
@@ -1197,6 +1211,8 @@ const Program = struct {
         lock: std.atomic.Mutex = .unlocked,
         failed_at: usize = std.math.maxInt(usize),
         failed: ?*helpers.Ctx = null,
+        /// The times the threads took the GIL
+        gil_takes: std.atomic.Value(u64) = .init(0),
 
         fn fresh(job: *const MapJob) helpers.Ctx {
             const t = job.template;
@@ -1218,6 +1234,7 @@ const Program = struct {
             }
             own.deinit();
             gil.done();
+            _ = job.gil_takes.fetchAdd(gil.takes, .monotonic);
         }
 
         /// A call failed: its context kept if it's the first failing item

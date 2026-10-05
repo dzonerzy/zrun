@@ -25,46 +25,13 @@ const granule = 16;
 const classes = max_small / granule;
 /// A slab: carved into blocks of one class
 const slab_size = 64 * 1024;
-/// The bytes of free blocks of a class a thread takes from the shared pool
-/// at a time
-const kept_bytes = 256 * 1024;
-
 /// A free block: the next one in its class's list
 const Free = struct { next: ?*Free };
 
-/// A list of free blocks: its last one and length known (spliced whole)
-const Chain = struct {
-    first: ?*Free = null,
-    last: ?*Free = null,
-    len: usize = 0,
-
-    fn push(ch: *Chain, f: *Free) void {
-        f.next = ch.first;
-        if (ch.first == null) ch.last = f;
-        ch.first = f;
-        ch.len += 1;
-    }
-
-    /// `other`'s blocks put before this one's, `other` emptied
-    fn take(ch: *Chain, other: *Chain) void {
-        const last = other.last orelse return;
-        last.next = ch.first;
-        if (ch.first == null) ch.last = last;
-        ch.first = other.first;
-        ch.len += other.len;
-        other.* = .{};
-    }
-
-    /// Up to `n` of `other`'s first blocks put before this one's
-    fn takeSome(ch: *Chain, other: *Chain, n: usize) void {
-        if (other.len <= n) return ch.take(other);
-        var part = Chain{ .first = other.first, .last = other.first, .len = 1 };
-        while (part.len < n) : (part.len += 1) part.last = part.last.?.next;
-        other.first = part.last.?.next;
-        other.len -= n;
-        ch.take(&part);
-    }
-};
+/// A free list in the shared pool (a thread's, given as it ended): its
+/// first block, which links it to the next list (blocks are 16 bytes or
+/// more: room for both)
+const Batch = struct { first: Free, next_batch: ?*Batch };
 
 /// A thread's blocks
 const Lists = struct {
@@ -81,21 +48,19 @@ const Lists = struct {
     /// is gone
     fn give(l: *Lists) void {
         for (0..classes) |c| {
-            var gone = Chain{};
-            if (l.free[c]) |first| {
-                gone = .{ .first = first, .last = first, .len = 1 };
-                while (gone.last.?.next) |n| : (gone.len += 1) gone.last = n;
-                l.free[c] = null;
-            }
             // (the slab being carved: its blocks free ones)
             const size = (c + 1) * granule;
             while (l.carve[c].len >= size) {
-                gone.push(@ptrCast(@alignCast(l.carve[c].ptr)));
+                const f: *Free = @ptrCast(@alignCast(l.carve[c].ptr));
+                f.next = l.free[c];
+                l.free[c] = f;
                 l.carve[c] = l.carve[c][size..];
             }
-            if (gone.len == 0) continue;
+            const b: *Batch = @ptrCast(l.free[c] orelse continue);
+            l.free[c] = null;
             lockShared();
-            shared[c].take(&gone);
+            b.next_batch = shared[c];
+            shared[c] = b;
             shared_lock.unlock();
         }
     }
@@ -108,8 +73,9 @@ var home_owner: usize = 0;
 /// The other threads'
 threadlocal var mine: Lists = .{};
 
-/// The shared pool: free blocks of any thread, per class
-var shared: [classes]Chain = .{Chain{}} ** classes;
+/// The shared pool: free lists of threads gone, per class (taken whole:
+/// nothing walked under the lock)
+var shared: [classes]?*Batch = .{null} ** classes;
 var shared_lock: std.atomic.Mutex = .unlocked;
 /// (its destructor runs as a thread that took blocks ends)
 var exit_key: std.c.pthread_key_t = undefined;
@@ -162,13 +128,6 @@ pub fn inUse() isize {
 fn lockShared() void {
     while (!shared_lock.tryLock()) std.atomic.spinLoopHint();
 }
-
-/// The free blocks a thread takes from the shared pool at a time, per class
-const kept: [classes]u32 = blk: {
-    var k: [classes]u32 = undefined;
-    for (&k, 0..) |*n, c| n.* = kept_bytes / ((c + 1) * granule);
-    break :blk k;
-};
 
 /// This thread's blocks given to the shared pool when it ends (and the
 /// home lists when no thread has them: this one's from now)
@@ -229,14 +188,14 @@ fn alloc(_: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize) ?[*]u
 noinline fn carved(c: usize, ret_addr: usize) ?[*]u8 {
     if (!watched) watch();
     const l = lists();
-    // (as many as a thread keeps: the others' share left)
-    var got = Chain{};
+    // (a gone thread's list, the others left to other threads)
     lockShared();
-    got.takeSome(&shared[c], kept[c]);
+    const got = shared[c];
+    if (got) |b| shared[c] = b.next_batch;
     shared_lock.unlock();
-    if (got.first) |f| {
-        l.free[c] = f.next;
-        return @ptrCast(f);
+    if (got) |b| {
+        l.free[c] = b.first.next;
+        return @ptrCast(b);
     }
     const size = (c + 1) * granule;
     const slab = std.heap.c_allocator.rawAlloc(slab_size, .fromByteUnits(granule), ret_addr) orelse return null;

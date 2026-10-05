@@ -1,0 +1,20 @@
+# Rules for scan.py: what kind of file, from its first bytes
+
+const ELF = 0x464c457f;
+const MZ = 0x5a4d;
+
+ruleset scan(f) {
+    rule elf      = size(f) >= 20 and u32le(f, 0) == ELF;
+    rule elf64    = elf and u8(f, 4) == 2;
+    rule elf_so   = elf and u16le(f, 16) == 3;
+    rule pe       = size(f) >= 64 and u16le(f, 0) == MZ
+                    and u32le(f, 0x3c) + 4 <= size(f)
+                    and u32le(f, u32le(f, 0x3c)) == 0x4550;
+    rule script   = size(f) >= 2 and u16be(f, 0) == 0x2321;
+    rule gzip     = size(f) >= 3 and u16le(f, 0) == 0x8b1f and u8(f, 2) == 8;
+    rule png      = size(f) >= 8 and u32be(f, 0) == 0x89504e47 and u32be(f, 4) == 0x0d0a1a0a;
+    rule nops     = count(f, 0x90) > 64;
+    rule packed   = size(f) >= 4096 and entropy(f) > 7.5;
+    rule empty    = size(f) == 0;
+    rule unknown  = not (elf or pe or script or gzip or png or empty);
+}

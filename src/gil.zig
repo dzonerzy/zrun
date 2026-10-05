@@ -17,6 +17,9 @@ pub threadlocal var held: bool = true;
 /// ensure() took it (done() gives it back)
 threadlocal var taken: bool = false;
 threadlocal var state: py.c.PyGILState_STATE = undefined;
+/// The times this thread took it (a program's report(): calls that could
+/// run in parallel and didn't)
+pub threadlocal var takes: u64 = 0;
 
 /// The GIL, held from here (taken if this thread hasn't it).
 pub inline fn ensure() void {
@@ -27,6 +30,7 @@ fn take() void {
     state = py.c.PyGILState_Ensure();
     held = true;
     taken = true;
+    takes += 1;
 }
 
 /// A call done: the GIL ensure() took given back.
