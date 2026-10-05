@@ -24,7 +24,7 @@ def _engine_lang():
                 use="Name",
                 hoist="FuncDef > .name",
                 after="Let > .name",
-                builtins=("print", "context"),
+                builtins=("print", "context", "u8", "u32le", "u32be", "i16le", "u64le", "size", "at", "part"),
             ),
         ],
     )
@@ -36,9 +36,27 @@ def _engine_lang():
 
     @lang.eval("Call")
     def call(node, rt):
-        if node.name.text == "context":
+        name = node.name.text
+        if name == "context":
             return rt.context
-        return rt.call(rt.eval(node.name), rt.eval(node.args))
+        args = rt.eval(node.args)
+        if name == "u8":
+            return rt.u8(args[0], args[1])
+        if name == "u32le":
+            return rt.u32le(args[0], args[1])
+        if name == "u32be":
+            return rt.u32be(args[0], args[1])
+        if name == "i16le":
+            return rt.i16le(args[0], args[1])
+        if name == "u64le":
+            return rt.u64le(args[0], args[1])
+        if name == "size":
+            return len(args[0])
+        if name == "at":
+            return args[0][args[1]]
+        if name == "part":
+            return args[0][args[1] : args[2]]
+        return rt.call(rt.eval(node.name), args)
 
     @lang.host
     def print(*args):
@@ -117,6 +135,60 @@ def test_deep_calls_from_a_small_thread():
     finally:
         threading.stack_size(old)
     assert out == {"ok": 900, "err": "call stack too deep (more than 1000 calls)"}
+
+
+RULES = """
+fn header(d) { return u32le(d, 0); }
+fn fields(d) { return u8(d, 1) + u32be(d, 2) + i16le(d, 6) + size(d) + at(d, 0 - 1); }
+fn big(d) { return u64le(d, 0) > 0; }
+fn magic(d) { let m = part(d, 0, 2); return m == part(d, 0, 2); }
+fn slice_len(d) { return size(part(d, 2, 100)); }
+fn read_past(d) { return u32le(d, size(d) - 2); }
+"""
+
+DATA = bytes([0x7F, 0x45, 0x4C, 0x46, 2, 1, 0xFE, 0xFF, 0x80, 0x90])
+
+
+def _data_kinds(tmp_path):
+    import mmap
+
+    path = tmp_path / "data.bin"
+    path.write_bytes(DATA)
+    f = open(path, "rb")
+    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    return f, {"bytes": DATA, "bytearray": bytearray(DATA), "memoryview": memoryview(DATA), "mmap": mm, "Bytes": zrun.Bytes(DATA)}
+
+
+def test_reading_data(tmp_path):
+    f, kinds = _data_kinds(tmp_path)
+    try:
+        results = {}
+        for mode in MODES:
+            program = lang.load(RULES, "rules")
+            for kind, data in kinds.items():
+                got = [program.call(fn, data, mode=mode) for fn in ("header", "fields", "magic", "slice_len")]
+                for fn in ("big", "read_past"):
+                    try:
+                        program.call(fn, data, mode=mode)
+                    except zrun.Error as e:
+                        got.append(e.diagnostic.message)
+                results[(mode, kind)] = got
+        # (big: a u64 beyond 63 bits, which a node's value can't be: an int
+        # of the program is 64 bits)
+        fields = DATA[1] + int.from_bytes(DATA[2:6], "big") + int.from_bytes(DATA[6:8], "little", signed=True) + len(DATA) + DATA[-1]
+        expected = [int.from_bytes(DATA[:4], "little"), fields, True, 8, "integer overflow", "rt.u32le(): offset 8 out of range"]
+        for key, got in results.items():
+            assert got == expected, key
+    finally:
+        kinds["mmap"].close()
+        f.close()
+
+
+def test_bytes_in_python():
+    b = zrun.Bytes(b"hello")
+    assert (len(b), b[1], b[-1], bytes(b[1:3]), b[1:3] == b"el", b == bytearray(b"hello"), hash(b) == hash(b"hello")) == (5, 101, 111, b"el", True, True, True)
+    with pytest.raises(IndexError):
+        b[5]
 
 
 def test_the_mode_last_run():

@@ -28,6 +28,7 @@ const program_mod = @import("program.zig");
 const grammar_mod = @import("grammar.zig");
 const helpers = @import("helpers.zig");
 const wrapping_mod = @import("wrapping.zig");
+const bytes_mod = @import("bytes.zig");
 const value = @import("value.zig");
 const objects_mod = @import("objects.zig");
 const types_mod = @import("types.zig");
@@ -124,7 +125,7 @@ pub const Dyn = struct {
     }
 };
 
-pub const RtMethod = enum { eval, exec, loop, load, store, function, call, @"error", kind, text, span, scope, symbol, type_of, node_at, fresh, wrapping_add, wrapping_sub, wrapping_mul, Return, Break, Continue };
+pub const RtMethod = enum { eval, exec, loop, load, store, function, call, @"error", kind, text, span, scope, symbol, type_of, node_at, fresh, wrapping_add, wrapping_sub, wrapping_mul, @"u8", @"i8", u16le, u16be, i16le, i16be, u32le, u32be, i32le, i32be, u64le, u64be, i64le, i64be, Return, Break, Continue };
 
 /// A list known at compile time (its items may be dynamic): mutable, with
 /// identity (aliases see changes)
@@ -138,6 +139,12 @@ pub const SList = struct {
     made_at: u32 = NONE,
     /// A module's table only read (frozenTable): the object it is
     frozen: ?*PyObject = null,
+    /// Its items are owned by it (copied out, `l[0]`, each a reference of
+    /// its own) until they're taken: a run-time list made of them, a call
+    /// given them, a tuple or another list sharing them. Not taken when the
+    /// last semantic's variable referring to it is done: given up then
+    /// (Gen.releaseLists).
+    taken: bool = false,
 };
 
 /// A dict known at compile time: keys known (scalars), values maybe not
@@ -1288,6 +1295,7 @@ pub const Compiler = struct {
         .{ "zr_setattr", "bpillpll" },
         .{ "zr_getitem", "bpillllp" },
         .{ "zr_wrapping", "bpiillllp" },
+        .{ "zr_read", "bpiillllp" },
         .{ "zr_setitem", "bpillllll" },
         .{ "zr_items", "bpillp" },
         .{ "zr_list_len", "lll" },
@@ -1363,9 +1371,10 @@ pub const Compiler = struct {
         const other = try f.label("other");
         const python = try f.label("python");
         const done = try f.label("done");
-        // (counted: str..function (4-9), a Big (13))
+        // (counted: str..function (4-9), a Big (13), Bytes (14))
         const k = f.sub(tag, m.k64(4));
-        try f.condBr(f.or_(f.icmp(jit_c.LLVMIntULT, k, m.k64(6)), f.icmp(jit_c.LLVMIntEQ, tag, m.k64(@intFromEnum(value.Tag.big)))), counted, other);
+        const big_or_bytes = f.icmp(jit_c.LLVMIntULT, f.sub(tag, m.k64(@intFromEnum(value.Tag.big))), m.k64(2));
+        try f.condBr(f.or_(f.icmp(jit_c.LLVMIntULT, k, m.k64(6)), big_or_bytes), counted, other);
         try f.block(counted);
         const p = f.intToPtr(bits);
         const rc = f.load(t.i64, p);
@@ -1801,8 +1810,8 @@ const Gen = struct {
         }
         const f = &self.f;
         const m = &self.c.m;
-        // (counted: 4 to 10, 13; as bits of a mask: tags under 16)
-        const mask: u64 = 0x7F0 | (1 << @intFromEnum(value.Tag.big));
+        // (counted: 4 to 10, 13, 14; as bits of a mask: tags under 16)
+        const mask: u64 = 0x7F0 | (1 << @intFromEnum(value.Tag.big)) | (1 << @intFromEnum(value.Tag.bytes));
         const bit = f.and_(f.lshr(m.k64(mask), f.and_(tag, m.k64(15))), m.k64(1));
         const counted = f.and_(f.icmp(jit_c.LLVMIntULT, tag, m.k64(16)), f.icmp(jit_c.LLVMIntNE, bit, m.k64(0)));
         const yes = try f.label("rc");
@@ -2101,6 +2110,7 @@ const Gen = struct {
             .list => |l| blk: {
                 if (l.frozen) |o| break :blk try self.frozenConst(o, .list);
                 const d = try self.buildSequence("zr_list", l.items.items, at, .list);
+                l.taken = true;
                 try self.promote(v, d);
                 break :blk d;
             },
@@ -2920,6 +2930,7 @@ const Gen = struct {
                     if (crid < d.grammar.actions.len and d.grammar.actions[crid] == .drop) continue;
                     try l.items.append(self.a(), try self.nodeValue(ch));
                 }
+                if (action == .tuple or action == .first) l.taken = true;
                 if (action == .tuple) return .{ .tuple = l.items.items };
                 if (action == .first) return if (l.items.items.len > 0) l.items.items[0] else SVal.none;
                 if (action == .dict) return c.unsupported("a -> dict field isn't supported in compiled code yet (node {d})", .{idx});
@@ -2934,7 +2945,24 @@ const Gen = struct {
     fn checkedAt(self: *Gen, v: SVal, at: u32) Error!SVal {
         switch (v) {
             .pint => |n| return .{ .int = n },
-            .dyn => |d| return .{ .dyn = self.checkedDyn(d) },
+            .dyn => |d| {
+                // (an int beyond 64 bits isn't one of the program: the
+                // overflow, as the reference mode's I64 raises it)
+                if (d.shape == .any) {
+                    const f = &self.f;
+                    const big = try f.label("big_int");
+                    const fine = try f.label("not_big");
+                    // (rare: out of the way)
+                    const is_big = f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.big)));
+                    const expect = self.c.m.intrinsic("llvm.expect", &.{self.c.m.t.i1});
+                    try f.condBr(f.call(expect, &.{ is_big, self.c.m.k1(false) }), big, fine);
+                    try f.block(big);
+                    try self.failAt(at, "integer overflow");
+                    try f.br(fine);
+                    try f.block(fine);
+                }
+                return .{ .dyn = self.checkedDyn(d) };
+            },
             .py => |o| if (ph.typeOf(o) == @as(*py.c.PyTypeObject, @ptrCast(py.types.typeObject("PyLong_Type")))) {
                 const where = if (self.insts.items.len > 0) self.insts.items[self.insts.items.len - 1].node else at;
                 try self.failAt(where, "integer overflow");
@@ -3938,13 +3966,38 @@ const Gen = struct {
 
     /// Drop the semantic's locals that hold run-time values.
     fn releaseLocals(self: *Gen, inst: *Inst) Error!void {
+        // (each list once, however many variables refer to it; on this path:
+        // another return releases them again, on its own)
+        var released: std.ArrayListUnmanaged(*SList) = .empty;
         for (inst.locals) |l| switch (l) {
             // (None again: the semantic may run again, along another path)
             .slot => |s| try self.dropTemp(s.ptr),
-            .static => |sv| try self.drop(sv),
+            .static => |sv| {
+                try self.drop(sv);
+                if (sv == .list and std.mem.indexOfScalar(*SList, released.items, sv.list) == null) {
+                    try released.append(self.a(), sv.list);
+                    try self.releaseList(inst, sv.list);
+                }
+            },
             .unset => {},
         };
         for (inst.temps.items) |slot| try self.dropTemp(slot);
+    }
+
+    /// A known list a semantic's variable refers to, the semantic done: its
+    /// items given up if nothing took them and nothing else refers to it
+    /// (another semantic running here, what this one returns).
+    fn releaseList(self: *Gen, inst: *Inst, l: *SList) Error!void {
+        if (l.taken or l.frozen != null) return;
+        if (inst.result) |r| if (refersTo(r, l, 4)) return;
+        for (self.insts.items) |other| {
+            if (other == inst) continue;
+            for (other.locals) |x| switch (x) {
+                .static => |sv| if (refersTo(sv, l, 4)) return,
+                else => {},
+            };
+        }
+        for (l.items.items) |item| try self.drop(item);
     }
 
     /// A slot holding None from the function's start (whichever path
@@ -4855,7 +4908,10 @@ const Gen = struct {
                 const l = try self.a().create(SList);
                 l.* = .{ .origin = e };
                 for (items) |item| try l.items.append(self.a(), try self.expr(inst, item));
-                if (e.kind == .tuple) return .{ .tuple = l.items.items };
+                if (e.kind == .tuple) {
+                    l.taken = true;
+                    return .{ .tuple = l.items.items };
+                }
                 return self.literal(.{ .list = l }, e, inst.node);
             },
             .list_comp, .gen_exp => |comp| return self.literal(try self.listComp(inst, comp, e.pos), e, inst.node),
@@ -5516,6 +5572,7 @@ const Gen = struct {
                 } else if (eq(u8, name, "extend") and args.len == 1 and args[0] == .list and args[0].list != l and args[0].list.frozen == null and !self.aliased(args[0].list)) {
                     // (by a list made here: its items, theirs now)
                     try l.items.appendSlice(self.a(), args[0].list.items.items);
+                    args[0].list.taken = true;
                     return .none;
                 },
                 .dict => |d| if (eq(u8, name, "get") and args.len >= 1 and args.len <= 2 and args[0].isStatic()) {
@@ -5555,6 +5612,7 @@ const Gen = struct {
         if (eq(u8, name, "extend") and args.len == 1 and args[0] == .list and args[0].list.frozen == null and !self.aliased(args[0].list)) {
             const items = args[0].list.items.items;
             const arr = try self.valueArray(items, inst.node);
+            args[0].list.taken = true;
             const ok = self.call("zr_extend_items", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, arr, self.k(@intCast(items.len)) });
             try self.dropArray(arr, items.len);
             try self.drop(.{ .dyn = d });
@@ -5791,6 +5849,7 @@ const Gen = struct {
         const want: usize = switch (m) {
             .eval, .exec, .loop, .load, .function, .kind, .text, .span, .scope, .symbol, .type_of, .node_at, .fresh => 1,
             .store, .call, .wrapping_add, .wrapping_sub, .wrapping_mul => 2,
+            .@"u8", .@"i8", .u16le, .u16be, .i16le, .i16be, .u32le, .u32be, .i32le, .i32be, .u64le, .u64be, .i64le, .i64be => 2,
             .@"error" => 2,
             .Return => if (args.len == 0) 0 else 1,
             .Break, .Continue => 0,
@@ -5830,6 +5889,7 @@ const Gen = struct {
             .wrapping_add => return self.wrapping(inst, .add, args[0], args[1]),
             .wrapping_sub => return self.wrapping(inst, .sub, args[0], args[1]),
             .wrapping_mul => return self.wrapping(inst, .mul, args[0], args[1]),
+            .@"u8", .@"i8", .u16le, .u16be, .i16le, .i16be, .u32le, .u32be, .i32le, .i32be, .u64le, .u64be, .i64le, .i64be => return self.readBytes(inst, std.meta.stringToEnum(bytes_mod.Read, @tagName(m)).?, args[0], args[1]),
             .@"error" => {
                 const n = switch (args[0]) {
                     .node => |x| x,
@@ -5927,6 +5987,53 @@ const Gen = struct {
         return .{ .dyn = out };
     }
 
+    /// rt.u8(data, i) and the others: a Bytes' bytes at an int offset in
+    /// it, read inline; anything else (an error too, as the reference mode
+    /// words it) by zr_read.
+    fn readBytes(self: *Gen, inst: *Inst, r: bytes_mod.Read, data_v: SVal, at_v: SVal) Error!SVal {
+        const f = &self.f;
+        const m = &self.c.m;
+        const t = m.t;
+        // (read, given up: a variable's value borrowed)
+        const dd = try self.borrowed(data_v, inst.node);
+        const ad = try self.materialize(at_v, inst.node);
+        const w: i64 = @intCast(r.width());
+        const fast = try f.label("read_fast");
+        const in_range = try f.label("read_in");
+        const slow = try f.label("read_other");
+        const join = try f.label("read_done");
+        const is_bytes = f.icmp(jit_c.LLVMIntEQ, dd.tag, self.k(@intFromEnum(value.Tag.bytes)));
+        const at_int = f.icmp(jit_c.LLVMIntEQ, f.or_(ad.tag, self.k(16)), self.k(@intCast(value.PINT_TAG)));
+        try f.condBr(f.and_(is_bytes, at_int), fast, slow);
+        try f.block(fast);
+        const p = f.intToPtr(dd.bits);
+        const len = f.load(t.i64, f.offset(p, @offsetOf(value.Bytes, "len")));
+        // (at >= 0, at + width <= len: unsigned, at below 2^63)
+        const ok = f.and_(f.icmp(jit_c.LLVMIntSGE, ad.bits, self.k(0)), f.icmp(jit_c.LLVMIntULE, f.add(ad.bits, self.k(w)), len));
+        try f.condBr(ok, in_range, slow);
+        try f.block(in_range);
+        const base = f.load(t.ptr, f.offset(p, @offsetOf(value.Bytes, "ptr")));
+        const ty = m.intType(@intCast(8 * w));
+        var x = f.loadUnaligned(ty, f.at(t.i8, base, ad.bits));
+        if (w > 1 and !r.little()) x = f.call(m.intrinsic("llvm.bswap", &.{ty}), &.{x});
+        const v = if (w == 8) x else if (r.signed()) f.sext64(x) else f.zext64(x);
+        // (a u64 beyond 63 bits: a big int, zr_read's)
+        const fits = if (w == 8 and !r.signed()) f.icmp(jit_c.LLVMIntSGE, v, self.k(0)) else m.k1(true);
+        const fast_end = f.current;
+        try f.condBr(fits, join, slow);
+        try f.block(slow);
+        const st = self.call("zr_read", &.{ self.ctx, self.k32(inst.node), self.k32(@intFromEnum(r)), dd.tag, dd.bits, ad.tag, ad.bits, self.out });
+        try self.check(st);
+        const g = try self.loadOut(.any);
+        const slow_end = f.current;
+        try f.br(join);
+        try f.block(join);
+        const out = Dyn{ .tag = f.phi(t.i64, self.k(@intCast(value.PINT_TAG)), fast_end, g.tag, slow_end), .bits = f.phi(t.i64, v, fast_end, g.bits, slow_end), .shape = .any };
+        try self.drop(.{ .dyn = dd });
+        try self.drop(.{ .dyn = ad });
+        return .{ .dyn = out };
+    }
+
     fn nodeArg(self: *Gen, inst: *Inst, v: SVal, pos: front.Pos) Error!u32 {
         return switch (v) {
             .node => |n| n,
@@ -5966,7 +6073,11 @@ const Gen = struct {
     /// Call a run-time function value (or a host function) with arguments.
     fn dynCall(self: *Gen, inst: *Inst, fv: SVal, args_v: SVal, receiver: ?SVal) Error!SVal {
         const items: []const SVal = switch (args_v) {
-            .list => |l| l.items.items,
+            .list => |l| blk: {
+                // (the call takes them)
+                l.taken = true;
+                break :blk l.items.items;
+            },
             .tuple => |t| t,
             else => return self.seqCall(inst, fv, args_v, receiver),
         };
@@ -7259,6 +7370,7 @@ const Gen = struct {
         if (sink.kind != .static_list) return;
         const items = sink.list.items.items;
         const d = try self.buildSequence("zr_list", items, inst.node, .list);
+        sink.list.taken = true;
         const slot = try self.valSlot();
         try self.storeSlot(slot, d);
         sink.kind = .list_into;

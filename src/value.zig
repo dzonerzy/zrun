@@ -19,6 +19,7 @@ const PyObject = ph.PyObject;
 const types = @import("types.zig");
 const objects = @import("objects.zig");
 const proxies = @import("proxies.zig");
+const bytes_mod = @import("bytes.zig");
 
 /// What values are made with (and freed with: anything making one
 /// elsewhere uses it too)
@@ -47,8 +48,31 @@ pub const Tag = enum(u64) {
     /// A plain int beyond 64 bits, within 128 (Big): Python's big ints a
     /// semantic's arithmetic makes (2**63, masks of 64 bits...), natively
     big = 13,
+    /// Data read without copies (Bytes): a zrun.Bytes in Python
+    bytes = 14,
     _,
 };
+
+/// Data compiled code reads (bytes.zig's zrun.Bytes, natively): part of the
+/// memory a zrun.Bytes object views, which it keeps
+pub const Bytes = extern struct {
+    head: Obj,
+    ptr: [*]const u8,
+    len: u64,
+    /// The zrun.Bytes whose memory it is (owned)
+    py: *PyObject,
+
+    pub fn slice(self: *const Bytes) []const u8 {
+        return self.ptr[0..self.len];
+    }
+};
+
+pub fn newBytes(ptr: [*]const u8, len: u64, owner: *PyObject) ?*Bytes {
+    const b = allocator.create(Bytes) catch return null;
+    py.Py_IncRef(owner);
+    b.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.bytes) }, .ptr = ptr, .len = len, .py = owner };
+    return b;
+}
 
 /// A plain int beyond 64 bits (never one within: those are ints)
 pub const Big = extern struct {
@@ -310,8 +334,11 @@ pub const KIND_FRAME: u32 = 100;
 
 /// A tag of a counted object: str..function (4-9), a Big (13). (By tags,
 /// not kind(): reference counts are most of what code does with values)
+/// The counted tags: str..function (4-9), Big, Bytes; a bit each
+const counted_mask: u64 = 0x3F0 | (1 << @intFromEnum(Tag.big)) | (1 << @intFromEnum(Tag.bytes));
+
 inline fn counted(tag: u64) bool {
-    return tag -% 4 < 6 or tag == @intFromEnum(Tag.big);
+    return tag < 16 and (counted_mask >> @intCast(tag)) & 1 != 0;
 }
 
 pub fn incref(v: Value) void {
@@ -396,6 +423,11 @@ pub fn free(tag: Tag, o: *Obj) void {
             allocator.destroy(f);
         },
         .big => allocator.destroy(@as(*Big, @ptrCast(@alignCast(o)))),
+        .bytes => {
+            const b: *Bytes = @ptrCast(@alignCast(o));
+            py.Py_DecRef(b.py);
+            allocator.destroy(b);
+        },
         else => {},
     }
 }
@@ -546,6 +578,7 @@ pub fn typeName(v: Value) []const u8 {
         .host => "object",
         .rt => "CompiledRuntime",
         .big => "int",
+        .bytes => "Bytes",
         _ => "object",
     };
 }
@@ -767,6 +800,7 @@ pub fn equal(a: Value, b: Value) bool {
     return switch (a.kind()) {
         .none => true,
         .str => a.bits == b.bits or std.mem.eql(u8, @as(*Str, @ptrCast(a.ptr())).bytes(), @as(*Str, @ptrCast(b.ptr())).bytes()),
+        .bytes => a.bits == b.bits or std.mem.eql(u8, @as(*Bytes, @ptrCast(@alignCast(a.ptr()))).slice(), @as(*Bytes, @ptrCast(@alignCast(b.ptr()))).slice()),
         .list => blk: {
             const x = @as(*List, @ptrCast(@alignCast(a.ptr()))).slice();
             const y = @as(*List, @ptrCast(@alignCast(b.ptr()))).slice();
@@ -1039,6 +1073,16 @@ pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
         .function => return objects.newNativeFunction(@ptrCast(@alignCast(v.ptr())), nodeObject.owner),
         // (rt reaching Python code: an rt object over its frames)
         .rt => return @import("bridge.zig").runtimeObject(v),
+        // (the zrun.Bytes it's of, or a slice of it: the same memory)
+        .bytes => {
+            const b: *Bytes = @ptrCast(@alignCast(v.ptr()));
+            const whole = bytes_mod.as(b.py);
+            if (whole.ptr == b.ptr and whole.len == b.len) {
+                py.Py_IncRef(b.py);
+                return b.py;
+            }
+            return bytes_mod.slice(b.py, b.ptr, b.len);
+        },
         _ => {
             ph.raise(py.PyExc_TypeError(), "an unknown value", .{});
             return null;
@@ -1076,6 +1120,15 @@ fn convert(o: *PyObject, unique: bool) ?Value {
     // (of exactly these types: a subclass (an IntEnum, a namedtuple...) is
     // a host value, itself)
     if (o == py.Py_True() or o == py.Py_False()) return Value.boolean(o == py.Py_True());
+    // (a zrun.Bytes: the same memory, natively)
+    if (bytes_mod.isBytes(o)) {
+        const view = bytes_mod.as(o);
+        const b = newBytes(view.ptr, view.len, o) orelse {
+            _ = py.c.PyErr_NoMemory();
+            return null;
+        };
+        return Value.obj(.bytes, &b.head);
+    }
     const ty = ph.typeOf(o);
     // (an int: plain; zrun.I64, what rt gives Python: the program's)
     const is_i64 = @as(*PyObject, @ptrCast(@alignCast(ty))) == types.I64;

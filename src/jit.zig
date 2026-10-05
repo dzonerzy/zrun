@@ -116,6 +116,7 @@ pub const Api = struct {
     BuildStore: *const fn (Builder, Value, Value) callconv(.c) Value,
     BuildInBoundsGEP2: *const fn (Builder, Type, Value, [*c]Value, c_uint, Str) callconv(.c) Value,
     BuildZExt: *const fn (Builder, Value, Type, Str) callconv(.c) Value,
+    BuildSExt: *const fn (Builder, Value, Type, Str) callconv(.c) Value,
     BuildBitCast: *const fn (Builder, Value, Type, Str) callconv(.c) Value,
     BuildPtrToInt: *const fn (Builder, Value, Type, Str) callconv(.c) Value,
     BuildIntToPtr: *const fn (Builder, Value, Type, Str) callconv(.c) Value,

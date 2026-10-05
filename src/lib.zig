@@ -26,6 +26,7 @@ const driver = @import("driver.zig");
 const compile_mod = @import("compile.zig");
 const bridge = @import("bridge.zig");
 const helpers = @import("helpers.zig");
+const bytes_mod = @import("bytes.zig");
 const value_mod = @import("value.zig");
 
 const allocator = std.heap.c_allocator;
@@ -1081,7 +1082,15 @@ const Program = struct {
     /// first if it hasn't run), in a mode ("python" or "compiled"; none
     /// said: the one it last ran in, "compiled" if it hasn't run), with
     /// rt.context the context.
-    fn callEntry(self: *Program, name: *PyObject, args: *PyObject, mode_obj: ?*PyObject, context: ?*PyObject) ?*PyObject {
+    fn callEntry(self: *Program, name: *PyObject, given: *PyObject, mode_obj: ?*PyObject, context: ?*PyObject) ?*PyObject {
+        // (data, any kind of it: a zrun.Bytes over its memory, in every mode)
+        const args = py.c.PyTuple_New(py.c.PyTuple_Size(given)) orelse return null;
+        defer py.Py_DecRef(args);
+        for (0..@intCast(py.c.PyTuple_Size(given))) |i| {
+            const x = py.c.PyTuple_GetItem(given, @intCast(i)).?;
+            const v = if (bytes_mod.isData(x)) bytes_mod.of(x) orelse return null else ref(x);
+            _ = py.c.PyTuple_SetItem(args, @intCast(i), v);
+        }
         const compiled = if (mode_obj) |m| blk: {
             const mode = ph.utf8(m, "mode") orelse return null;
             if (std.mem.eql(u8, mode, "compiled")) break :blk true;
@@ -1896,6 +1905,53 @@ const Runtime = struct {
         return ph.newString(self.data().text(idx));
     }
 
+    /// `rt.u8(data, i)`, `rt.i8`, `rt.u16le`... `rt.i64be`: the int at
+    /// offset i of data (a zrun.Bytes, or any data), bounds checked
+    /// (bytes.zig's readers: functions, properties here, as PyOZ makes
+    /// fewer methods than it would need)
+    pub fn get_u8(_: *const Runtime) ?*PyObject {
+        return bytes_mod.reader(.u8);
+    }
+    pub fn get_i8(_: *const Runtime) ?*PyObject {
+        return bytes_mod.reader(.i8);
+    }
+    pub fn get_u16le(_: *const Runtime) ?*PyObject {
+        return bytes_mod.reader(.u16le);
+    }
+    pub fn get_u16be(_: *const Runtime) ?*PyObject {
+        return bytes_mod.reader(.u16be);
+    }
+    pub fn get_i16le(_: *const Runtime) ?*PyObject {
+        return bytes_mod.reader(.i16le);
+    }
+    pub fn get_i16be(_: *const Runtime) ?*PyObject {
+        return bytes_mod.reader(.i16be);
+    }
+    pub fn get_u32le(_: *const Runtime) ?*PyObject {
+        return bytes_mod.reader(.u32le);
+    }
+    pub fn get_u32be(_: *const Runtime) ?*PyObject {
+        return bytes_mod.reader(.u32be);
+    }
+    pub fn get_i32le(_: *const Runtime) ?*PyObject {
+        return bytes_mod.reader(.i32le);
+    }
+    pub fn get_i32be(_: *const Runtime) ?*PyObject {
+        return bytes_mod.reader(.i32be);
+    }
+    pub fn get_u64le(_: *const Runtime) ?*PyObject {
+        return bytes_mod.reader(.u64le);
+    }
+    pub fn get_u64be(_: *const Runtime) ?*PyObject {
+        return bytes_mod.reader(.u64be);
+    }
+    pub fn get_i64le(_: *const Runtime) ?*PyObject {
+        return bytes_mod.reader(.i64le);
+    }
+    pub fn get_i64be(_: *const Runtime) ?*PyObject {
+        return bytes_mod.reader(.i64be);
+    }
+
     /// `rt.wrapping_add(a, b)`, `rt.wrapping_sub`, `rt.wrapping_mul`: 64-bit
     /// arithmetic wrapping around (wrapping.zig).
     pub fn wrapping_add(self: *Runtime, a: *PyObject, b: *PyObject) ?*PyObject {
@@ -2312,6 +2368,7 @@ fn moduleInit(module: *PyObject) callconv(.c) c_int {
     objects.init(module) catch return -1;
     bridge.init(module) catch return -1;
     @import("proxies.zig").init(module) catch return -1;
+    @import("bytes.zig").init(module) catch return -1;
     name_program = ph.newString("<program>") orelse return -1;
     CallerType = py.c.PyType_FromSpec(&caller_spec) orelse return -1;
     // (compiled code words Python's errors as the reference mode does)

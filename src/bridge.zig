@@ -975,6 +975,19 @@ fn rtWrapping(comptime op: @import("wrapping.zig").Op) fn (?*PyObject, ?*PyObjec
     }.f;
 }
 
+/// rt.u8(data, i) and the others (bytes.zig)
+fn rtRead(comptime r: @import("bytes.zig").Read) fn (?*PyObject, ?*PyObject) callconv(.c) ?*PyObject {
+    return struct {
+        fn f(self: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+            _ = live(self) orelse return null;
+            var data: ?*PyObject = null;
+            var at: ?*PyObject = null;
+            if (py.c.PyArg_UnpackTuple(args, @tagName(r), 2, 2, &data, &at) == 0) return null;
+            return @import("bytes.zig").read(r, data.?, at.?);
+        }
+    }.f;
+}
+
 fn rtFresh(self: ?*PyObject, x: ?*PyObject) callconv(.c) ?*PyObject {
     const r = live(self) orelse return null;
     const idx = nodeIndex(r, x.?, "node") orelse return null;
@@ -1083,6 +1096,20 @@ var methods = [_]py.c.PyMethodDef{
     method("wrapping_add", rtWrapping(.add), py.c.METH_VARARGS),
     method("wrapping_sub", rtWrapping(.sub), py.c.METH_VARARGS),
     method("wrapping_mul", rtWrapping(.mul), py.c.METH_VARARGS),
+    method("u8", rtRead(.u8), py.c.METH_VARARGS),
+    method("i8", rtRead(.i8), py.c.METH_VARARGS),
+    method("u16le", rtRead(.u16le), py.c.METH_VARARGS),
+    method("u16be", rtRead(.u16be), py.c.METH_VARARGS),
+    method("i16le", rtRead(.i16le), py.c.METH_VARARGS),
+    method("i16be", rtRead(.i16be), py.c.METH_VARARGS),
+    method("u32le", rtRead(.u32le), py.c.METH_VARARGS),
+    method("u32be", rtRead(.u32be), py.c.METH_VARARGS),
+    method("i32le", rtRead(.i32le), py.c.METH_VARARGS),
+    method("i32be", rtRead(.i32be), py.c.METH_VARARGS),
+    method("u64le", rtRead(.u64le), py.c.METH_VARARGS),
+    method("u64be", rtRead(.u64be), py.c.METH_VARARGS),
+    method("i64le", rtRead(.i64le), py.c.METH_VARARGS),
+    method("i64be", rtRead(.i64be), py.c.METH_VARARGS),
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 

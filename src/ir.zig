@@ -392,6 +392,12 @@ pub const Function = struct {
         return L("LLVMBuildZExt")(self.b, v, self.m.t.i64, "");
     }
 
+    /// A narrower int as an i64, its sign extended.
+    pub fn sext64(self: *Function, v: Value) Value {
+        self.open();
+        return L("LLVMBuildSExt")(self.b, v, self.m.t.i64, "");
+    }
+
     pub fn bitcast(self: *Function, v: Value, ty: Type) Value {
         self.open();
         return L("LLVMBuildBitCast")(self.b, v, ty, "");
@@ -411,6 +417,14 @@ pub const Function = struct {
         self.open();
         const v = L("LLVMBuildLoad2")(self.b, ty, ptr, "");
         L("LLVMSetAlignment")(v, 8);
+        return v;
+    }
+
+    /// A load from anywhere (data's bytes: no alignment)
+    pub fn loadUnaligned(self: *Function, ty: Type, ptr: Value) Value {
+        self.open();
+        const v = L("LLVMBuildLoad2")(self.b, ty, ptr, "");
+        L("LLVMSetAlignment")(v, 1);
         return v;
     }
 
