@@ -17,7 +17,7 @@ RUN = """
 import io, json, sys, contextlib
 sys.path.insert(0, sys.argv[1])
 import zrun
-zrun.configure(cache=json.loads(sys.argv[3]))
+zrun.configure(cache=json.loads(sys.argv[3]), tiers=False)
 import lua
 p = lua.lang.load(sys.argv[2], "prog.lua")
 out = io.StringIO()

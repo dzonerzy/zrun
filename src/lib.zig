@@ -741,6 +741,13 @@ const Program = struct {
     _state: ?*PyObject = null,
     /// The program compiled (once it ran compiled)
     _compiled: ?*driver.Compiled = null,
+    /// The program being compiled optimized, in the background (ensureCompiled)
+    _pending: ?*driver.Pending = null,
+    /// Code it ran before its optimized code took over: kept (values its
+    /// runs made may still refer to it)
+    _retired: std.ArrayListUnmanaged(*driver.Compiled) = .empty,
+    /// mode="auto" found it can't be compiled: run as Python
+    _uncompilable: bool = false,
     /// The last run with report=True: where its compiled code went through
     /// Python, {what: times} (report())
     _crossings: ?*PyObject = null,
@@ -751,7 +758,7 @@ const Program = struct {
     /// top level ran (the first call's)
     _cglobals: ?*value_mod.Frame = null,
     /// The mode it last ran in (program.call()'s, unless said)
-    _ran_compiled: ?bool = null,
+    _ran_mode: ?Mode = null,
     /// Its variables and module state made immortal (shared by calls
     /// without the GIL, on several threads at once: freezeShared)
     _frozen: bool = false,
@@ -763,6 +770,11 @@ const Program = struct {
         self._cglobals = null;
         if (self._compiled) |c| c.destroy();
         self._compiled = null;
+        if (self._pending) |p| p.abandon();
+        self._pending = null;
+        for (self._retired.items) |c| c.destroy();
+        self._retired.deinit(allocator);
+        self._retired = .empty;
         self._declared.deinit(allocator);
         self._declared = .empty;
         inline for (.{ "_state", "_lang", "_source", "_path", "_crossings" }) |f| {
@@ -893,63 +905,72 @@ const Program = struct {
     }
 
     /// `program.run(mode="python", report=False)`: run the program from its
-    /// start, its semantics as Python ("python") or compiled to native
-    /// code ("compiled"). Raises zrun.Error on a runtime error, the same in
-    /// every mode. report=True: where the compiled code goes through
-    /// Python is counted (report(); a little slower).
+    /// start, its semantics as Python ("python"), compiled to native code
+    /// ("compiled"), or compiled when its optimized code is at hand
+    /// ("auto": as Python while it's compiled in the background, compiled
+    /// from the run after it's done; compiled at once when the cache has
+    /// it). "compiled": compiled fast the first time if the cache hasn't
+    /// the optimized code, which runs from the run after it's made in the
+    /// background (zrun.configure(tiers=False): optimized at once). Raises
+    /// zrun.Error on a runtime error, the same in every mode. report=True:
+    /// where the compiled code goes through Python is counted (report(); a
+    /// little slower).
     pub fn run(self: *Program, args: pyoz.Args(struct { mode: ?*PyObject = null, report: bool = false })) ?*PyObject {
-        const mode: []const u8 = if (optional(args.value.mode)) |m| ph.utf8(m, "mode") orelse return null else "python";
-        if (std.mem.eql(u8, mode, "python")) {
-            self._ran_compiled = false;
-            return onBigStack(runHere, .{self}, self.language()._max_depth);
-        }
-        if (std.mem.eql(u8, mode, "compiled")) {
-            self._ran_compiled = true;
-            if (!self.ensureCompiled()) return null;
-            const reporting = args.value.report;
-            helpers.collecting = reporting;
-            defer if (reporting) {
-                helpers.collecting = false;
-                // (the run's error, if any, stays the one raised)
-                var t: ?*PyObject = null;
-                var v: ?*PyObject = null;
-                var tb: ?*PyObject = null;
-                py.c.PyErr_Fetch(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
-                if (self._crossings) |o| py.Py_DecRef(o);
-                self._crossings = helpers.takeStats();
-                if (self._crossings == null) py.c.PyErr_Clear();
-                py.c.PyErr_Restore(t, v, tb);
-            };
-            // (on this thread when it can: as program.call())
-            const max_depth = self.language()._max_depth;
-            if (!self._compiled.?.compiler.uses_python) if (stackLow()) |low| {
-                if (@frameAddress() > low + @as(usize, max_depth) * stack_per_call + stack_spare)
-                    return self.withCompiled(null, low + stack_spare, runMain, {});
-            };
-            return onBigStack(runCompiled, .{self}, max_depth);
-        }
-        ph.raise(py.PyExc_ValueError(), "mode must be 'python' or 'compiled', not '{s}'", .{mode});
-        return null;
+        const mode = parseMode(args.value.mode, .python) orelse return null;
+        const compiled = switch (mode) {
+            .python => false,
+            .compiled => true,
+            .auto => self.optimizedAtHand() orelse return null,
+        };
+        self._ran_mode = mode;
+        if (!compiled) return onBigStack(runHere, .{self}, self.language()._max_depth);
+        // (auto: the optimized code's at hand, not waited for)
+        if (!self.ensureCompiled(if (mode == .auto) .optimized else .any)) return null;
+        const reporting = args.value.report;
+        helpers.collecting = reporting;
+        defer if (reporting) {
+            helpers.collecting = false;
+            // (the run's error, if any, stays the one raised)
+            var t: ?*PyObject = null;
+            var v: ?*PyObject = null;
+            var tb: ?*PyObject = null;
+            py.c.PyErr_Fetch(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
+            if (self._crossings) |o| py.Py_DecRef(o);
+            self._crossings = helpers.takeStats();
+            if (self._crossings == null) py.c.PyErr_Clear();
+            py.c.PyErr_Restore(t, v, tb);
+        };
+        // (on this thread when it can: as program.call())
+        const max_depth = self.language()._max_depth;
+        if (!self._compiled.?.compiler.uses_python) if (stackLow()) |low| {
+            if (@frameAddress() > low + @as(usize, max_depth) * stack_per_call + stack_spare)
+                return self.withCompiled(null, low + stack_spare, runMain, {});
+        };
+        return onBigStack(runCompiled, .{self}, max_depth);
     }
 
-    /// `program.report()`: what to look at to make the compiled program
-    /// faster, as data. {"python_crossings": {what: times} (where compiled
-    /// code went through Python in the last run with report=True),
-    /// "module_state": {name: "native" or why Python keeps it} (the
-    /// module-level tables and records the semantics use), "cache":
-    /// {"loaded": n, "compiled": n} (modules of compiled code), "gil_taken":
-    /// n (the times compiled runs, calls and map()'s took the GIL back to
-    /// touch Python: calls that didn't run in parallel), "speculated":
-    /// {"line N": kinds} (functions given a typed entry for the kinds their
-    /// arguments have been)}. Which semantics run as Python:
-    /// Language.python_semantics().
+    const Mode = enum { python, compiled, auto };
+
+    /// A mode given (none: `default`); null with an exception.
+    fn parseMode(given: ?*PyObject, default: Mode) ?Mode {
+        const m = optional(given) orelse return default;
+        const s = ph.utf8(m, "mode") orelse return null;
+        return std.meta.stringToEnum(Mode, s) orelse {
+            ph.raise(py.PyExc_ValueError(), "mode must be 'python', 'compiled' or 'auto', not '{s}'", .{s});
+            return null;
+        };
+    }
+
     /// `program.save(path)`: the program as a compiled module (aot.zig):
     /// its source and the objects of the code compiled for it so far (the
     /// program compiled first if it isn't: save after running it, the code
     /// compiled as it ran goes in too). lang.load_compiled(path) loads it.
     pub fn save(self: *Program, path: *PyObject) ?*PyObject {
         const p = ph.utf8(path, "path") orelse return null;
-        if (!self.ensureCompiled()) return null;
+        if (!self.ensureCompiled(.optimized)) return null;
+        // (the optimized code of what was compiled fast as it ran: in the
+        // cache once the background's done)
+        driver.waitJobs();
         const def = self.language().definitionHash() orelse return null;
         const c = self._compiled.?;
         var objs: std.ArrayListUnmanaged(aot.Object) = .empty;
@@ -981,6 +1002,20 @@ const Program = struct {
         return none();
     }
 
+    /// `program.report()`: what to look at to make the compiled program
+    /// faster, as data. {"python_crossings": {what: times} (where compiled
+    /// code went through Python in the last run with report=True),
+    /// "module_state": {name: "native" or why Python keeps it} (the
+    /// module-level tables and records the semantics use), "cache":
+    /// {"loaded": n, "compiled": n} (modules of compiled code), "code":
+    /// "fast", "optimized" or None (the code compiled runs run: compiled
+    /// fast while the optimized code is made, or none yet), "optimizing":
+    /// whether it's being made in the background, "gil_taken":
+    /// n (the times compiled runs, calls and map()'s took the GIL back to
+    /// touch Python: calls that didn't run in parallel), "speculated":
+    /// {"line N": kinds} (functions given a typed entry for the kinds their
+    /// arguments have been)}. Which semantics run as Python:
+    /// Language.python_semantics().
     pub fn report(self: *Program) ?*PyObject {
         const out = py.c.PyDict_New() orelse return null;
         const crossings = if (self._crossings) |o| ref(o) else py.c.PyDict_New() orelse return null;
@@ -1007,6 +1042,12 @@ const Program = struct {
         }
         if (py.c.PyDict_SetItemString(out, "module_state", module_state) != 0) return null;
         if (py.c.PyDict_SetItemString(out, "cache", cache_d) != 0) return null;
+        // (the code compiled runs run: compiled fast or optimized; whether
+        // the optimized code is being made)
+        const code = if (self._compiled) |c| (ph.newString(if (c.opt == 0) "fast" else "optimized") orelse return null) else ref(py.Py_None());
+        defer py.Py_DecRef(code);
+        if (py.c.PyDict_SetItemString(out, "code", code) != 0) return null;
+        if (py.c.PyDict_SetItemString(out, "optimizing", if (self._pending != null) py.Py_True() else py.Py_False()) != 0) return null;
         const taken = py.c.PyLong_FromUnsignedLongLong(self._gil_taken) orelse return null;
         defer py.Py_DecRef(taken);
         if (py.c.PyDict_SetItemString(out, "gil_taken", taken) != 0) return null;
@@ -1063,10 +1104,90 @@ const Program = struct {
         };
     }
 
-    fn ensureCompiled(self: *Program) bool {
-        if (self._compiled != null) return true;
-        self._compiled = driver.compileProgram(self.ctx().data, self.langView(), &self.language()._python, ztypes.CompileError) orelse return false;
+    const Want = enum {
+        /// a run's: code compiled fast will do while the optimized code is
+        /// made in the background (zrun.configure(tiers=True))
+        any,
+        /// calls', map()'s, save()'s: the optimized code (their state is
+        /// the code's: it stays), waited for if it's being made
+        optimized,
+    };
+
+    /// The program compiled (self._compiled); false with an exception. The
+    /// optimized code takes over once it's made, unless calls have state
+    /// in the code they ran (program.call()'s variables).
+    fn ensureCompiled(self: *Program, want: Want) bool {
+        if (self._pending) |p| if (self._cglobals == null and (want == .optimized or p.ready())) {
+            if (!self.adoptPending()) return false;
+        };
+        if (self._compiled) |c| if (c.opt != 0 or want == .any or self._cglobals != null) return true;
+        const what = self.seed() orelse return false;
+        const lang = self.language();
+        if (want == .any and driver.tiers) {
+            // (nothing compiled yet: the optimized code made in the
+            // background, compiled fast meanwhile, unless it's at hand)
+            if (self._pending == null) {
+                self._pending = driver.compileInBackground(self.ctx().data, self.langView(), &lang._python, ztypes.CompileError, &what) orelse return false;
+                if (self._pending.?.ready()) return self.adoptPending();
+            }
+            self._compiled = driver.compileProgram(self.ctx().data, self.langView(), &lang._python, ztypes.CompileError, &what, 0) orelse return false;
+            return true;
+        }
+        const c = driver.compileProgram(self.ctx().data, self.langView(), &lang._python, ztypes.CompileError, &what, 2) orelse return false;
+        self.retire();
+        self._compiled = c;
         return true;
+    }
+
+    /// The optimized code made in the background, the program's from now
+    /// (waited for if it's still being made); false with an exception.
+    fn adoptPending(self: *Program) bool {
+        const p = self._pending.?;
+        self._pending = null;
+        const c = p.finish() orelse return false;
+        self.retire();
+        self._compiled = c;
+        return true;
+    }
+
+    /// The code the program ran so far kept aside (values may refer to it).
+    fn retire(self: *Program) void {
+        const c = self._compiled orelse return;
+        self._compiled = null;
+        self._retired.append(allocator, c) catch {
+            // (kept for good, then)
+        };
+    }
+
+    /// mode="auto": whether the optimized code is at hand (made, or the
+    /// code that has call state), its making started in the background
+    /// if it wasn't; null with an exception. A program that can't be
+    /// compiled runs as Python.
+    fn optimizedAtHand(self: *Program) ?bool {
+        if (self._uncompilable) return false;
+        if (self._compiled) |c| if (c.opt != 0 or self._cglobals != null) return true;
+        if (self._pending) |p| return p.ready();
+        const what = self.seed() orelse return null;
+        self._pending = driver.compileInBackground(self.ctx().data, self.langView(), &self.language()._python, ztypes.CompileError, &what) orelse {
+            if (py.c.PyErr_ExceptionMatches(ztypes.CompileError) == 0) return null;
+            py.c.PyErr_Clear();
+            self._uncompilable = true;
+            return false;
+        };
+        return self._pending.?.ready();
+    }
+
+    /// What the program is, for its compiled code's names (driver.zig's
+    /// prefixFor): its language's definition and its source, hashed.
+    fn seed(self: *Program) ?[32]u8 {
+        const def = self.language().definitionHash() orelse return null;
+        const source = ph.utf8(self._source.?, "source") orelse return null;
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update(&def);
+        h.update(source);
+        var out: [32]u8 = undefined;
+        h.final(&out);
+        return out;
     }
 
     /// `program.compiled_ir()`: the LLVM IR the program compiles to (before
@@ -1258,7 +1379,7 @@ const Program = struct {
     /// same). The calls share the program's variables and module state:
     /// they mustn't change them.
     fn mapEntry(self: *Program, name: *PyObject, items: *PyObject, threads_obj: ?*PyObject, context: ?*PyObject) ?*PyObject {
-        if (!self.ensureCompiled()) return null;
+        if (!self.ensureCompiled(.optimized)) return null;
         const wanted = ph.utf8(name, "name") orelse return null;
         var threads: usize = std.Thread.getCpuCount() catch 1;
         if (threads_obj) |t| {
@@ -1478,9 +1599,10 @@ const Program = struct {
 
     /// `program.call(name, *args, mode=None, context=None)`: call a
     /// function the program defines at its top level (running the program
-    /// first if it hasn't run), in a mode ("python" or "compiled"; none
-    /// said: the one it last ran in, "compiled" if it hasn't run), with
-    /// rt.context the context.
+    /// first if it hasn't run), in a mode ("python", "compiled" or "auto",
+    /// as run()'s, but compiled is always the optimized code, waited for if
+    /// it's being made; none said: the one it last ran in, "compiled" if it
+    /// hasn't run), with rt.context the context.
     fn callEntry(self: *Program, name: *PyObject, given: *PyObject, mode_obj: ?*PyObject, context: ?*PyObject) ?*PyObject {
         // (data, any kind of it: a zrun.Bytes over its memory, in every mode)
         const args = py.c.PyTuple_New(py.c.PyTuple_Size(given)) orelse return null;
@@ -1490,15 +1612,14 @@ const Program = struct {
             const v = if (bytes_mod.isData(x)) bytes_mod.of(x) orelse return null else ref(x);
             _ = py.c.PyTuple_SetItem(args, @intCast(i), v);
         }
-        const compiled = if (mode_obj) |m| blk: {
-            const mode = ph.utf8(m, "mode") orelse return null;
-            if (std.mem.eql(u8, mode, "compiled")) break :blk true;
-            if (std.mem.eql(u8, mode, "python")) break :blk false;
-            ph.raise(py.PyExc_ValueError(), "mode must be 'python' or 'compiled', not '{s}'", .{mode});
-            return null;
-        } else self._ran_compiled orelse true;
+        const mode = parseMode(mode_obj, self._ran_mode orelse .compiled) orelse return null;
+        const compiled = switch (mode) {
+            .python => false,
+            .compiled => true,
+            .auto => self.optimizedAtHand() orelse return null,
+        };
         if (compiled) {
-            if (!self.ensureCompiled()) return null;
+            if (!self.ensureCompiled(.optimized)) return null;
             const wanted = ph.utf8(name, "name") orelse return null;
             const call_args = CallArgs{ .name = wanted, .args = args };
             // (on this thread when its stack has room for the deepest calls
@@ -2779,8 +2900,8 @@ fn blocks() i64 {
     return pool.inUse();
 }
 
-/// zrun.configure(cache=None, perf_map=None): process-wide settings.
-fn configure(args: pyoz.Args(struct { cache: ?*PyObject = null, perf_map: ?*PyObject = null })) ?*PyObject {
+/// zrun.configure(cache=None, perf_map=None, tiers=None): process-wide settings.
+fn configure(args: pyoz.Args(struct { cache: ?*PyObject = null, perf_map: ?*PyObject = null, tiers: ?*PyObject = null })) ?*PyObject {
     const v = args.value;
     if (optional(v.cache)) |c| {
         const s: @import("cache.zig").Setting = if (c == py.Py_True()) .default else if (c == py.Py_False()) .off else blk: {
@@ -2797,6 +2918,11 @@ fn configure(args: pyoz.Args(struct { cache: ?*PyObject = null, perf_map: ?*PyOb
         const r = py.c.PyObject_IsTrue(p);
         if (r < 0) return null;
         driver.perf_map = r == 1;
+    }
+    if (optional(v.tiers)) |t| {
+        const r = py.c.PyObject_IsTrue(t);
+        if (r < 0) return null;
+        driver.tiers = r == 1;
     }
     return none();
 }
@@ -2823,7 +2949,7 @@ pub const Module = pyoz.module(.{
         pyoz.func("version", version, "Return the zrun version string"),
         pyoz.func("_blocks", blocks, "The values' blocks allocated and not freed (for tests)"),
         pyoz.func("collect", collect, "collect(): free the compiled code's values that only reference one another (reference cycles); how many were freed. Runs by itself as values are made, and at the end of a run."),
-        pyoz.kwfunc("configure", configure, "configure(cache=None, perf_map=None): process-wide settings (those not given stay). cache: True (the platform's place for caches: %LOCALAPPDATA%\\zrun\\Cache on Windows, ~/Library/Caches/zrun on macOS, $XDG_CACHE_HOME/zrun or ~/.cache/zrun elsewhere), False (no cache), or a directory; perf_map: name compiled functions for Linux's perf (/tmp/perf-<pid>.map)."),
+        pyoz.kwfunc("configure", configure, "configure(cache=None, perf_map=None, tiers=None): process-wide settings (those not given stay). cache: True (the platform's place for caches: %LOCALAPPDATA%\\zrun\\Cache on Windows, ~/Library/Caches/zrun on macOS, $XDG_CACHE_HOME/zrun or ~/.cache/zrun elsewhere), False (no cache), or a directory; perf_map: name compiled functions for Linux's perf (/tmp/perf-<pid>.map); tiers: True (default: a program run compiled whose optimized code isn't cached is compiled fast first, optimized in the background, the optimized code running from the run after it's done) or False (optimized at once)."),
     },
     .classes = &.{
         pyoz.class("Language", Language),

@@ -56,6 +56,9 @@ pub const Api = struct {
     ModuleCreateWithNameInContext: *const fn (Str, Context) callconv(.c) ModuleRef,
     DisposeModule: *const fn (ModuleRef) callconv(.c) void,
     PrintModuleToString: *const fn (ModuleRef) callconv(.c) [*c]u8,
+    WriteBitcodeToMemoryBuffer: *const fn (ModuleRef) callconv(.c) c.LLVMMemoryBufferRef,
+    ParseBitcodeInContext2: *const fn (Context, c.LLVMMemoryBufferRef, *ModuleRef) callconv(.c) Bool,
+    DisposeMemoryBuffer: *const fn (c.LLVMMemoryBufferRef) callconv(.c) void,
     GetHostCPUName: *const fn () callconv(.c) [*c]u8,
     GetHostCPUFeatures: *const fn () callconv(.c) [*c]u8,
     DisposeMessage: *const fn ([*c]u8) callconv(.c) void,
@@ -206,6 +209,21 @@ pub fn emitObject(view: *const LlvmView, module: c.LLVMModuleRef, opt_level: u32
 
 pub fn freeBytes(view: *const LlvmView, bytes: []u8) void {
     view.free_bytes(bytes.ptr);
+}
+
+/// A copy of a module in a context of its own (to be compiled apart from
+/// it, on another thread: emitObject takes a module and its context), by
+/// its bitcode; null if LLVM can't make it.
+pub fn copyOf(module: c.LLVMModuleRef) c.LLVMModuleRef {
+    const buf = f("LLVMWriteBitcodeToMemoryBuffer")(module) orelse return null;
+    defer f("LLVMDisposeMemoryBuffer")(buf);
+    const ctx = f("LLVMContextCreate")();
+    var copy: c.LLVMModuleRef = null;
+    if (f("LLVMParseBitcodeInContext2")(ctx, buf, &copy) != 0) {
+        f("LLVMContextDispose")(ctx);
+        return null;
+    }
+    return copy;
 }
 
 /// An object file emitObject made into the JIT.

@@ -60,6 +60,14 @@ pub const Compiled = struct {
     /// The program's number (its functions' Function.program), never used
     /// again by another
     id: u64 = 0,
+    /// Its code's names' start (prefixFor)
+    prefix: []const u8 = "",
+    /// LLVM's optimization level for its code (0: compiled fast, for a
+    /// run that can't wait; 2: the code programs run)
+    opt: u32 = 2,
+    /// Its main code in the JIT: modules compiled after are compiled as it
+    /// runs (tiers: compiled fast)
+    installed: bool = false,
     /// Thunks compiled, by node, eval or exec, and the frame's owner
     thunks: std.AutoHashMapUnmanaged(ThunkKey, Thunk) = .empty,
     /// What running a node as a value does, the last time (by node and
@@ -384,46 +392,85 @@ pub const Compiled = struct {
     /// cache (cache.zig) if it's there, else compiled (and kept there).
     /// Null with the error in `err`.
     fn compileModule(self: *Compiled, err: []u8) ?llvm.Module {
-        const m = &self.compiler.m;
-        const key = blk: {
-            const text = jit_f("LLVMPrintModuleToString")(m.mod);
-            defer jit_f("LLVMDisposeMessage")(text);
-            break :blk cache.keyOf(std.mem.span(text));
-        };
-        // (kept: the program saved as a compiled module has them all)
+        const text = jit_f("LLVMPrintModuleToString")(self.compiler.m.mod);
+        defer jit_f("LLVMDisposeMessage")(text);
+        const key = cache.keyOf(std.mem.span(text), self.opt);
+        if (self.atHand(key, err)) |module| {
+            // (kept: the program saved as a compiled module has them all)
+            self.keys.append(allocator, key) catch {};
+            return module;
+        }
+        // Code compiled as the program runs, optimized code's (tiers): not
+        // optimized now (seconds, for some) but compiled fast, and
+        // optimized in the background for the cache (the next process's;
+        // this one's names are taken by the code compiled fast). Its key
+        // the optimized object's, in the cache once it's made: what
+        // program.save() takes (waitJobs() first)
         self.keys.append(allocator, key) catch {};
-        // A compiled module's, loaded
-        if (cache.givenObject(key)) |bytes| {
-            // (the module isn't the JIT's: the compiler frees it)
-            if (llvm.loadObject(self.view, bytes, err)) |module| {
-                self.cache_loaded += 1;
-                return module;
-            } else |_| {}
-        }
-        const path = cache.pathFor(allocator, key) orelse {
-            // (no cache: the object kept here, for saving)
-            const bytes = llvm.emitObject(self.view, m.take(), 2, err) catch return null;
-            defer llvm.freeBytes(self.view, bytes);
-            if (allocator.dupe(u8, bytes)) |copy| {
-                self.kept_objects.put(allocator, key, copy) catch allocator.free(copy);
-            } else |_| {}
-            return llvm.loadObject(self.view, bytes, err) catch null;
-        };
-        defer allocator.free(path);
-        if (cache.read(allocator, path)) |bytes| {
-            defer allocator.free(bytes);
-            // (the module isn't the JIT's: the compiler frees it)
-            if (llvm.loadObject(self.view, bytes, err)) |module| {
-                self.cache_loaded += 1;
-                return module;
-            } else |_| {}
-            // (one that won't load: compiled again)
-        }
-        const bytes = llvm.emitObject(self.view, m.take(), 2, err) catch return null;
+        const fast = self.opt != 0 and tiers and self.installed and self.optimizeLater(key);
+        const kept = if (fast) cache.keyOf(std.mem.span(text), 0) else key;
+        if (fast) if (self.atHand(kept, err)) |module| return module;
+        const bytes = llvm.emitObject(self.view, self.compiler.m.take(), if (fast) 0 else self.opt, err) catch return null;
         defer llvm.freeBytes(self.view, bytes);
-        cache.write(path, bytes);
-        self.cache_kept += 1;
+        self.keep(kept, bytes);
         return llvm.loadObject(self.view, bytes, err) catch null;
+    }
+
+    /// The compiler's module optimized in the background (a copy: the
+    /// module's compiled fast here), its object kept in the cache; false if
+    /// it can't be (no cache: it's compiled optimized now).
+    fn optimizeLater(self: *Compiled, key: cache.Key) bool {
+        const path = cache.pathFor(allocator, key) orelse return false;
+        const copy = llvm.copyOf(self.compiler.m.mod) orelse {
+            allocator.free(path);
+            return false;
+        };
+        _ = inBackground(self.view, copy, self.opt, path, false);
+        return true;
+    }
+
+    /// The key of the compiler's module (its IR, at the program's level)
+    fn moduleKey(self: *Compiled) cache.Key {
+        const text = jit_f("LLVMPrintModuleToString")(self.compiler.m.mod);
+        defer jit_f("LLVMDisposeMessage")(text);
+        return cache.keyOf(std.mem.span(text), self.opt);
+    }
+
+    /// The object of a key in the JIT if it's at hand (a compiled module
+    /// loaded's, the cache's: the compiler's module left to the compiler,
+    /// which frees it), or null.
+    fn atHand(self: *Compiled, key: cache.Key, err: []u8) ?llvm.Module {
+        if (cache.givenObject(key)) |bytes| {
+            if (llvm.loadObject(self.view, bytes, err)) |module| {
+                self.cache_loaded += 1;
+                return module;
+            } else |_| {}
+        }
+        const path = cache.pathFor(allocator, key) orelse return null;
+        defer allocator.free(path);
+        const bytes = cache.read(allocator, path) orelse return null;
+        defer allocator.free(bytes);
+        if (llvm.loadObject(self.view, bytes, err)) |module| {
+            self.cache_loaded += 1;
+            return module;
+        } else |_| {}
+        // (one that won't load: compiled again)
+        return null;
+    }
+
+    /// An object compiled: kept in the cache, or here when there's none
+    /// (for saving).
+    fn keep(self: *Compiled, key: cache.Key, bytes: []const u8) void {
+        if (cache.pathFor(allocator, key)) |path| {
+            defer allocator.free(path);
+            cache.write(path, bytes);
+            self.cache_kept += 1;
+        } else self.keepHere(key, bytes);
+    }
+
+    fn keepHere(self: *Compiled, key: cache.Key, bytes: []const u8) void {
+        const copy = allocator.dupe(u8, bytes) catch return;
+        self.kept_objects.put(allocator, key, copy) catch allocator.free(copy);
     }
 
     /// zrun.configure(perf_map=True): the module's functions named for perf
@@ -463,26 +510,40 @@ pub const Compiled = struct {
     fn add(self: *Compiled, name: [:0]const u8) ?usize {
         var err: [2048]u8 = undefined;
         @memset(&err, 0);
-        // The addresses the code names (ir.Module.ptrConst): defined first
-        const m = &self.compiler.m;
-        if (m.syms.items.len > 0) {
-            const names = allocator.alloc([*:0]const u8, m.syms.items.len) catch return oomA();
-            defer allocator.free(names);
-            const addrs = allocator.alloc(u64, m.syms.items.len) catch return oomA();
-            defer allocator.free(addrs);
-            for (m.syms.items, names, addrs) |s, *n, *a| {
-                n.* = s.name.ptr;
-                a.* = s.addr;
-            }
-            llvm.define(self.view, names, addrs, &err) catch {
-                ph.raise(py.PyExc_RuntimeError(), "zrun: the JIT refused the compiled code's names (a zrun bug): {s}", .{std.mem.sliceTo(&err, 0)});
-                return null;
-            };
-        }
+        if (!self.defineNames()) return null;
         const module = self.compileModule(&err) orelse {
             ph.raise(py.PyExc_RuntimeError(), "zrun: LLVM rejected the compiled program (a zrun bug): {s}", .{std.mem.sliceTo(&err, 0)});
             return null;
         };
+        return self.install(module, name);
+    }
+
+    /// The addresses the compiler's module's code names (ir.Module.ptrConst)
+    /// defined in the JIT (before its code is loaded); false with the
+    /// exception.
+    fn defineNames(self: *Compiled) bool {
+        const m = &self.compiler.m;
+        if (m.syms.items.len == 0) return true;
+        var err: [2048]u8 = undefined;
+        @memset(&err, 0);
+        const names = allocator.alloc([*:0]const u8, m.syms.items.len) catch return oomA() != null;
+        defer allocator.free(names);
+        const addrs = allocator.alloc(u64, m.syms.items.len) catch return oomA() != null;
+        defer allocator.free(addrs);
+        for (m.syms.items, names, addrs) |s, *n, *a| {
+            n.* = s.name.ptr;
+            a.* = s.addr;
+        }
+        llvm.define(self.view, names, addrs, &err) catch {
+            ph.raise(py.PyExc_RuntimeError(), "zrun: the JIT refused the compiled code's names (a zrun bug): {s}", .{std.mem.sliceTo(&err, 0)});
+            return false;
+        };
+        return true;
+    }
+
+    /// A module's code in the JIT, the program's from now: the address of
+    /// `name` in it (null with the exception).
+    fn install(self: *Compiled, module: llvm.Module, name: [:0]const u8) ?usize {
         self.modules.append(allocator, module) catch {
             var code = module;
             code.release();
@@ -505,8 +566,37 @@ fn types() type {
 
 var helpers_defined = false;
 var next_id: u64 = 0;
+
+/// The names of a program's compiled code start with: what it is (`seed`:
+/// its language's definition and its source), so its IR, and its objects
+/// in the cache (by their IR), are the same in every process, whatever was
+/// compiled before it; a counter after, if the process had it already (the
+/// JIT's names are the process's, for good: the names of the addresses the
+/// code refers to stay defined after its modules go).
+var prefixes: std.StringHashMapUnmanaged(void) = .empty;
+
+fn prefixFor(a: std.mem.Allocator, seed: *const [32]u8, opt: u32) ?[]const u8 {
+    const hex = std.fmt.bytesToHex(seed[0..6].*, .lower);
+    // (the code compiled fast: names of its own, its objects apart)
+    const tag: []const u8 = if (opt == 0) "f" else "";
+    var n: usize = 0;
+    while (true) : (n += 1) {
+        const p = (if (n == 0) std.fmt.allocPrint(a, "zr{s}{s}", .{ hex, tag }) else std.fmt.allocPrint(a, "zr{s}{s}x{d}", .{ hex, tag, n })) catch return null;
+        const slot = prefixes.getOrPut(allocator, p) catch return null;
+        if (slot.found_existing) continue;
+        // (the set's own copy: the program's arena goes with it)
+        slot.key_ptr.* = allocator.dupe(u8, p) catch {
+            _ = prefixes.remove(p);
+            return null;
+        };
+        return p;
+    }
+}
 /// zrun.configure(perf_map=True): compiled functions named for perf
 pub var perf_map = false;
+/// zrun.configure(tiers=False): a program run compiled is compiled
+/// optimized first (not compiled fast, then optimized in the background)
+pub var tiers = true;
 /// Compiled functions by address (perf_map)
 var perf_syms: std.AutoArrayHashMapUnmanaged(usize, [:0]u8) = .empty;
 
@@ -592,30 +682,298 @@ fn build(out: *Compiled, data: *program_mod.Data, lang: compile_mod.LangView, pr
     }
 }
 
-/// Compile a program: null with an exception (zrun.CompileError when the
-/// semantics can't be compiled).
-pub fn compileProgram(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject) ?*Compiled {
+/// A program's IR made (its compiler's module, not compiled yet), for
+/// LLVM's level `opt` (0: compiled fast, 2: optimized): null with an
+/// exception (zrun.CompileError when the semantics can't be compiled).
+fn prepare(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject, seed: *const [32]u8, opt: u32) ?*Compiled {
     const view = llvm.get() orelse return null;
     if (!defineHelpers(view)) return null;
 
     const out = allocator.create(Compiled) catch return oom();
-    out.* = .{ .arena = std.heap.ArenaAllocator.init(allocator), .compiler = undefined, .python = python, .view = view, .main = undefined, .globals = 0 };
+    out.* = .{ .arena = std.heap.ArenaAllocator.init(allocator), .compiler = undefined, .python = python, .view = view, .main = undefined, .globals = 0, .opt = opt };
     next_id += 1;
     out.id = next_id;
-    const prefix = std.fmt.allocPrint(out.arena.allocator(), "zr{d}", .{next_id}) catch return oom();
+    const prefix = prefixFor(out.arena.allocator(), seed, opt) orelse {
+        out.arena.deinit();
+        allocator.destroy(out);
+        return oom();
+    };
+    out.prefix = prefix;
     if (!build(out, data, lang, prefix, compile_error)) {
         out.arena.deinit();
         allocator.destroy(out);
         return null;
     }
-    const main_name = std.fmt.allocPrintSentinel(out.arena.allocator(), "{s}_main", .{prefix}, 0) catch return oom();
+    out.globals = if (out.compiler.layouts.get(program_mod.NONE)) |l| l.syms.items.len else 0;
+    return out;
+}
+
+fn mainName(c: *Compiled) ?[:0]const u8 {
+    return std.fmt.allocPrintSentinel(c.arena.allocator(), "{s}_main", .{c.prefix}, 0) catch null;
+}
+
+/// Compile a program at LLVM's level `opt` (0: fast, 2: optimized), now:
+/// null with an exception (zrun.CompileError when the semantics can't be
+/// compiled).
+pub fn compileProgram(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject, seed: *const [32]u8, opt: u32) ?*Compiled {
+    const out = prepare(data, lang, python, compile_error, seed, opt) orelse return null;
+    const main_name = mainName(out) orelse {
+        out.destroy();
+        return oom();
+    };
     const addr = out.add(main_name) orelse {
         out.destroy();
         return null;
     };
     out.main = @ptrFromInt(addr);
-    out.globals = if (out.compiler.layouts.get(program_mod.NONE)) |l| l.syms.items.len else 0;
+    out.installed = true;
     return out;
+}
+
+/// LLVM's work in the background: modules made into objects on worker
+/// threads (nothing of Python's: each module and its context its own, the
+/// JIT not touched), as many as the CPUs but one, in the order given. Waited
+/// for when Python finalizes (LLVM's own state goes as the process exits:
+/// no thread in it then), so the objects are in the cache for the next
+/// process.
+const Job = struct {
+    view: *const llvm.LlvmView,
+    module: llvm.c.LLVMModuleRef,
+    opt: u32,
+    /// Where the object is kept (owned), or null
+    path: ?[]u8,
+    /// Someone waits for it (`done`, then `bytes`: null with LLVM's error
+    /// in `err`); else it's freed when done
+    waited: bool,
+    bytes: ?[]u8 = null,
+    err: [2048]u8 = @splat(0),
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn work(self: *Job) void {
+        if (llvm.emitObject(self.view, self.module, self.opt, &self.err)) |bytes| {
+            if (self.path) |p| cache.write(p, bytes);
+            if (self.waited) self.bytes = bytes else llvm.freeBytes(self.view, bytes);
+        } else |_| {}
+        if (self.path) |p| allocator.free(p);
+        self.path = null;
+        if (self.waited) self.done.store(true, .release) else allocator.destroy(self);
+    }
+};
+
+var jobs: std.ArrayListUnmanaged(*Job) = .empty;
+var jobs_lock: std.atomic.Mutex = .unlocked;
+var workers: usize = 0;
+/// Jobs given and not done
+var outstanding: usize = 0;
+var exit_hook = false;
+
+fn lockJobs() void {
+    while (!jobs_lock.tryLock()) std.atomic.spinLoopHint();
+}
+
+/// A job to a worker (one started if there's room); false if none can
+/// take it (the caller does it).
+fn submit(job: *Job) bool {
+    if (!exit_hook) {
+        if (py.c.Py_AtExit(&waitJobs) != 0) return false;
+        exit_hook = true;
+    }
+    lockJobs();
+    defer jobs_lock.unlock();
+    jobs.append(allocator, job) catch return false;
+    outstanding += 1;
+    if (workers < (std.Thread.getCpuCount() catch 2) -| 1 or workers == 0) {
+        if (std.Thread.spawn(.{}, worker, .{})) |t| {
+            t.detach();
+            workers += 1;
+        } else |_| if (workers == 0) {
+            _ = jobs.pop();
+            outstanding -= 1;
+            return false;
+        }
+    }
+    return true;
+}
+
+fn worker() void {
+    while (true) {
+        lockJobs();
+        if (jobs.items.len == 0) {
+            workers -= 1;
+            jobs_lock.unlock();
+            return;
+        }
+        const job = jobs.orderedRemove(0);
+        jobs_lock.unlock();
+        job.work();
+        lockJobs();
+        outstanding -= 1;
+        jobs_lock.unlock();
+    }
+}
+
+/// Every job given done (program.save()'s objects in the cache; Python
+/// finalizing).
+pub fn waitJobs() callconv(.c) void {
+    while (true) {
+        lockJobs();
+        const n = outstanding;
+        jobs_lock.unlock();
+        if (n == 0) return;
+        std.Io.sleep(cache.io(), .fromMilliseconds(2), .awake) catch {};
+    }
+}
+
+/// A module made into an object in the background (`waited`: the job's
+/// the caller's to free once done), kept at `path` (taken); null if it
+/// can't be (LLVM can't read its copy; out of memory).
+fn inBackground(view: *const llvm.LlvmView, module: llvm.c.LLVMModuleRef, opt: u32, path: ?[]u8, waited: bool) ?*Job {
+    const job = allocator.create(Job) catch {
+        if (path) |p| allocator.free(p);
+        return null;
+    };
+    job.* = .{ .view = view, .module = module, .opt = opt, .path = path, .waited = waited };
+    if (!submit(job)) {
+        // (done here, then)
+        if (!waited) {
+            job.work();
+            return null;
+        }
+        job.work();
+    }
+    return job;
+}
+
+/// A program being compiled optimized while it runs otherwise: its IR made
+/// and its names defined here (with the GIL: the compiler is Python's
+/// too), its main module made into an object in the background (LLVM's
+/// work, nearly all of it), the code put in the JIT here again (finish).
+/// Its object kept in the cache by the worker: the next process has it
+/// even if this one never finishes it.
+pub const Pending = struct {
+    compiled: *Compiled,
+    main_name: [:0]const u8,
+    /// The main module's code if it was at hand (no job)
+    module: ?llvm.Module = null,
+    job: ?*Job = null,
+    /// The object's key, and whether the job keeps it in the cache (else
+    /// the Compiled does)
+    key: cache.Key = undefined,
+    cached: bool = false,
+
+    /// Whether finish() won't wait.
+    pub fn ready(self: *Pending) bool {
+        const job = self.job orelse return true;
+        return job.done.load(.acquire);
+    }
+
+    /// The program compiled (waiting for its job if it's still at work),
+    /// its code in the JIT; null with an exception. The Pending is gone
+    /// either way.
+    pub fn finish(self: *Pending) ?*Compiled {
+        while (!self.ready()) std.Io.sleep(cache.io(), .fromMilliseconds(1), .awake) catch {};
+        const c = self.compiled;
+        defer allocator.destroy(self);
+        const module = self.module orelse blk: {
+            const job = self.job.?;
+            defer allocator.destroy(job);
+            const bytes = job.bytes orelse {
+                ph.raise(py.PyExc_RuntimeError(), "zrun: LLVM rejected the compiled program (a zrun bug): {s}", .{std.mem.sliceTo(&job.err, 0)});
+                c.destroy();
+                return null;
+            };
+            defer llvm.freeBytes(c.view, bytes);
+            if (self.cached) c.cache_kept += 1 else c.keepHere(self.key, bytes);
+            var err: [2048]u8 = @splat(0);
+            break :blk llvm.loadObject(c.view, bytes, &err) catch {
+                ph.raise(py.PyExc_RuntimeError(), "zrun: the JIT refused the compiled program (a zrun bug): {s}", .{std.mem.sliceTo(&err, 0)});
+                c.destroy();
+                return null;
+            };
+        };
+        const addr = c.install(module, self.main_name) orelse {
+            c.destroy();
+            return null;
+        };
+        c.main = @ptrFromInt(addr);
+        c.installed = true;
+        return c;
+    }
+
+    /// Given up (the program gone): freed now if its thread is done, else
+    /// when it is (LLVM can't be stopped: the object it makes is kept in
+    /// the cache all the same).
+    pub fn abandon(self: *Pending) void {
+        if (self.ready()) return self.drop();
+        abandoned.append(allocator, self) catch self.drop();
+    }
+
+    /// Freed (its job done)
+    fn drop(self: *Pending) void {
+        if (self.module) |m| {
+            var code = m;
+            code.release();
+        }
+        if (self.job) |job| {
+            if (job.bytes) |b| llvm.freeBytes(self.compiled.view, b);
+            allocator.destroy(job);
+        }
+        self.compiled.destroy();
+        allocator.destroy(self);
+    }
+};
+
+/// Pendings given up, freed once their jobs are done
+var abandoned: std.ArrayListUnmanaged(*Pending) = .empty;
+
+fn freeAbandoned() void {
+    var i: usize = 0;
+    while (i < abandoned.items.len) {
+        const p = abandoned.items[i];
+        if (p.ready()) {
+            _ = abandoned.swapRemove(i);
+            p.drop();
+        } else i += 1;
+    }
+}
+
+/// Compile a program optimized (LLVM's level 2), the work in the background
+/// when its code isn't at hand: null with an exception.
+pub fn compileInBackground(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject, seed: *const [32]u8) ?*Pending {
+    freeAbandoned();
+    const c = prepare(data, lang, python, compile_error, seed, 2) orelse return null;
+    const p = allocator.create(Pending) catch {
+        c.destroy();
+        _ = py.c.PyErr_NoMemory();
+        return null;
+    };
+    p.* = .{ .compiled = c, .main_name = mainName(c) orelse {
+        allocator.destroy(p);
+        c.destroy();
+        _ = py.c.PyErr_NoMemory();
+        return null;
+    } };
+    if (!c.defineNames()) {
+        p.drop();
+        return null;
+    }
+    const key = c.moduleKey();
+    c.keys.append(allocator, key) catch {};
+    var err: [2048]u8 = @splat(0);
+    if (c.atHand(key, &err)) |module| {
+        p.module = module;
+        return p;
+    }
+    p.key = key;
+    // (where, worked out here: the cache's directory is found once)
+    const path = cache.pathFor(allocator, key);
+    p.cached = path != null;
+    p.job = inBackground(c.view, c.compiler.m.take(), 2, path, true) orelse {
+        p.drop();
+        _ = py.c.PyErr_NoMemory();
+        return null;
+    };
+    return p;
 }
 
 /// The LLVM IR a program compiles to, as text (before optimization), for

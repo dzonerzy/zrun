@@ -144,9 +144,10 @@ pub fn salt() *const [32]u8 {
 /// A module's key: what its object is the code of (its IR text, salted)
 pub const Key = [32]u8;
 
-pub fn keyOf(ir_text: []const u8) Key {
+pub fn keyOf(ir_text: []const u8, opt: u32) Key {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     h.update(salt());
+    h.update(std.mem.asBytes(&opt));
     h.update(ir_text);
     var digest: Key = undefined;
     h.final(&digest);
