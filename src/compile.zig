@@ -4260,11 +4260,106 @@ const Gen = struct {
         }
         const od = try self.materialize(obj, inst.node);
         const kd = try self.materialize(key, inst.node);
+        if ((od.shape == .any or od.shape == .list or od.shape == .tuple) and canBeInt(kd)) return .{ .dyn = try self.indexInline(inst, od, kd) };
+        return .{ .dyn = try self.getitemCall(inst, od, kd) };
+    }
+
+    /// len(v): a list's, tuple's, dict's length, a str's code points,
+    /// inline; anything else by zr_builtin (a class's __len__, errors).
+    fn lenInline(self: *Gen, inst: *Inst, len_obj: *PyObject, d: Dyn) Error!Dyn {
+        const f = &self.f;
+        const t = self.c.m.t;
+        const T = value.Tag;
+        const sized = try f.label("len_sized");
+        const str = try f.label("len_str");
+        const other = try f.label("len_other");
+        const slow = try f.label("len_call");
+        const join = try f.label("len_got");
+        const tag = d.tag;
+        const seq = f.or_(f.or_(f.icmp(jit_c.LLVMIntEQ, tag, self.k(@intFromEnum(T.list))), f.icmp(jit_c.LLVMIntEQ, tag, self.k(@intFromEnum(T.tuple)))), f.icmp(jit_c.LLVMIntEQ, tag, self.k(@intFromEnum(T.dict))));
+        try f.condBr(seq, sized, other);
+        try f.block(sized);
+        // (their length at the same place)
+        const n1 = f.load(t.i64, f.offset(f.intToPtr(d.bits), @offsetOf(value.List, "len")));
+        try self.drop(.{ .dyn = d });
+        const sized_end = f.current;
+        try f.br(join);
+        try f.block(other);
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, tag, self.k(@intFromEnum(T.str))), str, slow);
+        try f.block(str);
+        const n2 = f.load(t.i64, f.offset(f.intToPtr(d.bits), @offsetOf(value.Str, "chars")));
+        try self.drop(.{ .dyn = d });
+        const str_end = f.current;
+        try f.br(join);
+        try f.block(slow);
+        const idx = try self.c.objectIndex(len_obj);
+        const ok = self.call("zr_builtin", &.{ self.ctx, self.k32(inst.node), self.k32(@intFromEnum(helpers.Builtin.len)), self.k(@intCast(idx)), d.tag, d.bits, self.out });
+        try self.drop(.{ .dyn = d });
+        try self.check(ok);
+        const g = try self.loadOut(.int);
+        const slow_end = f.current;
+        try f.br(join);
+        try f.block(join);
+        const n = f.phiN(t.i64, &.{ n1, n2, g.bits }, &.{ sized_end, str_end, slow_end });
+        const tg = f.phiN(t.i64, &.{ self.k(@intCast(value.PINT_TAG)), self.k(@intCast(value.PINT_TAG)), g.tag }, &.{ sized_end, str_end, slow_end });
+        return .{ .tag = tg, .bits = n, .shape = .int };
+    }
+
+    fn getitemCall(self: *Gen, inst: *Inst, od: Dyn, kd: Dyn) Error!Dyn {
         const ok = self.call("zr_getitem", &.{ self.ctx, self.k32(inst.node), od.tag, od.bits, kd.tag, kd.bits, self.out });
         try self.drop(.{ .dyn = od });
         try self.drop(.{ .dyn = kd });
         try self.check(ok);
-        return .{ .dyn = try self.loadOut(.any) };
+        return self.loadOut(.any);
+    }
+
+    /// v[i] of a list or tuple by an int in it (negative from its end):
+    /// inline; anything else (and the errors) by zr_getitem.
+    fn indexInline(self: *Gen, inst: *Inst, od: Dyn, kd: Dyn) Error!Dyn {
+        const f = &self.f;
+        const t = self.c.m.t;
+        const T = value.Tag;
+        const fast = try f.label("index_fast");
+        const found = try f.label("index_found");
+        const slow = try f.label("index_other");
+        const join = try f.label("index_got");
+        const is_list = f.icmp(jit_c.LLVMIntEQ, od.tag, self.k(@intFromEnum(T.list)));
+        const is_tuple = f.icmp(jit_c.LLVMIntEQ, od.tag, self.k(@intFromEnum(T.tuple)));
+        const key_int = f.or_(f.icmp(jit_c.LLVMIntEQ, kd.tag, self.k(@intFromEnum(T.int))), f.icmp(jit_c.LLVMIntEQ, kd.tag, self.k(@intCast(value.PINT_TAG))));
+        try f.condBr(f.and_(f.or_(is_list, is_tuple), key_int), fast, slow);
+        try f.block(fast);
+        const p = f.intToPtr(od.bits);
+        // (both: their length at the same place; a list's items through a
+        // pointer, a tuple's after it)
+        const len = f.load(t.i64, f.offset(p, @offsetOf(value.List, "len")));
+        const of_list = try f.label("index_list");
+        const of_tuple = try f.label("index_tuple");
+        const have = try f.label("index_items");
+        try f.condBr(is_list, of_list, of_tuple);
+        try f.block(of_list);
+        const list_items = f.load(t.ptr, f.offset(p, @offsetOf(value.List, "items")));
+        try f.br(have);
+        try f.block(of_tuple);
+        const tuple_items = f.offset(p, @sizeOf(value.Tuple));
+        try f.br(have);
+        try f.block(have);
+        const items = f.phi(t.ptr, list_items, of_list, tuple_items, of_tuple);
+        const neg = f.icmp(jit_c.LLVMIntSLT, kd.bits, self.k(0));
+        const i = f.select(neg, f.add(kd.bits, len), kd.bits);
+        try f.condBr(f.icmp(jit_c.LLVMIntULT, i, len), found, slow);
+        try f.block(found);
+        const slot = f.at(t.val, items, i);
+        const item = try self.loadSlot(slot, .any);
+        try self.increfDyn(item);
+        try self.drop(.{ .dyn = od });
+        const found_end = f.current;
+        try f.br(join);
+        try f.block(slow);
+        const g = try self.getitemCall(inst, od, kd);
+        const slow_end = f.current;
+        try f.br(join);
+        try f.block(join);
+        return .{ .tag = f.phi(t.i64, item.tag, found_end, g.tag, slow_end), .bits = f.phi(t.i64, item.bits, found_end, g.bits, slow_end), .shape = .any };
     }
 
     /// An f-string: known pieces joined now; else each piece formatted at
@@ -5199,6 +5294,7 @@ const Gen = struct {
         }
         // int(), float(), len(), abs(), str(), bool() of a run-time value:
         // natively where it can be (zr_builtin)
+        if (args.len == 1 and args[0] == .dyn and isBuiltin(o, "len")) return .{ .dyn = try self.lenInline(inst, o, args[0].dyn) };
         if (args.len == 1 and args[0] == .dyn) {
             inline for (@typeInfo(helpers.Builtin).@"enum".fields) |fd| {
                 if (isBuiltin(o, fd.name)) {

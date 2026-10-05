@@ -49,6 +49,7 @@ BUILTINS = (
     "folds",
     "typeis",
     "extends",
+    "indexes",
 )
 
 
@@ -381,6 +382,22 @@ def make_lang():
             out.append(len("héllo".encode("utf-8")))
             out.append("ab".encode())
             return out
+        if name == "indexes":
+            # v[i] and len(v) of values of every kind, ints of each kind as
+            # indexes, out of range ones
+            xs, t, d, s, e, sized = rt.call(rt.load(node.name), [])
+            n = len(xs)
+            out = [xs[0], xs[n - 1], xs[-1], xs[-n], t[1], t[-2], d["k"], s[1], s[-1], xs[True], len(xs), len(t), len(d), len(s), len(e), len(sized)]
+            for bad in (n, -n - 1):
+                try:
+                    out.append(xs[bad])
+                except IndexError as err:
+                    out.append(str(err))
+            try:
+                out.append(e[0])
+            except IndexError as err:
+                out.append(str(err))
+            return out
         if name == "extends":
             # extend() by lists made here, by ones variables refer to, of
             # lists and of other things, in and out of run-time branches
@@ -621,6 +638,12 @@ def make_lang():
         return 3
 
     @lang.host
+    def indexes():
+        import collections
+
+        return ([10, 20, 30], (1, 2, 3), {"k": "v"}, "héllo", (), collections.deque([1, 2]))
+
+    @lang.host
     def extends():
         import collections
 
@@ -728,6 +751,7 @@ PROGRAMS = {
     "folds": "print(folds());\n",
     "typeis": "print(typeis());\n",
     "extends": "print(extends());\n",
+    "indexes": "print(indexes());\n",
 }
 
 
@@ -750,6 +774,7 @@ def test_shared_with_python(name, capsys):
         "genexp": "(True, False, 12, 2, True, False, '123')",
         "defaults": "(6, 9, 7, 13, 2)",
         "extends": "([3, 3, 4, 7, 30, [1, 1], 8, 9], [3, 5], True, [0, 3, 'a'])",
+        "indexes": "[10, 30, 30, 10, 2, 2, 'v', 'é', 'o', 20, 3, 3, 1, 5, 0, 2, 'list index out of range', 'list index out of range', 'tuple index out of range']",
         "folds": "[31, -1000, 42, -1, ['7', '-8'], ['x', 'b', 'y', 'x', 'y', '!'], ['x', 'b', 'y', 'x', 'y'], \"bad digit 'z' in '12z'\", 6, b'ab']",
         "trying": "[\"value:invalid literal for int() with base 10: 'x'\", 'key', 'fin', 'body', 'else', 'loop0', 'f0', 'f1', 'f2', 'g1', 'g2', 'rf', 'ret', 'v', 'again', 'inner', 'zero']",
     }.get(name)
