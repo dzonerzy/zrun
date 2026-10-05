@@ -45,6 +45,15 @@ pub const Module = struct {
     fns: std.StringHashMapUnmanaged(Fn) = .empty,
     /// Given to the JIT: no longer ours to free
     taken: bool = false,
+    /// Addresses of this process the code refers to (objects, tables...),
+    /// as names (`<prefix>_k<n>`, defined before the code is linked): the
+    /// code itself the same in every process (a cache of it serves).
+    /// Numbered for the program (`counter`: its modules' names differ).
+    addrs: std.AutoHashMapUnmanaged(usize, Value) = .empty,
+    syms: std.ArrayListUnmanaged(Sym) = .empty,
+    counter: ?*u32 = null,
+
+    pub const Sym = struct { name: [:0]const u8, addr: u64 };
 
     pub fn init(gpa: Allocator, prefix: []const u8) Module {
         const ctx = L("LLVMContextCreate")();
@@ -79,6 +88,8 @@ pub const Module = struct {
         }
         self.strings.deinit(self.gpa);
         self.fns.deinit(self.gpa);
+        self.addrs.deinit(self.gpa);
+        self.syms.deinit(self.gpa);
     }
 
     /// The module for the JIT (it takes the module and its context).
@@ -167,9 +178,24 @@ pub const Module = struct {
         return L("LLVMConstNull")(self.t.ptr);
     }
 
-    /// A pointer known when compiling (an object of the compiler's).
+    /// A pointer known when compiling (an object of the process's): a name
+    /// for it (syms), defined to it when the code is linked.
     pub fn ptrConst(self: *Module, addr: usize) Value {
-        return L("LLVMConstIntToPtr")(L("LLVMConstInt")(self.t.i64, addr, 0), self.t.ptr);
+        if (self.addrs.get(addr)) |g| return g;
+        const n = if (self.counter) |c_| blk: {
+            c_.* += 1;
+            break :blk c_.*;
+        } else self.syms.items.len;
+        const name = std.fmt.allocPrintSentinel(self.gpa, "{s}_k{d}", .{ self.prefix, n }, 0) catch @panic("out of memory");
+        const g = L("LLVMAddGlobal")(self.mod, self.t.i8, name);
+        self.syms.append(self.gpa, .{ .name = name, .addr = addr }) catch @panic("out of memory");
+        self.addrs.put(self.gpa, addr, g) catch @panic("out of memory");
+        return g;
+    }
+
+    /// An address as an int constant (ptrConst's name).
+    pub fn addrInt(self: *Module, addr: usize) Value {
+        return L("LLVMConstPtrToInt")(self.ptrConst(addr), self.t.i64);
     }
 
     /// The immortal string object of a literal (value.literal: the

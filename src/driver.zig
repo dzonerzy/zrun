@@ -16,6 +16,8 @@ const value = @import("value.zig");
 // (not named llvm.zig: Zig names functions after their file, and LLVM
 // reserves every name starting with "llvm.")
 const llvm = @import("jit.zig");
+const jit_f = llvm.f;
+const cache = @import("cache.zig");
 const program_mod = @import("program.zig");
 const grammar_mod = @import("grammar.zig");
 
@@ -326,6 +328,34 @@ pub const Compiled = struct {
         }
     }
 
+    /// The compiler's module as code in the JIT: its object file from the
+    /// cache (cache.zig) if it's there, else compiled (and kept there).
+    /// Null with the error in `err`.
+    fn compileModule(self: *Compiled, err: []u8) ?llvm.Module {
+        const m = &self.compiler.m;
+        const path = blk: {
+            const text = jit_f("LLVMPrintModuleToString")(m.mod);
+            defer jit_f("LLVMDisposeMessage")(text);
+            break :blk cache.pathFor(allocator, std.mem.span(text));
+        } orelse return llvm.compile(self.view, m.take(), 2, err) catch null;
+        defer allocator.free(path);
+        const stats = std.c.getenv("ZRUN_STATS") != null;
+        if (cache.read(allocator, path)) |bytes| {
+            defer allocator.free(bytes);
+            // (the module isn't the JIT's: the compiler frees it)
+            if (llvm.loadObject(self.view, bytes, err)) |module| {
+                if (stats) std.debug.print("  from the cache: {s}\n", .{path});
+                return module;
+            } else |_| {}
+            // (one that won't load: compiled again)
+        }
+        const bytes = llvm.emitObject(self.view, m.take(), 2, err) catch return null;
+        defer llvm.freeBytes(self.view, bytes);
+        cache.write(path, bytes);
+        if (stats) std.debug.print("  compiled, kept: {s}\n", .{path});
+        return llvm.loadObject(self.view, bytes, err) catch null;
+    }
+
     /// The compiler's module into the JIT: the address of `name` in it.
     fn add(self: *Compiled, name: [:0]const u8) ?usize {
         var err: [2048]u8 = undefined;
@@ -334,13 +364,31 @@ pub const Compiled = struct {
             std.debug.print("module {s}: {d} bodies inlined, {d} helpers out of line\n", .{ name, self.compiler.inlined, self.compiler.helper_fns.items.len });
             self.compiler.inlined = 0;
         }
-        const module = llvm.compile(self.view, self.compiler.m.take(), 2, &err) catch {
+        // The addresses the code names (ir.Module.ptrConst): defined first
+        const m = &self.compiler.m;
+        if (m.syms.items.len > 0) {
+            const names = allocator.alloc([*:0]const u8, m.syms.items.len) catch return oomA();
+            defer allocator.free(names);
+            const addrs = allocator.alloc(u64, m.syms.items.len) catch return oomA();
+            defer allocator.free(addrs);
+            for (m.syms.items, names, addrs) |s, *n, *a| {
+                n.* = s.name.ptr;
+                a.* = s.addr;
+            }
+            llvm.define(self.view, names, addrs, &err) catch {
+                ph.raise(py.PyExc_RuntimeError(), "zrun: the JIT refused the compiled code's names (a zrun bug): {s}", .{std.mem.sliceTo(&err, 0)});
+                return null;
+            };
+        }
+        const t0 = nowUs();
+        const module = self.compileModule(&err) orelse {
             ph.raise(py.PyExc_RuntimeError(), "zrun: LLVM rejected the compiled program (a zrun bug): {s}", .{std.mem.sliceTo(&err, 0)});
             return null;
         };
+        llvm_us += nowUs() - t0;
         self.modules.append(allocator, module) catch {
-            var m = module;
-            m.release();
+            var code = module;
+            code.release();
             _ = py.c.PyErr_NoMemory();
             return null;
         };
@@ -365,6 +413,8 @@ fn types() type {
 
 var helpers_defined = false;
 var next_id: u64 = 0;
+/// Time in LLVM (optimizing, compiling) so far (zrun.llvm_time())
+pub var llvm_us: i64 = 0;
 
 /// Give zgram's JIT the runtime helpers (once per process).
 fn defineHelpers(view: *const llvm.LlvmView) bool {
@@ -441,6 +491,8 @@ fn build(out: *Compiled, data: *program_mod.Data, lang: compile_mod.LangView, pr
 pub fn compileProgram(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject) ?*Compiled {
     const view = llvm.get() orelse return null;
     if (!defineHelpers(view)) return null;
+    const t_start = nowUs();
+    const llvm_start = llvm_us;
 
     const out = allocator.create(Compiled) catch return oom();
     out.* = .{ .arena = std.heap.ArenaAllocator.init(allocator), .compiler = undefined, .python = python, .view = view, .main = undefined, .globals = 0 };
@@ -459,6 +511,7 @@ pub fn compileProgram(data: *program_mod.Data, lang: compile_mod.LangView, pytho
     };
     out.main = @ptrFromInt(addr);
     out.globals = if (out.compiler.layouts.get(program_mod.NONE)) |l| l.syms.items.len else 0;
+    if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("program compiled: {d}ms, LLVM {d}ms of it\n", .{ @divTrunc(nowUs() - t_start, 1000), @divTrunc(llvm_us - llvm_start, 1000) });
     return out;
 }
 

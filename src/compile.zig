@@ -812,6 +812,8 @@ pub const Compiler = struct {
     specialized: usize = 0,
     /// Blocks of the helpers generated so far (a specialization's size)
     helper_blocks: usize = 0,
+    /// Names given to addresses so far (ir.Module.ptrConst)
+    ksyms: u32 = 0,
     /// By node: its kind's str (kindTable); by label, its child (fieldTable)
     kind_table: ?[]u64 = null,
     owner_table: ?[]u64 = null,
@@ -1205,6 +1207,8 @@ pub const Compiler = struct {
     }
 
     fn declareRuntime(self: *Compiler) !void {
+        // (the program's names for addresses, across its modules)
+        self.m.counter = &self.ksyms;
         for (runtime_decls) |d| {
             var params: [12]ir.Type = undefined;
             for (d[1][1..], 0..) |l, i| params[i] = self.letterType(l);
@@ -1839,7 +1843,7 @@ const Gen = struct {
             try frozen_natives.put(std.heap.c_allocator, o, v);
             break :blk v;
         };
-        return self.konst(@intCast(v.tag), @bitCast(v.bits), shape);
+        return .{ .tag = self.k(@intCast(v.tag)), .bits = self.c.m.addrInt(v.bits), .shape = shape };
     }
 
     /// A Python list or dict as a native one (its items as values are:
@@ -1891,7 +1895,7 @@ const Gen = struct {
             // (a big int within 128 bits: a Big, made once for the program)
             .py => |o| if (ph.typeOf(o) == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyLong_Type")))) and value.bigOf(o) != null) blk: {
                 const b = try self.c.bigConst(value.bigOf(o).?);
-                break :blk self.konst(@intFromEnum(value.Tag.big), @intCast(@intFromPtr(b)), .any);
+                break :blk .{ .tag = self.k(@intFromEnum(value.Tag.big)), .bits = self.c.m.addrInt(@intFromPtr(b)), .shape = .any };
             } else blk: {
                 const idx = try self.c.objectIndex(o);
                 _ = self.call("zr_object", &.{ self.ctx, self.k(@intCast(idx)), self.out });
@@ -3666,7 +3670,7 @@ const Gen = struct {
             for (cands) |cand| {
                 const yes = try f.label("setfield_of");
                 const no = try f.label("setfield_next");
-                try f.condBr(f.icmp(jit_c.LLVMIntEQ, rt, self.k(@intCast(@intFromPtr(cand.rtype)))), yes, no);
+                try f.condBr(f.icmp(jit_c.LLVMIntEQ, rt, self.c.m.addrInt(@intFromPtr(cand.rtype))), yes, no);
                 try f.block(yes);
                 const p = self.fieldPtr(d, cand.index);
                 const old = Dyn{ .tag = f.load(t.i64, p), .bits = f.load(t.i64, f.offset(p, 8)), .shape = .any };
@@ -4324,7 +4328,7 @@ const Gen = struct {
             // shared with Python (adopt.zig), its address a constant)
             if (try adopt_mod.adopt(v, globals)) |nv| return .{ .dyn = .{
                 .tag = self.k(@intCast(nv.tag)),
-                .bits = self.k(@bitCast(nv.bits)),
+                .bits = self.c.m.addrInt(nv.bits),
                 .shape = switch (nv.kind()) {
                     .list => .list,
                     .dict => .dict,
@@ -4601,7 +4605,7 @@ const Gen = struct {
         for (cands) |cand| {
             const yes = try f.label("field_of");
             const no = try f.label("field_next");
-            try f.condBr(f.icmp(jit_c.LLVMIntEQ, rt, self.k(@intCast(@intFromPtr(cand.rtype)))), yes, no);
+            try f.condBr(f.icmp(jit_c.LLVMIntEQ, rt, self.c.m.addrInt(@intFromPtr(cand.rtype))), yes, no);
             try f.block(yes);
             const p = self.fieldPtr(d, cand.index);
             const ftag = f.load(t.i64, p);
@@ -4752,7 +4756,7 @@ const Gen = struct {
             try f.block(of_type);
             // (a record's type: the word after its header)
             const rt = f.load(t.i64, f.offset(f.intToPtr(d.bits), 16));
-            try f.condBr(f.icmp(jit_c.LLVMIntEQ, rt, self.k(@intCast(@intFromPtr(cand.rtype)))), yes, no);
+            try f.condBr(f.icmp(jit_c.LLVMIntEQ, rt, self.c.m.addrInt(@intFromPtr(cand.rtype))), yes, no);
             try f.block(yes);
             const r = try self.materialize(try self.outOfLine(cand.func, inst.node, try self.withDefaults(cand.func, all)), inst.node);
             try self.storeSlot(result, r);
@@ -5368,7 +5372,7 @@ const Gen = struct {
         try f.block(maybe);
         try f.condBr(is_rec, rec, slow);
         try f.block(rec);
-        try f.condBr(f.icmp(jit_c.LLVMIntEQ, self.recordTypeOf(d), self.k(@intCast(@intFromPtr(rtype)))), join, slow);
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, self.recordTypeOf(d), self.c.m.addrInt(@intFromPtr(rtype))), join, slow);
         try f.block(slow);
         const r = f.zext64(self.call("zr_is_record", &.{ d.tag, d.bits, self.ptrConst(rtype) }));
         const slow_end = f.current;

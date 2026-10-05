@@ -15,7 +15,7 @@ pub const c = @cImport({
     @cInclude("llvm-c/Core.h");
 });
 
-pub const LLVM_ABI: u32 = 1;
+pub const LLVM_ABI: u32 = 2;
 pub const CAPSULE_NAME = "zgram.llvm.v1";
 pub const LLVM_VERSION = "21.1.8";
 
@@ -31,6 +31,7 @@ pub const LlvmView = extern struct {
     free_bytes: *const fn (bytes: ?[*]u8) callconv(.c) void,
     triple: *const fn () callconv(.c) ?[*:0]const u8,
     data_layout: *const fn () callconv(.c) ?[*:0]const u8,
+    load_object: *const fn (bytes: [*]const u8, len: usize, err: [*]u8, err_cap: usize) callconv(.c) ?*anyopaque,
 };
 
 // The C types of the prototypes below
@@ -55,6 +56,8 @@ pub const Api = struct {
     ModuleCreateWithNameInContext: *const fn (Str, Context) callconv(.c) ModuleRef,
     DisposeModule: *const fn (ModuleRef) callconv(.c) void,
     PrintModuleToString: *const fn (ModuleRef) callconv(.c) [*c]u8,
+    GetHostCPUName: *const fn () callconv(.c) [*c]u8,
+    GetHostCPUFeatures: *const fn () callconv(.c) [*c]u8,
     DisposeMessage: *const fn ([*c]u8) callconv(.c) void,
     Int1TypeInContext: *const fn (Context) callconv(.c) Type,
     Int8TypeInContext: *const fn (Context) callconv(.c) Type,
@@ -75,6 +78,7 @@ pub const Api = struct {
     ConstStructInContext: *const fn (Context, [*c]Value, c_uint, Bool) callconv(.c) Value,
     ConstIntToPtr: *const fn (Value, Type) callconv(.c) Value,
     AddGlobal: *const fn (ModuleRef, Type, Str) callconv(.c) Value,
+    ConstPtrToInt: *const fn (Value, Type) callconv(.c) Value,
     SetInitializer: *const fn (Value, Value) callconv(.c) void,
     SetGlobalConstant: *const fn (Value, Bool) callconv(.c) void,
     SetLinkage: *const fn (Value, c.LLVMLinkage) callconv(.c) void,
@@ -188,4 +192,27 @@ pub fn compile(view: *const LlvmView, module: c.LLVMModuleRef, opt_level: u32, e
 
 pub fn lookup(view: *const LlvmView, name: [:0]const u8) usize {
     return @intCast(view.lookup(name.ptr));
+}
+
+/// A module compiled to an object file for this process (taking it and
+/// its context): the bytes (free them with freeBytes).
+pub fn emitObject(view: *const LlvmView, module: c.LLVMModuleRef, opt_level: u32, err: []u8) error{Compile}![]u8 {
+    var n: usize = 0;
+    const p = view.emit_object(@ptrCast(module), opt_level, null, null, null, &n, err.ptr, err.len) orelse return error.Compile;
+    return p[0..n];
+}
+
+pub fn freeBytes(view: *const LlvmView, bytes: []u8) void {
+    view.free_bytes(bytes.ptr);
+}
+
+/// An object file emitObject made into the JIT.
+pub fn loadObject(view: *const LlvmView, bytes: []const u8, err: []u8) error{Compile}!Module {
+    const handle = view.load_object(bytes.ptr, bytes.len, err.ptr, err.len) orelse return error.Compile;
+    return .{ .handle = handle };
+}
+
+/// Names compiled code refers to, at these addresses.
+pub fn define(view: *const LlvmView, names: []const [*:0]const u8, addrs: []const u64, err: []u8) error{Compile}!void {
+    if (view.define(names.ptr, addrs.ptr, names.len, err.ptr, err.len) != 0) return error.Compile;
 }
