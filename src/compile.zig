@@ -782,6 +782,18 @@ pub const Site = struct {
     pub const Hot = extern struct { code: u64 = 0, count: i64 = 0 };
 };
 
+/// What a language function's generic entry has seen of its arguments
+/// (Gen.entryForward): the kinds of values each has been (a bit per tag,
+/// 16 per parameter, the first 4), counted until it's hot; then its typed
+/// entry for those (zr_speculate), the kinds it takes (`want`, as `seen`).
+pub const Speculation = extern struct {
+    code: u64 = 0,
+    count: i64 = 0,
+    seen: u64 = 0,
+    want: u64 = 0,
+    nparams: u64 = 0,
+};
+
 /// The most specializations a program makes (compiling costs)
 pub const max_specialized = 256;
 /// The biggest specialization compiled (blocks of code, the helpers it
@@ -872,6 +884,8 @@ pub const Compiler = struct {
     /// By semantic or helper read: the reads of its locals that move their
     /// value out (localMoves), worked out
     local_moves: std.AutoHashMapUnmanaged(*const front.Function, *std.AutoHashMapUnmanaged(*const front.Expr, void)) = .empty,
+    /// Language functions' speculations (Speculation), by node
+    speculations: std.AutoHashMapUnmanaged(u32, *Speculation) = .empty,
     /// Functions' typed entries (Gen.typedParams), worked out
     typed_params: std.AutoHashMapUnmanaged(u32, ?[]const Shape) = .empty,
     /// By node: its kind's str (kindTable); by label, its child (fieldTable)
@@ -1259,6 +1273,7 @@ pub const Compiler = struct {
         .{ "zr_function", "bpppiplp" },
         .{ "zr_call", "bpillplpp" },
         .{ "zr_specialize", "vpl" },
+        .{ "zr_speculate", "vpl" },
         .{ "zr_frame_of", "ppiip" },
         .{ "zr_object", "vplp" },
         .{ "zr_frame_new", "ppl" },
@@ -1563,6 +1578,7 @@ pub const Compiler = struct {
             g.nargs = g.f.param(3);
             g.recv = g.f.param(4);
             g.result = g.f.param(5);
+            try g.entryForward();
         }
         try g.prologue();
         if (fnode == NONE) {
@@ -2721,7 +2737,6 @@ const Gen = struct {
         if (c.typed_params.get(fnode)) |r| return r;
         const result = blk: {
             const spec = c.specOf(fnode) orelse break :blk null;
-            if (spec.extra == .keep) break :blk null;
             const params = self.paramNodes(fnode, spec);
             if (params.len == 0) break :blk null;
             const shapes = try c.a.alloc(Shape, params.len);
@@ -2736,6 +2751,100 @@ const Gen = struct {
         };
         try c.typed_params.put(c.a, fnode, result);
         return result;
+    }
+
+    /// The kinds a function's arguments have, as bits: a bit per tag (an
+    /// int's two tags one), 16 per parameter (Speculation's `seen`).
+    fn kindBits(self: *Gen, n: usize) ir.Value {
+        const f = &self.f;
+        var bits = self.k(0);
+        for (0..n) |i| {
+            const tag = f.load(self.c.m.t.i64, self.elem(self.args, i));
+            const bit = f.shl(self.k(1), f.and_(tag, self.k(15)));
+            bits = f.or_(bits, f.shl(bit, self.k(@intCast(16 * i))));
+        }
+        return bits;
+    }
+
+    /// A function's generic entry: arguments of the kinds its typed entry
+    /// takes go to it (the guard: their kinds; anything else runs here,
+    /// nothing having run yet). Its typed entry: the declared one, or (none
+    /// declared) the one made for the kinds its arguments have always been
+    /// once it's hot (zr_speculate), their kinds counted until then.
+    fn entryForward(self: *Gen) Error!void {
+        const c = self.c;
+        const f = &self.f;
+        const t = c.m.t;
+        const fnode = self.fnode;
+        const spec = c.specOf(fnode).?;
+        const n = self.paramNodes(fnode, spec).len;
+        if (n == 0 or n > 4) return;
+        const generic = try f.label("entry_generic");
+        const guard = try f.label("entry_check");
+        const forward = try f.label("entry_typed");
+        var code: ir.Value = undefined;
+        var want: ir.Value = undefined;
+        if (try self.typedParams(fnode)) |shapes| {
+            // (declared: its kinds known here)
+            code = f.ptrToInt(try c.functionCode(fnode | Compiler.TYPED));
+            var w: u64 = 0;
+            for (shapes, 0..) |s, i| {
+                const tag: u6 = switch (s) {
+                    .int => @intFromEnum(value.Tag.int),
+                    .float => @intFromEnum(value.Tag.float),
+                    else => @intFromEnum(value.Tag.bool),
+                };
+                w |= (@as(u64, 1) << tag) << @intCast(16 * i);
+            }
+            want = self.k(@bitCast(w));
+            try f.br(guard);
+        } else {
+            const rec = try c.a.create(Speculation);
+            rec.* = .{ .nparams = n };
+            try c.speculations.put(c.a, fnode, rec);
+            const p = c.m.ptrConst(@intFromPtr(rec));
+            code = f.load(t.i64, f.offset(p, @offsetOf(Speculation, "code")));
+            want = f.load(t.i64, f.offset(p, @offsetOf(Speculation, "want")));
+            const counting = try f.label("entry_count");
+            try f.condBr(f.icmp(jit_c.LLVMIntNE, code, self.k(0)), guard, counting);
+            // Not yet: the kinds seen (all of them unknown if the arguments
+            // aren't one for each parameter), counted; zr_speculate once
+            // hot
+            try f.block(counting);
+            const all = f.icmp(jit_c.LLVMIntEQ, self.nargs, self.k(@intCast(n)));
+            const seen_p = f.offset(p, @offsetOf(Speculation, "seen"));
+            const bits = f.select(all, self.kindBits(n), self.k(@bitCast(@as(u64, 0x8000800080008000))));
+            f.store(f.or_(f.load(t.i64, seen_p), bits), seen_p);
+            const count_p = f.offset(p, @offsetOf(Speculation, "count"));
+            const count = f.add(f.load(t.i64, count_p), self.k(1));
+            f.store(count, count_p);
+            const now_hot = try f.label("entry_hot");
+            try f.condBr(f.icmp(jit_c.LLVMIntEQ, count, self.k(c.lang.hot_calls)), now_hot, generic);
+            try f.block(now_hot);
+            _ = self.call("zr_speculate", &.{ self.ctx, self.k(@intCast(fnode)) });
+            try f.br(generic);
+        }
+        // The guard: one argument for each parameter, of the kinds it takes
+        try f.block(guard);
+        const all = f.icmp(jit_c.LLVMIntEQ, self.nargs, self.k(@intCast(n)));
+        const kinds_ok = try f.label("entry_count_ok");
+        try f.condBr(all, kinds_ok, generic);
+        try f.block(kinds_ok);
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, self.kindBits(n), want), forward, generic);
+        try f.block(forward);
+        const params = try self.a().alloc(ir.Value, Compiler.typed_first + n);
+        @memcpy(params[0..Compiler.typed_first], &[_]ir.Value{ self.ctx, self.env, self.recv });
+        for (params[Compiler.typed_first..], 0..) |*q, i| q.* = f.load(t.i64, f.field(t.val, self.elem(self.args, i), 1));
+        // (its type: as llvmFunction makes it, for n parameters)
+        const types_ = try self.a().alloc(ir.Type, Compiler.typed_first + n);
+        @memcpy(types_[0..Compiler.typed_first], &[_]ir.Type{ t.ptr, t.ptr, t.ptr });
+        @memset(types_[Compiler.typed_first..], t.i64);
+        const r = f.call(.{ .v = f.intToPtr(code), .ty = c.m.fnType(t.val, types_) }, params);
+        const rtag = f.extract(r, 0);
+        f.store(rtag, self.result);
+        f.store(f.extract(r, 1), f.field(t.val, self.result, 1));
+        try f.ret(f.icmp(jit_c.LLVMIntNE, rtag, self.k(Compiler.typed_error)));
+        try f.block(generic);
     }
 
     /// Whether a variable always has a value where code reads it: a
@@ -3378,7 +3487,8 @@ const Gen = struct {
             // (its first `if` small with what's known: that inline, the
             // rest out of line)
             if (try self.headOf(func)) |head| if (try self.foldedSizeOf(func, head, args) <= folded_inline_size)
-                return self.runBody(func, head, at, args);            return self.outOfLine(func, at, args);
+                return self.runBody(func, head, at, args);
+            return self.outOfLine(func, at, args);
         }
         return self.runFunction(func, at, args);
     }
@@ -5901,8 +6011,11 @@ const Gen = struct {
         const t = m.t;
         const n = ds.len;
         const code = try self.c.functionCode(fd.func);
-        const typed = if (try self.typedParams(fd.func)) |shapes| for (shapes, ds) |s, d| {
-            if (d.shape != s) break false;
+        const shapes = try self.typedParams(fd.func);
+        // (arguments of the kinds its typed entry takes, or of kinds known
+        // when the code runs: that entry, for them)
+        const typed = if (shapes) |ss| for (ss, ds) |s, d| {
+            if (d.shape != s and d.shape != .any) break false;
         } else true else false;
         const is_fn = try f.label("call_is_fn");
         const direct = try f.label("call_direct");
@@ -5927,7 +6040,23 @@ const Gen = struct {
         f.store(self.k32(inst.node), f.offset(at, @offsetOf(helpers.CallEntry, "node")));
         f.store(f.add(depth, self.k(1)), depth_p);
         const env = f.load(t.ptr, f.offset(fo, @offsetOf(value.Function, "env")));
+        const generic_args = [_]ir.Value{ ctx, env, arr, self.k(@intCast(n)), recv_ptr, self.out };
         const st = if (typed) blk: {
+            // (the kinds known only when the code runs: checked)
+            var ok = m.k1(true);
+            for (shapes.?, ds) |s, d| {
+                if (d.shape == s) continue;
+                ok = f.and_(ok, switch (s) {
+                    .int => f.icmp(jit_c.LLVMIntEQ, f.or_(d.tag, self.k(16)), self.k(@intCast(value.PINT_TAG))),
+                    .float => f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.float))),
+                    else => f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.bool))),
+                });
+            }
+            const typed_b = try f.label("call_typed");
+            const generic_b = try f.label("call_entry");
+            const entered = try f.label("call_entered");
+            try f.condBr(ok, typed_b, generic_b);
+            try f.block(typed_b);
             const entry_code = try self.c.functionCode(fd.func | Compiler.TYPED);
             const first = Compiler.typed_first;
             const params = try self.a().alloc(ir.Value, first + n);
@@ -5938,8 +6067,16 @@ const Gen = struct {
             const rtag = f.extract(r, 0);
             f.store(rtag, self.out);
             f.store(f.extract(r, 1), f.field(t.val, self.out, 1));
-            break :blk f.icmp(jit_c.LLVMIntNE, rtag, self.k(Compiler.typed_error));
-        } else f.call(.{ .v = code, .ty = (try self.c.llvmFunction(fd.func)).ty }, &.{ ctx, env, arr, self.k(@intCast(n)), recv_ptr, self.out });
+            const st_typed = f.icmp(jit_c.LLVMIntNE, rtag, self.k(Compiler.typed_error));
+            const typed_end = f.current;
+            try f.br(entered);
+            try f.block(generic_b);
+            const st_generic = f.call(.{ .v = code, .ty = (try self.c.llvmFunction(fd.func)).ty }, &generic_args);
+            const generic_end = f.current;
+            try f.br(entered);
+            try f.block(entered);
+            break :blk f.phi(t.i1, st_typed, typed_end, st_generic, generic_end);
+        } else f.call(.{ .v = code, .ty = (try self.c.llvmFunction(fd.func)).ty }, &generic_args);
         f.store(depth, depth_p);
         // (its result as rt.call gives it: an int an I64)
         const out_tag = f.load(t.i64, self.out);

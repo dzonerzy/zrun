@@ -113,6 +113,34 @@ def test_function_variables_rebound(capsys):
     assert capsys.readouterr().out == "4 6 34 10\n" * 2
 
 
+def test_speculation_guards_fail(capsys):
+    # functions hot with ints (a typed entry made for them, taken when the
+    # arguments are ints), then called with anything else: the generic code,
+    # as the reference does it
+    src = (
+        "local function f(a, b) return a * 2 + b end\n"
+        "local s = 0\n"
+        "for i = 1, 1500 do s = s + f(i, 1) end\n"
+        "print(s)\n"
+        "print(f(1.5, 2), f(2, 0.5), f('3', 4), f(7, 1, 99), pcall(f, true, 1))\n"
+        "local function g(n) if n < 1 then return 0 end return n + g(n - 1) end\n"
+        "for i = 1, 1500 do g(3) end\n"
+        "print(g(10), g(2.5), g(4), pcall(g, 'x'))\n"
+        "local function h(x) return x end\n"
+        "for i = 1, 1500 do h(i) end\n"
+        "print(h(1), h(nil), h('s'), h(1.25), h({}) ~= nil)\n"
+    )
+    outs = []
+    for mode in ("python", "compiled"):
+        program = lua.lang.load(src, "guards.lua")
+        program.run(mode=mode)
+        outs.append(capsys.readouterr().out)
+    assert outs[0] == outs[1]
+    assert outs[1].startswith("2253000\n5.0\t4.5\t10\t15\tfalse\t")
+    # (f, g and h: typed entries for ints)
+    assert program.report()["speculated"] == {"line 1": "int, int", "line 6": "int", "line 9": "int"}
+
+
 def test_arguments(capsys):
     lua.run("print(#arg, arg[0], arg[1], ...)\n", "script.lua", args=["a", "b"])
     assert capsys.readouterr().out == "2\tscript.lua\ta\n"

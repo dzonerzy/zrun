@@ -230,6 +230,54 @@ pub const Compiled = struct {
         hot.code = addr;
     }
 
+    /// A hot language function compiled again for the kinds of values its
+    /// arguments have always been (bridge's zr_speculate): its typed entry,
+    /// which its generic entry calls for arguments of those kinds (as code
+    /// compiled from now on does directly). Arguments of more than one kind,
+    /// or of none an entry takes, or code that can't be compiled: nothing
+    /// (it isn't counted any more).
+    pub fn speculate(self: *Compiled, fnode: u32) void {
+        const c = &self.compiler;
+        const rec = c.speculations.get(fnode) orelse return;
+        rec.count = std.math.minInt(i64);
+        const shapes = c.a.alloc(compile_mod.Shape, rec.nparams) catch return;
+        for (shapes, 0..) |*s, i| {
+            const bits = (rec.seen >> @intCast(16 * i)) & 0xFFFF;
+            s.* = if (bits == 1 << @intFromEnum(value.Tag.int))
+                .int
+            else if (bits == 1 << @intFromEnum(value.Tag.float))
+                .float
+            else if (bits == 1 << @intFromEnum(value.Tag.bool))
+                .bool
+            else
+                return;
+        }
+        const key = fnode | compile_mod.Compiler.TYPED;
+        c.typed_params.put(c.a, fnode, shapes) catch return;
+        const name = std.fmt.allocPrintSentinel(c.a, "{s}_t{d}", .{ c.m.prefix, fnode }, 0) catch return;
+        const addr = while (true) {
+            c.failed_semantic = null;
+            c.need_retry = false;
+            c.newModule() catch return;
+            _ = c.functionCode(key) catch return;
+            c.drainQueues() catch |e| {
+                c.forgetModule();
+                if (e == error.Unsupported and c.need_retry) continue;
+                // (it stays generic: as it was compiled)
+                c.typed_params.put(c.a, fnode, null) catch {};
+                py.c.PyErr_Clear();
+                return;
+            };
+            break self.add(name) orelse {
+                c.typed_params.put(c.a, fnode, null) catch {};
+                py.c.PyErr_Clear();
+                return;
+            };
+        };
+        rec.want = rec.seen;
+        rec.code = addr;
+    }
+
     /// The compiled code of a Python function compiled code calls (for
     /// `nargs` arguments, those of rt_mask rt values): its address, made the
     /// first time; null if it can't be compiled (Python runs it, then).

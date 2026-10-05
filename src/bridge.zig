@@ -1135,10 +1135,17 @@ pub export fn zr_specialize(ctx: *Ctx, site: u64) callconv(.c) void {
     linkOf(ctx).compiled.specialize(@intCast(site));
 }
 
+/// A hot language function's typed entry, for the kinds its arguments have
+/// always been (driver's speculate)
+pub export fn zr_speculate(ctx: *Ctx, fnode: u64) callconv(.c) void {
+    linkOf(ctx).compiled.speculate(@intCast(fnode));
+}
+
 /// The bridge's helpers, by name (for the JIT)
-pub fn symbols() [7]struct { []const u8, usize } {
+pub fn symbols() [8]struct { []const u8, usize } {
     return .{
         .{ "zr_specialize", @intFromPtr(&zr_specialize) },
+        .{ "zr_speculate", @intFromPtr(&zr_speculate) },
         .{ "zr_py_semantic", @intFromPtr(&zr_py_semantic) },
         .{ "zr_run_value", @intFromPtr(&zr_run_value) },
         .{ "zr_runtime", @intFromPtr(&zr_runtime) },

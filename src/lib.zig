@@ -783,8 +783,10 @@ const Program = struct {
     /// code went through Python in the last run with report=True),
     /// "module_state": {name: "native" or why Python keeps it} (the
     /// module-level tables and records the semantics use), "cache":
-    /// {"loaded": n, "compiled": n} (modules of compiled code)}. Which
-    /// semantics run as Python: Language.python_semantics().
+    /// {"loaded": n, "compiled": n} (modules of compiled code), "speculated":
+    /// {"line N": kinds} (functions given a typed entry for the kinds their
+    /// arguments have been)}. Which semantics run as Python:
+    /// Language.python_semantics().
     pub fn report(self: *Program) ?*PyObject {
         const out = py.c.PyDict_New() orelse return null;
         const crossings = if (self._crossings) |o| ref(o) else py.c.PyDict_New() orelse return null;
@@ -811,6 +813,33 @@ const Program = struct {
         }
         if (py.c.PyDict_SetItemString(out, "module_state", module_state) != 0) return null;
         if (py.c.PyDict_SetItemString(out, "cache", cache_d) != 0) return null;
+        // (the functions given a typed entry for what their arguments have
+        // been: "line N": their kinds)
+        const speculated = py.c.PyDict_New() orelse return null;
+        defer py.Py_DecRef(speculated);
+        if (self._compiled) |c| {
+            var it = c.compiler.speculations.iterator();
+            while (it.next()) |e| {
+                if (e.value_ptr.*.code == 0) continue;
+                const fnode = e.key_ptr.*;
+                const shapes = (c.compiler.typed_params.get(fnode) orelse continue) orelse continue;
+                var buf: std.ArrayListUnmanaged(u8) = .empty;
+                defer buf.deinit(allocator);
+                for (shapes, 0..) |s, i| {
+                    if (i > 0) buf.appendSlice(allocator, ", ") catch return py.c.PyErr_NoMemory();
+                    buf.appendSlice(allocator, @tagName(s)) catch return py.c.PyErr_NoMemory();
+                }
+                const where = c.compiler.data.lineCol(c.compiler.data.nodes[fnode].text_start);
+                const key = std.fmt.allocPrint(allocator, "line {d}", .{where.line}) catch return py.c.PyErr_NoMemory();
+                defer allocator.free(key);
+                const k = ph.newString(key) orelse return null;
+                defer py.Py_DecRef(k);
+                const v = ph.newString(buf.items) orelse return null;
+                defer py.Py_DecRef(v);
+                if (py.c.PyDict_SetItem(speculated, k, v) != 0) return null;
+            }
+        }
+        if (py.c.PyDict_SetItemString(out, "speculated", speculated) != 0) return null;
         return out;
     }
 
