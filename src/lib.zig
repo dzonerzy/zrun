@@ -75,7 +75,7 @@ const Language = struct {
     _python: driver.PythonSet = .empty,
     /// List and dict literals of the semantics compiled programs build at
     /// run time (they escape where known ones can't follow)
-    _escaping: std.AutoHashMapUnmanaged(*const front.Expr, void) = .empty,
+    _escaping: std.AutoHashMapUnmanaged(compile_mod.EscapeKey, void) = .empty,
 
     pub fn __new__(args: pyoz.Args(struct { parser: *PyObject, rules: ?*PyObject = null, max_depth: i64 = 1000 })) ?Language {
         const v = args.value;

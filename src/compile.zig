@@ -56,9 +56,12 @@ pub const LangView = struct {
     /// the compiled code with an rt over its frames (bridge.zig)
     python: *const PythonSet,
     /// List and dict literals built at run time (they escape where a known
-    /// one can't follow: learned while compiling)
-    escaping: *std.AutoHashMapUnmanaged(*const front.Expr, void),
+    /// one can't follow: learned while compiling), by the code they're in
+    /// (Gen.unit: elsewhere, the same literal may stay known)
+    escaping: *std.AutoHashMapUnmanaged(EscapeKey, void),
 };
+
+pub const EscapeKey = struct { origin: *const front.Expr, unit: u64 };
 
 /// Semantics run as Python, by their function: why (the compiler's
 /// message, owned by c_allocator)
@@ -939,7 +942,7 @@ pub const Compiler = struct {
     /// reported at node `at`, the caller's receiver and varargs given.
     fn genHelper(self: *Compiler, h: *HelperSpec) Error!void {
         const fun = try self.helperFn(h.name);
-        var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = NONE, .layout = try self.layoutOf(NONE), .thunk = true, .detached = true, .helper_semantic = h.semantic };
+        var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = NONE, .layout = try self.layoutOf(NONE), .thunk = true, .detached = true, .helper_semantic = h.semantic, .unit = std.hash.Wyhash.hash(1, h.name) };
         // (one that can't be compiled: its semantic runs as Python)
         errdefer if (self.failed_semantic == null) {
             self.failed_semantic = h.semantic;
@@ -1097,7 +1100,7 @@ pub const Compiler = struct {
         // (the function around the code: the owner's, through the scopes)
         var fnode = owner;
         while (fnode != NONE and !self.isFunctionNode(fnode)) fnode = self.ownerOf(fnode);
-        var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = fnode, .layout = try self.layoutOf(fnode), .thunk = true };
+        var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = fnode, .layout = try self.layoutOf(fnode), .thunk = true, .unit = std.hash.Wyhash.hash(2, std.mem.asBytes(&[3]u32{ idx, @intFromEnum(which), owner })) };
         g.ctx = g.f.param(0);
         g.out_param = g.f.param(2);
         try g.thunkPrologue(owner, g.f.param(1));
@@ -1170,6 +1173,7 @@ pub const Compiler = struct {
         .{ "zr_list_len", "lll" },
         .{ "zr_list_at", "vlllp" },
         .{ "zr_append", "bpillll" },
+        .{ "zr_extend_items", "bpillpl" },
         .{ "zr_call_method", "bpillpplp" },
         .{ "zr_call_python", "bpilplp" },
         .{ "zr_global", "bpilpp" },
@@ -1402,7 +1406,7 @@ pub const Compiler = struct {
     /// Generate one function: the top level (NONE) or a language function.
     pub fn genFunction(self: *Compiler, fnode: u32) Error!void {
         const fun = try self.llvmFunction(fnode);
-        var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = fnode, .layout = try self.layoutOf(fnode) };
+        var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = fnode, .layout = try self.layoutOf(fnode), .unit = std.hash.Wyhash.hash(3, std.mem.asBytes(&fnode)) };
         g.ctx = g.f.param(0);
         if (fnode == NONE) {
             g.globals = g.f.param(1);
@@ -1469,6 +1473,9 @@ const Inst = struct {
     exit_label: ir.Block,
     /// Run-time control flow depth within it (if, while...)
     dyn_depth: u32 = 0,
+    /// The run-time loops around it when it started (one opened since: its
+    /// code runs more than once)
+    loop_level0: u32 = 0,
     /// Try bodies it's in (a return there goes through their finally; a
     /// raise there lands in their handlers, the rest isn't dead)
     in_try: u32 = 0,
@@ -1596,6 +1603,10 @@ const Gen = struct {
     base_scopes: usize = 0,
     /// While loops being unrolled around the code
     unrolling: u32 = 0,
+    /// What code this is (a language function's, a helper's, a thunk's: the
+    /// same each time it's compiled again): literals escaping here are
+    /// built at run time here only (EscapeKey)
+    unit: u64 = 0,
 
     /// Code that runs many times (a function's, a loop's): reference
     /// counts inline. (Elsewhere, calls: each inline one is blocks for
@@ -1940,7 +1951,7 @@ const Gen = struct {
             .dict => |d| d.origin = e,
             else => return v,
         }
-        if (!self.c.lang.escaping.contains(e)) return v;
+        if (!self.c.lang.escaping.contains(.{ .origin = e, .unit = self.unit })) return v;
         return .{ .dyn = try self.materialize(v, at) };
     }
 
@@ -1953,11 +1964,11 @@ const Gen = struct {
     fn promote(self: *Gen, old: SVal, d: Dyn) Error!void {
         const ptr = containerPtr(old) orelse return;
         if (!self.aliased(ptr)) return;
-        if (self.inFlow()) {
+        if (self.inFlow() and !self.straightFor(ptr)) {
             // (one no literal made: a copy, for reading (one changed is
             // refused: materializeToChange))
             const origin = originOf(old) orelse return;
-            try self.c.lang.escaping.put(std.heap.c_allocator, origin, {});
+            try self.c.lang.escaping.put(std.heap.c_allocator, .{ .origin = origin, .unit = self.unit }, {});
             self.c.need_retry = true;
             return self.c.unsupported("a list or dict escapes inside run-time control flow: compiled again, made at run time", .{});
         }
@@ -1973,9 +1984,27 @@ const Gen = struct {
     /// known list or dict no literal made, that variables refer to, can't
     /// follow inside run-time control flow.
     fn materializeToChange(self: *Gen, v: SVal, at: u32) Error!Dyn {
-        if (containerPtr(v)) |ptr| if (originOf(v) == null and self.aliased(ptr) and self.inFlow())
+        if (containerPtr(v)) |ptr| if (originOf(v) == null and self.aliased(ptr) and self.inFlow() and !self.straightFor(ptr))
             return self.c.unsupported("a list or dict made when compiling (not by a literal) changed inside run-time control flow isn't compiled yet", .{});
         return self.materialize(v, at);
+    }
+
+    /// Whether the variables referring to a known container are all of
+    /// semantics running straight on from here (no run-time control flow
+    /// of their own, no return from inside one, no loop since they
+    /// started): run-time control flow around them only, so every path
+    /// their code is on from here is this one (the variables can refer to
+    /// the run-time object from here).
+    fn straightFor(self: *Gen, ptr: *const anyopaque) bool {
+        for (self.insts.items) |inst| {
+            const refers = for (inst.locals) |l| switch (l) {
+                .static => |sv| if (refersTo(sv, ptr, 4)) break true,
+                else => {},
+            } else false;
+            if (!refers) continue;
+            if (inst.dyn_depth > 0 or inst.result_slot != null or inst.loop_level0 != self.loop_level) return false;
+        }
+        return true;
     }
 
     fn containerPtr(v: SVal) ?*const anyopaque {
@@ -3160,7 +3189,7 @@ const Gen = struct {
         if (args.len != func.param_count) return self.c.unsupportedAt(func, .{ .line = func.first_line }, "called with {d} arguments, takes {d}", .{ args.len, func.param_count });
         for (args, 0..) |arg, i| locals[i] = .{ .static = arg };
         const inst = try self.a().create(Inst);
-        inst.* = .{ .func = func, .node = at, .locals = locals, .exit_label = try self.f.label("ret") };
+        inst.* = .{ .func = func, .node = at, .locals = locals, .exit_label = try self.f.label("ret"), .loop_level0 = self.loop_level };
         try self.insts.append(self.a(), inst);
         defer _ = self.insts.pop();
 
@@ -4642,6 +4671,10 @@ const Gen = struct {
                 .list => |l| if (eq(u8, name, "append") and args.len == 1) {
                     try l.items.append(self.a(), args[0]);
                     return .none;
+                } else if (eq(u8, name, "extend") and args.len == 1 and args[0] == .list and args[0].list != l and args[0].list.frozen == null and !self.aliased(args[0].list)) {
+                    // (by a list made here: its items, theirs now)
+                    try l.items.appendSlice(self.a(), args[0].list.items.items);
+                    return .none;
                 },
                 .dict => |d| if (eq(u8, name, "get") and args.len >= 1 and args.len <= 2 and args[0].isStatic()) {
                     if (d.find(args[0])) |i| return self.copyOf(d.values.items[i]);
@@ -4674,6 +4707,18 @@ const Gen = struct {
         // referring to it see it change): append natively; the rest as
         // Python does it (on the object itself, through its proxy)
         const d = try self.materializeToChange(obj, inst.node);
+        // extend() by a list made here, of items known one by one ([x]): each
+        // pushed, no list made for them (one a variable refers to: made, as
+        // its items are its)
+        if (eq(u8, name, "extend") and args.len == 1 and args[0] == .list and args[0].list.frozen == null and !self.aliased(args[0].list)) {
+            const items = args[0].list.items.items;
+            const arr = try self.valueArray(items, inst.node);
+            const ok = self.call("zr_extend_items", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, arr, self.k(@intCast(items.len)) });
+            try self.dropArray(arr, items.len);
+            try self.drop(.{ .dyn = d });
+            try self.check(ok);
+            return .none;
+        }
         if (eq(u8, name, "append") and args.len == 1) {
             const x = try self.materialize(args[0], inst.node);
             const ok = self.call("zr_append", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, x.tag, x.bits });

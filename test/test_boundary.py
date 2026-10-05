@@ -48,6 +48,7 @@ BUILTINS = (
     "isinst",
     "folds",
     "typeis",
+    "extends",
 )
 
 
@@ -380,6 +381,28 @@ def make_lang():
             out.append(len("héllo".encode("utf-8")))
             out.append("ab".encode())
             return out
+        if name == "extends":
+            # extend() by lists made here, by ones variables refer to, of
+            # lists and of other things, in and out of run-time branches
+            n, dq = rt.call(rt.load(node.name), [])
+            out = []
+            x = [n]
+            out.extend(x)
+            x.append(5)
+            out.extend([n, n + 1])
+            y = out
+            y.extend([7])
+            if n > 0:
+                z = []
+                z.extend([n * 10])
+                out.extend(z)
+                z.append(99)
+                w = [1]
+                w.extend(w)
+                out.append(w)
+            dq.extend([n, "a"])
+            out.extend((8, 9))
+            return (out, x, y is out, list(dq))
         if name == "typeis":
             # type(a) is type(b), type(a) is C, of values of every kind
             # (an I64 and an int differ; a big int is an int)
@@ -598,6 +621,12 @@ def make_lang():
         return 3
 
     @lang.host
+    def extends():
+        import collections
+
+        return (3, collections.deque([0]))
+
+    @lang.host
     def typeis():
         return [1, True, 2**70, 2**200, 2.0, "s", MyStr("x"), [1], (1,), {}, None, Color.RED, Point(1, 2), Holder(1), Slot3(1, 2), Box(1)]
 
@@ -698,6 +727,7 @@ PROGRAMS = {
     "isinst": "print(isinst());\n",
     "folds": "print(folds());\n",
     "typeis": "print(typeis());\n",
+    "extends": "print(extends());\n",
 }
 
 
@@ -719,6 +749,7 @@ def test_shared_with_python(name, capsys):
         "slices": "([2, 3, 4], [5, 3, 1], [], (4, 5), 'ello', 'éllo', [1, 2], [1, 2, 3, 4])",
         "genexp": "(True, False, 12, 2, True, False, '123')",
         "defaults": "(6, 9, 7, 13, 2)",
+        "extends": "([3, 3, 4, 7, 30, [1, 1], 8, 9], [3, 5], True, [0, 3, 'a'])",
         "folds": "[31, -1000, 42, -1, ['7', '-8'], ['x', 'b', 'y', 'x', 'y', '!'], ['x', 'b', 'y', 'x', 'y'], \"bad digit 'z' in '12z'\", 6, b'ab']",
         "trying": "[\"value:invalid literal for int() with base 10: 'x'\", 'key', 'fin', 'body', 'else', 'loop0', 'f0', 'f1', 'f2', 'g1', 'g2', 'rf', 'ret', 'v', 'again', 'inner', 'zero']",
     }.get(name)

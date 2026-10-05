@@ -1317,6 +1317,32 @@ export fn zr_append(ctx: *Ctx, node: u32, t: u64, bits: u64, xt: u64, xb: u64) c
     return true;
 }
 
+/// v.extend(items) for items the code knows one by one (borrowed): a list's
+/// natively, anything else's by its extend() with a list of them.
+export fn zr_extend_items(ctx: *Ctx, node: u32, t: u64, bits: u64, items: [*]const Value, n: u64) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    if (v.kind() == .list) {
+        const l: *value.List = @ptrCast(@alignCast(v.ptr()));
+        for (items[0..n]) |x| {
+            value.incref(x);
+            if (!value.listPush(l, x)) return oomFail(ctx, node);
+        }
+        return true;
+    }
+    const l = value.newList(n) orelse return oomFail(ctx, node);
+    for (items[0..n]) |x| {
+        value.incref(x);
+        _ = value.listPush(l, x);
+    }
+    const lv = Value.obj(.list, &l.head);
+    defer value.decref(lv);
+    var r = Value.none_v;
+    const ext = value.literal("extend") orelse return oomFail(ctx, node);
+    if (!zr_call_method(ctx, node, t, bits, ext, @ptrCast(&lv), 1, &r)) return false;
+    value.decref(r);
+    return true;
+}
+
 /// A method of a value called with arguments, as Python does it (for
 /// methods that don't change the value: str's, a dict's get...).
 export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value.Str, args: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
@@ -2036,6 +2062,7 @@ const helper_names = [_][]const u8{
     "zr_is_type",  "zr_global",     "zr_format",     "zr_concat",        "zr_unpack",
     "zr_varargs",  "zr_record_new", "zr_isinstance", "zr_call_seq",      "zr_slice",
     "zr_type",     "zr_builtin",    "zr_range",      "zr_cell",          "zr_frame_of",
+    "zr_extend_items",
 };
 
 /// The names compiled code calls them by, and their addresses
