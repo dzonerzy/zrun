@@ -378,6 +378,11 @@ pub const Function = struct {
         return L("LLVMBuildLShr")(self.b, a, b, "");
     }
 
+    pub fn ashr(self: *Function, a: Value, b: Value) Value {
+        self.open();
+        return L("LLVMBuildAShr")(self.b, a, b, "");
+    }
+
     pub fn xor(self: *Function, a: Value, b: Value) Value {
         self.open();
         return L("LLVMBuildXor")(self.b, a, b, "");

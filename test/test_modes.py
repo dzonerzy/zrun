@@ -240,7 +240,8 @@ def test_borrowing_gives_back_what_it_takes(name, capsys):
 
 
 def _wrapping_lang():
-    """tiny whose + - * wrap around at 64 bits (rt.wrapping_add...)."""
+    """tiny whose + - * wrap around at 64 bits (rt.wrapping_add...), and
+    whose / % < are the 64-bit shifts << >> >>> (rt.wrapping_shl...)."""
     lang = zrun.Language(tiny.PARSER, tiny.RULES)
     lang.function("FuncDef")
     lang.exec(["Let", "Assign"])(tiny.assign)
@@ -255,6 +256,12 @@ def _wrapping_lang():
             return rt.wrapping_add(a, b)
         if node.op == "-":
             return rt.wrapping_sub(a, b)
+        if node.op == "/":
+            return rt.wrapping_shl(a, b)
+        if node.op == "%":
+            return rt.wrapping_shr(a, b)
+        if node.op == "<":
+            return rt.wrapping_ushr(a, b)
         return rt.wrapping_mul(a, b)
 
     @lang.host
@@ -268,7 +275,15 @@ WRAPPING = {
     "known": "print(9223372036854775807 + 1, 3 * 9223372036854775807, 0 - 9223372036854775807 - 2);\n",
     "run_time": "fn f(a, b) { return a * b + a - b; }\nprint(f(9223372036854775807, 3), f(5, 7), f(0 - 4611686018427387904, 2));\n",
     "not_ints": 'fn f(a, b) { return a + b; }\nprint(f("a", 1));\n',
+    # (shifts: known and at run time; negative values; by 63, 64, 65, -1)
+    "shifts_known": "print(1 / 63, 3 / 62, 0 - 8 % 1, 0 - 8 < 60, 1 / 64, 1 / 65, 5 % (0 - 1), 0 - 1 < 0 - 1);\n",
+    "shifts_run_time": "fn f(a, n) { return (a / n) + (a % n) + (a < n); }\nprint(f(0 - 12345, 3), f(9223372036854775807, 1), f(1, 64), f(0 - 1, 63), f(7, 0 - 2));\n",
+    "shift_not_ints": 'fn f(a, n) { return a < n; }\nprint(f(1, "x"));\n',
 }
+
+# (1 << 63; 3 << 62; -(8 >> 1); -8 >>> 60; by 64 and 65: by 0 and 1; by -1:
+# by 63; -1 >>> 63)
+SHIFTS_KNOWN = [-(2**63), -(2**62), -4, 15, 1, 2, 0, 1]
 
 
 @pytest.mark.parametrize("name", sorted(WRAPPING))
@@ -276,8 +291,12 @@ def test_wrapping_arithmetic(name, capsys):
     out, err = same_in_every_mode(_wrapping_lang(), WRAPPING[name], capsys)
     if name == "not_ints":
         assert err[0] == "rt.wrapping_add() takes ints of 64 bits"
+    elif name == "shift_not_ints":
+        assert err[0] == "rt.wrapping_ushr() takes ints of 64 bits"
     else:
         assert err is None and out
+    if name == "shifts_known":
+        assert out == " ".join(str(x) for x in SHIFTS_KNOWN) + "\n"
 
 
 def combine(a, b):

@@ -112,6 +112,7 @@ pub const Api = struct {
     BuildXor: *const fn (Builder, Value, Value, Str) callconv(.c) Value,
     BuildShl: *const fn (Builder, Value, Value, Str) callconv(.c) Value,
     BuildLShr: *const fn (Builder, Value, Value, Str) callconv(.c) Value,
+    BuildAShr: *const fn (Builder, Value, Value, Str) callconv(.c) Value,
     BuildICmp: *const fn (Builder, c.LLVMIntPredicate, Value, Value, Str) callconv(.c) Value,
     BuildFCmp: *const fn (Builder, c.LLVMRealPredicate, Value, Value, Str) callconv(.c) Value,
     BuildAlloca: *const fn (Builder, Type, Str) callconv(.c) Value,

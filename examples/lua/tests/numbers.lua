@@ -9,6 +9,7 @@ print(math.fmod(7, 3), math.fmod(-7, 3), math.fmod(7, -3), math.fmod(7.5, 2), ma
 print(tonumber("  12  "), tonumber("1e3"), tonumber("0x"), tonumber(""), tonumber("12a"), tonumber("ff", 16), tonumber("777", 8), tonumber("1.5e2"))
 print(string.format("%.14g", 0.1 + 0.2), 0.1 + 0.2 == 0.3, 100000000000000, 1e14)
 print(1 << 63, 1 << 64, -1 >> 1, -1 >> 63, 3 ~ 5, ~5, 0xF0 & 0x3C, 0xF0 | 0x0F)
+print(8 << -2, -8 >> -1, 1 >> 64, -1 >> 64, 1 << -64, -1 << 1, -16 >> 2)
 print(7 // 0.0, -7 // 0.0, 0/0 == 0/0, math.huge - math.huge ~= math.huge - math.huge)
 print(math.type(1), math.type(1.0), math.type("1"), math.ult(1, -1))
 local n = 0

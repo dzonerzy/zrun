@@ -1,20 +1,27 @@
 //! `rt.wrapping_add(a, b)`, `rt.wrapping_sub`, `rt.wrapping_mul`: 64-bit
 //! two's complement arithmetic, as languages with fixed-size ints do it
-//! (Lua's): the same in every mode. Ints of 64 bits only (an I64 or a plain
-//! int); the result a plain int.
+//! (Lua's): the same in every mode. `rt.wrapping_shl(a, n)`,
+//! `rt.wrapping_shr` (the sign kept), `rt.wrapping_ushr` (zeros shifted
+//! in: a as unsigned): shifts of 64 bits, by n modulo 64 (as Rust's, Java's
+//! and JavaScript's). Ints of 64 bits only (an I64 or a plain int); the
+//! result a plain int.
 
 const ph = @import("pyhelp.zig");
 const py = ph.py;
 
 const PyObject = py.PyObject;
 
-pub const Op = enum(u32) { add, sub, mul };
+pub const Op = enum(u32) { add, sub, mul, shl, shr, ushr };
 
 pub fn apply(op: Op, x: i64, y: i64) i64 {
+    const n: u6 = @truncate(@as(u64, @bitCast(y)));
     return switch (op) {
         .add => x +% y,
         .sub => x -% y,
         .mul => x *% y,
+        .shl => @bitCast(@as(u64, @bitCast(x)) << n),
+        .shr => x >> n,
+        .ushr => @bitCast(@as(u64, @bitCast(x)) >> n),
     };
 }
 

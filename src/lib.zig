@@ -2506,7 +2506,9 @@ const Runtime = struct {
     }
 
     /// `rt.wrapping_add(a, b)`, `rt.wrapping_sub`, `rt.wrapping_mul`: 64-bit
-    /// arithmetic wrapping around (wrapping.zig).
+    /// arithmetic wrapping around; `rt.wrapping_shl(a, n)`,
+    /// `rt.wrapping_shr`, `rt.wrapping_ushr`: 64-bit shifts by n modulo 64
+    /// (wrapping.zig).
     pub fn wrapping_add(self: *Runtime, a: *PyObject, b: *PyObject) ?*PyObject {
         _ = self;
         return @import("wrapping.zig").ofPython(.add, a, b);
@@ -2520,6 +2522,21 @@ const Runtime = struct {
     pub fn wrapping_mul(self: *Runtime, a: *PyObject, b: *PyObject) ?*PyObject {
         _ = self;
         return @import("wrapping.zig").ofPython(.mul, a, b);
+    }
+
+    pub fn wrapping_shl(self: *Runtime, a: *PyObject, n: *PyObject) ?*PyObject {
+        _ = self;
+        return @import("wrapping.zig").ofPython(.shl, a, n);
+    }
+
+    pub fn wrapping_shr(self: *Runtime, a: *PyObject, n: *PyObject) ?*PyObject {
+        _ = self;
+        return @import("wrapping.zig").ofPython(.shr, a, n);
+    }
+
+    pub fn wrapping_ushr(self: *Runtime, a: *PyObject, n: *PyObject) ?*PyObject {
+        _ = self;
+        return @import("wrapping.zig").ofPython(.ushr, a, n);
     }
 
     pub fn span(self: *Runtime, n: *PyObject) ?*PyObject {
@@ -2804,6 +2821,12 @@ const Runtime = struct {
     pub const wrapping_sub__params__ = "a, b";
     pub const wrapping_mul__doc__: [*:0]const u8 = "a * b in 64 bits, wrapping around (signed).";
     pub const wrapping_mul__params__ = "a, b";
+    pub const wrapping_shl__doc__: [*:0]const u8 = "a << n in 64 bits, the bits shifted out lost; n modulo 64.";
+    pub const wrapping_shl__params__ = "a, n";
+    pub const wrapping_shr__doc__: [*:0]const u8 = "a >> n in 64 bits, the sign kept (arithmetic shift); n modulo 64.";
+    pub const wrapping_shr__params__ = "a, n";
+    pub const wrapping_ushr__doc__: [*:0]const u8 = "a >> n in 64 bits with zeros shifted in (a as unsigned: logical shift); n modulo 64.";
+    pub const wrapping_ushr__params__ = "a, n";
     pub const u8__doc__: [*:0]const u8 = "The unsigned byte at offset i of data (a zrun.Bytes, bytes, or any buffer); IndexError past the end.";
     pub const u8__params__ = "data, i";
     pub const i8__doc__: [*:0]const u8 = "The signed byte at offset i of data; IndexError past the end.";

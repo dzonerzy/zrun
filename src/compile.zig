@@ -126,7 +126,7 @@ pub const Dyn = struct {
     }
 };
 
-pub const RtMethod = enum { eval, exec, loop, load, store, function, call, @"error", kind, text, span, scope, symbol, type_of, node_at, fresh, wrapping_add, wrapping_sub, wrapping_mul, @"u8", @"i8", u16le, u16be, i16le, i16be, u32le, u32be, i32le, i32be, u64le, u64be, i64le, i64be, Return, Break, Continue };
+pub const RtMethod = enum { eval, exec, loop, load, store, function, call, @"error", kind, text, span, scope, symbol, type_of, node_at, fresh, wrapping_add, wrapping_sub, wrapping_mul, wrapping_shl, wrapping_shr, wrapping_ushr, @"u8", @"i8", u16le, u16be, i16le, i16be, u32le, u32be, i32le, i32be, u64le, u64be, i64le, i64be, Return, Break, Continue };
 
 /// A list known at compile time (its items may be dynamic): mutable, with
 /// identity (aliases see changes)
@@ -6217,7 +6217,7 @@ const Gen = struct {
         const c = self.c;
         const want: usize = switch (m) {
             .eval, .exec, .loop, .load, .function, .kind, .text, .span, .scope, .symbol, .type_of, .node_at, .fresh => 1,
-            .store, .call, .wrapping_add, .wrapping_sub, .wrapping_mul => 2,
+            .store, .call, .wrapping_add, .wrapping_sub, .wrapping_mul, .wrapping_shl, .wrapping_shr, .wrapping_ushr => 2,
             .@"u8", .@"i8", .u16le, .u16be, .i16le, .i16be, .u32le, .u32be, .i32le, .i32be, .u64le, .u64be, .i64le, .i64be => 2,
             .@"error" => 2,
             .Return => if (args.len == 0) 0 else 1,
@@ -6258,6 +6258,9 @@ const Gen = struct {
             .wrapping_add => return self.wrapping(inst, .add, args[0], args[1]),
             .wrapping_sub => return self.wrapping(inst, .sub, args[0], args[1]),
             .wrapping_mul => return self.wrapping(inst, .mul, args[0], args[1]),
+            .wrapping_shl => return self.wrapping(inst, .shl, args[0], args[1]),
+            .wrapping_shr => return self.wrapping(inst, .shr, args[0], args[1]),
+            .wrapping_ushr => return self.wrapping(inst, .ushr, args[0], args[1]),
             .@"u8", .@"i8", .u16le, .u16be, .i16le, .i16be, .u32le, .u32be, .i32le, .i32be, .u64le, .u64be, .i64le, .i64be => return self.readBytes(inst, std.meta.stringToEnum(bytes_mod.Read, @tagName(m)).?, args[0], args[1]),
             .@"error" => {
                 const n = switch (args[0]) {
@@ -6340,6 +6343,10 @@ const Gen = struct {
             .add => f.add(ad.bits, bd.bits),
             .sub => f.sub(ad.bits, bd.bits),
             .mul => f.mul(ad.bits, bd.bits),
+            // (by n modulo 64: LLVM's shifts by 64 or more aren't defined)
+            .shl => f.shl(ad.bits, f.and_(bd.bits, self.k(63))),
+            .shr => f.ashr(ad.bits, f.and_(bd.bits, self.k(63))),
+            .ushr => f.lshr(ad.bits, f.and_(bd.bits, self.k(63))),
         };
         const fast_end = f.current;
         try f.br(join);

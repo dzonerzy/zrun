@@ -998,24 +998,25 @@ def bitwise(rt, node, op, a, b):
         lua_error(rt, node, "attempt to perform bitwise operation on a %s value%s" % (type_name(badv), describe(rt, node.left if x is None else node.right)))
     x = int(x)
     y = int(y)
+    # (of two ints of 64 bits, & | ~ give one)
     if op == "&":
-        return wrap(x & y)
+        return x & y
     if op == "|":
-        return wrap(x | y)
+        return x | y
     if op == "~":
-        return wrap(x ^ y)
+        return x ^ y
     if op == "<<":
-        return shift_left(x, y)
-    return shift_left(x, -y)
+        return shift_left(rt, x, y)
+    return shift_left(rt, x, -y)
 
 
-def shift_left(x, n):
+def shift_left(rt, x, n):
+    """Lua's shift: logical, to the right for a negative n, 0 past 63."""
     if n <= -64 or n >= 64:
         return 0
-    u = x & 0xFFFFFFFFFFFFFFFF
     if n >= 0:
-        return wrap(u << n)
-    return wrap(u >> -n)
+        return rt.wrapping_shl(x, n)
+    return rt.wrapping_ushr(x, -n)
 
 
 def concat(rt, node, a, b):
