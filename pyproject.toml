@@ -1,0 +1,40 @@
+[build-system]
+requires = ["pyoz>=0.13.7"]
+build-backend = "pyoz.backend"
+
+[project]
+# The import name is `zrun` (module-name below); every zsuite package is
+# published as <name>-py
+name = "zrun-py"
+version = "0.1.0"
+description = "Execution for languages built with zgram and zrules: semantics written as Python functions, compiled to native code."
+requires-python = ">=3.10"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Daniele Linguaglossa" }]
+dependencies = ["zgram-py>=0.3.5", "zrules-py>=0.1.5"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Software Development :: Interpreters",
+]
+
+[tool.pyoz]
+# Path to your Zig source file
+module-path = "src/lib.zig"
+
+# Python import name (the distribution is zrun-py)
+module-name = "zrun"
+
+# Strip debug symbols in release builds
+strip = true
+
+# One wheel per platform for CPython 3.10+ (stable ABI)
+abi3 = true

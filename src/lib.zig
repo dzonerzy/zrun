@@ -2823,7 +2823,7 @@ pub const Module = pyoz.module(.{
         pyoz.func("version", version, "Return the zrun version string"),
         pyoz.func("_blocks", blocks, "The values' blocks allocated and not freed (for tests)"),
         pyoz.func("collect", collect, "collect(): free the compiled code's values that only reference one another (reference cycles); how many were freed. Runs by itself as values are made, and at the end of a run."),
-        pyoz.kwfunc("configure", configure, "configure(cache=None, perf_map=None): process-wide settings (those not given stay). cache: True (the usual place: $XDG_CACHE_HOME/zrun or ~/.cache/zrun), False (no cache), or a directory; perf_map: name compiled functions for perf (/tmp/perf-<pid>.map)."),
+        pyoz.kwfunc("configure", configure, "configure(cache=None, perf_map=None): process-wide settings (those not given stay). cache: True (the platform's place for caches: %LOCALAPPDATA%\\zrun\\Cache on Windows, ~/Library/Caches/zrun on macOS, $XDG_CACHE_HOME/zrun or ~/.cache/zrun elsewhere), False (no cache), or a directory; perf_map: name compiled functions for Linux's perf (/tmp/perf-<pid>.map)."),
     },
     .classes = &.{
         pyoz.class("Language", Language),

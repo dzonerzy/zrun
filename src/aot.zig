@@ -24,7 +24,7 @@ const cache = @import("cache.zig");
 
 const magic = "ZRUNMOD1";
 /// zrun's version (build.zig.zon's)
-pub const version = "0.1.0";
+pub const version = @import("build_options").version;
 
 pub const Object = struct { key: cache.Key, bytes: []u8 };
 
@@ -48,8 +48,7 @@ pub const File = struct {
 
 pub const Error = error{ OutOfMemory, NotAModule, Truncated, Io };
 
-/// Write a compiled module at `path` (whole or not at all: written aside,
-/// then renamed).
+/// Write a compiled module at `path` (whole or not at all: cache.writeWhole).
 pub fn write(a: std.mem.Allocator, path: []const u8, definition: [32]u8, prog_path: []const u8, source: []const u8, objects: []const Object) Error!void {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(a);
@@ -66,30 +65,12 @@ pub fn write(a: std.mem.Allocator, path: []const u8, definition: [32]u8, prog_pa
         try putInt(a, &out, u64, o.bytes.len);
         try out.appendSlice(a, o.bytes);
     }
-    const tmp = try std.fmt.allocPrintSentinel(a, "{s}.{d}.tmp", .{ path, std.c.getpid() }, 0);
-    defer a.free(tmp);
-    const final = try a.dupeZ(u8, path);
-    defer a.free(final);
-    const fd = std.c.open(tmp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    if (fd < 0) return error.Io;
-    var done: usize = 0;
-    while (done < out.items.len) {
-        const n = std.c.write(fd, out.items[done..].ptr, out.items.len - done);
-        if (n <= 0) break;
-        done += @intCast(n);
-    }
-    _ = std.c.close(fd);
-    if (done < out.items.len or std.c.rename(tmp.ptr, final.ptr) != 0) {
-        _ = std.c.unlink(tmp.ptr);
-        return error.Io;
-    }
+    cache.writeWhole(path, out.items) catch return error.Io;
 }
 
 /// Read a compiled module.
 pub fn read(a: std.mem.Allocator, path: []const u8) Error!File {
-    const p = try a.dupeZ(u8, path);
-    defer a.free(p);
-    const bytes = cache.read(a, p) orelse return error.Io;
+    const bytes = cache.read(a, path) orelse return error.Io;
     defer a.free(bytes);
     var r = Reader{ .bytes = bytes };
     if (!std.mem.eql(u8, try r.take(magic.len), magic)) return error.NotAModule;

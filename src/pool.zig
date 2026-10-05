@@ -85,21 +85,67 @@ threadlocal var mine: Lists = .{};
 /// nothing walked under the lock)
 var shared: [classes]?*Batch = .{null} ** classes;
 var shared_lock: std.atomic.Mutex = .unlocked;
-/// (its destructor runs as a thread that took blocks ends)
-var exit_key: std.c.pthread_key_t = undefined;
-var have_key = false;
+/// The hook run as a thread that took blocks ends (threadGone): a pthread
+/// key's destructor; on Windows, a fiber-local slot's callback
+const ExitHook = if (builtin.os.tag == .windows) struct {
+    extern "kernel32" fn FlsAlloc(callback: ?*const fn (?*anyopaque) callconv(.winapi) void) callconv(.winapi) u32;
+    extern "kernel32" fn FlsSetValue(index: u32, value: ?*anyopaque) callconv(.winapi) i32;
+    const out_of_indexes: u32 = 0xFFFF_FFFF;
 
-/// A word naming this thread, read with an instruction (Linux's thread
-/// pointer: its TCB's address); 0: not known here (no home lists)
+    var index: u32 = out_of_indexes;
+
+    fn gone(_: ?*anyopaque) callconv(.winapi) void {
+        threadGone();
+    }
+
+    fn make() bool {
+        index = FlsAlloc(&gone);
+        return index != out_of_indexes;
+    }
+
+    fn arm() void {
+        _ = FlsSetValue(index, @ptrFromInt(1));
+    }
+} else struct {
+    var key: std.c.pthread_key_t = undefined;
+
+    fn gone(_: *anyopaque) callconv(.c) void {
+        threadGone();
+    }
+
+    fn make() bool {
+        return std.c.pthread_key_create(&key, &gone) == .SUCCESS;
+    }
+
+    fn arm() void {
+        _ = std.c.pthread_setspecific(key, @ptrFromInt(1));
+    }
+};
+var have_hook = false;
+
+/// A word naming this thread, read with an instruction (the thread
+/// pointer: Linux's TCB address, Windows' TEB address); 0: not known here
+/// (no home lists)
 pub inline fn threadPointer() usize {
-    if (builtin.os.tag != .linux) return 0;
-    return switch (builtin.cpu.arch) {
-        .x86_64 => asm ("movq %%fs:0, %[ret]"
-            : [ret] "=r" (-> usize),
-        ),
-        .aarch64 => asm ("mrs %[ret], tpidr_el0"
-            : [ret] "=r" (-> usize),
-        ),
+    return switch (builtin.os.tag) {
+        .linux => switch (builtin.cpu.arch) {
+            .x86_64 => asm ("movq %%fs:0, %[ret]"
+                : [ret] "=r" (-> usize),
+            ),
+            .aarch64 => asm ("mrs %[ret], tpidr_el0"
+                : [ret] "=r" (-> usize),
+            ),
+            else => 0,
+        },
+        .windows => switch (builtin.cpu.arch) {
+            .x86_64 => asm ("movq %%gs:0x30, %[ret]"
+                : [ret] "=r" (-> usize),
+            ),
+            .aarch64 => asm ("mov %[ret], x18"
+                : [ret] "=r" (-> usize),
+            ),
+            else => 0,
+        },
         else => 0,
     };
 }
@@ -167,14 +213,14 @@ noinline fn watch() void {
     mine.watched = true;
     lockShared();
     defer shared_lock.unlock();
-    if (!have_key) {
-        if (std.c.pthread_key_create(&exit_key, &threadGone) != .SUCCESS) return;
-        have_key = true;
+    if (!have_hook) {
+        if (!ExitHook.make()) return;
+        have_hook = true;
     }
-    _ = std.c.pthread_setspecific(exit_key, @ptrFromInt(1));
+    ExitHook.arm();
 }
 
-fn threadGone(_: *anyopaque) callconv(.c) void {
+fn threadGone() void {
     // (the buffer first: freeing its dead objects later gives blocks to
     // another thread's lists)
     gc_mod.orphan(&mine.gc);

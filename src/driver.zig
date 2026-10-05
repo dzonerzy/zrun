@@ -430,6 +430,8 @@ pub const Compiled = struct {
     /// (/tmp/perf-<pid>.map: each one's address, its size taken as up to
     /// the next one's).
     fn perfMap(self: *Compiled) void {
+        // (Linux's perf reads it: nothing elsewhere)
+        if (@import("builtin").os.tag != .linux) return;
         var it = self.compiler.m.fns.keyIterator();
         while (it.next()) |k| {
             if (!std.mem.startsWith(u8, k.*, self.compiler.m.prefix)) continue;

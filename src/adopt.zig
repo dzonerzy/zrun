@@ -57,6 +57,19 @@ pub const Outcome = union(enum) { not_state, native: Value, refused: []const u8 
 /// What's adopted with it: the objects connected to it, through each other
 /// and the other tables and records `globals` (its module's) holds (one
 /// another's state: a metatable the globals' table don't reach...).
+/// An object's type's name (copied into `a`), for messages (its
+/// __name__: the type object's fields aren't the stable ABI's)
+fn typeName(a: std.mem.Allocator, o: *PyObject) Error![]const u8 {
+    const t: *PyObject = @ptrCast(@alignCast(ph.typeOf(o)));
+    return (ph.attrString(a, t, "__name__") catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Python => {
+            py.c.PyErr_Clear();
+            return "object";
+        },
+    }) orelse "object";
+}
+
 pub fn adopt(a: std.mem.Allocator, o: *PyObject, globals: *PyObject) Error!Outcome {
     if (proxies.objectOf(o)) |v| {
         // (a proxy of a native object compiled code made: not module state
@@ -71,10 +84,10 @@ pub fn adopt(a: std.mem.Allocator, o: *PyObject, globals: *PyObject) Error!Outco
     const target = g.find(g.seen.getIndex(o).?);
     for (g.seen.keys(), g.seen.values(), 0..) |x, e, i| {
         if (g.find(i) != target) continue;
-        if (e.unfit) return .{ .refused = try std.fmt.allocPrint(a, "a {s} in it has a key compiled code's dicts can't hash, or attributes beyond its fields", .{ph.typeOf(x).tp_name}) };
+        if (e.unfit) return .{ .refused = try std.fmt.allocPrint(a, "a {s} in it has a key compiled code's dicts can't hash, or attributes beyond its fields", .{try typeName(a, x)}) };
         const refs = ph.refcnt(x);
         const known = e.internal + e.module;
-        if (refs != known) return .{ .refused = try std.fmt.allocPrint(a, "a {s} in it is referred to from somewhere besides it and module names ({d} references, {d} of them those)", .{ ph.typeOf(x).tp_name, refs, known }) };
+        if (refs != known) return .{ .refused = try std.fmt.allocPrint(a, "a {s} in it is referred to from somewhere besides it and module names ({d} references, {d} of them those)", .{ try typeName(a, x), refs, known }) };
     }
     try g.build(target);
     // The module's names: the native objects' proxies (kept by them: they

@@ -9,25 +9,82 @@
 //! the code compiling this one would make. zrun still generates the IR
 //! each time (a small part of the time), the key needs it.
 //!
-//! Where: $XDG_CACHE_HOME/zrun, else ~/.cache/zrun; or where
-//! zrun.configure(cache=path) says (cache=False: none, everything compiled
+//! Where: the platform's place for caches (Windows: %LOCALAPPDATA%\zrun\Cache;
+//! macOS: ~/Library/Caches/zrun; else $XDG_CACHE_HOME/zrun or ~/.cache/zrun);
+//! or where zrun.configure(cache=path) says (cache=False: none, everything compiled
 //! each time). Objects a compiled module loaded has (aot.zig) are looked at
 //! first, by the same keys.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const jit = @import("jit.zig");
 const L = jit.f;
 
 /// Bump when what the objects mean changes without the IR text showing it
 const format = "zrun-cache-1";
 
-/// Where the cache is (zrun.configure(cache=...)): the usual place
-/// ($XDG_CACHE_HOME/zrun, else ~/.cache/zrun), none, or a directory given
+/// Where the cache is (zrun.configure(cache=...)): the platform's usual
+/// place (default_dir), none, or a directory given
 pub const Setting = union(enum) { default, off, dir: []const u8 };
 
 var setting: Setting = .default;
 var resolved = false;
 var dir_path: ?[]const u8 = null;
+/// The platform's place for caches, zrun's directory in it (owned by the
+/// caller): %LOCALAPPDATA%\zrun\Cache on Windows, ~/Library/Caches/zrun on
+/// macOS, $XDG_CACHE_HOME/zrun or ~/.cache/zrun elsewhere; null if there's
+/// no home to put it in.
+fn defaultDir(a: std.mem.Allocator) ?[]u8 {
+    switch (builtin.os.tag) {
+        .windows => {
+            if (env(a, "LOCALAPPDATA")) |base| {
+                defer a.free(base);
+                return std.fmt.allocPrint(a, "{s}\\zrun\\Cache", .{base}) catch null;
+            }
+            const home = env(a, "USERPROFILE") orelse return null;
+            defer a.free(home);
+            return std.fmt.allocPrint(a, "{s}\\AppData\\Local\\zrun\\Cache", .{home}) catch null;
+        },
+        .macos => {
+            const home = env(a, "HOME") orelse return null;
+            defer a.free(home);
+            return std.fmt.allocPrint(a, "{s}/Library/Caches/zrun", .{home}) catch null;
+        },
+        else => {
+            // (XDG's must be absolute: a relative one is ignored)
+            if (env(a, "XDG_CACHE_HOME")) |base| {
+                defer a.free(base);
+                if (std.fs.path.isAbsolute(base)) return std.fmt.allocPrint(a, "{s}/zrun", .{base}) catch null;
+            }
+            const home = env(a, "HOME") orelse return null;
+            defer a.free(home);
+            return std.fmt.allocPrint(a, "{s}/.cache/zrun", .{home}) catch null;
+        },
+    }
+}
+
+/// An environment variable of the process, not empty (owned by the
+/// caller), or null.
+fn env(a: std.mem.Allocator, key: []const u8) ?[]u8 {
+    // (Windows: the process's block, read each time; elsewhere libc's)
+    const environ: std.process.Environ = if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = @ptrCast(std.mem.span(std.c.environ)) } };
+    const v = environ.getAlloc(a, key) catch return null;
+    if (v.len == 0) {
+        a.free(v);
+        return null;
+    }
+    return v;
+}
+
+/// Blocking file calls (the cache's, compiled modules'): the platform's
+var threaded: std.Io.Threaded = .init_single_threaded;
+
+pub fn io() std.Io {
+    return threaded.io();
+}
 
 /// The cache from now on (the directory given: the caller's, copied).
 pub fn set(s: Setting) !void {
@@ -50,17 +107,12 @@ fn dir() ?[]const u8 {
     const path = switch (setting) {
         .off => return null,
         .dir => |d| a.dupe(u8, d) catch return null,
-        .default => if (std.c.getenv("XDG_CACHE_HOME")) |d|
-            std.fmt.allocPrint(a, "{s}/zrun", .{std.mem.span(d)}) catch return null
-        else if (std.c.getenv("HOME")) |h|
-            std.fmt.allocPrint(a, "{s}/.cache/zrun", .{std.mem.span(h)}) catch return null
-        else
-            return null,
+        .default => defaultDir(a) orelse return null,
     };
-    if (!makePath(path)) {
+    std.Io.Dir.cwd().createDirPath(io(), path) catch {
         a.free(path);
         return null;
-    }
+    };
     dir_path = path;
     return path;
 }
@@ -102,9 +154,9 @@ pub fn keyOf(ir_text: []const u8) Key {
 }
 
 /// Where a module's object is kept, or null: no cache.
-pub fn pathFor(a: std.mem.Allocator, key: Key) ?[:0]u8 {
+pub fn pathFor(a: std.mem.Allocator, key: Key) ?[]u8 {
     const d = dir() orelse return null;
-    return std.fmt.allocPrintSentinel(a, "{s}/{s}.o", .{ d, std.fmt.bytesToHex(key, .lower) }, 0) catch null;
+    return std.fmt.allocPrint(a, "{s}" ++ std.fs.path.sep_str ++ "{s}.o", .{ d, std.fmt.bytesToHex(key, .lower) }) catch null;
 }
 
 /// Objects given by compiled modules loaded (zrun's module files: aot.zig),
@@ -144,58 +196,27 @@ pub fn objectOf(a: std.mem.Allocator, key: Key) ?[]u8 {
     return read(a, path);
 }
 
-/// The object kept at `path` (owned by the caller), or null.
-pub fn read(a: std.mem.Allocator, path: [:0]const u8) ?[]u8 {
-    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY });
-    if (fd < 0) return null;
-    defer _ = std.c.close(fd);
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    var buf: [65536]u8 = undefined;
-    while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
-        if (n < 0) {
-            out.deinit(a);
-            return null;
-        }
-        if (n == 0) break;
-        out.appendSlice(a, buf[0..@intCast(n)]) catch {
-            out.deinit(a);
-            return null;
-        };
-    }
-    return out.toOwnedSlice(a) catch null;
+/// The bytes of the file at `path` (owned by the caller), or null.
+pub fn read(a: std.mem.Allocator, path: []const u8) ?[]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io(), path, a, .unlimited) catch null;
 }
 
-/// Keep an object at `path` (whole or not at all: written aside, then
-/// renamed). Failing is fine: compiled again next time.
-pub fn write(path: [:0]const u8, bytes: []const u8) void {
-    var buf: [4096]u8 = undefined;
-    const tmp = std.fmt.bufPrintZ(&buf, "{s}.{d}.tmp", .{ path, std.c.getpid() }) catch return;
-    const fd = std.c.open(tmp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    if (fd < 0) return;
-    var done: usize = 0;
-    while (done < bytes.len) {
-        const n = std.c.write(fd, bytes[done..].ptr, bytes.len - done);
-        if (n <= 0) break;
-        done += @intCast(n);
-    }
-    _ = std.c.close(fd);
-    if (done < bytes.len or std.c.rename(tmp.ptr, path.ptr) != 0) _ = std.c.unlink(tmp.ptr);
+/// Keep an object at `path` (whole or not at all). Failing is fine:
+/// compiled again next time.
+pub fn write(path: []const u8, bytes: []const u8) void {
+    writeWhole(path, bytes) catch {};
 }
 
-/// mkdir -p (true: there).
-fn makePath(path: []const u8) bool {
+/// Write a file whole or not at all: written aside (a name of this
+/// process's), then renamed over `path` (replacing it, on every platform).
+pub fn writeWhole(path: []const u8, bytes: []const u8) !void {
     var buf: [4096]u8 = undefined;
-    if (path.len >= buf.len) return false;
-    var i: usize = 1;
-    while (i <= path.len) : (i += 1) {
-        if (i < path.len and path[i] != '/') continue;
-        @memcpy(buf[0..i], path[0..i]);
-        buf[i] = 0;
-        _ = std.c.mkdir(@ptrCast(&buf), 0o755);
-    }
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    // (F_OK)
-    return std.c.access(@ptrCast(&buf), 0) == 0;
+    const pid: u64 = if (builtin.os.tag == .windows) std.os.windows.GetCurrentProcessId() else @intCast(std.c.getpid());
+    const tmp = try std.fmt.bufPrint(&buf, "{s}.{d}.tmp", .{ path, pid });
+    const here = std.Io.Dir.cwd();
+    try here.writeFile(io(), .{ .sub_path = tmp, .data = bytes });
+    here.rename(tmp, here, path, io()) catch |e| {
+        here.deleteFile(io(), tmp) catch {};
+        return e;
+    };
 }

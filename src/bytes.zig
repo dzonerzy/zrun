@@ -7,8 +7,11 @@
 //!
 //! The buffer protocol (PyObject_GetBuffer) is in the Stable ABI from 3.11;
 //! its functions and Py_buffer's layout are the same in 3.10, declared here.
+//! (On Windows the import library of 3.10's Stable ABI hasn't them: they're
+//! looked up in Python's DLL as the module's made.)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ph = @import("pyhelp.zig");
 const py = ph.py;
 
@@ -27,8 +30,44 @@ const Py_buffer = extern struct {
     suboffsets: ?*isize = null,
     internal: ?*anyopaque = null,
 };
-extern "c" fn PyObject_GetBuffer(o: *PyObject, view: *Py_buffer, flags: c_int) c_int;
-extern "c" fn PyBuffer_Release(view: *Py_buffer) void;
+const Buffers = if (builtin.os.tag == .windows) struct {
+    const HMODULE = *opaque {};
+    extern "kernel32" fn GetModuleHandleExW(flags: u32, name: ?*const anyopaque, module: *?HMODULE) callconv(.winapi) i32;
+    extern "kernel32" fn GetProcAddress(module: HMODULE, name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
+    /// GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | ..._UNCHANGED_REFCOUNT
+    const by_address: u32 = 0x4 | 0x2;
+
+    var get: ?*const fn (o: *PyObject, view: *Py_buffer, flags: c_int) callconv(.c) c_int = null;
+    var release: ?*const fn (view: *Py_buffer) callconv(.c) void = null;
+
+    /// Looked up in the DLL Py_IncRef is in (Python's)
+    fn init() bool {
+        var module: ?HMODULE = null;
+        if (GetModuleHandleExW(by_address, @ptrCast(&py.c.Py_IncRef), &module) == 0) return false;
+        get = @ptrCast(GetProcAddress(module.?, "PyObject_GetBuffer") orelse return false);
+        release = @ptrCast(GetProcAddress(module.?, "PyBuffer_Release") orelse return false);
+        return true;
+    }
+} else struct {
+    const C = struct {
+        extern "c" fn PyObject_GetBuffer(o: *PyObject, view: *Py_buffer, flags: c_int) c_int;
+        extern "c" fn PyBuffer_Release(view: *Py_buffer) void;
+    };
+    const get: ?*const fn (o: *PyObject, view: *Py_buffer, flags: c_int) callconv(.c) c_int = &C.PyObject_GetBuffer;
+    const release: ?*const fn (view: *Py_buffer) callconv(.c) void = &C.PyBuffer_Release;
+
+    fn init() bool {
+        return true;
+    }
+};
+
+fn PyObject_GetBuffer(o: *PyObject, view: *Py_buffer, flags: c_int) c_int {
+    return Buffers.get.?(o, view, flags);
+}
+
+fn PyBuffer_Release(view: *Py_buffer) void {
+    Buffers.release.?(view);
+}
 /// PyBUF_SIMPLE: contiguous bytes, read only is enough
 const buf_simple = 0;
 
@@ -57,6 +96,10 @@ fn typeObj(o: *PyObject) *PyObject {
 }
 
 pub fn init(module: *PyObject) !void {
+    if (!Buffers.init()) {
+        ph.raise(py.PyExc_ImportError(), "zrun: Python's buffer protocol (PyObject_GetBuffer) wasn't found", .{});
+        return error.Python;
+    }
     BytesType = py.c.PyType_FromSpec(&spec) orelse return error.Python;
     if (py.c.PyModule_AddObject(module, "Bytes", BytesType) != 0) return error.Python;
     py.Py_IncRef(BytesType);
