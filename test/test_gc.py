@@ -122,6 +122,30 @@ def test_a_long_cycle(run):
     assert zrun._blocks() == before
 
 
+def test_lua_programs_leave_nothing():
+    # (every Lua test program, run again and again: no block left over;
+    # the leaks of compiled code it found: errors caught (pcall), known
+    # tuples and lists, loops over temporaries)
+    import gc
+    import glob
+    import io
+    import contextlib
+
+    for path in sorted(glob.glob(os.path.join(HERE, "..", "examples", "lua", "tests", "*.lua"))):
+        with open(path) as f:
+            program = lua.lang.load(f.read(), os.path.basename(path))
+        counts = []
+        for _ in range(3):
+            with contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    program.run(mode="compiled")
+                except zrun.Error:
+                    pass
+            gc.collect()
+            counts.append(zrun._blocks())
+        assert counts[2] == counts[1], path
+
+
 def test_what_python_holds_is_kept(run):
     # (cyclic tables Python got hold of, through a library function: kept
     # while Python has them, whatever the collector finds)

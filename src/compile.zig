@@ -1711,9 +1711,10 @@ const TryFrame = struct {
     body_locals: []const u32,
     /// Where its body's errors go
     catcher: ir.Block = null,
-    /// Where errors went before it (and Gen.err_keep then)
+    /// Where errors went before it (and Gen.err_keep, err_inflight then)
     outer_err: ir.Block,
     outer_keep: usize,
+    outer_inflight: usize,
     /// Each handler's code, and the exception it caught (a slot: None when
     /// it caught a jump)
     handler_blocks: []ir.Block,
@@ -1776,6 +1777,12 @@ const Gen = struct {
     /// first err_keep: a try's catching it, in its own); the others' values
     /// are released on the way (errorTarget)
     err_keep: usize = 0,
+    /// Values an expression has evaluated, held while it evaluates the rest
+    /// of its operands (released by an error before its operation takes
+    /// them: errorTarget); and how many of them an error going to err_label
+    /// leaves held (a try's in the middle of an expression)
+    inflight: std.ArrayListUnmanaged(SVal) = .empty,
+    err_inflight: usize = 0,
     ret_label: ir.Block = null,
     /// rt.loop targets, innermost last
     loops: std.ArrayListUnmanaged(LoopTarget) = .empty,
@@ -2064,7 +2071,72 @@ const Gen = struct {
         for (leaving) |inst| if (holdsValues(inst)) {
             target = try self.releaseBlock(inst, null, target);
         };
+        // (first, the operands held: the innermost things)
+        const held = self.inflight.items[@min(self.err_inflight, self.inflight.items.len)..];
+        for (held) |v| if (ownsReferences(v) or v == .list) {
+            target = try self.releaseHeldBlock(held, target);
+            break;
+        };
         return target;
+    }
+
+    /// A block dropping held operands (the last first), then to `next`
+    /// (shared as releaseBlock's)
+    fn releaseHeldBlock(self: *Gen, held: []const SVal, next: ir.Block) Error!ir.Block {
+        const inst = self.insts.items[self.insts.items.len - 1];
+        var sig: std.ArrayListUnmanaged(usize) = .empty;
+        try sig.appendSlice(self.a(), &.{ @intFromPtr(next), 7 });
+        for (held) |v| {
+            switch (v) {
+                .dyn => |d| if (d.heapish()) try sig.appendSlice(self.a(), &.{ 1, @intFromPtr(d.tag), @intFromPtr(d.bits), @intFromPtr(d.state) }),
+                .tuple => |t| try sig.appendSlice(self.a(), &.{ 2, @intFromPtr(t.ptr), t.len }),
+                .list => |l| try sig.appendSlice(self.a(), &.{ 3, @intFromPtr(l), @intFromBool(self.heldListReleased(l)), l.items.items.len }),
+                else => {},
+            }
+        }
+        for (self.release_blocks.items) |r| if (std.mem.eql(usize, r.sig, sig.items)) return r.block;
+        const f = &self.f;
+        const here = f.current;
+        const release = try f.label("error_release");
+        if (self.release_blocks.items.len >= 64) _ = self.release_blocks.orderedRemove(0);
+        try self.release_blocks.append(self.a(), .{ .sig = sig.items, .block = release });
+        f.positionAt(release);
+        var i = held.len;
+        while (i > 0) {
+            i -= 1;
+            switch (held[i]) {
+                .list => |l| if (self.heldListReleased(l)) try self.releaseList(inst, l),
+                else => try self.drop(held[i]),
+            }
+        }
+        try f.br(next);
+        f.positionAt(here);
+        return release;
+    }
+
+    /// A known list held as an operand is a temporary of its own (no local
+    /// refers to it): released with it
+    fn heldListReleased(self: *Gen, l: *SList) bool {
+        for (self.insts.items) |in| {
+            for (in.locals) |x| switch (x) {
+                .static => |sv| if (refersTo(sv, l, 4)) return false,
+                else => {},
+            };
+        }
+        return self.wouldRelease(self.insts.items[self.insts.items.len - 1], l);
+    }
+
+    /// An operand evaluated with others still to be: held until its
+    /// operation takes it (taken()).
+    fn operand(self: *Gen, inst: *Inst, e: *const front.Expr) Error!SVal {
+        const v = try self.expr(inst, e);
+        try self.inflight.append(self.a(), v);
+        return v;
+    }
+
+    /// The operands held since `mark`, taken by their operation.
+    fn taken(self: *Gen, mark: usize) void {
+        self.inflight.shrinkRetainingCapacity(mark);
     }
 
     /// A block releasing a semantic's locals (`only`: those) as they are
@@ -3614,12 +3686,15 @@ const Gen = struct {
         const saved = try self.a().dupe(*TryFrame, self.tries.items);
         const saved_err = self.err_label;
         const saved_keep = self.err_keep;
+        const saved_inflight = self.err_inflight;
         self.tries.shrinkRetainingCapacity(i);
         self.err_label = fr.outer_err;
         self.err_keep = fr.outer_keep;
+        self.err_inflight = fr.outer_inflight;
         try self.stmts(fr.inst, fr.finally);
         self.err_label = saved_err;
         self.err_keep = saved_keep;
+        self.err_inflight = saved_inflight;
         self.tries.clearRetainingCapacity();
         try self.tries.appendSlice(self.a(), saved);
     }
@@ -4409,6 +4484,7 @@ const Gen = struct {
             .finally = t.finally,
             .outer_err = self.err_label,
             .outer_keep = self.err_keep,
+            .outer_inflight = self.err_inflight,
             .handler_blocks = try self.a().alloc(ir.Block, t.handlers.len),
             .caught = try self.a().alloc(ir.Value, t.handlers.len),
         };
@@ -4466,8 +4542,10 @@ const Gen = struct {
         // The body (run straight through): its errors to the handlers
         try self.tries.append(self.a(), fr);
         self.err_label = catcher;
-        // (the semantic with the try runs on in its handlers)
+        // (the semantic with the try runs on in its handlers, the operands
+        // held around it too)
         self.err_keep = fr.depth;
+        self.err_inflight = self.inflight.items.len;
         inst.in_try += 1;
         try self.stmts(inst, t.body);
         inst.in_try -= 1;
@@ -4482,6 +4560,7 @@ const Gen = struct {
         defer inst.dyn_depth -= 1;
         self.err_label = fin_err;
         self.err_keep = if (t.finally.len > 0) fr.depth else fr.outer_keep;
+        if (t.finally.len == 0) self.err_inflight = fr.outer_inflight;
         try self.stmts(inst, t.else_);
         try f.br(handled);
 
@@ -4521,6 +4600,7 @@ const Gen = struct {
         // Every way out: the finally
         self.err_label = fr.outer_err;
         self.err_keep = fr.outer_keep;
+        self.err_inflight = fr.outer_inflight;
         try f.block(handled);
         try self.stmts(inst, t.finally);
         try f.br(done);
@@ -4622,10 +4702,23 @@ const Gen = struct {
                     try self.assign(inst, x, .{ .dyn = try self.loadSlot(self.elem(arr, i), .any) }, pos);
                 }
             },
-            .attr => |x| try self.setAttr(inst, try self.expr(inst, x.obj), x.name, v, pos),
-            .index => |x| {
+            .attr => |x| {
+                // (the value held as the object is made)
+                const mark = self.inflight.items.len;
+                errdefer self.taken(mark);
+                try self.inflight.append(self.a(), v);
                 const obj = try self.expr(inst, x.obj);
+                self.taken(mark);
+                try self.setAttr(inst, obj, x.name, v, pos);
+            },
+            .index => |x| {
+                // (the value, then the object, held as the rest is made)
+                const mark = self.inflight.items.len;
+                errdefer self.taken(mark);
+                try self.inflight.append(self.a(), v);
+                const obj = try self.operand(inst, x.obj);
                 const key = try self.expr(inst, x.index);
+                self.taken(mark);
                 try self.setItem(inst, obj, key, v, pos);
             },
         }
@@ -5087,8 +5180,11 @@ const Gen = struct {
             },
             .call => |x| return self.callExpr(inst, x.func, x.args, x.keywords, e.pos),
             .binary => |x| {
-                const l = try self.expr(inst, x.left);
+                const mark = self.inflight.items.len;
+                errdefer self.taken(mark);
+                const l = try self.operand(inst, x.left);
                 const r = try self.expr(inst, x.right);
+                self.taken(mark);
                 return self.binary(inst, x.op, l, r);
             },
             .unary => |x| {
@@ -5102,13 +5198,19 @@ const Gen = struct {
                 }
                 // a < b < c: each pair, and-ed (each operand once)
                 var left = try self.expr(inst, x.first);
+                const mark = self.inflight.items.len;
+                errdefer self.taken(mark);
                 if (x.ops.len == 1) {
+                    try self.inflight.append(self.a(), left);
                     const right = try self.expr(inst, x.rest[0]);
+                    self.taken(mark);
                     return self.compare(inst, x.ops[0], left, right);
                 }
                 var result: SVal = .{ .bool = true };
                 for (x.ops, x.rest, 0..) |op, rest_e, i| {
+                    try self.inflight.append(self.a(), left);
                     const right = try self.expr(inst, rest_e);
+                    self.taken(mark);
                     if (i + 1 < x.ops.len and right == .dyn) try self.increfDyn(right.dyn);
                     const r = try self.compare(inst, op, left, right);
                     result = try self.andValues(inst, result, r);
@@ -5127,7 +5229,10 @@ const Gen = struct {
             .list, .tuple => |items| {
                 const l = try self.a().create(SList);
                 l.* = .{ .origin = e };
-                for (items) |item| try l.items.append(self.a(), try self.expr(inst, item));
+                const mark = self.inflight.items.len;
+                errdefer self.taken(mark);
+                for (items) |item| try l.items.append(self.a(), try self.operand(inst, item));
+                self.taken(mark);
                 if (e.kind == .tuple) {
                     l.taken = true;
                     return .{ .tuple = l.items.items };
@@ -5141,11 +5246,14 @@ const Gen = struct {
                 var dynamic = false;
                 const keys = try self.a().alloc(SVal, x.keys.len);
                 const vals = try self.a().alloc(SVal, x.keys.len);
+                const mark = self.inflight.items.len;
+                errdefer self.taken(mark);
                 for (x.keys, x.values, 0..) |ke, ve, i| {
-                    keys[i] = try self.expr(inst, ke);
-                    vals[i] = try self.expr(inst, ve);
+                    keys[i] = try self.operand(inst, ke);
+                    vals[i] = try self.operand(inst, ve);
                     if (!keys[i].isStatic() or !isScalar(keys[i])) dynamic = true;
                 }
+                self.taken(mark);
                 if (!dynamic) {
                     for (keys, vals) |key, v| try self.sdictSet(d, key, v);
                     return self.literal(.{ .dict = d }, e, inst.node);
@@ -5161,15 +5269,21 @@ const Gen = struct {
             },
             .dict_comp => |comp| return self.dictComp(inst, comp.key, comp.value, comp.generators, e.pos),
             .index => |x| {
-                const obj = try self.expr(inst, x.obj);
+                const mark = self.inflight.items.len;
+                errdefer self.taken(mark);
+                const obj = try self.operand(inst, x.obj);
                 const key = try self.expr(inst, x.index);
+                self.taken(mark);
                 return self.getItem(inst, obj, key);
             },
             .slice => |x| {
-                const obj = try self.expr(inst, x.obj);
-                const lo = if (x.lo) |v| try self.expr(inst, v) else SVal.none;
-                const hi = if (x.hi) |v| try self.expr(inst, v) else SVal.none;
+                const mark = self.inflight.items.len;
+                errdefer self.taken(mark);
+                const obj = try self.operand(inst, x.obj);
+                const lo = if (x.lo) |v| try self.operand(inst, v) else SVal.none;
+                const hi = if (x.hi) |v| try self.operand(inst, v) else SVal.none;
                 const step = if (x.step) |v| try self.expr(inst, v) else SVal.none;
+                self.taken(mark);
                 // Known: Python's slice now (strings, known lists of scalars)
                 if (isScalar(obj) and isScalar(lo) and isScalar(hi) and isScalar(step)) {
                     const o = try self.pyOf(obj);
@@ -6028,26 +6142,35 @@ const Gen = struct {
         // obj.name(...): a method of a value, or an attribute of rt, a node,
         // a module
         var callee: SVal = undefined;
+        // (the callee and the arguments evaluated so far held while the rest
+        // are)
+        const mark = self.inflight.items.len;
+        errdefer self.taken(mark);
         if (func_e.kind == .attr) {
             const obj = try self.expr(inst, func_e.kind.attr.obj);
             switch (obj) {
                 .rt, .node, .py => callee = try self.attr(inst, obj, func_e.kind.attr.name, func_e.pos),
                 else => {
                     if (kws.len != 0) return c.unsupportedAt(inst.func, pos, "keyword arguments to a method aren't compiled yet", .{});
+                    try self.inflight.append(self.a(), obj);
                     const margs = try self.a().alloc(SVal, args_e.len);
-                    for (margs, args_e) |*slot, ae| slot.* = try self.expr(inst, ae);
+                    for (margs, args_e) |*slot, ae| slot.* = try self.operand(inst, ae);
+                    self.taken(mark);
                     return self.methodCall(inst, obj, func_e.kind.attr.name, margs, pos);
                 },
             }
         } else callee = try self.expr(inst, func_e);
+        try self.inflight.append(self.a(), callee);
         // all() / any() of a generator expression: up to the item deciding
         if (callee == .py and args_e.len == 1 and kws.len == 0 and args_e[0].kind == .gen_exp) {
+            self.taken(mark);
             if (isBuiltin(callee.py, "all")) return self.allAny(inst, args_e[0].kind.gen_exp, false, pos);
             if (isBuiltin(callee.py, "any")) return self.allAny(inst, args_e[0].kind.gen_exp, true, pos);
+            try self.inflight.append(self.a(), callee);
         }
         // (arguments in order, as Python evaluates them)
         const args = try self.a().alloc(SVal, args_e.len);
-        for (args, args_e) |*slot, ae| slot.* = try self.expr(inst, ae);
+        for (args, args_e) |*slot, ae| slot.* = try self.operand(inst, ae);
         var receiver: ?SVal = null;
         // A helper's keyword arguments: in their parameters' places
         if (kws.len > 0 and callee == .py and try isInstanceOf(callee.py, (try pyTypes()).function)) {
@@ -6061,20 +6184,22 @@ const Gen = struct {
                     if (std.mem.eql(u8, p, kw.name)) break j;
                 } else return c.unsupportedAt(inst.func, pos, "{s}() has no parameter {s}", .{ func.name, kw.name });
                 if (all[i] != null) return c.unsupportedAt(inst.func, pos, "{s}() given {s} twice", .{ func.name, kw.name });
-                all[i] = try self.expr(inst, kw.value);
+                all[i] = try self.operand(inst, kw.value);
             }
+            self.taken(mark);
             const full = try self.a().alloc(SVal, func.param_count);
             for (all, full, 0..) |x, *slot, i| slot.* = x orelse (if (i < func.required) return c.unsupportedAt(inst.func, pos, "{s}() missing its argument {s}", .{ func.name, func.locals[i] }) else try self.defaultOf(func, i));
             return self.callHelper(func, inst.node, full);
         }
         for (kws) |kw| {
             if (callee == .rt_method and callee.rt_method == .call and std.mem.eql(u8, kw.name, "receiver")) {
-                receiver = try self.expr(inst, kw.value);
+                receiver = try self.operand(inst, kw.value);
             } else if (callee == .rt_method and callee.rt_method == .@"error" and std.mem.eql(u8, kw.name, "code")) {
                 // (the code isn't kept by compiled errors yet: reported as runtime)
                 try self.drop(try self.expr(inst, kw.value));
             } else return c.unsupportedAt(inst.func, pos, "the keyword argument {s}= isn't compiled", .{kw.name});
         }
+        self.taken(mark);
         switch (callee) {
             .rt_method => |m| return self.rtCall(inst, m, args, receiver, pos),
             .py => |o| return self.pyCall(inst, o, args, pos),
