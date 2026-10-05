@@ -198,7 +198,10 @@ pub export fn zr_py_semantic(ctx: *Ctx, which: u32, idx: u32, frame_slot: **valu
 pub export fn zr_run_value(ctx: *Ctx, which: u32, at: u32, tag: u64, bits: u64, frame_slot: **value.Frame, owner: u32, out: *Value) callconv(.c) i32 {
     out.* = Value.none_v;
     const v = Value{ .tag = tag, .bits = bits };
-    helpers.stat("run_value {s}", .{@tagName(v.kind())});
+    if (v.kind() == .node) {
+        const d = linkOf(ctx).data;
+        helpers.stat("run_value node {s} (at {s})", .{ d.grammar.kind_names[d.rule(@intCast(v.bits))], if (at < d.nodes.len) d.grammar.kind_names[d.rule(at)] else "-" });
+    } else helpers.stat("run_value {s}", .{@tagName(v.kind())});
     const loop = which == 2;
     const w: compile_mod.Which = if (which == 0) .eval else .exec;
     switch (v.kind()) {
@@ -1112,9 +1115,18 @@ pub fn init(module: *PyObject) !void {
     if (py.c.PyModule_AddObjectRef(module, "CompiledRuntime", RuntimeType) != 0) return error.Python;
 }
 
+/// A call site of a helper compiled out of line ran often: its helper
+/// compiled for what the site knows of its arguments (Compiled.specialize),
+/// what the site calls from now on. Nothing (the site keeps calling the
+/// generic code) if that can't be done.
+pub export fn zr_specialize(ctx: *Ctx, site: u64) callconv(.c) void {
+    linkOf(ctx).compiled.specialize(@intCast(site));
+}
+
 /// The bridge's helpers, by name (for the JIT)
-pub fn symbols() [6]struct { []const u8, usize } {
+pub fn symbols() [7]struct { []const u8, usize } {
     return .{
+        .{ "zr_specialize", @intFromPtr(&zr_specialize) },
         .{ "zr_py_semantic", @intFromPtr(&zr_py_semantic) },
         .{ "zr_run_value", @intFromPtr(&zr_run_value) },
         .{ "zr_runtime", @intFromPtr(&zr_runtime) },

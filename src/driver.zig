@@ -63,6 +63,8 @@ pub const Compiled = struct {
     /// What running a node as a value does, the last time (by node and
     /// eval or exec: bridge.runNode's, looked up without hashing)
     runs: []Run = &.{},
+    /// Specialized helpers' addresses, by name (specialize)
+    special: std.StringHashMapUnmanaged(usize) = .empty,
     /// Node attributes by name (attrOf), nodes' texts (textStr)
     attrs: std.AutoHashMapUnmanaged(*const value.Str, Attr) = .empty,
     texts: []?*value.Str = &.{},
@@ -145,6 +147,7 @@ pub const Compiled = struct {
         self.thunks.deinit(allocator);
         if (self.runs.len > 0) allocator.free(self.runs);
         self.attrs.deinit(allocator);
+        self.special.deinit(allocator);
         for (self.texts) |t| if (t) |s| value.decref(value.Value.obj(.str, &s.head));
         if (self.texts.len > 0) allocator.free(self.texts);
         self.called.deinit(allocator);
@@ -193,6 +196,46 @@ pub const Compiled = struct {
             self.thunks.put(allocator, key, t) catch return oomT();
             return t;
         }
+    }
+
+    /// A hot call site's helper compiled for what the site knows (bridge's
+    /// zr_specialize): the site's code from now on. If it can't be, the
+    /// site keeps calling the generic code (and isn't counted any more).
+    pub fn specialize(self: *Compiled, site: usize) void {
+        const c = &self.compiler;
+        const hot = c.sites.items[site].hot;
+        hot.count = std.math.minInt(i64);
+        if (c.specializedBefore(site)) |name| {
+            if (self.special.get(name)) |addr| hot.code = addr;
+            return;
+        }
+        if (c.specialized >= compile_mod.max_specialized) return;
+        c.failed_semantic = null;
+        c.need_retry = false;
+        const t0 = nowUs();
+        const inlined0 = c.inlined;
+        const blocks0 = c.helper_blocks;
+        const name = c.compileSpecialized(site) catch |e| {
+            c.forgetModule();
+            if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("not specialized {s} for site {d}: {s} {s}\n", .{ c.sites.items[site].func.name, site, @errorName(e), self.failure.message.items });
+            // (a Python error on the way: not the program's)
+            py.c.PyErr_Clear();
+            return;
+        };
+        const inlined = c.inlined - inlined0;
+        const addr = self.add(name) orelse {
+            // (what it made isn't in the JIT)
+            c.forgetModule();
+            if (std.c.getenv("ZRUN_STATS") != null) {
+                std.debug.print("not specialized {s} for site {d}: the JIT refused it\n", .{ c.sites.items[site].func.name, site });
+                py.c.PyErr_Print();
+            }
+            py.c.PyErr_Clear();
+            return;
+        };
+        self.special.put(allocator, name, addr) catch return;
+        if (std.c.getenv("ZRUN_STATS") != null) std.debug.print("specialized {s} (size {d}, {d} bodies inline, {d} blocks) for site {d}: {d}us\n", .{ c.sites.items[site].func.name, c.sites.items[site].func.size, inlined, c.helper_blocks - blocks0, site, nowUs() - t0 });
+        hot.code = addr;
     }
 
     /// The compiled code of a Python function compiled code calls (for

@@ -887,6 +887,15 @@ export fn zr_object(ctx: *Ctx, idx: u64, out: *Value) callconv(.c) void {
 }
 
 /// A heap frame for a run of a function (its slots unset).
+/// The frame of scope `home` seen from `frame` (of scope `owner`): up the
+/// frames' parents as up the scopes' owners (`owners`: by node).
+export fn zr_frame_of(frame: *value.Frame, owner: u32, home: u32, owners: [*]const u64) callconv(.c) *value.Frame {
+    var f = frame;
+    var at = owner;
+    while (at != home and at != std.math.maxInt(u32)) : (at = @intCast(owners[at])) f = f.parent orelse break;
+    return f;
+}
+
 pub export fn zr_frame_new(parent: ?*value.Frame, n: u64) callconv(.c) ?*value.Frame {
     const f = value.newFrame(parent, n) orelse return null;
     for (f.slots()) |*s| s.tag = UNSET;
@@ -2011,7 +2020,7 @@ const helper_names = [_][]const u8{
     "zr_list_len", "zr_list_at",    "zr_append",     "zr_call_method",   "zr_call_python",
     "zr_is_type",  "zr_global",     "zr_format",     "zr_concat",        "zr_unpack",
     "zr_varargs",  "zr_record_new", "zr_isinstance", "zr_call_seq",      "zr_slice",
-    "zr_type",     "zr_builtin",    "zr_range",      "zr_cell",
+    "zr_type",     "zr_builtin",    "zr_range",      "zr_cell",          "zr_frame_of",
 };
 
 /// The names compiled code calls them by, and their addresses

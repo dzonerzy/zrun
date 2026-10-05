@@ -39,6 +39,38 @@ def test_all_native():
     assert lua.lang.python_semantics() == {}
 
 
+SPECIALIZED = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import contextlib, io, lua
+bad = []
+for name in sys.argv[2:]:
+    path = sys.argv[1] + "/tests/" + name + ".lua"
+    expected = open(path[:-4] + ".expected").read()
+    for _ in range(2):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            lua.run(open(path).read(), name + ".lua", mode="compiled")
+        if out.getvalue() != expected:
+            bad.append(name)
+print(bad)
+"""
+
+
+def test_specialized():
+    # every call site of a helper compiled out of line hot at its first
+    # call: each compiled for what it knows (ZRUN_HOT_CALLS=1), the
+    # programs printing what real Lua does, the second run too (the
+    # specialized code then)
+    import subprocess
+
+    env = dict(os.environ, ZRUN_HOT_CALLS="1")
+    some = [p for p in ("funcs", "programs", "strings") if p in PROGRAMS]
+    r = subprocess.run([sys.executable, "-c", SPECIALIZED, LUA_DIR, *some], env=env, capture_output=True, text=True, timeout=1800)
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert r.stdout.strip() == "[]"
+
+
 def test_uncaught_error():
     with pytest.raises(zrun.Error) as e:
         lua.run("local t = nil\nprint(t.x)\n", "boom.lua")

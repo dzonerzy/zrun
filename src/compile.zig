@@ -31,6 +31,7 @@ const value = @import("value.zig");
 const objects_mod = @import("objects.zig");
 const types_mod = @import("types.zig");
 const adopt_mod = @import("adopt.zig");
+const Value = value.Value;
 
 const Allocator = std.mem.Allocator;
 const NONE = program_mod.NONE;
@@ -111,6 +112,8 @@ pub const SList = struct {
     /// run time instead once it's known to escape where a known one can't
     /// follow (Compiler.escaping)
     origin: ?*const front.Expr = null,
+    /// A module's table only read (frozenTable): the object it is
+    frozen: ?*PyObject = null,
 };
 
 /// A dict known at compile time: keys known (scalars), values maybe not
@@ -118,6 +121,8 @@ pub const SDict = struct {
     keys: std.ArrayListUnmanaged(SVal) = .empty,
     values: std.ArrayListUnmanaged(SVal) = .empty,
     origin: ?*const front.Expr = null,
+    /// A module's table only read (frozenTable): the object it is
+    frozen: ?*PyObject = null,
 
     fn find(self: *const SDict, key: SVal) ?usize {
         for (self.keys.items, 0..) |k, i| if (sameKey(k, key)) return i;
@@ -334,6 +339,17 @@ fn pureFunction(o: *PyObject) error{Python}!bool {
     return r == py.Py_True();
 }
 
+/// Whether a Python function only reads its positional parameter `i`
+/// (indexes it, iterates it, `in` it, len() of it...: never changes, keeps,
+/// returns or gives it away). Worked out once per function.
+fn readonlyParam(o: *PyObject, i: usize) error{Python}!bool {
+    try scanners();
+    const r = py.c.PyObject_CallFunctionObjArgs(readonly_checker.?, o, @as(?*PyObject, null)) orelse return error.Python;
+    defer py.Py_DecRef(r);
+    if (i >= py.c.PyTuple_Size(r)) return false;
+    return py.c.PyTuple_GetItem(r, @intCast(i)).? == py.Py_True();
+}
+
 /// The Python code reading modules (moduleScan, pureFunction), made once.
 fn scanners() error{Python}!void {
     if (rebound_scanner == null) {
@@ -483,15 +499,54 @@ fn scanners() error{Python}!void {
             \\            if not (isinstance(base, ast.Name) and base.id in local and base.id not in params):
             \\                return False
             \\    return True
+            \\readonly_cache = {}
+            \\def readonly(fn):
+            \\    # Which positional parameters the function only reads (as frozen()
+            \\    # tells a table only read): a list given there can't be changed
+            \\    # or kept by it
+            \\    if fn in readonly_cache:
+            \\        return readonly_cache[fn]
+            \\    out = ()
+            \\    try:
+            \\        fdef = ast.parse(textwrap.dedent(inspect.getsource(fn))).body[0]
+            \\        names = [x.arg for x in fdef.args.posonlyargs + fdef.args.args]
+            \\        parents = {}
+            \\        for node in ast.walk(fdef):
+            \\            for ch in ast.iter_child_nodes(node):
+            \\                parents[ch] = node
+            \\        bad = set()
+            \\        for node in ast.walk(fdef):
+            \\            if not isinstance(node, ast.Name) or node.id not in names:
+            \\                continue
+            \\            p = parents.get(node)
+            \\            if not isinstance(node.ctx, ast.Load):
+            \\                bad.add(node.id)
+            \\                continue
+            \\            ok = (isinstance(p, ast.Subscript) and p.value is node and isinstance(p.ctx, ast.Load)) \
+            \\                or (isinstance(p, ast.Compare) and node in p.comparators and all(isinstance(o, (ast.In, ast.NotIn)) for o in p.ops)) \
+            \\                or (isinstance(p, (ast.For, ast.comprehension)) and p.iter is node) \
+            \\                or (isinstance(p, ast.Attribute) and p.value is node and p.attr in SAFE_METHODS - {"copy"}
+            \\                    and isinstance(parents.get(p), ast.Call) and parents[p].func is p) \
+            \\                or (isinstance(p, ast.Call) and node in p.args and isinstance(p.func, ast.Name) and p.func.id in ("len", "isinstance", "bool"))
+            \\            if not ok:
+            \\                bad.add(node.id)
+            \\        out = tuple(n not in bad for n in names)
+            \\    except Exception:
+            \\        pass
+            \\    readonly_cache[fn] = out
+            \\    return out
         ;
         const ns = runPython(src) orelse return error.Python;
         defer py.Py_DecRef(ns);
         const f = py.c.PyDict_GetItemString(ns, "scan") orelse return error.Python;
         const p = py.c.PyDict_GetItemString(ns, "pure") orelse return error.Python;
+        const r = py.c.PyDict_GetItemString(ns, "readonly") orelse return error.Python;
         py.Py_IncRef(f);
         py.Py_IncRef(p);
+        py.Py_IncRef(r);
         rebound_scanner = f;
         pure_checker = p;
+        readonly_checker = r;
     }
 }
 
@@ -586,6 +641,9 @@ var not_records: std.AutoHashMapUnmanaged(*PyObject, void) = .empty;
 
 var rebound_scanner: ?*PyObject = null;
 var pure_checker: ?*PyObject = null;
+/// Modules' tables only read, native (Gen.frozenConst), by the table
+var frozen_natives: std.AutoHashMapUnmanaged(*PyObject, Value) = .empty;
+var readonly_checker: ?*PyObject = null;
 /// (the module dicts are kept: modules live as long)
 var rebound_cache: std.AutoHashMapUnmanaged(*PyObject, ScanEntry) = .empty;
 
@@ -614,24 +672,81 @@ const HelperSpec = struct {
     /// A closure's code: the function called is the last argument, its
     /// variables (cells) read from it when the code runs
     closure: bool = false,
+    /// A specialization (Site): the arguments the calls give in the array,
+    /// as the generic code's (it knows some of them: those it skips)
+    layout: ?[]const bool = null,
 
     fn matches(self: *const HelperSpec, func: *const front.Function, args: []const SVal) bool {
-        if (self.func != func or self.args.len != args.len) return false;
-        for (self.args, args) |x, y| {
-            if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
-            const same = switch (x) {
-                .dyn, .none, .rt => true,
-                .bool => |b| b == y.bool,
-                .node => |n| n == y.node,
-                .str => |s| std.mem.eql(u8, s, y.str),
-                .py => |o| o == y.py,
-                else => false,
-            };
-            if (!same) return false;
-        }
+        if (self.func != func or self.args.len != args.len or self.layout != null) return false;
+        for (self.args, args) |x, y| if (!sameSpec(x, y)) return false;
         return true;
     }
+
+    /// The same specialization: the same function, known arguments, array.
+    fn sameSpecial(self: *const HelperSpec, func: *const front.Function, args: []const SVal, layout: []const bool) bool {
+        if (self.func != func or self.args.len != args.len) return false;
+        const l = self.layout orelse return false;
+        if (!std.mem.eql(bool, l, layout)) return false;
+        for (self.args, args) |x, y| if (!sameSpec(x, y)) return false;
+        return true;
+    }
+
+    /// The same argument to compile for (exactly: 1 and 1.0 aren't).
+    fn sameSpec(x: SVal, y: SVal) bool {
+        if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
+        return switch (x) {
+            .dyn, .none, .rt => true,
+            .bool => |b| b == y.bool,
+            .node => |n| n == y.node,
+            .str => |s| std.mem.eql(u8, s, y.str),
+            .py => |o| o == y.py,
+            .int => |n| n == y.int,
+            .pint => |n| n == y.pint,
+            .float => |v| @as(u64, @bitCast(v)) == @as(u64, @bitCast(y.float)),
+            .tuple => |t| t.len == y.tuple.len and for (t, y.tuple) |a, b| {
+                if (!sameSpec(a, b)) break false;
+            } else true,
+            .list => |l| l.items.items.len == y.list.items.items.len and for (l.items.items, y.list.items.items) |a, b| {
+                if (!sameSpec(a, b)) break false;
+            } else true,
+            else => false,
+        };
+    }
 };
+
+/// A call site of a helper out of line knowing more of its arguments than
+/// the helper's generic code does (a node, a str...): the calls counted,
+/// and once it's hot (`hot_calls`), the helper compiled for them
+/// (Compiled.specialize), called from then on. `hot` is what the code
+/// reads: the specialized code's address (0: none yet), the calls so far
+/// (negative: never to specialize).
+pub const Site = struct {
+    hot: *Hot,
+    func: *const front.Function,
+    /// The arguments as the site knows them (.dyn: given at run time)
+    args: []const SVal,
+    /// Which are in the array the calls give (the generic code's)
+    layout: []const bool,
+    semantic: ?*PyObject,
+
+    pub const Hot = extern struct { code: u64 = 0, count: i64 = 0 };
+};
+
+/// Calls of a site before its helper is compiled for it (ZRUN_HOT_CALLS:
+/// another number, 1 to test the specializations)
+fn hotCalls() i64 {
+    if (hot_calls == 0) {
+        hot_calls = 1000;
+        if (std.c.getenv("ZRUN_HOT_CALLS")) |s| hot_calls = std.fmt.parseInt(i64, std.mem.span(s), 10) catch 1000;
+    }
+    return hot_calls;
+}
+var hot_calls: i64 = 0;
+/// The most specializations a program makes (compiling costs)
+pub const max_specialized = 256;
+/// The biggest specialization compiled (blocks of code, the helpers it
+/// needs with it)
+const max_specialized_blocks = 1500;
 
 /// Where a language function keeps its variables
 const Layout = struct {
@@ -691,13 +806,30 @@ pub const Compiler = struct {
     inlined: usize = 0,
     /// Record fields by module and name (Gen.fieldCandidates)
     field_cands: std.StringHashMapUnmanaged([]const Gen.FieldCandidate) = .empty,
+    /// Call sites of helpers out of line that may get code of their own
+    /// (Site), by number; specializations made so far
+    sites: std.ArrayListUnmanaged(*Site) = .empty,
+    specialized: usize = 0,
+    /// Blocks of the helpers generated so far (a specialization's size)
+    helper_blocks: usize = 0,
     /// By node: its kind's str (kindTable); by label, its child (fieldTable)
     kind_table: ?[]u64 = null,
+    owner_table: ?[]u64 = null,
     field_tables: std.AutoHashMapUnmanaged(u8, []u64) = .empty,
 
     /// In a field table: a node whose label isn't one child or none (a
     /// list of them, a value an action makes): zr_getattr's
     pub const field_other: i64 = @as(i64, NONE) - 1;
+
+    /// Each node's owner (the scope whose frame its code runs in: ownerOf),
+    /// by node: what code out of line walks frames by (zr_frame_of).
+    pub fn ownerTable(self: *Compiler) Error![]u64 {
+        if (self.owner_table) |t| return t;
+        const t = try self.a.alloc(u64, self.data.nodes.len);
+        for (t, 0..) |*slot, i| slot.* = self.ownerOf(@intCast(i));
+        self.owner_table = t;
+        return t;
+    }
 
     /// Each node's kind as a str (immortal: value.literal), by node: what
     /// node.kind of a node only known at run time reads.
@@ -825,12 +957,25 @@ pub const Compiler = struct {
         const args = try self.a.alloc(SVal, h.args.len);
         var j: usize = 0;
         for (h.args, 0..) |x, i| {
+            // (a specialization: the array is the generic code's, with
+            // what it knows skipped)
+            const in_array = if (h.layout) |l| l[i] else x == .dyn;
+            const at = j;
+            if (in_array) j += 1;
+            if (x == .list) {
+                // (a specialization's list of known items: a copy of its
+                // own, the helper only reads it)
+                const l = try self.a.create(SList);
+                l.* = .{};
+                try l.items.appendSlice(self.a, x.list.items.items);
+                args[i] = .{ .list = l };
+                continue;
+            }
             if (x != .dyn) {
                 args[i] = x;
                 continue;
             }
-            const d = try g.loadSlot(g.elem(g.f.param(2), j), .any);
-            j += 1;
+            const d = try g.loadSlot(g.elem(g.f.param(2), at), .any);
             // (a closure's function, last: borrowed, its cells read)
             if (h.closure and i == h.args.len - 1) {
                 g.closure_fn = d;
@@ -847,6 +992,7 @@ pub const Compiler = struct {
         try g.f.block(g.err_label);
         try g.f.ret(self.m.k32(0));
         g.f.finish();
+        self.helper_blocks += g.f.next_label;
     }
 
     /// A Big for a constant (immortal: freed with the program).
@@ -889,6 +1035,33 @@ pub const Compiler = struct {
         try self.helper_fns.append(self.a, h);
         try self.helper_queue.append(self.a, h);
         try self.drainQueues();
+        return h.name;
+    }
+
+    /// The specialization a site's calls are, made before (another site
+    /// like it): its name, or null.
+    pub fn specializedBefore(self: *Compiler, site: usize) ?[:0]const u8 {
+        const s = self.sites.items[site];
+        for (self.helper_fns.items[0..self.helpers_kept]) |h| if (h.sameSpecial(s.func, s.args, s.layout)) return h.name;
+        return null;
+    }
+
+    /// A site's helper compiled for what the site knows of its arguments
+    /// (Site), in a module of its own: its name.
+    pub fn compileSpecialized(self: *Compiler, site: usize) Error![:0]const u8 {
+        const s = self.sites.items[site];
+        try self.newModule();
+        self.specialized += 1;
+        const blocks0 = self.helper_blocks;
+        const h = try self.a.create(HelperSpec);
+        h.* = .{ .func = s.func, .args = s.args, .name = try std.fmt.allocPrintSentinel(self.a, "{s}_s{d}", .{ self.m.prefix, self.helper_fns.items.len }, 0), .semantic = s.semantic, .layout = s.layout };
+        try self.helper_fns.append(self.a, h);
+        try self.helper_queue.append(self.a, h);
+        try self.drainQueues();
+        // (code too big to be worth compiling: LLVM's time grows with it,
+        // the generic code serves)
+        const blocks = self.helper_blocks - blocks0;
+        if (blocks > max_specialized_blocks) return self.unsupported("{d} blocks: too big to specialize", .{blocks});
         return h.name;
     }
 
@@ -977,6 +1150,8 @@ pub const Compiler = struct {
         .{ "zr_truthy", "bll" },
         .{ "zr_function", "bpppiplp" },
         .{ "zr_call", "bpillplpp" },
+        .{ "zr_specialize", "vpl" },
+        .{ "zr_frame_of", "ppiip" },
         .{ "zr_object", "vplp" },
         .{ "zr_frame_new", "ppl" },
         .{ "zr_frame_release", "vp" },
@@ -1415,6 +1590,8 @@ const Gen = struct {
     closure_root: ?*const front.Function = null,
     out_param: ir.Value = null,
     base_scopes: usize = 0,
+    /// While loops being unrolled around the code
+    unrolling: u32 = 0,
 
     /// Code that runs many times (a function's, a loop's): reference
     /// counts inline. (Elsewhere, calls: each inline one is blocks for
@@ -1650,6 +1827,47 @@ const Gen = struct {
     }
 
     /// A value of a tag and constant bits.
+    /// A module's table only read (frozenTable) at run time: made native
+    /// once, for the process (immortal: the module's table never changes),
+    /// its address a constant.
+    fn frozenConst(self: *Gen, o: *PyObject, shape: Shape) Error!Dyn {
+        const v = frozen_natives.get(o) orelse blk: {
+            const v = try nativeCopy(o);
+            v.ptr().rc = value.IMMORTAL;
+            // (the table kept: its address is the key)
+            py.Py_IncRef(o);
+            try frozen_natives.put(std.heap.c_allocator, o, v);
+            break :blk v;
+        };
+        return self.konst(@intCast(v.tag), @bitCast(v.bits), shape);
+    }
+
+    /// A Python list or dict as a native one (its items as values are:
+    /// lists and dicts in it Python's).
+    fn nativeCopy(o: *PyObject) Error!Value {
+        if (py.PyList_Check(o)) {
+            const n: usize = @intCast(py.c.PyList_Size(o));
+            const l = value.newList(n) orelse return error.OutOfMemory;
+            for (0..n) |i| {
+                const x = value.fromPython(py.c.PyList_GetItem(o, @intCast(i)).?) orelse return error.Python;
+                if (!value.listPush(l, x)) return error.OutOfMemory;
+            }
+            return Value.obj(.list, &l.head);
+        }
+        const d = value.newDict() orelse return error.OutOfMemory;
+        var pos: py.Py_ssize_t = 0;
+        var key: ?*PyObject = null;
+        var val: ?*PyObject = null;
+        while (py.c.PyDict_Next(o, &pos, @ptrCast(&key), @ptrCast(&val)) != 0) {
+            const kv = value.fromPython(key.?) orelse return error.Python;
+            defer value.decref(kv);
+            const x = value.fromPython(val.?) orelse return error.Python;
+            defer value.decref(x);
+            if (!value.dictSet(d, kv, x)) return error.OutOfMemory;
+        }
+        return Value.obj(.dict, &d.head);
+    }
+
     fn konst(self: *Gen, tag: i64, bits: i64, shape: Shape) Dyn {
         return .{ .tag = self.k(tag), .bits = self.k(bits), .shape = shape };
     }
@@ -1680,12 +1898,14 @@ const Gen = struct {
                 break :blk try self.loadOut(.any);
             },
             .list => |l| blk: {
+                if (l.frozen) |o| break :blk try self.frozenConst(o, .list);
                 const d = try self.buildSequence("zr_list", l.items.items, at, .list);
                 try self.promote(v, d);
                 break :blk d;
             },
             .tuple => |t| self.buildSequence("zr_tuple", t, at, .tuple),
             .dict => |x| blk: {
+                if (x.frozen) |o| break :blk try self.frozenConst(o, .dict);
                 const d = try self.buildDict(x, at);
                 try self.promote(v, d);
                 break :blk d;
@@ -1958,12 +2178,16 @@ const Gen = struct {
     fn frameOf(self: *Gen, owner: u32, comptime unreachable_msg: []const u8) Error!ir.Value {
         const c = self.c;
         const f = &self.f;
-        // (a helper's code out of line runs in frames it doesn't know)
-        if (self.detached) return c.unsupported("a variable known when compiling is used in a helper compiled out of line", .{});
         var i = self.scopes.items.len;
         while (i > 0) {
             i -= 1;
             if (self.scopes.items[i].scope == owner) return f.load(c.m.t.ptr, self.scopes.items[i].slot);
+        }
+        // (a helper's code out of line runs in its caller's frames, of a
+        // scope it's given: the frames up to `owner`'s walked when it runs)
+        if (self.detached) {
+            const owners = try c.ownerTable();
+            return self.call("zr_frame_of", &.{ self.frame.?, self.owner_param, c.m.k32(owner), c.m.ptrConst(@intFromPtr(owners.ptr)) });
         }
         if (owner == self.fnode) return self.frame orelse c.unsupported(unreachable_msg ++ " (node {d})", .{owner});
         if (self.fnode == NONE) return c.unsupported(unreachable_msg ++ " (node {d})", .{owner});
@@ -2247,7 +2471,7 @@ const Gen = struct {
         const t = ph.typeOf(o);
         if (t == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyDict_Type"))))) {
             const d = try self.a().create(SDict);
-            d.* = .{};
+            d.* = .{ .frozen = o };
             var pos: py.Py_ssize_t = 0;
             var key: ?*PyObject = null;
             var v: ?*PyObject = null;
@@ -2259,7 +2483,7 @@ const Gen = struct {
         }
         if (t == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyList_Type"))))) {
             const l = try self.a().create(SList);
-            l.* = .{};
+            l.* = .{ .frozen = o };
             const n: usize = @intCast(py.c.PyList_Size(o));
             for (0..n) |i| try l.items.append(self.a(), try self.constant(py.c.PyList_GetItem(o, @intCast(i)).?, at));
             return .{ .list = l };
@@ -2751,6 +2975,33 @@ const Gen = struct {
     const inline_size = 40;
     /// The longest range() known when compiling that's unrolled
     const max_unrolled = 16;
+    /// The most iterations of a while loop with a known test unrolled
+    const max_unrolled_while = 8;
+    /// The most while loops unrolled in one another
+    const max_unrolled_nesting = 4;
+
+    /// While loops (their tests) found to go on past max_unrolled_while
+    /// iterations with their test known: not unrolled again (the front's
+    /// functions live as long as their language)
+    var long_loops: std.AutoHashMapUnmanaged(*const front.Expr, void) = .empty;
+
+    /// A loop body worth unrolling: a few statements, no loops in it.
+    fn smallBody(body: []const front.Stmt) bool {
+        var n: usize = 0;
+        return countSmall(body, &n) and n <= 12;
+    }
+
+    fn countSmall(body: []const front.Stmt, n: *usize) bool {
+        for (body) |s| {
+            n.* += 1;
+            switch (s.kind) {
+                .while_, .for_, .try_ => return false,
+                .if_ => |i| if (!countSmall(i.body, n) or !countSmall(i.else_, n)) return false,
+                else => {},
+            }
+        }
+        return true;
+    }
 
     /// A call of a helper's code out of line (made for the arguments known
     /// here, the first time: HelperSpec); the arguments are taken.
@@ -2803,10 +3054,96 @@ const Gen = struct {
         const recv = if (self.detached or fn_here) self.recv_slot else null_ptr;
         const varargs = if (self.detached or (fn_here and c.specOf(self.fnode).?.extra == .keep)) self.varargs_slot else null_ptr;
         const fun = try c.helperFn(spec.name);
-        const status = self.f.call(fun, &.{ self.ctx, try self.currentFrame(), arr, self.k32(at), self.k32(self.currentOwner()), recv, varargs, self.out });
+        const call_args = [_]ir.Value{ self.ctx, try self.currentFrame(), arr, self.k32(at), self.k32(self.currentOwner()), recv, varargs, self.out };
+        const status = if (try self.siteOf(func, args, key, spec.semantic)) |site|
+            try self.siteCall(site, fun, &call_args)
+        else
+            self.f.call(fun, &call_args);
         for (ds) |d| try self.drop(.{ .dyn = d });
         try self.statusJumps(status, at);
         return .{ .dyn = try self.loadOut(.any) };
+    }
+
+    /// A call site that knows more of a helper's arguments than its generic
+    /// code (`key`) does: its Site (a number in the compiler's), or null.
+    fn siteOf(self: *Gen, func: *const front.Function, args: []const SVal, key: []const SVal, semantic: ?*PyObject) Error!?usize {
+        const c = self.c;
+        const full = try c.a.alloc(SVal, args.len);
+        const layout = try c.a.alloc(bool, args.len);
+        var more = false;
+        for (args, key, full, layout, 0..) |x, generic, *slot, *given, i| {
+            given.* = generic == .dyn;
+            slot.* = generic;
+            if (generic != .dyn) continue;
+            if (specializable(x)) {
+                slot.* = x;
+            } else if (x == .list) {
+                // (a list of known items, to a parameter the helper only
+                // reads: the items as they are now, what the call gives)
+                for (x.list.items.items) |item| {
+                    if (!specializable(item)) break;
+                } else if (try readonlyParam(func.py_function, i)) {
+                    const l = try c.a.create(SList);
+                    l.* = .{};
+                    try l.items.appendSlice(c.a, x.list.items.items);
+                    slot.* = .{ .list = l };
+                }
+            }
+            if (slot.* != .dyn) more = true;
+        }
+        if (!more) return null;
+        const counts = try c.a.create(Site.Hot);
+        counts.* = .{};
+        const site = try c.a.create(Site);
+        site.* = .{ .hot = counts, .func = func, .args = full, .layout = layout, .semantic = semantic };
+        try c.sites.append(c.a, site);
+        return c.sites.items.len - 1;
+    }
+
+    /// What a helper can be compiled for when a site knows it: a node, a
+    /// str, a number, a tuple of those (constant: what a call site knows
+    /// stays so).
+    fn specializable(x: SVal) bool {
+        return switch (x) {
+            .node, .str, .int, .pint, .float => true,
+            .tuple => |t| for (t) |item| {
+                if (!specializable(item)) break false;
+            } else true,
+            else => false,
+        };
+    }
+
+    /// The call of a site: its specialized code if it has some, else the
+    /// generic code, counted (zr_specialize once it's hot). Its status.
+    fn siteCall(self: *Gen, site: usize, generic: ir.Fn, args: []const ir.Value) Error!ir.Value {
+        const f = &self.f;
+        const t = self.c.m.t;
+        const counts = self.c.m.ptrConst(@intFromPtr(self.c.sites.items[site].hot));
+        const count_ptr = f.offset(counts, @offsetOf(Site.Hot, "count"));
+        const special = try f.label("site_special");
+        const counted = try f.label("site_generic");
+        const now_hot = try f.label("site_hot");
+        const call_generic = try f.label("site_call");
+        const join = try f.label("site_done");
+        const code = f.load(t.i64, counts);
+        try f.condBr(f.icmp(jit_c.LLVMIntNE, code, self.k(0)), special, counted);
+        try f.block(counted);
+        const n = f.add(f.load(t.i64, count_ptr), self.k(1));
+        f.store(n, count_ptr);
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, n, self.k(hotCalls())), now_hot, call_generic);
+        try f.block(now_hot);
+        _ = self.call("zr_specialize", &.{ self.ctx, self.k(@intCast(site)) });
+        try f.br(call_generic);
+        try f.block(call_generic);
+        const s1 = f.call(generic, args);
+        const end1 = f.current;
+        try f.br(join);
+        try f.block(special);
+        const s2 = f.call(.{ .v = f.intToPtr(code), .ty = generic.ty }, args);
+        const end2 = f.current;
+        try f.br(join);
+        try f.block(join);
+        return f.phi(t.i32, s1, end1, s2, end2);
     }
 
     /// Run a front function inline with arguments.
@@ -2956,12 +3293,53 @@ const Gen = struct {
                 }
             },
             .while_ => |w| {
+                // A test known now: iterations unrolled while it stays
+                // known (a few); then, or from the first one it isn't
+                // (its value already: into the body), a loop at run time
+                const exit = try self.f.label("endwhile");
+                var entry: ?ir.Value = null;
+                var n: usize = 0;
+                // (a small body without loops, in few others unrolled (an
+                // `if` of the language in another's block...): code
+                // growing a little)
+                const unroll = self.unrolling < max_unrolled_nesting and smallBody(w.body) and !long_loops.contains(w.test_);
+                if (unroll) self.unrolling += 1;
+                defer if (unroll) {
+                    self.unrolling -= 1;
+                };
+                while (unroll and n < max_unrolled_while) : (n += 1) {
+                    switch (try self.truth(try self.expr(inst, w.test_), inst.node)) {
+                        .known => |b| {
+                            if (!b) {
+                                try self.stmts(inst, w.else_);
+                                try self.f.br(exit);
+                                try self.f.block(exit);
+                                return;
+                            }
+                            const next = try self.f.label("next");
+                            try inst.loops.append(self.a(), .{ .brk = exit, .cont = next, .tries = self.tries.items.len });
+                            try self.stmts(inst, w.body);
+                            _ = inst.loops.pop();
+                            try self.f.block(next);
+                            if (inst.done) {
+                                try self.f.block(exit);
+                                return;
+                            }
+                        },
+                        .dyn => |cond| {
+                            entry = cond;
+                            break;
+                        },
+                    }
+                }
+                // (one going on past the iterations unrolled: a loop over
+                // data, not unrolled again)
+                if (unroll and entry == null) try long_loops.put(std.heap.c_allocator, w.test_, {});
                 try self.prepareDynamic(inst, &.{w.body});
                 const head = try self.f.label("while");
                 const body = try self.f.label("body");
                 const els = try self.f.label("whileelse");
-                const exit = try self.f.label("endwhile");
-                try self.f.br(head);
+                if (entry) |cond| try self.f.condBr(cond, body, els) else try self.f.br(head);
                 try self.f.block(head);
                 inst.dyn_depth += 1;
                 self.loop_level += 1;
