@@ -844,6 +844,8 @@ pub const Compiler = struct {
     module_state: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
     /// Nodes' kinds of values, worked out (kindOfNode)
     kinds: std.AutoHashMapUnmanaged(u32, ?Kind) = .empty,
+    /// Symbols always set where they're read (Gen.alwaysSet), worked out
+    always_set: std.AutoHashMapUnmanaged(u32, bool) = .empty,
     /// By node: its kind's str (kindTable); by label, its child (fieldTable)
     kind_table: ?[]u64 = null,
     owner_table: ?[]u64 = null,
@@ -2393,16 +2395,18 @@ const Gen = struct {
         const f = &self.f;
         const slot = try self.varSlot(si);
         const v = try self.loadSlot(slot, .any);
-        // Unset: an error at the name
-        const is_unset = f.icmp(jit_c.LLVMIntEQ, v.tag, self.k(@bitCast(helpers.UNSET)));
-        const bad = try f.label("unset");
-        const good = try f.label("set");
-        try f.condBr(is_unset, bad, good);
-        try f.block(bad);
-        const name = try c.m.string(sym.name);
-        _ = self.call("zr_unset", &.{ self.ctx, self.k32(name_node), name });
-        try f.br(self.err_label);
-        try f.block(good);
+        // Unset: an error at the name (one always set: not checked)
+        if (!self.alwaysSet(si)) {
+            const is_unset = f.icmp(jit_c.LLVMIntEQ, v.tag, self.k(@bitCast(helpers.UNSET)));
+            const bad = try f.label("unset");
+            const good = try f.label("set");
+            try f.condBr(is_unset, bad, good);
+            try f.block(bad);
+            const name = try c.m.string(sym.name);
+            _ = self.call("zr_unset", &.{ self.ctx, self.k32(name_node), name });
+            try f.br(self.err_label);
+            try f.block(good);
+        }
         try self.increfDyn(v);
         // (a variable of a type whose values' kind is declared: known)
         var r = try self.typedValue(name_node, .{ .dyn = v });
@@ -2511,6 +2515,31 @@ const Gen = struct {
             try self.increfDyn(v);
             try self.storeVar(p, .{ .dyn = v });
         }
+    }
+
+    /// Whether a variable always has a value where code reads it: a
+    /// function's parameter (set when it's called), a function's name its
+    /// scope hoists (set when the scope's entered), nothing unsets them.
+    fn alwaysSet(self: *Gen, si: u32) bool {
+        const c = self.c;
+        const d = c.data;
+        if (c.always_set.get(si)) |b| return b;
+        const def = d.syms[si].node;
+        const result = blk: {
+            if (def == NONE) break :blk false;
+            var at = d.parents[def];
+            while (at != NONE and !c.isFunctionNode(at)) at = d.parents[at];
+            if (at == NONE) break :blk false;
+            const spec = c.specOf(at) orelse break :blk false;
+            for (self.paramNodes(at, spec)) |p| if (p == def) break :blk true;
+            if (d.parents[def] == at and program_mod.labelled(d, at, spec.name) == def) {
+                var it = d.hoisted.valueIterator();
+                while (it.next()) |list| for (list.items) |h| if (h == at) break :blk true;
+            }
+            break :blk false;
+        };
+        c.always_set.put(c.a, si, result) catch {};
+        return result;
     }
 
     /// Define the hoisted functions of a scope just entered.
