@@ -555,13 +555,36 @@ pub fn compiledCall(ctx: *Ctx, node: u32, callee: *PyObject, args: []const Value
             if (checked) out.* = out.*.checked();
             return true;
         },
-        0 => return false,
+        // (rt.call's: a host function's failure, worded as the reference
+        // mode words it)
+        0 => return if (checked) helpers.hostCodeFailed(ctx, callee) else false,
         else => {
             // (rt.Return, Break, Continue out of it: as the reference mode
             // raises them out of a call, an error here)
             return helpers.fail(ctx, node, "rt.Return, rt.Break or rt.Continue raised out of a function called with rt.call", .{});
         },
     }
+}
+
+/// The compiled code of a Python function (not a closure) compiled code
+/// calls with `nargs` arguments of its values (no rt values): made the
+/// first time; null if it can't have one (Python runs it). With the GIL.
+pub fn hostCode(ctx: *Ctx, callee: *PyObject, nargs: usize) ?@import("driver.zig").Helper {
+    const link = ctx.link orelse return null;
+    const lk: *const Link = @ptrCast(@alignCast(link));
+    if (nargs > 63) return null;
+    const pt = compile_mod.pyFunctionType() orelse return null;
+    if (ph.typeOf(callee) != @as(*py.c.PyTypeObject, @ptrCast(@alignCast(pt)))) return null;
+    const closure_obj = py.c.PyObject_GetAttrString(callee, "__closure__") orelse {
+        py.c.PyErr_Clear();
+        return null;
+    };
+    py.Py_DecRef(closure_obj);
+    if (closure_obj != py.Py_None()) return null;
+    return lk.compiled.calledCode(callee, nargs, 0, false) orelse {
+        py.c.PyErr_Clear();
+        return null;
+    };
 }
 
 /// obj.name(args) where obj.name is a Python function, or a bound method

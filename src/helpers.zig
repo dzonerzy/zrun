@@ -268,13 +268,13 @@ pub var pythonMessage: *const fn () ?*PyObject = undefined;
 // Reference counts
 // ======================================================================
 
+// (the GIL taken by value.incref/decref for a Python object, theirs:
+// native values' counts touch no Python, and checking costs a thread-local)
 export fn zr_incref(tag: u64, bits: u64) callconv(.c) void {
-    gil.ensure();
     value.incref(.{ .tag = tag, .bits = bits });
 }
 
 export fn zr_decref(tag: u64, bits: u64) callconv(.c) void {
-    gil.ensure();
     value.decref(.{ .tag = tag, .bits = bits });
 }
 
@@ -865,7 +865,9 @@ pub export fn zr_call(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Val
         },
         .host => {
             const callee: *PyObject = @ptrFromInt(f.bits);
-            // (a Python function: by its compiled code, if it can have one)
+            // (a Python function: by its compiled code, if it can have one;
+            // finding it touches Python)
+            gil.ensure();
             if (receiver == null) if (@import("bridge.zig").compiledMethod(ctx, node, callee, args[0..nargs], true, out)) |ok| return ok;
             if (collecting) {
                 var b: [64]u8 = undefined;
@@ -894,6 +896,77 @@ pub export fn zr_call(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Val
         },
         else => return fail(ctx, node, "'{s}' value is not callable", .{value.typeName(f)}),
     }
+}
+
+/// A call site's host function (rt.call's, no receiver: the compiled code's
+/// object `idx`, a Python function of the language's), the first time: its
+/// compiled code kept at the site (`slot`), whose code calls it directly
+/// from then on (zr_host_jump for what that code says); without one, as
+/// zr_call.
+pub export fn zr_call_site(ctx: *Ctx, node: u32, slot: *u64, idx: u64, args: [*]const Value, nargs: u64, out: *Value) callconv(.c) bool {
+    gil.ensure();
+    const callee = ctx.object(idx);
+    if (@import("bridge.zig").hostCode(ctx, callee, nargs)) |code| {
+        @atomicStore(u64, slot, @intFromPtr(code), .release);
+        // (its arguments made I64s, as rt.call hands them over)
+        var checked: [64]Value = undefined;
+        for (args[0..nargs], checked[0..nargs]) |a, *g| g.* = a.checked();
+        const status = code(ctx, null, &checked, node, 0, null, null, out);
+        if (status == 1) {
+            out.* = out.*.checked();
+            return true;
+        }
+        return if (status == 0) hostCodeFailed(ctx, callee) else zr_host_jump(ctx, node);
+    }
+    return zr_call(ctx, node, @intFromEnum(Tag.host), @intFromPtr(callee), args, nargs, null, out);
+}
+
+/// A host function's compiled code failed (the compiled code's object
+/// `idx`): its error worded as the reference mode words a host function's
+/// failure (hostFailed: "name: Type: message"). False.
+pub export fn zr_host_failed(ctx: *Ctx, node: u32, idx: u64) callconv(.c) bool {
+    _ = node;
+    return hostCodeFailed(ctx, ctx.object(idx));
+}
+
+pub fn hostCodeFailed(ctx: *Ctx, f: *PyObject) bool {
+    if (!ctx.failed) return false;
+    gil.ensure();
+    var name_buf: [128]u8 = undefined;
+    const name = pyName(f, &name_buf, "host function");
+    // (the exception's type: one Python code raised, or the native error's
+    // class)
+    var type_buf: [128]u8 = undefined;
+    const type_name = if (ctx.pending orelse ctx.exc) |e|
+        pyName(@ptrCast(@alignCast(ph.typeOf(e))), &type_buf, "Error")
+    else if (ctx.exc_class) |c| pyName(c, &type_buf, "Error") else "Error";
+    const old = allocator.dupe(u8, ctx.err_msg.items) catch return false;
+    defer allocator.free(old);
+    ctx.err_msg.clearRetainingCapacity();
+    ctx.err_msg.print(allocator, "{s}: {s}: {s}", .{ name, type_name, old }) catch {};
+    return false;
+}
+
+/// An object's __name__ (copied into `buf`), or `default`.
+fn pyName(o: *PyObject, buf: []u8, default: []const u8) []const u8 {
+    const n = ph.attr(o, "__name__") orelse {
+        py.c.PyErr_Clear();
+        return default;
+    };
+    defer py.Py_DecRef(n);
+    const s = ph.utf8(n, "name") orelse {
+        py.c.PyErr_Clear();
+        return default;
+    };
+    const k = @min(s.len, buf.len);
+    @memcpy(buf[0..k], s[0..k]);
+    return buf[0..k];
+}
+
+/// A host function called with rt.call let rt.Return, Break or Continue
+/// out: an error, as the reference mode raises them out of a call.
+pub export fn zr_host_jump(ctx: *Ctx, node: u32) callconv(.c) bool {
+    return fail(ctx, node, "rt.Return, rt.Break or rt.Continue raised out of a function called with rt.call", .{});
 }
 
 /// "name: Error: message", as the reference mode words a host function's
@@ -2149,7 +2222,7 @@ const helper_names = [_][]const u8{
     "zr_call",     "zr_object",     "zr_frame_new",  "zr_frame_release", "zr_free",
     "zr_list",     "zr_tuple",      "zr_dict",       "zr_record",        "zr_is_record",
     "zr_getattr",  "zr_setattr",    "zr_getitem",    "zr_setitem",       "zr_items",
-    "zr_wrapping", "zr_read", "zr_native_fail",
+    "zr_wrapping", "zr_read", "zr_native_fail", "zr_call_site", "zr_host_jump", "zr_host_failed",
     "zr_list_len", "zr_list_at",    "zr_append",     "zr_call_method",   "zr_call_python",
     "zr_is_type",  "zr_global",     "zr_format",     "zr_concat",        "zr_unpack",
     "zr_varargs",  "zr_record_new", "zr_isinstance", "zr_call_seq",      "zr_slice",

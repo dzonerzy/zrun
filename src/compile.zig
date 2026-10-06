@@ -1296,6 +1296,9 @@ pub const Compiler = struct {
         .{ "zr_truthy", "bll" },
         .{ "zr_function", "bpppiplp" },
         .{ "zr_call", "bpillplpp" },
+        .{ "zr_call_site", "bpiplplp" },
+        .{ "zr_host_jump", "bpi" },
+        .{ "zr_host_failed", "bpil" },
         .{ "zr_specialize", "vpl" },
         .{ "zr_speculate", "vpl" },
         .{ "zr_context", "bpp" },
@@ -6454,8 +6457,10 @@ const Gen = struct {
             .tuple => |t| t,
             else => return self.seqCall(inst, fv, args_v, receiver),
         };
-        // (a native library's function known here: called directly)
+        // (a native library's function known here: called directly; a
+        // Python function of the language's: by its code, kept at the site)
         if (fv == .py and receiver == null and native_mod.isNative(fv.py)) return self.nativeCall(inst, fv.py, items);
+        if (fv == .py and receiver == null and try isPlainFunction(fv.py)) return self.hostCall(inst, fv.py, items);
         const fd = try self.materialize(fv, inst.node);
         // The arguments, in a stack array
         const n = items.len;
@@ -6482,6 +6487,85 @@ const Gen = struct {
         if (recv_d) |r| try self.drop(.{ .dyn = r });
         try self.drop(.{ .dyn = fd });
         try self.check(ok);
+        return .{ .dyn = try self.loadOut(.any) };
+    }
+
+    /// Whether `o` is a Python function that isn't a closure (its compiled
+    /// code serves every call of it: hostSiteCall).
+    fn isPlainFunction(o: *PyObject) Error!bool {
+        const pt = try pyTypes();
+        if (!try isInstanceOf(o, pt.function)) return false;
+        const cl = ph.attr(o, "__closure__") orelse return error.Python;
+        defer py.Py_DecRef(cl);
+        return cl == py.Py_None();
+    }
+
+    /// rt.call of a host function known here (a Python function of the
+    /// language's: len, print...): its compiled code found by the first call
+    /// (zr_call_site) and kept at the call site, called directly after
+    /// (nothing of Python's on the way: the function isn't even counted,
+    /// the compiled code keeps it). The arguments made I64s and the result
+    /// too, as rt.call hands them over.
+    fn hostCall(self: *Gen, inst: *Inst, o: *PyObject, items: []const SVal) Error!SVal {
+        const f = &self.f;
+        const m = &self.c.m;
+        const t = m.t;
+        const n = items.len;
+        const arr = try self.valueSlots(@max(n, 1));
+        const ds = try self.a().alloc(Dyn, n);
+        for (items, 0..) |item, i| {
+            ds[i] = try self.materialize(item, inst.node);
+            try self.storeSlot(self.elem(arr, i), ds[i]);
+        }
+        const idx = try self.c.objectIndex(o);
+        const slot = try self.c.a.create(u64);
+        slot.* = 0;
+        const slot_p = m.ptrConst(@intFromPtr(slot));
+        // (ints as rt hands them over: I64s, a plain int's tag made an I64's)
+        for (0..n) |i| {
+            const p = self.elem(arr, i);
+            const tag = f.load(t.i64, p);
+            f.store(f.select(f.icmp(jit_c.LLVMIntEQ, tag, self.k(@intCast(value.PINT_TAG))), self.k(@intFromEnum(value.Tag.int)), tag), p);
+        }
+        const code = f.load(t.i64, slot_p);
+        const direct = try f.label("host_direct");
+        const first = try f.label("host_first");
+        const jumped = try f.label("host_jumped");
+        const join = try f.label("host_done");
+        try f.condBr(f.icmp(jit_c.LLVMIntNE, code, self.k(0)), direct, first);
+        try f.block(direct);
+        // (a helper's code: driver.Helper)
+        const helper_ty = m.fnType(t.i32, &.{ t.ptr, t.ptr, t.ptr, t.i32, t.i32, t.ptr, t.ptr, t.ptr });
+        const null_ptr = m.nullPtr();
+        const status = f.call(.{ .v = f.intToPtr(code), .ty = helper_ty }, &.{ self.ctx, null_ptr, arr, self.k32(inst.node), self.k32(0), null_ptr, null_ptr, self.out });
+        const ok_direct = f.icmp(jit_c.LLVMIntEQ, status, m.k32(1));
+        const direct_end = f.current;
+        const not_ok = try f.label("host_not_ok");
+        const failed = try f.label("host_failed");
+        try f.condBr(ok_direct, join, not_ok);
+        try f.block(not_ok);
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, status, m.k32(0)), failed, jumped);
+        // (its error, as the reference mode words a host function's)
+        try f.block(failed);
+        const failed_ok = self.call("zr_host_failed", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)) });
+        const failed_end = f.current;
+        try f.br(join);
+        try f.block(jumped);
+        const jump_ok = self.call("zr_host_jump", &.{ self.ctx, self.k32(inst.node) });
+        const jumped_end = f.current;
+        try f.br(join);
+        try f.block(first);
+        const ok_first = self.call("zr_call_site", &.{ self.ctx, self.k32(inst.node), slot_p, self.k(@intCast(idx)), arr, self.k(@intCast(n)), self.out });
+        const first_end = f.current;
+        try f.br(join);
+        try f.block(join);
+        const ok = f.phiN(t.i1, &.{ ok_direct, failed_ok, jump_ok, ok_first }, &.{ direct_end, failed_end, jumped_end, first_end });
+        // (the call borrowed them)
+        for (ds) |d| try self.drop(.{ .dyn = d });
+        try self.check(ok);
+        // (the result as rt.call gives it: an int an I64)
+        const out_tag = f.load(t.i64, self.out);
+        f.store(f.select(f.icmp(jit_c.LLVMIntEQ, out_tag, self.k(@intCast(value.PINT_TAG))), self.k(@intFromEnum(value.Tag.int)), out_tag), self.out);
         return .{ .dyn = try self.loadOut(.any) };
     }
 
@@ -7487,6 +7571,18 @@ const Gen = struct {
                 } else false;
                 return .{ .bool = found == (op == .in) };
             };
+            // (any known scalar in known scalars: `None in ("float", ...)`,
+            // as Python decides it)
+            if ((op == .in or op == .not_in) and isScalar(l)) if (try self.staticScalars(r)) |items| {
+                const x = try self.pyOf(l);
+                defer py.Py_DecRef(x);
+                const tuple = py.c.PyTuple_New(@intCast(items.len)) orelse return error.Python;
+                defer py.Py_DecRef(tuple);
+                for (items, 0..) |item, i| _ = py.c.PyTuple_SetItem(tuple, @intCast(i), try self.pyOf(item));
+                const res = py.c.PySequence_Contains(tuple, x);
+                if (res >= 0) return .{ .bool = (res == 1) == (op == .in) };
+                py.c.PyErr_Clear();
+            };
         }
         // A run-time value against None: its tag
         if ((op == .is or op == .is_not) and (l == .none or r == .none)) {
@@ -7570,6 +7666,18 @@ const Gen = struct {
             key.* = item.str;
         }
         return keys;
+    }
+
+    /// A known tuple's or list's items, if they're all scalars; else null.
+    fn staticScalars(self: *Gen, v: SVal) Error!?[]const SVal {
+        _ = self;
+        const items: []const SVal = switch (v) {
+            .tuple => |t| t,
+            .list => |l| l.items.items,
+            else => return null,
+        };
+        for (items) |item| if (!isScalar(item)) return null;
+        return items;
     }
 
     /// `d == s` / `d in (s1, s2...)` for constant strs: d a Str, its length

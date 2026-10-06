@@ -239,6 +239,87 @@ def test_borrowing_gives_back_what_it_takes(name, capsys):
     assert kept[0] == kept[1] >= 0
 
 
+def _host_lang():
+    """tiny with host functions called from compiled code by their own
+    compiled code (kept at the call site): one adding (its ints I64s, as
+    rt.call hands them over: overflow checked), one raising, one compiled
+    code can't run (Python runs it)."""
+    from zrules import Rules, scopes
+
+    rules = Rules(
+        tiny.PARSER,
+        [
+            scopes(
+                scope=("Program", "FuncDef"),
+                define=("Let > .name", "FuncDef > .params"),
+                define_outer="FuncDef > .name",
+                use="Name",
+                hoist="FuncDef > .name",
+                after="Let > .name",
+                builtins=("print", "add", "picky", "opened"),
+            )
+        ],
+    )
+    lang = zrun.Language(tiny.PARSER, rules)
+    lang.function("FuncDef")
+    lang.exec(["Let", "Assign"])(tiny.assign)
+    lang.exec("Return")(tiny.return_)
+    lang.exec("While")(tiny.while_)
+    lang.eval("Call")(tiny.call)
+    lang.eval("BinOp")(tiny.binop)
+
+    @lang.host
+    def print(*args):
+        builtins.print(*args)
+
+    @lang.host
+    def add(a, b):
+        return a + b
+
+    @lang.host
+    def picky(x):
+        if x < 0:
+            raise ValueError("negative: %d" % x)
+        return x * 2
+
+    @lang.host
+    def opened(n):
+        with open(os.devnull) as f:
+            f.read()
+        return n + 1
+
+    return lang
+
+
+HOSTS = {
+    "loop": "let i = 0; let t = 0;\nwhile i < 300 { t = add(t, picky(i)) + opened(i); i = i + 1; }\nprint(t);\n",
+    "overflow": "fn f(n) { return add(n, n); }\nprint(f(4611686018427387904));\n",
+    "raises": "fn f(n) { return picky(n); }\nprint(f(3));\nprint(f(0 - 1));\n",
+    "python_runs_it": "let i = 0;\nwhile i < 3 { print(opened(i)); i = i + 1; }\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(HOSTS))
+def test_host_functions(name, capsys):
+    out, err = same_in_every_mode(_host_lang(), HOSTS[name], capsys)
+    if name == "overflow":
+        assert err is not None and "overflow" in err[0]
+    elif name == "raises":
+        assert out == "6\n" and "negative: -1" in err[0]
+    else:
+        assert err is None and out
+
+
+def test_host_calls_dont_take_the_gil():
+    # (a call site knowing its host function's code calls it directly:
+    # nothing of Python's, no GIL taken, once the site has it)
+    p = _host_lang().load("fn f(n) { let i = 0; let t = 0; while i < n { t = add(t, picky(i)); i = i + 1; } return t; }\n", "prog")
+    assert p.call("f", 10) == 90
+    taken = p.report()["gil_taken"]
+    assert p.call("f", 1000) == 999000
+    assert p.report()["gil_taken"] == taken
+
+
 def _wrapping_lang():
     """tiny whose + - * wrap around at 64 bits (rt.wrapping_add...), and
     whose / % < are the 64-bit shifts << >> >>> (rt.wrapping_shl...)."""
