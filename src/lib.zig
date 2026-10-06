@@ -247,10 +247,28 @@ const Language = struct {
         return true;
     }
 
-    // (No __traverse__: PyOZ 0.13.7 frees a collected class's objects with
-    // PyObject_Del in the stable ABI, which crashes. A language is in a
-    // cycle only through its semantics' module, which lives as long anyway.)
     pub fn __del__(self: *Language) void {
+        self.release();
+    }
+
+    /// For Python's cycle collector: a language is in a cycle through its
+    /// semantics (a closure, or the module, naming it). The objects it
+    /// owns: its fields', and the functions of the semantics read
+    /// (_read's); the other tables (_eval_of, _python...) borrow.
+    pub fn __traverse__(self: *Language, visitor: pyoz.GCVisitor) c_int {
+        inline for (.{ "_parser", "_rules", "_evals", "_execs", "_hosts", "_types" }) |f| {
+            const r = visitor.call(@field(self, f));
+            if (r != 0) return r;
+        }
+        var it = self._read.valueIterator();
+        while (it.next()) |f| {
+            const r = visitor.call(f.*.py_function);
+            if (r != 0) return r;
+        }
+        return 0;
+    }
+
+    pub fn __clear__(self: *Language) void {
         self.release();
     }
 
@@ -561,7 +579,7 @@ const Language = struct {
             };
             defer py.Py_DecRef(value);
             if (value == py.Py_None()) continue;
-            const r = py.c.PyObject_CallOneArg(show, value) orelse {
+            const r = py.c.PyObject_CallFunctionObjArgs(show, value, @as(?*PyObject, null)) orelse {
                 if (!printError(print)) return null;
                 continue;
             };
@@ -761,7 +779,7 @@ fn readEntry(s: *Session, input: *PyObject, prompt: *PyObject, more: *PyObject) 
     defer buf.deinit(allocator);
     var first = true;
     while (true) {
-        const line_obj = py.c.PyObject_CallOneArg(input, if (first) prompt else more) orelse return null;
+        const line_obj = py.c.PyObject_CallFunctionObjArgs(input, if (first) prompt else more, @as(?*PyObject, null)) orelse return null;
         defer py.Py_DecRef(line_obj);
         const line = ph.utf8(line_obj, "line") orelse return null;
         const blank = std.mem.trim(u8, line, " \t\r\n").len == 0;
@@ -796,7 +814,7 @@ fn printError(print: *PyObject) bool {
     defer py.Py_DecRef(text);
     const ours = py.c.PyErr_GivenExceptionMatches(exc, ztypes.Error) != 0 or py.c.PyErr_GivenExceptionMatches(exc, ztypes.LoadError) != 0;
     const line = if (ours) ref(text) else blk: {
-        const name = ph.attr(@ptrCast(ph.typeOf(exc)), "__name__") orelse return false;
+        const name = ph.attr(@ptrCast(@alignCast(ph.typeOf(exc))), "__name__") orelse return false;
         defer py.Py_DecRef(name);
         break :blk py.c.PyUnicode_FromFormat("%U: %U", name, text) orelse return false;
     };

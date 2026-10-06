@@ -175,3 +175,25 @@ def test_what_python_holds_is_kept(run):
         assert all(t.get("me").get("n") == t.get("n") for t in kept)
     finally:
         lua.G.set("keep", None)
+
+
+def test_a_language_in_a_cycle_is_collected():
+    # (a language whose semantics name it (a closure): Python's collector
+    # frees it, Language traversing what it holds)
+    import gc
+    import weakref
+
+    from conftest import tiny
+
+    def make():
+        lang = zrun.Language(tiny.PARSER, tiny.RULES)
+
+        @lang.eval("BinOp")
+        def binop(node, rt):
+            return lang and rt.eval(node.left)
+
+        return weakref.ref(binop)
+
+    gone = make()
+    gc.collect()
+    assert gone() is None
