@@ -3666,6 +3666,9 @@ const Gen = struct {
                 if (n == 1) try self.storeSlot(self.elem(arr, 0), ret orelse self.noneDyn());
                 try self.callCheck("zr_call_python", &.{ self.ctx, self.k32(self.atNode()), self.k(@intCast(try self.c.objectIndex(cls))), arr, self.k(@intCast(n)), self.out });
                 const exc = try self.loadOut(.any);
+                // (the value the exception holds now: the jump's given up
+                // here, before the handler: code after this is never run)
+                if (ret) |r| try self.drop(.{ .dyn = r });
                 try self.releaseAbove(fr.depth);
                 self.releaseScopesAbove(fr.scope_depth);
                 try self.dropTemp(fr.caught[h]);
@@ -3700,11 +3703,9 @@ const Gen = struct {
     }
 
     fn returnWith(self: *Gen, d: Dyn, at: u32) Error!void {
-        // (through the try statements here: caught, or their finally run)
-        if (try self.leaveTries(0, .Return, d)) {
-            try self.drop(.{ .dyn = d });
-            return;
-        }
+        // (through the try statements here: caught (the value given to the
+        // exception), or their finally run)
+        if (try self.leaveTries(0, .Return, d)) return;
         if (self.thunk) {
             try self.releaseAbove(0);
             self.releaseScopesAbove(self.base_scopes);
@@ -4860,13 +4861,9 @@ const Gen = struct {
             },
         };
         switch (ctl.kind) {
-            .Return => {
-                if (self.fnode == NONE and !self.thunk) {
-                    try self.failAt(inst.node, "return outside a function");
-                    return;
-                }
-                try self.returnWith(try self.materialize(if (ctl.value) |x| x.* else .none, inst.node), inst.node);
-            },
+            // (outside a function: an error unless a try here catches it,
+            // returnWith says)
+            .Return => try self.returnWith(try self.materialize(if (ctl.value) |x| x.* else .none, inst.node), inst.node),
             .Break, .Continue => try self.loopJump(ctl.kind, inst.node),
             else => unreachable,
         }

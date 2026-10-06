@@ -502,11 +502,71 @@ const Language = struct {
         prog._lang = ref(Module.selfObject(Language, self));
         prog._source = ref(v.source);
         if (optional(v.path)) |p| prog._path = ref(p);
-        if (!prog.setup(self, tree)) {
+        if (!prog.setup(self, tree, null)) {
             prog.release();
             return null;
         }
         return prog;
+    }
+
+    /// `lang.session()`: a Session: programs run one after another, each
+    /// seeing what the ones before it defined (a REPL's).
+    pub fn session(self: *Language) ?Session {
+        const programs = py.c.PyList_New(0) orelse return null;
+        const known = py.c.PyDict_New() orelse {
+            py.Py_DecRef(programs);
+            return null;
+        };
+        return .{ ._lang = ref(Module.selfObject(Language, self)), ._programs = programs, ._names = known };
+    }
+
+    /// `lang.repl(prompt="> ", more="... ", show=None)`: an interactive
+    /// session. Each entry is read with input() (more lines while what it
+    /// writes isn't finished; an empty line ends it anyway) and run; the
+    /// value of an expression is shown with show(value) (by default
+    /// printed, unless None). Errors are printed and the session goes on.
+    /// End of input (Ctrl-D) ends it; Ctrl-C drops the entry being written,
+    /// or stops the one running.
+    pub fn repl(self: *Language, args: pyoz.Args(struct { prompt: ?*PyObject = null, more: ?*PyObject = null, show: ?*PyObject = null })) ?*PyObject {
+        const builtins = py.c.PyImport_ImportModule("builtins") orelse return null;
+        defer py.Py_DecRef(builtins);
+        const input = py.c.PyObject_GetAttrString(builtins, "input") orelse return null;
+        defer py.Py_DecRef(input);
+        const print = py.c.PyObject_GetAttrString(builtins, "print") orelse return null;
+        defer py.Py_DecRef(print);
+        const prompt = if (optional(args.value.prompt)) |p| ref(p) else ph.newString("> ") orelse return null;
+        defer py.Py_DecRef(prompt);
+        const more = if (optional(args.value.more)) |m| ref(m) else ph.newString("... ") orelse return null;
+        defer py.Py_DecRef(more);
+        const show = optional(args.value.show) orelse print;
+        const s_obj = Module.toPy(Session, self.session() orelse return null) orelse return null;
+        defer py.Py_DecRef(s_obj);
+        const s = unwrap(Session, s_obj).?;
+        while (true) {
+            const entry = readEntry(s, input, prompt, more) orelse {
+                if (py.c.PyErr_ExceptionMatches(py.PyExc_EOFError()) != 0) {
+                    py.c.PyErr_Clear();
+                    // (the line the prompt was on, ended)
+                    const r = py.c.PyObject_CallNoArgs(print) orelse return null;
+                    py.Py_DecRef(r);
+                    return none();
+                }
+                if (!printError(print)) return null;
+                continue;
+            };
+            defer py.Py_DecRef(entry);
+            const value = s.run(entry) orelse {
+                if (!printError(print)) return null;
+                continue;
+            };
+            defer py.Py_DecRef(value);
+            if (value == py.Py_None()) continue;
+            const r = py.c.PyObject_CallOneArg(show, value) orelse {
+                if (!printError(print)) return null;
+                continue;
+            };
+            py.Py_DecRef(r);
+        }
     }
 
     /// `lang.compile(source, output, path=None)`: the program compiled, saved
@@ -626,6 +686,8 @@ const Language = struct {
     pub const function__doc__: [*:0]const u8 = "function(kind, params='params', body='body', name='name', hoist=True): nodes of kind define functions, with those labels for their parameters, body and name.";
     pub const host__doc__: [*:0]const u8 = "@lang.host, @lang.host('name') or lang.host('name', fn): a Python function the program calls through the builtin of that name.";
     pub const load__doc__: [*:0]const u8 = "load(source, path=None): parse and check a program; a Program. Raises zrun.LoadError listing its errors.";
+    pub const session__doc__: [*:0]const u8 = "session(): a Session, to run programs one after another, each seeing the variables and functions the ones before it defined (a REPL's).";
+    pub const repl__doc__: [*:0]const u8 = "repl(prompt='> ', more='... ', show=None): an interactive session on input(): more lines while an entry isn't finished (an empty line ends it anyway); the value of an expression shown with show(value) (default: printed, unless None); errors printed and the session going on. Ctrl-D ends it, Ctrl-C drops or stops the entry.";
 };
 
 /// Raise zrun.CompileError for a semantic outside the subset: "file:line:
@@ -687,6 +749,79 @@ fn parseTree(parser: *PyObject, source: *PyObject) ?*PyObject {
     const kwargs = py.c.PyDict_New() orelse return null;
     defer py.Py_DecRef(kwargs);
     if (py.c.PyDict_SetItemString(kwargs, "recover", py.Py_True()) != 0) return null;
+    return py.c.PyObject_Call(method, args, kwargs);
+}
+
+/// A REPL's entry: lines read with input() (`prompt` first, `more` after)
+/// until what they write is finished, or a line is empty (blank lines
+/// before it skipped); a new str, or null with the exception (EOFError at
+/// the end of input).
+fn readEntry(s: *Session, input: *PyObject, prompt: *PyObject, more: *PyObject) ?*PyObject {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    var first = true;
+    while (true) {
+        const line_obj = py.c.PyObject_CallOneArg(input, if (first) prompt else more) orelse return null;
+        defer py.Py_DecRef(line_obj);
+        const line = ph.utf8(line_obj, "line") orelse return null;
+        const blank = std.mem.trim(u8, line, " \t\r\n").len == 0;
+        if (first and blank) continue;
+        buf.appendSlice(allocator, line) catch return py.c.PyErr_NoMemory();
+        buf.append(allocator, '\n') catch return py.c.PyErr_NoMemory();
+        const text = ph.newString(buf.items) orelse return null;
+        if (blank) return text;
+        const unfinished = s.unfinished(text) orelse {
+            py.Py_DecRef(text);
+            return null;
+        };
+        if (!unfinished) return text;
+        py.Py_DecRef(text);
+        first = false;
+    }
+}
+
+/// A REPL's error, printed to sys.stderr (cleared): zrun's errors as
+/// they read, others as "Type: message". False (the exception kept) for
+/// SystemExit, which ends the REPL.
+fn printError(print: *PyObject) bool {
+    if (py.c.PyErr_ExceptionMatches(py.PyExc_SystemExit()) != 0) return false;
+    var t: ?*PyObject = null;
+    var v: ?*PyObject = null;
+    var tb: ?*PyObject = null;
+    py.c.PyErr_Fetch(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
+    py.c.PyErr_NormalizeException(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
+    defer inline for (.{ t, v, tb }) |o| if (o) |x| py.Py_DecRef(x);
+    const exc = v orelse return true;
+    const text = py.c.PyObject_Str(exc) orelse return false;
+    defer py.Py_DecRef(text);
+    const ours = py.c.PyErr_GivenExceptionMatches(exc, ztypes.Error) != 0 or py.c.PyErr_GivenExceptionMatches(exc, ztypes.LoadError) != 0;
+    const line = if (ours) ref(text) else blk: {
+        const name = ph.attr(@ptrCast(ph.typeOf(exc)), "__name__") orelse return false;
+        defer py.Py_DecRef(name);
+        break :blk py.c.PyUnicode_FromFormat("%U: %U", name, text) orelse return false;
+    };
+    defer py.Py_DecRef(line);
+    const args = py.c.PyTuple_Pack(1, line) orelse return false;
+    defer py.Py_DecRef(args);
+    const kwargs = py.c.PyDict_New() orelse return false;
+    defer py.Py_DecRef(kwargs);
+    if (py.c.PySys_GetObject("stderr")) |err| if (py.c.PyDict_SetItemString(kwargs, "file", err) != 0) return false;
+    const r = py.c.PyObject_Call(print, args, kwargs) orelse return false;
+    py.Py_DecRef(r);
+    return true;
+}
+
+/// rules.analyze(tree, builtins=builtins): a new Analysis, or null with
+/// an exception.
+fn analyze(rules: *PyObject, tree: *PyObject, builtins: ?*PyObject) ?*PyObject {
+    const method = py.c.PyObject_GetAttrString(rules, "analyze") orelse return null;
+    defer py.Py_DecRef(method);
+    const args = py.c.PyTuple_Pack(1, tree) orelse return null;
+    defer py.Py_DecRef(args);
+    const b = builtins orelse return py.c.PyObject_Call(method, args, null);
+    const kwargs = py.c.PyDict_New() orelse return null;
+    defer py.Py_DecRef(kwargs);
+    if (py.c.PyDict_SetItemString(kwargs, "builtins", b) != 0) return null;
     return py.c.PyObject_Call(method, args, kwargs);
 }
 
@@ -764,6 +899,9 @@ const Program = struct {
     _frozen: bool = false,
     /// The times its compiled runs and calls took the GIL back
     _gil_taken: u64 = 0,
+    /// The session it's an entry of (borrowed: the session keeps it, and
+    /// clears this when it goes), or null
+    _session: ?*Session = null,
 
     fn release(self: *Program) void {
         if (self._cglobals) |g| value_mod.decrefFrame(g);
@@ -796,7 +934,9 @@ const Program = struct {
     }
 
     /// Check the tree (syntax errors, the rules) and build the native data.
-    fn setup(self: *Program, lang: *Language, tree_obj: *PyObject) bool {
+    /// `builtins`: names defined outside the program (a session's earlier
+    /// entries'), a list of str, or null.
+    fn setup(self: *Program, lang: *Language, tree_obj: *PyObject, builtins: ?*PyObject) bool {
         defer py.Py_DecRef(tree_obj);
         // The diagnostics: the rules' (syntax errors included), or the
         // tree's syntax errors
@@ -804,7 +944,7 @@ const Program = struct {
         defer if (analysis) |a| py.Py_DecRef(a);
         var diagnostics: *PyObject = undefined;
         if (lang._rules) |rules| {
-            analysis = py.c.PyObject_CallMethod(rules, "analyze", "(O)", tree_obj) orelse return false;
+            analysis = analyze(rules, tree_obj, builtins) orelse return false;
             diagnostics = py.c.PyObject_GetAttrString(analysis.?, "diagnostics") orelse return false;
         } else {
             diagnostics = py.c.PyObject_GetAttrString(tree_obj, "errors") orelse return false;
@@ -1576,6 +1716,21 @@ const Program = struct {
         return none();
     }
 
+    /// A session's entry run (as Python): as runHere, the value of its last
+    /// statement if that's an expression (a new reference), else None.
+    fn runEntry(self: *Program) ?*PyObject {
+        var rt = Runtime.begin(self) orelse return null;
+        defer rt.end();
+        const frame = objects.newFrame(NONE, NONE, null, name_program orelse return null) orelse return null;
+        rt.self()._frame = frame;
+        const st = self.state();
+        if (st.globals) |g| py.Py_DecRef(g);
+        st.globals = ref(frame);
+        const r = rt.self();
+        if (!r.hoist(NONE)) return uncaught();
+        return r.execRoot() orelse uncaught();
+    }
+
     /// A run ended by an exception: a rt.Throw nothing caught becomes the
     /// zrun.Error it is (made where it was raised); null.
     fn uncaught() ?*PyObject {
@@ -1863,6 +2018,169 @@ var caller_spec = py.c.PyType_Spec{
 };
 
 // ============================================================================
+// Session: a REPL's programs
+// ============================================================================
+
+/// `lang.session()`: programs run one after another as the entries of a
+/// session (a REPL's), each seeing what the entries before it defined at
+/// their top level: the same variables (assigning one changes it for the
+/// earlier entry's code too) and functions (run in their own program). A
+/// name defined again is the new entry's from then on. Entries run as
+/// Python (the reference mode): each runs once.
+pub const Session = struct {
+    _lang: ?*PyObject = null,
+    /// The entries run so far (Programs): their functions run in them
+    _programs: ?*PyObject = null,
+    /// Each name defined at an entry's top level -> (the entry's frame, the
+    /// name's symbol there), the last entry defining it
+    _names: ?*PyObject = null,
+
+    /// Where a session's variable lives
+    pub const Place = struct { frame: *objects.FrameObject, sym: u32 };
+
+    fn place(self: *Session, name: *PyObject) ?Place {
+        const t = py.c.PyDict_GetItem(self._names.?, name) orelse return null;
+        const frame = py.c.PyTuple_GetItem(t, 0).?;
+        const sym = py.c.PyLong_AsUnsignedLong(py.c.PyTuple_GetItem(t, 1).?);
+        return .{ .frame = objects.asFrame(frame), .sym = @intCast(sym) };
+    }
+
+    /// The entry whose State `state_obj` is, or null.
+    fn programOf(self: *Session, state_obj: *PyObject) ?*Program {
+        const list = self._programs.?;
+        for (0..@intCast(py.c.PyList_Size(list))) |i| {
+            const p = unwrap(Program, py.c.PyList_GetItem(list, @intCast(i)).?).?;
+            if (p._state == state_obj) return p;
+        }
+        return null;
+    }
+
+    pub fn __del__(self: *Session) void {
+        // (an entry someone else keeps doesn't look at the session any more)
+        if (self._programs) |list| {
+            for (0..@intCast(py.c.PyList_Size(list))) |i| unwrap(Program, py.c.PyList_GetItem(list, @intCast(i)).?).?._session = null;
+        }
+        inline for (.{ "_lang", "_programs", "_names" }) |f| {
+            if (@field(self, f)) |o| py.Py_DecRef(o);
+            @field(self, f) = null;
+        }
+    }
+
+    /// `session.run(source)`: run an entry: load it (zrun.LoadError with
+    /// its errors) and run it as Python (zrun.Error on a runtime error).
+    /// The value of its last statement if that's an expression, else
+    /// None. What an entry defined before an error is kept, as a REPL
+    /// keeps it.
+    pub fn run(self: *Session, source: *PyObject) ?*PyObject {
+        if (!py.PyUnicode_Check(source)) {
+            ph.raise(py.PyExc_TypeError(), "source must be a str", .{});
+            return null;
+        }
+        const lang = unwrap(Language, self._lang.?).?;
+        const tree = parseTree(lang._parser.?, source) orelse return null;
+        const known = py.c.PyDict_Keys(self._names.?) orelse {
+            py.Py_DecRef(tree);
+            return null;
+        };
+        defer py.Py_DecRef(known);
+        var prog = Program{};
+        prog._lang = ref(self._lang.?);
+        prog._source = ref(source);
+        if (!prog.setup(lang, tree, known)) {
+            prog.release();
+            return null;
+        }
+        const obj = Module.toPy(Program, prog) orelse {
+            prog.release();
+            return null;
+        };
+        defer py.Py_DecRef(obj);
+        if (py.c.PyList_Append(self._programs.?, obj) != 0) return null;
+        const p = unwrap(Program, obj).?;
+        p._session = self;
+        p._ran_mode = .python;
+        const result = onBigStack(Program.runEntry, .{p}, lang._max_depth);
+        if (!self.keep(p)) {
+            if (result) |r| py.Py_DecRef(r);
+            return null;
+        }
+        return result;
+    }
+
+    /// The variables an entry defined at its top level (those with a
+    /// value), the session's from now.
+    fn keep(self: *Session, p: *Program) bool {
+        const g = p.state().globals orelse return true;
+        const frame = objects.asFrame(g);
+        const d = p.ctx().data;
+        for (d.syms, 0..) |s, i| {
+            if (s.builtin or d.homeOf(@intCast(i)) != NONE) continue;
+            if (frame.slots.?.get(@intCast(i)) == null) continue;
+            const key = ph.newString(s.name) orelse return false;
+            defer py.Py_DecRef(key);
+            const t = py.c.Py_BuildValue("(OI)", g, @as(c_uint, @intCast(i))) orelse return false;
+            defer py.Py_DecRef(t);
+            if (py.c.PyDict_SetItem(self._names.?, key, t) != 0) return false;
+        }
+        return true;
+    }
+
+    pub const __doc__: [*:0]const u8 = "A session (Language.session()): run(source) runs an entry, which sees the variables and functions the entries before it defined (the same variables); names() lists them. Entries run as Python.";
+    pub const run__doc__: [*:0]const u8 = "Run an entry: its last statement's value if that's an expression, else None. Raises zrun.LoadError or zrun.Error; what it defined before an error is kept.";
+    pub const run__params__ = "source";
+    pub const names__doc__: [*:0]const u8 = "The names the entries defined so far, sorted.";
+
+    /// `session.names()`: the names the entries defined so far, sorted.
+    pub fn names(self: *Session) ?*PyObject {
+        const keys = py.c.PyDict_Keys(self._names.?) orelse return null;
+        if (py.c.PyList_Sort(keys) != 0) {
+            py.Py_DecRef(keys);
+            return null;
+        }
+        return keys;
+    }
+
+    /// Whether `text` ends before what it's writing does (a REPL asks for
+    /// more lines): its syntax error, if any, is at its end.
+    fn unfinished(self: *Session, text: *PyObject) ?bool {
+        const lang = unwrap(Language, self._lang.?).?;
+        const r = py.c.PyObject_CallMethod(lang._parser.?, "parse", "(O)", text) orelse {
+            // (taken, to look at it: put back unless it's a syntax error)
+            var t: ?*PyObject = null;
+            var v: ?*PyObject = null;
+            var tb: ?*PyObject = null;
+            py.c.PyErr_Fetch(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
+            py.c.PyErr_NormalizeException(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
+            const zgram = py.c.PyImport_ImportModule("zgram") orelse {
+                inline for (.{ t, v, tb }) |o| if (o) |x| py.Py_DecRef(x);
+                return null;
+            };
+            defer py.Py_DecRef(zgram);
+            const parse_error = py.c.PyObject_GetAttrString(zgram, "ParseError") orelse {
+                inline for (.{ t, v, tb }) |o| if (o) |x| py.Py_DecRef(x);
+                return null;
+            };
+            defer py.Py_DecRef(parse_error);
+            if (v == null or py.c.PyErr_GivenExceptionMatches(v, parse_error) == 0) {
+                py.c.PyErr_Restore(t, v, tb);
+                return null;
+            }
+            defer inline for (.{ t, v, tb }) |o| if (o) |x| py.Py_DecRef(x);
+            const off_obj = py.c.PyObject_GetAttrString(v.?, "offset") orelse return null;
+            defer py.Py_DecRef(off_obj);
+            const off = py.c.PyLong_AsLongLong(off_obj);
+            if (off == -1 and py.c.PyErr_Occurred() != null) return null;
+            // (bytes: the end of the text, past its trailing blanks)
+            const s = ph.utf8(text, "text") orelse return null;
+            const end = std.mem.trimEnd(u8, s, " \t\r\n").len;
+            return off >= end;
+        };
+        py.Py_DecRef(r);
+        return false;
+    }
+};
+
+// ============================================================================
 // Runtime: rt
 // ============================================================================
 
@@ -2113,6 +2431,77 @@ const Runtime = struct {
         return true;
     }
 
+    /// The root run as execNode(0) runs it, its value (a REPL shows it):
+    /// what the root's exec semantics return (a language's chunk giving
+    /// what a `return` at its top level returned), or, the root having no
+    /// semantics of its own, its last statement's if that's an expression.
+    /// A new reference (None otherwise), or null with the exception.
+    fn execRoot(self: *Runtime) ?*PyObject {
+        const lang = self._lang.?;
+        lang.resolve();
+        const d = self.data();
+        const root_rule = d.rule(0);
+        if (root_rule < lang._exec_of.len) if (lang._exec_of[root_rule]) |f| {
+            var saved: ?*PyObject = null;
+            if (d.hasFrame(0)) saved = self.enterScope(0) orelse return null;
+            defer if (saved) |s| self.leaveScope(s);
+            const prev = self._at;
+            self._at = 0;
+            defer self._at = prev;
+            const n = self.node(0) orelse return null;
+            defer py.Py_DecRef(n);
+            const r = py.c.PyObject_CallFunctionObjArgs(f, n, self.obj(), @as(?*PyObject, null)) orelse return self.raised(0);
+            return ztypes.wrapOwned(r) orelse self.raised(0);
+        };
+        const own = struct {
+            fn has(l: *Language, rid: u32) bool {
+                return (rid < l._exec_of.len and l._exec_of[rid] != null) or
+                    (rid < l._functions.len and l._functions[rid] != null) or
+                    (rid < l._eval_of.len and l._eval_of[rid] != null);
+            }
+        }.has;
+        if (own(lang, d.rule(0))) return if (self.execNode(0)) none() else null;
+        var saved: ?*PyObject = null;
+        if (d.hasFrame(0)) saved = self.enterScope(0) orelse return null;
+        defer if (saved) |s| self.leaveScope(s);
+        const values = objects.childValues(self.stateObj(), self.ctx(), 0) orelse return null;
+        defer py.Py_DecRef(values);
+        // (the last statement, if it's an expression: its rule has eval
+        // semantics and no exec ones, or it's a name or a literal)
+        // (a literal's value is the statement itself: its own value)
+        const n: isize = if (py.PyList_Check(values)) py.c.PyList_Size(values) else -1;
+        const last: ?*PyObject = if (n > 0) blk: {
+            const item = py.c.PyList_GetItem(values, n - 1).?;
+            if (objects.asNode(item)) |nd| {
+                if (nd.ctx != self.ctx()) break :blk null;
+                break :blk if (self.isExpression(nd.idx) orelse return null) item else null;
+            }
+            break :blk if (py.PyList_Check(item) or py.PyTuple_Check(item)) null else item;
+        } else null;
+        const target = last orelse return if (self.execObj(values)) none() else null;
+        const before = py.c.PyList_GetSlice(values, 0, n - 1) orelse return null;
+        defer py.Py_DecRef(before);
+        if (!self.execObj(before)) return null;
+        return self.evalObj(target);
+    }
+
+    /// Whether a statement node is an expression run for its value: its
+    /// rule has eval semantics and no exec ones (nor is a function kind),
+    /// or it's a name, or a literal (a value of zgram's action). Null with
+    /// an exception.
+    fn isExpression(self: *Runtime, idx: u32) ?bool {
+        const lang = self._lang.?;
+        const d = self.data();
+        const rid = d.rule(idx);
+        if (rid < lang._exec_of.len and lang._exec_of[rid] != null) return false;
+        if (rid < lang._functions.len and lang._functions[rid] != null) return false;
+        if (rid < lang._eval_of.len and lang._eval_of[rid] != null) return true;
+        if (d.symbolIndex(idx) != null) return true;
+        const values = objects.childValues(self.stateObj(), self.ctx(), idx) orelse return null;
+        defer py.Py_DecRef(values);
+        return py.c.PyList_Size(values) == 1 and objects.asNode(py.c.PyList_GetItem(values, 0).?) == null;
+    }
+
     fn execNode(self: *Runtime, idx: u32) bool {
         if (!self.data().hasFrame(idx)) return self.execHere(idx);
         const saved = self.enterScope(idx) orelse return false;
@@ -2194,6 +2583,11 @@ const Runtime = struct {
         if (sym.builtin) {
             const key = ph.newString(sym.name) orelse return null;
             defer py.Py_DecRef(key);
+            // (a variable an earlier entry of the session defined)
+            if (self.sessionVariable(key)) |at| {
+                const v = at.frame.slots.?.get(at.sym) orelse return self.fail(idx, "'{s}' has no value yet", .{sym.name});
+                return self.checkKind(idx, ref(v));
+            }
             const h = py.c.PyDict_GetItem(self._lang.?._hosts.?, key) orelse
                 return self.fail(idx, "no host function for the builtin '{s}'", .{sym.name});
             return ref(h);
@@ -2216,21 +2610,36 @@ const Runtime = struct {
             _ = self.notAVariable(idx);
             return false;
         };
-        if (d.syms[si].builtin) {
-            _ = self.fail(idx, "can't assign to the builtin '{s}'", .{d.syms[si].name});
-            return false;
-        }
-        const f = self.frameFor(si, idx) orelse return false;
+        var slot = si;
+        const f = if (d.syms[si].builtin) blk: {
+            const key = ph.newString(d.syms[si].name) orelse return false;
+            defer py.Py_DecRef(key);
+            // (a variable an earlier entry of the session defined)
+            const at = self.sessionVariable(key) orelse {
+                _ = self.fail(idx, "can't assign to the builtin '{s}'", .{d.syms[si].name});
+                return false;
+            };
+            slot = at.sym;
+            break :blk at.frame;
+        } else self.frameFor(si, idx) orelse return false;
         const v = ztypes.wrap(value) orelse {
             _ = self.raised(idx);
             return false;
         };
         defer py.Py_DecRef(v);
-        objects.setSlot(f, si, v) catch {
+        objects.setSlot(f, slot, v) catch {
             _ = py.c.PyErr_NoMemory();
             return false;
         };
         return true;
+    }
+
+    /// Where a variable of an earlier entry of the program's session lives
+    /// (`name`, a builtin here), or null (none: not a session's, or not
+    /// defined by its entries).
+    fn sessionVariable(self: *Runtime, name: *PyObject) ?Session.Place {
+        const s = self._p.?._session orelse return null;
+        return s.place(name);
     }
 
     fn notAVariable(self: *Runtime, idx: u32) ?*PyObject {
@@ -2349,7 +2758,18 @@ const Runtime = struct {
     }
 
     fn callFunction(self: *Runtime, fo: *objects.FunctionObject, args: *PyObject, receiver: ?*PyObject) ?*PyObject {
-        if (fo.state != self.stateObj()) return self.fail(self._at, "a function of another program can't be called here", .{});
+        if (fo.state != self.stateObj()) {
+            // (an earlier entry of the session's: called in its program)
+            const s = self._p.?._session orelse return self.fail(self._at, "a function of another program can't be called here", .{});
+            const other = s.programOf(fo.state.?) orelse return self.fail(self._at, "a function of another program can't be called here", .{});
+            const h = Runtime.begin(other) orelse return null;
+            defer h.end();
+            const r = h.self();
+            r._depth = self._depth;
+            r._at = fo.node;
+            if (self._context) |c| r._context = ref(c);
+            return r.callFunction(fo, args, receiver);
+        }
         const fnode = fo.node;
         const spec = self.specOf(fnode).?;
         const program = self.stateObj();
@@ -3012,6 +3432,7 @@ pub const Module = pyoz.module(.{
         pyoz.class("Registrar", Registrar),
         pyoz.class("Program", Program),
         pyoz.class("Runtime", Runtime),
+        pyoz.class("Session", Session),
     },
     .module_init = moduleInit,
 });

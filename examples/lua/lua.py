@@ -479,13 +479,15 @@ def explist_of(node, rt):
 
 @lang.exec("chunk")
 def chunk(node, rt):
-    # (`return` at the top level ends the chunk)
+    # (`return` at the top level ends the chunk: what it returns, the
+    # chunk's value, a REPL's to show)
     try:
         for c in node.children:
             if c.kind == "block":
                 rt.exec(c)
-    except rt.Return:
-        pass
+    except rt.Return as r:
+        return r.args[0]
+    return None
 
 
 @lang.exec("local_stmt")
@@ -2351,7 +2353,18 @@ def run(source, path="input", mode="python", args=()):
     lang.load(source, path).run(mode=mode)
 
 
+def show(values):
+    """What a REPL entry returned (`return ...`), as print shows it (a
+    table's __tostring aside: no program runs to call it)."""
+    if values:
+        write("\t".join("table: 0x%014x" % (id(v) & 0xFFFFFFFFFFFFFF) if isinstance(v, Table) else tostring(None, None, v) for v in values) + "\n")
+
+
 if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        # (no script: interactive, `return` showing values)
+        lang.repl(show=show)
+        sys.exit(0)
     path = sys.argv[1]
     with open(path) as f:
         src = f.read()
