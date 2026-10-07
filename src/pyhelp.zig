@@ -93,6 +93,8 @@ pub fn takeError(buf: []u8) []const u8 {
     var v: ?*PyObject = null;
     var tb: ?*PyObject = null;
     py.c.PyErr_Fetch(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
+    // (as raised: a KeyError of a dict's is its key in a tuple until then)
+    py.c.PyErr_NormalizeException(@ptrCast(&t), @ptrCast(&v), @ptrCast(&tb));
     defer inline for (.{ t, v, tb }) |o| {
         if (o) |obj| py.Py_DecRef(obj);
     };

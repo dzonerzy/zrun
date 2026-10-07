@@ -1394,9 +1394,9 @@ const Program = struct {
         }
         // (the GIL released, as for program.call(): the code takes it back
         // if it touches Python)
-        const takes = gil.takes;
+        const takes = gil.takes();
         const ok = gil.without(runMainCode, .{ c, ectx, globals });
-        self._gil_taken += gil.takes - takes;
+        self._gil_taken += gil.takes() - takes;
         if (ok) return none();
         return self.compiledError(ectx);
     }
@@ -1520,9 +1520,9 @@ const Program = struct {
         var out = value_mod.Value.none_v;
         // (the GIL released: Python threads run meanwhile, and calls on
         // them; the code takes it back if it touches Python)
-        const takes = gil.takes;
+        const takes = gil.takes();
         const ok = gil.without(callFunction, .{ ectx, fv, vals, &out });
-        self._gil_taken += gil.takes - takes;
+        self._gil_taken += gil.takes() - takes;
         if (!ok) return self.compiledError(ectx);
         defer value_mod.decref(out);
         return value_mod.toPython(out, ectx.node_maker);
@@ -1669,7 +1669,7 @@ const Program = struct {
             _ = gc.collectParallel();
             own.deinit();
             gil.done();
-            _ = job.gil_takes.fetchAdd(gil.takes, .monotonic);
+            _ = job.gil_takes.fetchAdd(gil.takes(), .monotonic);
         }
 
         /// A call failed: its context kept if it's the first failing item

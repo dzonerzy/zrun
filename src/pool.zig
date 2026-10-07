@@ -150,6 +150,18 @@ pub inline fn threadPointer() usize {
     };
 }
 
+/// The thread with the home lists (its threadPointer()), or 0.
+pub inline fn homeOwner() usize {
+    return @atomicLoad(usize, &home_owner, .monotonic);
+}
+
+/// The home lists this thread's if no thread has them (as its first
+/// allocation would make them: gil.zig asks before it reads its state, code
+/// that allocates nothing reading a thread-local otherwise).
+pub fn claimHome() void {
+    _ = mineLists();
+}
+
 /// This thread's lists
 inline fn lists() *Lists {
     const tp = threadPointer();
@@ -164,10 +176,12 @@ noinline fn mineLists() *Lists {
     if (tp != 0 and @atomicLoad(usize, &home_owner, .acquire) == 0) {
         if (!mine.watched) watch();
         if (@cmpxchgStrong(usize, &home_owner, 0, tp, .acquire, .monotonic) == null) {
-            // (the counts this thread's: carried over)
+            // (the counts this thread's: carried over; its GIL state too,
+            // gil.zig's home state the home lists' thread's)
             home.in_use = mine.in_use;
             mine.in_use = 0;
             home.watched = true;
+            @import("gil.zig").claimHome();
             return &home;
         }
     }

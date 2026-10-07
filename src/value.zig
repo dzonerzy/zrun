@@ -1181,6 +1181,12 @@ pub fn fromPython(o: *PyObject) ?Value {
     return convert(o, ph.refcnt(o) == 1);
 }
 
+/// fromPython of a reference borrowed (an item of a Python list: never
+/// the only one, its container has it).
+pub fn fromBorrowed(o: *PyObject) ?Value {
+    return convert(o, false);
+}
+
 /// The types converted (exactly these)
 const exact = struct {
     const int = py.types.typeObject("PyLong_Type");

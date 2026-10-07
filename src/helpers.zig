@@ -940,7 +940,17 @@ pub fn hostCodeFailed(ctx: *Ctx, f: *PyObject) bool {
     const type_name = if (ctx.pending orelse ctx.exc) |e|
         pyName(@ptrCast(@alignCast(ph.typeOf(e))), &type_buf, "Error")
     else if (ctx.exc_class) |c| pyName(c, &type_buf, "Error") else "Error";
-    const old = allocator.dupe(u8, ctx.err_msg.items) catch return false;
+    // (the message as Python's str() of the exception says it: a Python
+    // exception's own, a native error's Python wording (exc_msg), else the
+    // error's)
+    var text_obj: ?*PyObject = null;
+    defer if (text_obj) |o| py.Py_DecRef(o);
+    if (ctx.pending orelse ctx.exc) |e| {
+        text_obj = py.c.PyObject_Str(e);
+        if (text_obj == null) py.c.PyErr_Clear();
+    }
+    const msg: []const u8 = if (text_obj) |o| (ph.utf8(o, "message") orelse "") else if (ctx.exc_class != null) ctx.exc_msg.items else ctx.err_msg.items;
+    const old = allocator.dupe(u8, msg) catch return false;
     defer allocator.free(old);
     ctx.err_msg.clearRetainingCapacity();
     ctx.err_msg.print(allocator, "{s}: {s}: {s}", .{ name, type_name, old }) catch {};
@@ -1201,6 +1211,33 @@ export fn zr_getitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
                 if (value.dictGet(d, k)) |x| {
                     value.incref(x);
                     out.* = x;
+                    return true;
+                }
+            }
+        },
+        // A Python list or tuple (data given by Python) at an int in it:
+        // its item read and converted (no int made for the index, no call
+        // of Python's); out of range, Python's error
+        .host => if (isInt(k)) {
+            const o: *PyObject = @ptrFromInt(v.bits);
+            gil.ensure();
+            const t_ = ph.typeOf(o);
+            const is_list = t_ == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyList_Type"))));
+            const is_tuple = !is_list and t_ == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyTuple_Type"))));
+            if (is_list or is_tuple) {
+                const n: usize = @intCast(if (is_list) py.c.PyList_Size(o) else py.c.PyTuple_Size(o));
+                if (index(k.asInt(), n)) |i| {
+                    const item = (if (is_list) py.c.PyList_GetItem(o, @intCast(i)) else py.c.PyTuple_GetItem(o, @intCast(i))) orelse return failPython(ctx, node);
+                    // (an int of 64 bits, the common item: read here)
+                    if (ph.typeOf(item) == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyLong_Type"))))) {
+                        var overflow: c_int = 0;
+                        const x = py.c.PyLong_AsLongLongAndOverflow(item, &overflow);
+                        if (overflow == 0) {
+                            out.* = Value.pint(x);
+                            return true;
+                        }
+                    }
+                    out.* = value.fromBorrowed(item) orelse return failPython(ctx, node);
                     return true;
                 }
             }
@@ -2019,6 +2056,24 @@ export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64,
             .list => {
                 out.* = Value.pint(@intCast(@as(*value.List, @ptrCast(@alignCast(v.ptr()))).len));
                 return true;
+            },
+            // (a Python list, tuple or dict (data given by Python): its
+            // size, without calling Python)
+            .host => {
+                const o: *PyObject = @ptrFromInt(v.bits);
+                const t_ = ph.typeOf(o);
+                const n: isize = if (t_ == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyList_Type")))))
+                    py.c.PyList_Size(o)
+                else if (t_ == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyTuple_Type")))))
+                    py.c.PyTuple_Size(o)
+                else if (t_ == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyDict_Type")))))
+                    py.c.PyDict_Size(o)
+                else
+                    -1;
+                if (n >= 0) {
+                    out.* = Value.pint(@intCast(n));
+                    return true;
+                }
             },
             .tuple => {
                 out.* = Value.pint(@intCast(@as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).len));

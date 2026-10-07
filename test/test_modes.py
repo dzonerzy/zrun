@@ -256,7 +256,7 @@ def _host_lang():
                 use="Name",
                 hoist="FuncDef > .name",
                 after="Let > .name",
-                builtins=("print", "add", "picky", "opened"),
+                builtins=("print", "add", "picky", "opened", "count", "item"),
             )
         ],
     )
@@ -281,6 +281,14 @@ def _host_lang():
         if x < 0:
             raise ValueError("negative: %d" % x)
         return x * 2
+
+    @lang.host
+    def count(xs):
+        return len(xs)
+
+    @lang.host
+    def item(xs, i):
+        return xs[i]
 
     @lang.host
     def opened(n):
@@ -318,6 +326,35 @@ def test_host_calls_dont_take_the_gil():
     taken = p.report()["gil_taken"]
     assert p.call("f", 1000) == 999000
     assert p.report()["gil_taken"] == taken
+
+
+PY_DATA = [
+    [1, 2, 3],
+    (4, 5, -6),
+    [2**63 - 1, -(2**63)],
+    [2**64, "s", None, [7, 8], 1.5],
+    {"a": 1, "b": 2},
+    [],
+]
+
+
+@pytest.mark.parametrize("data", PY_DATA, ids=lambda d: type(d).__name__ + str(len(d)))
+def test_python_data_items(data):
+    # (Python's lists and tuples read by compiled code item by item, their
+    # len() natively: as the reference mode reads them, errors too)
+    p = _host_lang().load("fn at(xs, i) { return item(xs, i); }\nfn size(xs) { return count(xs); }\n", "prog")
+    keys = ["a", "z"] if isinstance(data, dict) else [0, 1, -1, len(data) - 1, len(data), -len(data) - 1]
+    for name, args in [("at", (data, k)) for k in keys] + [("size", (data,))]:
+        got = {}
+        for mode in MODES:
+            try:
+                got[mode] = ("ok", p.call(name, *args, mode=mode))
+            except zrun.Error as e:
+                got[mode] = ("error", e.diagnostic.message)
+        assert got["compiled"] == got["python"], (name, args, got)
+        # (a host function's failure as Python words its exception)
+        if args[1:] == ("z",):
+            assert got["python"] == ("error", "item: KeyError: 'z'")
 
 
 def _wrapping_lang():
