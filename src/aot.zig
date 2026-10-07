@@ -131,18 +131,34 @@ fn putBytes32(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), s: []const
 
 /// The Python computing a language's definition hash: its grammar (what
 /// its parser tells of it), its semantics' and host functions' code, the
-/// rest of its definition as text (lib.zig's).
+/// rest of its definition as text (lib.zig's). A code object is hashed by
+/// its fields, not marshal.dumps(): what marshal writes depends on the
+/// reference counts of the constants, and those on what else the process
+/// has run.
 pub const definition_source =
-    \\import hashlib, marshal
+    \\import hashlib
+    \\FIELDS = ("co_name", "co_filename", "co_firstlineno", "co_argcount", "co_posonlyargcount",
+    \\          "co_kwonlyargcount", "co_flags", "co_varnames", "co_freevars", "co_cellvars",
+    \\          "co_names", "co_code", "co_linetable", "co_exceptiontable")
     \\def definition(parser, tables, hosts, rest):
     \\    h = hashlib.sha256()
     \\    def text(x):
     \\        h.update(repr(x).encode("utf-8", "replace"))
     \\        h.update(b"\0")
+    \\    def code_object(c):
+    \\        for name in FIELDS:
+    \\            text(getattr(c, name, None))
+    \\        for k in c.co_consts:
+    \\            if hasattr(k, "co_code"):
+    \\                code_object(k)
+    \\            elif isinstance(k, frozenset):
+    \\                text(("frozenset", sorted(map(repr, k))))
+    \\            else:
+    \\                text((type(k).__name__, k))
     \\    def code(f):
     \\        c = getattr(f, "__code__", None)
     \\        if c is not None:
-    \\            h.update(marshal.dumps(c))
+    \\            code_object(c)
     \\        else:
     \\            text((type(f).__name__, getattr(f, "__name__", None), getattr(f, "signature", None)))
     \\    for m in ("rules", "actions", "fields", "labels", "literals"):

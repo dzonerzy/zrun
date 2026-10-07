@@ -3461,6 +3461,7 @@ fn configure(args: pyoz.Args(struct { cache: ?*PyObject = null, perf_map: ?*PyOb
 }
 
 fn moduleInit(module: *PyObject) callconv(.c) c_int {
+    ph.initVersion() catch return -1;
     if (ztypes.init(module) != 0) return -1;
     objects.init(module) catch return -1;
     bridge.init(module) catch return -1;

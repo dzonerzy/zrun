@@ -5,6 +5,17 @@ const pyoz = @import("PyOZ");
 pub const py = pyoz.py;
 pub const PyObject = pyoz.PyObject;
 
+/// The running Python's minor version (3.x), read as the module's made:
+/// compiled code words errors as this Python does.
+pub var minor: u32 = 10;
+
+pub fn initVersion() error{Python}!void {
+    const info = py.c.PySys_GetObject("version_info") orelse return error.Python;
+    const m = py.c.PySequence_GetItem(info, 1) orelse return error.Python;
+    defer py.Py_DecRef(m);
+    minor = @intCast((try toInt(m)) orelse 10);
+}
+
 /// An object's type (Py_TYPE).
 pub inline fn typeOf(o: *PyObject) *py.PyTypeObject {
     return py.Py_TYPE(o).?;

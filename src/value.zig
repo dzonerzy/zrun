@@ -283,6 +283,9 @@ pub const Dict = extern struct {
 
 pub const RecordType = struct {
     name: []const u8,
+    /// The class's name in the error reading a slot never assigned
+    /// (Python's words for it: `name` before 3.13, module.qualname after)
+    unset_name: []const u8,
     fields: []const []const u8,
     /// The Python class it was made from (a dataclass, or a plain class),
     /// for converting

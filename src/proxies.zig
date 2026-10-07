@@ -723,7 +723,12 @@ fn keyOf(k: *PyObject) ?Value {
     const v = in(k) orelse return null;
     if (!value.hashable(v)) {
         value.decref(v);
-        ph.raise(py.PyExc_TypeError(), "unhashable type: '{s}'", .{typeNameOf(k)});
+        // (as this Python words it: from 3.14 saying where it was used)
+        const name = typeNameOf(k);
+        if (ph.minor >= 14)
+            ph.raise(py.PyExc_TypeError(), "cannot use '{s}' as a dict key (unhashable type: '{s}')", .{ name, name })
+        else
+            ph.raise(py.PyExc_TypeError(), "unhashable type: '{s}'", .{name});
         return null;
     }
     return v;
@@ -1008,7 +1013,7 @@ fn recordGetattro(o: ?*PyObject, name: ?*PyObject) callconv(.c) ?*PyObject {
     const n = ph.utf8(name.?, "attribute") orelse return null;
     if (fieldIndex(r, n)) |i| {
         if (r.fields()[i].tag == value.UNSET_TAG) {
-            ph.raise(py.PyExc_AttributeError(), "'{s}' object has no attribute '{s}'", .{ r.rtype.name, n });
+            ph.raise(py.PyExc_AttributeError(), "'{s}' object has no attribute '{s}'", .{ r.rtype.unset_name, n });
             return null;
         }
         return out(p, r.fields()[i]);
@@ -1033,7 +1038,11 @@ fn recordSetattro(o: ?*PyObject, name: ?*PyObject, v: ?*PyObject) callconv(.c) c
     const r = record(p);
     const n = ph.utf8(name.?, "attribute") orelse return -1;
     const i = fieldIndex(r, n) orelse {
-        ph.raise(py.PyExc_AttributeError(), "'{s}' object has no attribute '{s}'", .{ r.rtype.name, n });
+        // (from 3.13 Python says why it can't be added)
+        if (ph.minor >= 13)
+            ph.raise(py.PyExc_AttributeError(), "'{s}' object has no attribute '{s}' and no __dict__ for setting new attributes", .{ r.rtype.name, n })
+        else
+            ph.raise(py.PyExc_AttributeError(), "'{s}' object has no attribute '{s}'", .{ r.rtype.name, n });
         return -1;
     };
     if (r.rtype.frozen) {

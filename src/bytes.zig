@@ -32,20 +32,22 @@ const Py_buffer = extern struct {
 };
 const Buffers = if (builtin.os.tag == .windows) struct {
     const HMODULE = *opaque {};
-    extern "kernel32" fn GetModuleHandleExW(flags: u32, name: ?*const anyopaque, module: *?HMODULE) callconv(.winapi) i32;
     extern "kernel32" fn GetProcAddress(module: HMODULE, name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
-    /// GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | ..._UNCHANGED_REFCOUNT
-    const by_address: u32 = 0x4 | 0x2;
 
     var get: ?*const fn (o: *PyObject, view: *Py_buffer, flags: c_int) callconv(.c) c_int = null;
     var release: ?*const fn (view: *Py_buffer) callconv(.c) void = null;
 
-    /// Looked up in the DLL Py_IncRef is in (Python's)
+    /// Looked up in Python's DLL (python3X.dll), `sys.dllhandle` (the
+    /// address of an imported function is this module's import thunk, and
+    /// python3.dll only forwards the Stable ABI of its version)
     fn init() bool {
-        var module: ?HMODULE = null;
-        if (GetModuleHandleExW(by_address, @ptrCast(&py.c.Py_IncRef), &module) == 0) return false;
-        get = @ptrCast(GetProcAddress(module.?, "PyObject_GetBuffer") orelse return false);
-        release = @ptrCast(GetProcAddress(module.?, "PyBuffer_Release") orelse return false);
+        const handle = py.c.PySys_GetObject("dllhandle") orelse return false;
+        const module: HMODULE = @ptrCast(py.c.PyLong_AsVoidPtr(handle) orelse {
+            py.c.PyErr_Clear();
+            return false;
+        });
+        get = @ptrCast(GetProcAddress(module, "PyObject_GetBuffer") orelse return false);
+        release = @ptrCast(GetProcAddress(module, "PyBuffer_Release") orelse return false);
         return true;
     }
 } else struct {

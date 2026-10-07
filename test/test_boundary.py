@@ -585,7 +585,11 @@ def make_lang():
         try:
             d[[1]] = 2
         except TypeError as e:
-            assert str(e) == "unhashable type: 'list'"
+            # (Python's words for a dict's, of this version)
+            try:
+                {}[[1]] = 2
+            except TypeError as p:
+                assert str(e) == str(p)
         c = d.copy()
         c.clear()
         assert len(c) == 0 and len(d) == 2

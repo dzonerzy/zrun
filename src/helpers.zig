@@ -182,6 +182,14 @@ fn failAs(ctx: *Ctx, node: u32, exc: *PyObject, py_msg: ?[]const u8, comptime fm
     return fail(ctx, node, fmt, args);
 }
 
+/// A value of type `name` used as a dict key, unhashable: as this Python
+/// words it (from 3.14 saying where it was used)
+fn unhashableKey(ctx: *Ctx, node: u32, name: []const u8) bool {
+    if (ph.minor >= 14)
+        return failAs(ctx, node, py.PyExc_TypeError(), null, "cannot use '{s}' as a dict key (unhashable type: '{s}')", .{ name, name });
+    return failAs(ctx, node, py.PyExc_TypeError(), null, "unhashable type: '{s}'", .{name});
+}
+
 /// While a run is reported (Program.run(report=True)): how many times the
 /// compiled code went through Python, by what (Program.report()).
 pub var collecting: bool = false;
@@ -663,7 +671,7 @@ export fn zr_compare(ctx: *Ctx, node: u32, cmp_code: u32, ta: u64, ba: u64, tb: 
             }
             // (a list, a dict... looked up in a dict: Python's error)
             if (b.kind() == .dict and a.kind() != .host and !value.hashable(a))
-                return failAs(ctx, node, py.PyExc_TypeError(), null, "unhashable type: '{s}'", .{value.typeName(a)});
+                return unhashableKey(ctx, node, value.typeName(a));
         },
     }
     // Through Python
@@ -1100,7 +1108,7 @@ export fn zr_dict(ctx: *Ctx, node: u32, keys: [*]const Value, vals: [*]const Val
     for (0..n) |i| {
         if (!value.hashable(keys[i])) {
             value.decref(Value.obj(.dict, &d.head));
-            return failAs(ctx, node, py.PyExc_TypeError(), null, "unhashable type: '{s}'", .{value.typeName(keys[i])});
+            return unhashableKey(ctx, node, value.typeName(keys[i]));
         }
         if (!value.dictSet(d, keys[i], vals[i])) return oomFail(ctx, node);
     }
@@ -1165,7 +1173,7 @@ export fn zr_getattr(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value
             if (std.mem.eql(u8, f, name.bytes())) {
                 const x = r.fields()[i];
                 // (a slot never assigned: as Python says it)
-                if (x.tag == UNSET) return failAs(ctx, node, py.PyExc_AttributeError(), null, "'{s}' object has no attribute '{s}'", .{ r.rtype.name, f });
+                if (x.tag == UNSET) return failAs(ctx, node, py.PyExc_AttributeError(), null, "'{s}' object has no attribute '{s}'", .{ r.rtype.unset_name, f });
                 value.incref(x);
                 out.* = x;
                 return true;
@@ -1215,6 +1223,9 @@ export fn zr_setattr(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value
         if (py.c.PyObject_SetAttr(o, key, val) != 0) return failPython(ctx, node);
         return true;
     }
+    // (from 3.13 Python says why it can't be added)
+    if (ph.minor >= 13)
+        return failAs(ctx, node, py.PyExc_AttributeError(), null, "'{s}' object has no attribute '{s}' and no __dict__ for setting new attributes", .{ value.typeName(v), name.bytes() });
     return failAs(ctx, node, py.PyExc_AttributeError(), null, "'{s}' object has no attribute '{s}'", .{ value.typeName(v), name.bytes() });
 }
 
@@ -1336,7 +1347,7 @@ export fn zr_setitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
         } else return failAs(ctx, node, py.PyExc_TypeError(), null, "list indices must be integers or slices, not {s}", .{value.typeName(k)}),
         .dict => {
             const d: *value.Dict = @ptrCast(@alignCast(v.ptr()));
-            if (!value.hashable(k)) return failAs(ctx, node, py.PyExc_TypeError(), null, "unhashable type: '{s}'", .{value.typeName(k)});
+            if (!value.hashable(k)) return unhashableKey(ctx, node, value.typeName(k));
             if (!value.dictSet(d, k, x)) return oomFail(ctx, node);
             return true;
         },
@@ -1487,6 +1498,12 @@ export fn zr_unpack(ctx: *Ctx, node: u32, t: u64, bits: u64, n: u64, out: [*]Val
                 }
                 return true;
             }
+            // (Python's words for a list or tuple: from 3.14 with its length)
+            if (items.len < n)
+                return failAs(ctx, node, py.PyExc_ValueError(), null, "not enough values to unpack (expected {d}, got {d})", .{ n, items.len });
+            if (ph.minor >= 14)
+                return failAs(ctx, node, py.PyExc_ValueError(), null, "too many values to unpack (expected {d}, got {d})", .{ n, items.len });
+            return failAs(ctx, node, py.PyExc_ValueError(), null, "too many values to unpack (expected {d})", .{n});
         },
         else => {},
     }

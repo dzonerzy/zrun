@@ -613,6 +613,9 @@ pub fn recordOf(cls: *PyObject) Error!?*value.RecordType {
             \\import dataclasses
             \\OK = {"__module__", "__qualname__", "__doc__", "__slots__", "__init__", "__repr__", "__str__",
             \\      "__annotations__", "__match_args__", "__firstlineno__", "__static_attributes__"}
+            \\def full_name(cls):
+            \\    m = cls.__module__
+            \\    return cls.__qualname__ if m in ("builtins", "__main__") else m + "." + cls.__qualname__
             \\def describe(cls):
             \\    if type(cls) is not type or cls.__mro__[-1] is not object or len(cls.__bases__) != 1:
             \\        return None
@@ -622,7 +625,7 @@ pub fn recordOf(cls: *PyObject) Error!?*value.RecordType {
             \\        if p.order or "__post_init__" in dir(cls):
             \\            return None
             \\        names = tuple(f.name for f in dataclasses.fields(cls))
-            \\        return (names, False, bool(p.eq), bool(p.frozen), base if dataclasses.is_dataclass(base) else None)
+            \\        return (names, False, bool(p.eq), bool(p.frozen), base if dataclasses.is_dataclass(base) else None, full_name(cls))
             \\    out = []
             \\    for k in reversed(cls.__mro__[:-1]):
             \\        d = k.__dict__
@@ -638,7 +641,7 @@ pub fn recordOf(cls: *PyObject) Error!?*value.RecordType {
             \\        for n in d:
             \\            if n.startswith("__") and n.endswith("__") and n not in OK:
             \\                return None
-            \\    return (tuple(out), True, False, False, None if base is object else base)
+            \\    return (tuple(out), True, False, False, None if base is object else base, full_name(cls))
         ;
         const ns = runPython(src) orelse return error.Python;
         defer py.Py_DecRef(ns);
@@ -666,9 +669,12 @@ pub fn recordOf(cls: *PyObject) Error!?*value.RecordType {
     for (names, 0..) |*slot, i| slot.* = try gpa.dupe(u8, ph.utf8(py.c.PyTuple_GetItem(field_names, @intCast(i)).?, "field") orelse return error.Python);
     const qual = ph.attr(cls, "__name__") orelse return error.Python;
     defer py.Py_DecRef(qual);
+    const name = try gpa.dupe(u8, ph.utf8(qual, "name") orelse return error.Python);
     const t = try gpa.create(value.RecordType);
     t.* = .{
-        .name = try gpa.dupe(u8, ph.utf8(qual, "name") orelse return error.Python),
+        .name = name,
+        // (from 3.13 an unset slot's error names the class in full)
+        .unset_name = if (ph.minor >= 13) try gpa.dupe(u8, ph.utf8(py.c.PyTuple_GetItem(d, 5).?, "name") orelse return error.Python) else name,
         .fields = names,
         .py_class = cls,
         .slots = py.c.PyTuple_GetItem(d, 1).? == py.Py_True(),
