@@ -273,6 +273,10 @@ pub const Compiled = struct {
                 .float
             else if (bits == 1 << @intFromEnum(value.Tag.bool))
                 .bool
+                // (a native list: the entry gets it as a pointer, its items
+                // read inline)
+            else if (bits == 1 << @intFromEnum(value.Tag.list))
+                .list
             else
                 return;
         }

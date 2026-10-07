@@ -2972,7 +2972,11 @@ const Gen = struct {
             const shapes = (try self.typedParams(fnode)).?;
             for (self.paramNodes(fnode, spec), shapes, 0..) |p, s, i| {
                 const tag: value.Tag = if (s == .int) .int else shapeTag(s);
-                try self.storeVar(p, dyn(self.k(@intCast(@intFromEnum(tag))), self.f.param(@intCast(Compiler.typed_first + i)), s));
+                const d = dyn(self.k(@intCast(@intFromEnum(tag))), self.f.param(@intCast(Compiler.typed_first + i)), s);
+                // (a list: the caller's, borrowed; the variable's own
+                // reference, as the generic entry takes one)
+                if (s == .list) try self.increfDyn(d.dyn);
+                try self.storeVar(p, d);
             }
             return;
         }
@@ -5462,8 +5466,9 @@ const Gen = struct {
         const found = try f.label("index_found");
         const slow = try f.label("index_other");
         const join = try f.label("index_got");
-        const is_list = f.icmp(jit_c.LLVMIntEQ, od.tag, self.k(@intFromEnum(T.list)));
-        const is_tuple = f.icmp(jit_c.LLVMIntEQ, od.tag, self.k(@intFromEnum(T.tuple)));
+        // (a list known: a typed entry's parameter...)
+        const is_list = if (od.shape == .list) self.c.m.k1(true) else f.icmp(jit_c.LLVMIntEQ, od.tag, self.k(@intFromEnum(T.list)));
+        const is_tuple = if (od.shape == .list) self.c.m.k1(false) else f.icmp(jit_c.LLVMIntEQ, od.tag, self.k(@intFromEnum(T.tuple)));
         const key_int = f.or_(f.icmp(jit_c.LLVMIntEQ, kd.tag, self.k(@intFromEnum(T.int))), f.icmp(jit_c.LLVMIntEQ, kd.tag, self.k(@intCast(value.PINT_TAG))));
         try f.condBr(f.and_(f.or_(is_list, is_tuple), key_int), fast, slow);
         try f.block(fast);
@@ -5486,7 +5491,35 @@ const Gen = struct {
         const neg = f.icmp(jit_c.LLVMIntSLT, kd.bits, self.k(0));
         const i = f.select(neg, f.add(kd.bits, len), kd.bits);
         try f.condBr(f.icmp(jit_c.LLVMIntULT, i, len), found, slow);
+        // A list whose items are all ints (its elements kind: value.List's
+        // LIST_INTS): the item read as one, nothing counted
+        // (a list of the program's ints, or of plain ints: their tag a
+        // constant, the checks after it folded by LLVM along this path)
+        const ints = try f.label("index_ints");
+        const not_ints = try f.label("index_not_ints");
+        const pints = try f.label("index_pints");
+        const any = try f.label("index_any");
         try f.block(found);
+        const flags = f.load(t.i32, f.offset(p, @offsetOf(value.Obj, "flags")));
+        const has = struct {
+            fn flag(g: *Gen, fl: ir.Value, bit: u32) ir.Value {
+                return g.f.icmp(jit_c.LLVMIntNE, g.f.and_(fl, g.c.m.k32(bit)), g.c.m.k32(0));
+            }
+        }.flag;
+        try f.condBr(f.and_(is_list, has(self, flags, value.LIST_INTS)), ints, not_ints);
+        try f.block(ints);
+        const int_bits = f.load(t.i64, f.field(t.val, f.at(t.val, items, i), 1));
+        try self.drop(.{ .dyn = od });
+        const ints_end = f.current;
+        try f.br(join);
+        try f.block(not_ints);
+        try f.condBr(f.and_(is_list, has(self, flags, value.LIST_PINTS)), pints, any);
+        try f.block(pints);
+        const pint_bits = f.load(t.i64, f.field(t.val, f.at(t.val, items, i), 1));
+        try self.drop(.{ .dyn = od });
+        const pints_end = f.current;
+        try f.br(join);
+        try f.block(any);
         const slot = f.at(t.val, items, i);
         const item = try self.loadSlot(slot, .any);
         try self.increfDyn(item);
@@ -5498,7 +5531,11 @@ const Gen = struct {
         const slow_end = f.current;
         try f.br(join);
         try f.block(join);
-        return .{ .tag = f.phi(t.i64, item.tag, found_end, g.tag, slow_end), .bits = f.phi(t.i64, item.bits, found_end, g.bits, slow_end), .shape = .any };
+        return .{
+            .tag = f.phiN(t.i64, &.{ self.k(@intFromEnum(T.int)), self.k(@intCast(value.PINT_TAG)), item.tag, g.tag }, &.{ ints_end, pints_end, found_end, slow_end }),
+            .bits = f.phiN(t.i64, &.{ int_bits, pint_bits, item.bits, g.bits }, &.{ ints_end, pints_end, found_end, slow_end }),
+            .shape = .any,
+        };
     }
 
     /// An f-string: known pieces joined now; else each piece formatted at
@@ -6460,7 +6497,10 @@ const Gen = struct {
         // (a native library's function known here: called directly; a
         // Python function of the language's: by its code, kept at the site)
         if (fv == .py and receiver == null and native_mod.isNative(fv.py)) return self.nativeCall(inst, fv.py, items);
-        if (fv == .py and receiver == null and try isPlainFunction(fv.py)) return self.hostCall(inst, fv.py, items);
+        if (fv == .py and receiver == null and try isPlainFunction(fv.py)) {
+            if (try self.hostInline(inst, fv.py, items)) |v| return v;
+            return self.hostCall(inst, fv.py, items);
+        }
         const fd = try self.materialize(fv, inst.node);
         // The arguments, in a stack array
         const n = items.len;
@@ -6498,6 +6538,86 @@ const Gen = struct {
         const cl = ph.attr(o, "__closure__") orelse return error.Python;
         defer py.Py_DecRef(cl);
         return cl == py.Py_None();
+    }
+
+    /// rt.call of a host function known here, run inline when its code is
+    /// small (a language's `len`: a call of a builtin): as rt.call runs it,
+    /// its ints handed over and back as the program's (I64s), its failure
+    /// worded "name: Type: message" (zr_host_failed, on its errors' way).
+    /// Null: it isn't (too big, or it names rt's jumps, which inline would
+    /// jump out of the code around it).
+    fn hostInline(self: *Gen, inst: *Inst, o: *PyObject, items: []const SVal) Error!?SVal {
+        const func = self.c.readFunction(o) catch |e| switch (e) {
+            error.Unsupported => {
+                self.c.failure.* = .{};
+                return null;
+            },
+            else => |x| return x,
+        };
+        if (func.size > inline_size or items.len < func.required or items.len > func.param_count) return null;
+        if (try namesJumps(o)) return null;
+        // (containers known here made, once, as a call gives them: the
+        // function sees one object, which it may keep, compare, change)
+        const args = try self.a().alloc(SVal, items.len);
+        for (items, args) |x, *slot| slot.* = try self.checkedVal(if (isScalar(x) or x == .node or x == .py) x else .{ .dyn = try self.materialize(x, inst.node) });
+        const idx = try self.c.objectIndex(o);
+        // Its errors: worded as a host function's, then on as the code
+        // around them goes
+        const f = &self.f;
+        const host_err = try f.label("host_error");
+        // (where they go after: what the code around holds here, made now;
+        // the function's own are released on its errors' way to host_err)
+        const outer = try self.errorTarget();
+        const saved_err = self.err_label;
+        const saved_keep = self.err_keep;
+        const saved_inflight = self.err_inflight;
+        self.err_label = host_err;
+        self.err_keep = self.insts.items.len;
+        self.err_inflight = self.inflight.items.len;
+        const r = self.callHelper(func, inst.node, args);
+        self.err_label = saved_err;
+        self.err_keep = saved_keep;
+        self.err_inflight = saved_inflight;
+        const v = r catch |e| return e;
+        // (made apart: no jump to it from the code here)
+        const after = f.current;
+        f.positionAt(host_err);
+        _ = self.call("zr_host_failed", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)) });
+        try f.br(outer);
+        f.positionAt(after);
+        return try self.checkedVal(v);
+    }
+
+    /// Whether a function's code names rt.Return, rt.Break or rt.Continue.
+    fn namesJumps(o: *PyObject) Error!bool {
+        const code = ph.attr(o, "__code__") orelse return error.Python;
+        defer py.Py_DecRef(code);
+        const names = ph.attr(code, "co_names") orelse return error.Python;
+        defer py.Py_DecRef(names);
+        for ([_][*:0]const u8{ "Return", "Break", "Continue" }) |n| {
+            const s = py.c.PyUnicode_FromString(n) orelse return error.Python;
+            defer py.Py_DecRef(s);
+            const r = py.c.PySequence_Contains(names, s);
+            if (r < 0) return error.Python;
+            if (r == 1) return true;
+        }
+        return false;
+    }
+
+    /// A value as rt hands it over (to and from Python): a plain int made a
+    /// program's (I64), the rest as it is.
+    fn checkedVal(self: *Gen, v: SVal) Error!SVal {
+        switch (v) {
+            .pint => |n| return .{ .int = n },
+            .dyn => |d| {
+                if (d.shape != .int and d.shape != .any) return v;
+                const f = &self.f;
+                var out = d;
+                out.tag = f.select(f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intCast(value.PINT_TAG))), self.k(@intFromEnum(value.Tag.int)), d.tag);
+                return .{ .dyn = out };
+            },
+            else => return v,
+        }
     }
 
     /// rt.call of a host function known here (a Python function of the
@@ -6628,6 +6748,7 @@ const Gen = struct {
                 ok = f.and_(ok, switch (s) {
                     .int => f.icmp(jit_c.LLVMIntEQ, f.or_(d.tag, self.k(16)), self.k(@intCast(value.PINT_TAG))),
                     .float => f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.float))),
+                    .list => f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.list))),
                     else => f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.bool))),
                 });
             }

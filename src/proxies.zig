@@ -272,10 +272,14 @@ fn listRemoveAt(l: *value.List, k: usize) Value {
 }
 
 fn listInsertAt(l: *value.List, k: usize, v: Value) bool {
+    // (room made with a None: the elements kind the list had, then v's)
+    const kinds = l.head.flags & value.LIST_KINDS;
     if (!value.listPush(l, Value.none_v)) return false;
+    l.head.flags |= kinds;
     const items = l.slice();
     std.mem.copyBackwards(Value, items[k + 1 ..], items[k .. items.len - 1]);
     items[k] = v;
+    value.listStored(l, v);
     return true;
 }
 
@@ -336,6 +340,7 @@ fn listAssSubscript(o: ?*PyObject, key: ?*PyObject, v: ?*PyObject) callconv(.c) 
                 const k: usize = @intCast(i);
                 const old = l.slice()[k];
                 l.slice()[k] = x.*;
+                value.listStored(l, x.*);
                 x.* = Value.none_v;
                 value.decref(old);
                 i += step;
@@ -366,6 +371,7 @@ fn listAssSubscript(o: ?*PyObject, key: ?*PyObject, v: ?*PyObject) callconv(.c) 
         const nv = in(x) orelse return -1;
         const old = l.slice()[k];
         l.slice()[k] = nv;
+        value.listStored(l, nv);
         value.decref(old);
     } else value.decref(listRemoveAt(l, k));
     return 0;
@@ -573,6 +579,7 @@ fn listSort(o: ?*PyObject, args: ?*PyObject, kwargs: ?*PyObject) callconv(.c) ?*
         const v = in(py.c.PyList_GetItem(copy, @intCast(i)).?) orelse return null;
         const old = slot.*;
         slot.* = v;
+        value.listStored(l, v);
         value.decref(old);
     }
     return none();

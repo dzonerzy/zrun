@@ -224,6 +224,18 @@ pub const Str = extern struct {
     }
 };
 
+/// A list's elements kind (its head's flags), as V8 keeps one: every item a
+/// program's int (an I64: what rt gives, the ints a program makes), every
+/// item a plain int (Python's, as data given brings them), every item a
+/// float. An empty list has them all; storing anything else drops what it
+/// isn't (listStored), never set again for the list. Compiled code reading
+/// an item of a list with one knows its tag: a constant, no checks of it
+/// or count after it.
+pub const LIST_INTS: u32 = 1 << 0;
+pub const LIST_FLOATS: u32 = 1 << 1;
+pub const LIST_PINTS: u32 = 1 << 2;
+pub const LIST_KINDS: u32 = LIST_INTS | LIST_FLOATS | LIST_PINTS;
+
 pub const List = extern struct {
     head: Obj,
     len: u64,
@@ -557,9 +569,21 @@ fn listInline(l: *List) [*]Value {
     return @ptrCast(@alignCast(@as([*]u8, @ptrCast(l)) + @sizeOf(List)));
 }
 
+/// A list's elements kind after `v` is stored in it (List's LIST_INTS...):
+/// what `v` isn't dropped. Every write of a value into a list's items goes
+/// through it (listPush does).
+pub inline fn listStored(l: *List, v: Value) void {
+    const keep: u32 = if (v.tag == PINT_TAG)
+        LIST_PINTS
+    else if (v.tag == @intFromEnum(Tag.int))
+        LIST_INTS
+    else if (v.tag == @intFromEnum(Tag.float)) LIST_FLOATS else 0;
+    l.head.flags &= ~(LIST_KINDS & ~keep);
+}
+
 pub fn newList(cap: usize) ?*List {
     const l: *List = @ptrCast(@alignCast(gc.alloc(list_block) orelse return null));
-    l.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.list) }, .len = 0, .cap = list_inline, .items = listInline(l) };
+    l.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.list), .flags = LIST_KINDS }, .len = 0, .cap = list_inline, .items = listInline(l) };
     if (cap > list_inline) {
         const items = allocator.alloc(Value, cap) catch {
             gc.free(&l.head, list_block);
@@ -591,6 +615,7 @@ pub inline fn listPush(l: *List, v: Value) bool {
     }
     l.items.?[l.len] = v;
     l.len += 1;
+    listStored(l, v);
     return true;
 }
 

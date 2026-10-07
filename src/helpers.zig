@@ -1039,7 +1039,10 @@ fn oomFail(ctx: *Ctx, node: u32) bool {
 export fn zr_list(ctx: *Ctx, node: u32, items: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
     const l = value.newList(n) orelse return oomFail(ctx, node);
     // (room for n made: the items written in place)
-    for (0..n) |i| l.items.?[i] = given(&items[i]);
+    for (0..n) |i| {
+        l.items.?[i] = given(&items[i]);
+        value.listStored(l, l.items.?[i]);
+    }
     l.len = n;
     out.* = Value.obj(.list, &l.head);
     return true;
@@ -1298,6 +1301,7 @@ export fn zr_setitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
             value.incref(x);
             value.decref(l.items.?[i]);
             l.items.?[i] = x;
+            value.listStored(l, x);
             return true;
         } else return failAs(ctx, node, py.PyExc_TypeError(), null, "list indices must be integers or slices, not {s}", .{value.typeName(k)}),
         .dict => {

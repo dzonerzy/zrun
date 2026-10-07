@@ -539,7 +539,7 @@ def _python_lang():
                 use="Name",
                 hoist="FuncDef > .name",
                 after="Let > .name",
-                builtins=("print", "nums", "total", "evens", "grid", "table", "swap", "setat", "bump", "grow", "pairs", "indexed", "pairs_whole", "triples", "has", "text"),
+                builtins=("print", "nums", "total", "evens", "grid", "table", "swap", "setat", "bump", "grow", "pairs", "indexed", "pairs_whole", "triples", "has", "text", "mixed", "halves", "poke", "reread"),
             ),
         ],
     )
@@ -599,7 +599,32 @@ def _python_lang():
             xs = args[0]
             xs[0] += args[1]
             return xs
+        # (a list's elements kind: all ints, then not, as items are stored)
+        if name == "mixed":
+            xs = args[0]
+            s = xs[0] + xs[-1]
+            xs[1] = "s"
+            t = xs[0] + xs[-1]
+            xs[0] = 2.5
+            ys = [1, 2]
+            ys.append(args[1])
+            ys.append(7)
+            return [s, t, xs[0] + 1, xs[1], len(xs), ys[2] + ys[3], ys[0] + ys[1]]
+        if name == "halves":
+            xs = [x * 0.5 for x in args[0]]
+            xs.append(1)
+            return [xs[1] + xs[2], xs[-1] + 1]
+        if name == "reread":
+            xs = args[0]
+            return [xs[0], xs[1], len(xs)]
         return rt.call(rt.eval(node.name), args)
+
+    @lang.host
+    def poke(xs):
+        # (a list compiled code made, changed by Python: its proxy's)
+        xs[0] = "p"
+        xs.insert(1, 9.5)
+        return xs
 
     @lang.host
     def nums(n):
@@ -628,6 +653,8 @@ PYTHON_FEATURES = {
     "enumerate": "print(indexed(nums(5)));\n",
     "in": 'print(has(2, nums(3)), has(5, nums(3)), has("b", "abc"), has(1, table(nums(2), nums(2))));\n',
     "in_function": "fn f(n) { let s = 0; let i = 0; while i < n { s = s + total(nums(i)); i = i + 1; } return s; }\nprint(f(6));\n",
+    "elements_kinds": "fn f(x) { return mixed(nums(4), x); }\nprint(f(5), f(9223372036854775000), halves(nums(4)));\n",
+    "kinds_from_python": "print(reread(poke(evens(nums(6)))));\n",
 }
 
 PYTHON_FEATURE_ERRORS = {
