@@ -161,6 +161,41 @@ print(fib(15), pick(3, 4, false), pick(xs[0], 2, false), pick(1, xs[1], true), a
         # through the generic entries for arguments of their kinds)
         assert ir.count("define { i64, i64 } @zr_ir_t") == 3
 
+    def test_list_parameters_borrowed(self, capsys):
+        # a typed entry takes a list declared as a parameter borrowed from
+        # its caller: read, returned, kept in another list, changed, the
+        # parameter stored to (a reference taken first), recursion with it;
+        # the same in both modes, and nothing left allocated
+        src = """
+fn total(xs: list[int]) -> int { let t = 0; let i = 0; while i < len(xs) { t = t + xs[i]; i = i + 1; } return t; }
+fn same(xs: list[int]) -> list[int] { return xs; }
+fn pair(xs: list[int]) -> list[list[int]] { return [xs, xs]; }
+fn bump(xs: list[int], n: int) -> int { xs[0] = xs[0] + n; return xs[0]; }
+fn swap(xs: list[int], ys: list[int]) -> int { let a = total(xs); xs = ys; return a * 100 + total(xs); }
+fn down(xs: list[int], n: int) -> int { if n == 0 { return total(xs); } return down(xs, n - 1) + 1; }
+let a = [1, 2, 3];
+let b = [10, 20];
+let kept = pair(a);
+let k = 0;
+let sum = 0;
+while k < 300 {
+    let p = pair(b);
+    sum = sum + total(a) + total(same(b)) + total(p[1]) + bump(b, 1) + swap(a, [4, 5]) + down(a, 3);
+    k = k + 1;
+}
+print(sum, total(kept[0]), total(b), len(kept));
+"""
+        assert self.outcomes(src) == {"python": None, "compiled": None}
+        out = capsys.readouterr().out
+        assert out.splitlines()[0] == out.splitlines()[1]
+        # (once more: what the first run kept for good, kept; the rest freed)
+        zrun.collect()
+        before = zrun._blocks()
+        assert self.outcomes(src) == {"python": None, "compiled": None}
+        assert capsys.readouterr().out == out
+        zrun.collect()
+        assert zrun._blocks() == before
+
     @pytest.mark.parametrize(
         "name, src",
         [
@@ -168,8 +203,8 @@ print(fib(15), pick(3, 4, false), pick(xs[0], 2, false), pick(1, xs[1], true), a
             ("deep_error", "fn f(n: int) -> int { if n == 0 { return 9223372036854775807 + n + 1; } return f(n - 1) + 1; }\nprint(f(6));\n"),
             # (the calls' limit reached in typed code: the same call failing)
             pytest.param("too_deep", "fn f(n: int) -> int { return f(n + 1) + 1; }\nprint(f(0));\n", marks=shallow_python),
-            # (typed code calling generic code (a list: no typed entry for
-            # it here) that fails, and back)
+            # (typed code calling a function taking a list (the list
+            # borrowed) that fails, and back)
             ("through_generic", 'fn g(xs: list[int], i: int) -> int { return xs[i]; }\nfn f(n: int) -> int { if n == 0 { return g([1, 2], 5); } return f(n - 1); }\nprint(f(4));\n'),
             # (a typed function failing after typed calls returned)
             ("after_calls", "fn h(n: int) -> int { return n; }\nfn f(n: int) -> int { let a = h(n) + h(n); return a + 9223372036854775807; }\nprint(f(3));\n"),

@@ -943,6 +943,17 @@ pub const Compiler = struct {
         return k;
     }
 
+    /// Whether a node's declared type's values are lists (Language.types()
+    /// maps it to `list`). Not a kind (kindOfNode): a host function may give
+    /// a Python list, a host value; a typed entry takes lists, their tag
+    /// checked where it's called.
+    pub fn declaredList(self: *Compiler, idx: u32) Error!bool {
+        const mapping = self.lang.types orelse return false;
+        const analysis = self.lang.analysis orelse return false;
+        const cls = try declaredClass(mapping, analysis, idx) orelse return false;
+        return cls == @as(*PyObject, @ptrCast(@alignCast(py.types.typeObject("PyList_Type"))));
+    }
+
     fn kindFrom(mapping: *PyObject, analysis: *PyObject, idx: u32) error{Python}!?Kind {
         const cls = try declaredClass(mapping, analysis, idx) orelse return null;
         return kindOfClass(cls);
@@ -1774,6 +1785,10 @@ const Gen = struct {
     uncommon: u32 = 0,
     /// Variables' values read borrowed (loadVar), by variable
     borrows: std.ArrayListUnmanaged(struct { sym: u32, state: ir.Value, kept: ir.Value }) = .empty,
+    /// A typed entry's parameters holding the caller's list borrowed
+    /// (bindParams): their slots, and their borrows' states (0: still the
+    /// caller's, not released when the function ends)
+    param_borrows: std.ArrayListUnmanaged(struct { slot: ir.Value, state: ir.Value }) = .empty,
     /// A function's typed entry: its parameters are the LLVM function's,
     /// plain values of their declared kinds (Gen.typedParams)
     typed: bool = false,
@@ -2079,10 +2094,23 @@ const Gen = struct {
             _ = self.call("zr_frame_release", &.{fr});
             return;
         }
-        for (self.var_slots.items) |slot| {
+        slots: for (self.var_slots.items) |slot| {
             // (the receiver borrowed: storeReceiver)
             if (slot == self.recv_slot) continue;
             const v = try self.loadSlot(slot, .any);
+            // (a parameter holding the caller's list: released only if a
+            // reference was taken since: bindParams)
+            for (self.param_borrows.items) |pb| if (pb.slot == slot) {
+                const f = &self.f;
+                const release = try f.label("param_release");
+                const done = try f.label("param_released");
+                try f.condBr(f.icmp(jit_c.LLVMIntEQ, f.load(self.c.m.t.i64, pb.state), self.k(0)), done, release);
+                try f.block(release);
+                try self.refcount(true, v.tag, v.bits);
+                try f.br(done);
+                try f.block(done);
+                continue :slots;
+            };
             // (an unset slot holds no reference: decrefs ignore its tag)
             try self.refcount(true, v.tag, v.bits);
         }
@@ -3093,9 +3121,31 @@ const Gen = struct {
             for (self.paramNodes(fnode, spec), shapes, 0..) |p, s, i| {
                 const tag: value.Tag = if (s == .int) .int else shapeTag(s);
                 const d = dyn(self.k(@intCast(@intFromEnum(tag))), self.f.param(@intCast(Compiler.typed_first + i)), s);
-                // (a list: the caller's, borrowed; the variable's own
-                // reference, as the generic entry takes one)
-                if (s == .list) try self.increfDyn(d.dyn);
+                if (s == .list) {
+                    // (a list: the caller's, borrowed. A variable on the
+                    // stack keeps it borrowed, as a value read borrowed is:
+                    // a store to it takes a reference first (storeVar), as
+                    // a frame made for a call does (frameForCall); the
+                    // function's end releases it only then. Else the
+                    // variable's own reference, as the generic entry takes)
+                    const si = self.c.data.symbolIndex(p);
+                    if (si != null and try self.borrowable(si.?)) {
+                        const f = &self.f;
+                        const t = self.c.m.t;
+                        const slot = try self.varSlot(si.?);
+                        f.store(d.dyn.tag, slot);
+                        f.store(d.dyn.bits, f.field(t.val, slot, 1));
+                        const state = try f.alloca(t.i64);
+                        f.entryStore(self.k(0), state);
+                        const kept = try f.alloca(t.val);
+                        f.store(d.dyn.tag, kept);
+                        f.store(d.dyn.bits, f.field(t.val, kept, 1));
+                        try self.borrows.append(self.a(), .{ .sym = si.?, .state = state, .kept = kept });
+                        try self.param_borrows.append(self.a(), .{ .slot = slot, .state = state });
+                        continue;
+                    }
+                    try self.increfDyn(d.dyn);
+                }
                 try self.storeVar(p, d);
             }
             return;
@@ -3109,8 +3159,8 @@ const Gen = struct {
 
     /// The kinds of a function's parameters, when it has a typed entry
     /// (called with them plain values, no argument list): it takes
-    /// parameters only, each declared (Language.types()) an int, a float or
-    /// a bool. Null: it hasn't.
+    /// parameters only, each declared (Language.types()) an int, a float, a
+    /// bool or a list (given the list's pointer, borrowed). Null: it hasn't.
     fn typedParams(self: *Gen, fnode: u32) Error!?[]const Shape {
         const c = self.c;
         if (c.typed_params.get(fnode)) |r| return r;
@@ -3120,7 +3170,11 @@ const Gen = struct {
             if (params.len == 0) break :blk null;
             const shapes = try c.a.alloc(Shape, params.len);
             for (params, shapes) |p, *s| {
-                const kind = try c.kindOfNode(p) orelse break :blk null;
+                const kind = try c.kindOfNode(p) orelse {
+                    if (!try c.declaredList(p)) break :blk null;
+                    s.* = .list;
+                    continue;
+                };
                 switch (kind.shape) {
                     .int, .float, .bool => s.* = kind.shape,
                     else => break :blk null,
@@ -3171,6 +3225,7 @@ const Gen = struct {
                 const tag: u6 = switch (s) {
                     .int => @intFromEnum(value.Tag.int),
                     .float => @intFromEnum(value.Tag.float),
+                    .list => @intFromEnum(value.Tag.list),
                     else => @intFromEnum(value.Tag.bool),
                 };
                 w |= (@as(u64, 1) << tag) << @intCast(16 * i);
@@ -6633,7 +6688,11 @@ const Gen = struct {
         const n = items.len;
         const arr = try self.valueSlots(n);
         const ds = try self.a().alloc(Dyn, n);
-        for (items, 0..) |item, i| ds[i] = try self.materialize(item, inst.node);
+        // (a variable's value borrowed stays so: the call borrows its
+        // arguments (a callee's parameters take references of their own),
+        // and nothing it runs reaches a variable read so (Gen.borrowable);
+        // one written to the arguments' array is owned there: storeSlot)
+        for (items, 0..) |item, i| ds[i] = try self.borrowed(item, inst.node);
         const direct = fd.func != NONE and n == try self.paramCount(fd.func);
         if (!direct) try self.fillArgs(arr, ds);
         var recv_ptr = self.c.m.nullPtr();
