@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Background gradient: the zsuite tile -->
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#161b22"/>
+    </linearGradient>
+
+    <!-- Zig orange: the zsuite Z -->
+    <linearGradient id="zig" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f7a41d"/>
+      <stop offset="100%" stop-color="#f97316"/>
+    </linearGradient>
+
+    <!-- zrun's own accent: electric cyan, for code running -->
+    <linearGradient id="run" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#67e8f9"/>
+      <stop offset="100%" stop-color="#0ea5e9"/>
+    </linearGradient>
+
+    <!-- Motion streaks: fading in from the left -->
+    <linearGradient id="streak" gradientUnits="userSpaceOnUse" x1="40" y1="0" x2="170" y2="0">
+      <stop offset="0%" stop-color="#22d3ee" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#22d3ee" stop-opacity="0.75"/>
+    </linearGradient>
+
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <filter id="outerGlow">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feComposite in="blur" in2="SourceGraphic" operator="out" result="glowOut"/>
+      <feMerge>
+        <feMergeNode in="glowOut"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="512" height="512" rx="64" fill="url(#bg)"/>
+
+  <!-- A speed gauge around the Z: open at the bottom, its ticks rising -->
+  <g filter="url(#glow)">
+    <path d="M 133.4 361.8 A 160 160 0 1 1 378.6 361.8"
+          fill="none" stroke="url(#run)" stroke-width="4" stroke-opacity="0.3" stroke-linecap="round"/>
+    <path d="M 394.6 179 A 160 160 0 0 1 378.6 361.8"
+          fill="none" stroke="url(#run)" stroke-width="6" stroke-opacity="0.9" stroke-linecap="round"/>
+    <g stroke="url(#run)" stroke-linecap="round">
+      <line x1="96" y1="259" x2="108" y2="259" stroke-width="3" stroke-opacity="0.3"/>
+      <line x1="142.9" y1="145.9" x2="151.4" y2="154.4" stroke-width="3" stroke-opacity="0.4"/>
+      <line x1="256" y1="99" x2="256" y2="111" stroke-width="3" stroke-opacity="0.55"/>
+      <line x1="369.1" y1="145.9" x2="360.6" y2="154.4" stroke-width="3" stroke-opacity="0.75"/>
+      <line x1="416" y1="259" x2="404" y2="259" stroke-width="4" stroke-opacity="0.95"/>
+    </g>
+  </g>
+
+  <!-- A program's tree, small, top left: what goes in -->
+  <g filter="url(#glow)" opacity="0.7">
+    <g stroke="url(#run)" stroke-width="2.5" stroke-opacity="0.6">
+      <line x1="84" y1="70" x2="62" y2="102"/>
+      <line x1="84" y1="70" x2="106" y2="102"/>
+      <line x1="106" y1="102" x2="94" y2="132"/>
+      <line x1="106" y1="102" x2="122" y2="132"/>
+    </g>
+    <g fill="url(#run)">
+      <circle cx="84" cy="70" r="7"/>
+      <circle cx="62" cy="102" r="5.5"/>
+      <circle cx="106" cy="102" r="5.5"/>
+      <circle cx="94" cy="132" r="4.5"/>
+      <circle cx="122" cy="132" r="4.5"/>
+    </g>
+  </g>
+
+  <!-- Motion streaks behind the Z: running -->
+  <g stroke="url(#streak)" stroke-linecap="round" filter="url(#glow)">
+    <line x1="56" y1="214" x2="150" y2="214" stroke-width="6"/>
+    <line x1="88" y1="252" x2="168" y2="252" stroke-width="8"/>
+    <line x1="40" y1="290" x2="142" y2="290" stroke-width="6"/>
+    <line x1="104" y1="328" x2="160" y2="328" stroke-width="4"/>
+  </g>
+
+  <!-- Main "Z" letterform: the zsuite mark, leaning forward -->
+  <g filter="url(#outerGlow)" transform="translate(256 259) skewX(-12) translate(-256 -259)">
+    <path d="
+      M 160 168
+      L 372 168
+      L 372 197
+      L 230 321
+      L 372 321
+      L 372 350
+      L 160 350
+      L 160 321
+      L 302 197
+      L 160 197
+      Z
+    " fill="url(#zig)"/>
+  </g>
+
+  <!-- The run mark: a play triangle beside the Z -->
+  <g filter="url(#glow)">
+    <path d="M 428 300 L 470 324 L 428 348 Z"
+          fill="url(#run)" fill-opacity="0.18"
+          stroke="url(#run)" stroke-width="5" stroke-linejoin="round"/>
+  </g>
+
+  <!-- Machine code coming out: instruction lanes under the Z -->
+  <g fill="url(#run)" filter="url(#glow)">
+    <rect x="128" y="372" width="48" height="6" rx="3" opacity="0.85"/>
+    <rect x="184" y="372" width="26" height="6" rx="3" opacity="0.5"/>
+    <rect x="218" y="372" width="70" height="6" rx="3" opacity="0.75"/>
+    <rect x="296" y="372" width="40" height="6" rx="3" opacity="0.55"/>
+    <rect x="344" y="372" width="48" height="6" rx="3" opacity="0.35"/>
+    <rect x="128" y="388" width="30" height="6" rx="3" opacity="0.45"/>
+    <rect x="166" y="388" width="84" height="6" rx="3" opacity="0.8"/>
+    <rect x="258" y="388" width="36" height="6" rx="3" opacity="0.4"/>
+    <rect x="302" y="388" width="90" height="6" rx="3" opacity="0.65"/>
+  </g>
+
+  <!-- The package's name, as the others carry theirs -->
+  <text x="256" y="474" text-anchor="middle"
+        font-family="'SF Mono', 'Fira Code', 'JetBrains Mono', monospace"
+        font-size="58" font-weight="700" letter-spacing="8"
+        fill="url(#run)">run</text>
+
+  <!-- What it does, in its API's words -->
+  <text x="256" y="58" text-anchor="middle"
+        font-family="'SF Mono', 'Fira Code', monospace"
+        font-size="11" fill="#ffffff" opacity="0.14"
+        letter-spacing="1">program.run(mode="compiled")</text>
+</svg>

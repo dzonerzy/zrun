@@ -704,6 +704,16 @@ const Language = struct {
     pub const function__doc__: [*:0]const u8 = "function(kind, params='params', body='body', name='name', hoist=True): nodes of kind define functions, with those labels for their parameters, body and name.";
     pub const host__doc__: [*:0]const u8 = "@lang.host, @lang.host('name') or lang.host('name', fn): a Python function the program calls through the builtin of that name.";
     pub const load__doc__: [*:0]const u8 = "load(source, path=None): parse and check a program; a Program. Raises zrun.LoadError listing its errors.";
+    pub const types__doc__: [*:0]const u8 = "types(mapping): what values of the language's types (zrules' types(): 'int', 'list[int]', a struct's name) are, as Python types (int, float, bool, str, type(None), list, tuple, dict, zrun.Function, a record class): a dict by type name (or a generic's name: 'list' for 'list[int]'), or a function of the type's text. Compiled code then knows a node's kind from its type: checked once where it's made, unboxed after.";
+    pub const types__params__ = "mapping";
+    pub const native_host__doc__: [*:0]const u8 = "native_host(name, capsule): a native library's function (a 'zrun.native.v1' capsule) as the host function `name`, called by compiled code directly, without Python. Returns the zrun.NativeHost made for it.";
+    pub const native_host__params__ = "name, capsule";
+    pub const python_semantics__doc__: [*:0]const u8 = "python_semantics(): the semantics compiled programs run as Python, {name: why}: those marked native=False and those the compiler couldn't compile (where, and what): what to rewrite for speed.";
+    pub const compile__doc__: [*:0]const u8 = "compile(source, output, path=None): load the program, compile it and save it as a compiled module at `output` (Program.save()); returns the Program.";
+    pub const load_compiled__doc__: [*:0]const u8 = "load_compiled(path): a program saved as a compiled module, loaded without compiling it again. Raises ValueError if it was made for another definition of the language, another zrun or another CPU.";
+    pub const load_compiled__params__ = "path";
+    pub const ir__doc__: [*:0]const u8 = "ir(fn): a semantic (or any function) as the compiler's front reads it, as text (for tests, and to see what gets compiled).";
+    pub const ir__params__ = "fn";
     pub const session__doc__: [*:0]const u8 = "session(): a Session, to run programs one after another, each seeing the variables and functions the ones before it defined (a REPL's).";
     pub const repl__doc__: [*:0]const u8 = "repl(prompt='> ', more='... ', show=None): an interactive session on input(): more lines while an entry isn't finished (an empty line ends it anyway); the value of an expression shown with show(value) (default: printed, unless None); errors printed and the session going on. Ctrl-D ends it, Ctrl-C drops or stops the entry.";
 };
@@ -1881,7 +1891,18 @@ const Program = struct {
     }
 
     pub const __doc__: [*:0]const u8 = "A program loaded by Language.load(): run() runs it, call(name, *args) calls one of its functions. Also: source, tree, analysis, diagnostics (its warnings), root.";
-    pub const run__doc__: [*:0]const u8 = "Run the program from its start. Raises zrun.Error on a runtime error.";
+    pub const run__doc__: [*:0]const u8 = "run(mode='python', report=False): run the program from its start. mode: 'python' (semantics run as Python: the reference), 'compiled' (native code; compiled fast first if the cache hasn't the optimized code, which is made in the background: zrun.configure(tiers=)), 'auto' (as Python until the optimized code is at hand, compiled from then). Raises zrun.Error on a runtime error, the same in every mode. report=True: count where compiled code goes through Python (report()).";
+    pub const call__doc__: [*:0]const u8 = "call(name, *args, mode=None, context=None): call a function the program defines at its top level (its top level run first, the first time): an engine's entry point, called many times. Compiled calls release the GIL. mode: as run()'s (default: the one it last ran in, else 'compiled'); context: what rt.context is.";
+    pub const map__doc__: [*:0]const u8 = "map(name, items, threads=None, context=None): call the function `name` with each item (a tuple: its arguments) on native threads at once (default: one per CPU), without the GIL or Python between items: the results, in order. The first failing item's error is raised, as one thread calling them in order would. The calls share the program's variables: they mustn't change them.";
+    pub const save__doc__: [*:0]const u8 = "save(path): the program as a compiled module: its source and the code compiled for it so far (save after running it: what was compiled as it ran goes in too). Language.load_compiled(path) loads it.";
+    pub const save__params__ = "path";
+    pub const report__doc__: [*:0]const u8 = "report(): what to look at to make the compiled program faster: python_crossings (where compiled code went through Python, in the last run with report=True), module_state, cache (modules loaded / compiled), code ('fast', 'optimized' or None), optimizing, gil_taken, speculated (typed entries made for functions' argument kinds).";
+    pub const compiled_ir__doc__: [*:0]const u8 = "compiled_ir(): the LLVM IR the program compiles to (before LLVM optimizes it), as text.";
+    pub const source__doc__: [*:0]const u8 = "The program's source.";
+    pub const tree__doc__: [*:0]const u8 = "The zgram Tree.";
+    pub const analysis__doc__: [*:0]const u8 = "The zrules Analysis (None without rules).";
+    pub const diagnostics__doc__: [*:0]const u8 = "The warnings found loading it.";
+    pub const root__doc__: [*:0]const u8 = "The root node.";
 };
 
 var name_program: ?*PyObject = null;
@@ -3253,6 +3274,24 @@ const Runtime = struct {
     pub const text__params__ = "node";
     pub const span__doc__: [*:0]const u8 = "A node's (start, end) byte offsets.";
     pub const span__params__ = "node";
+    pub const Return__doc__: [*:0]const u8 = "zrun.Return: raise rt.Return(value) to return from the function being run.";
+    pub const Break__doc__: [*:0]const u8 = "zrun.Break: raise rt.Break() to leave the loop rt.loop() is running.";
+    pub const Continue__doc__: [*:0]const u8 = "zrun.Continue: raise rt.Continue() to go on with the loop's next iteration.";
+    pub const Throw__doc__: [*:0]const u8 = "zrun.Throw: raise rt.Throw(value, message=None) for an error of the language carrying a value of it, caught by semantics (except rt.Throw as e: e.value).";
+    pub const receiver__doc__: [*:0]const u8 = "What the method being run was called on (rt.call(f, args, receiver=x)), through the frames functions were made in; None outside a method.";
+    pub const varargs__doc__: [*:0]const u8 = "The arguments the function being run got beyond its parameters (a function kind with extra='keep'), a tuple; () otherwise.";
+    pub const context__doc__: [*:0]const u8 = "What the host passed to the run or call (context=), or None.";
+    pub const path__doc__: [*:0]const u8 = "The name the program was loaded under (Language.load(source, path)), or None.";
+    pub const fresh__doc__: [*:0]const u8 = "From here, the variables of the block scope `node` (being run) are new ones, closures made so far keeping theirs: a loop's variable new each time round (Lua's for, JavaScript's for (let ...)).";
+    pub const fresh__params__ = "node";
+    pub const scope__doc__: [*:0]const u8 = "The scope node the name `node` refers to is defined in (a function, a struct...), or None for builtins and the global scope.";
+    pub const scope__params__ = "node";
+    pub const symbol__doc__: [*:0]const u8 = "zrules' Symbol for the name `node` defines or uses, or None.";
+    pub const symbol__params__ = "node";
+    pub const type_of__doc__: [*:0]const u8 = "The type zrules' types() rule gave a node, as text ('int', 'list[float]', 'Point?'), or None.";
+    pub const type_of__params__ = "node";
+    pub const node_at__doc__: [*:0]const u8 = "The node at an index of the tree (symbols refer to nodes by index).";
+    pub const node_at__params__ = "index";
     pub const wrapping_add__doc__: [*:0]const u8 = "a + b in 64 bits, wrapping around (signed).";
     pub const wrapping_add__params__ = "a, b";
     pub const wrapping_sub__doc__: [*:0]const u8 = "a - b in 64 bits, wrapping around (signed).";
