@@ -5,7 +5,7 @@ import builtins
 
 import pytest
 import zrun
-from conftest import tiny
+from conftest import shallow_python, tiny
 
 MODES = ["python", "compiled"]
 
@@ -103,7 +103,7 @@ def test_errors(mode):
 DEEP = "fn down(n) { if n == 0 { return 0; } return 1 + down(n - 1); }\n"
 
 
-@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("mode", [pytest.param("python", marks=shallow_python), "compiled"])
 def test_deep_calls(mode):
     program = lang.load(DEEP, "deep")
     assert program.call("down", 900, mode=mode) == 900

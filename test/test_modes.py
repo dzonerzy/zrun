@@ -6,7 +6,7 @@ import os
 
 import pytest
 import zrun
-from conftest import HERE, tiny, typed
+from conftest import HERE, shallow_python, tiny, typed
 
 MODES = ["python", "compiled"]
 
@@ -137,7 +137,12 @@ def test_typed(name, capsys):
     assert err is None and out
 
 
-@pytest.mark.parametrize("name", sorted(TYPED_ERRORS))
+def _cases(table, deep):
+    """The names of a table's programs, those going deep marked."""
+    return [pytest.param(n, marks=shallow_python) if n in deep else n for n in sorted(table)]
+
+
+@pytest.mark.parametrize("name", _cases(TYPED_ERRORS, {"deep"}))
 def test_typed_errors(name, capsys):
     out, err = same_in_every_mode(typed.lang, TYPED_ERRORS[name], capsys)
     assert err is not None
@@ -149,7 +154,7 @@ def test_tiny(name, capsys):
     assert err is None and out
 
 
-@pytest.mark.parametrize("name", sorted(TINY_ERRORS))
+@pytest.mark.parametrize("name", _cases(TINY_ERRORS, {"too_deep"}))
 def test_tiny_errors(name, capsys):
     out, err = same_in_every_mode(tiny.lang, TINY_ERRORS[name], capsys)
     assert err is not None

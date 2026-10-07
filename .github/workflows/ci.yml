@@ -51,6 +51,14 @@ jobs:
                   unzip -o -q dist/*.whl zrun.so -d /tmp/whl
                   nm -D /tmp/whl/zrun.so | grep -q " U PyType_FromSpec" || { echo "not an abi3 build"; exit 1; }
 
+            # (an address of Python's data made a constant: the import slot's
+            # on Windows, see the script)
+            - name: Check the DLL has no constants of import slots
+              if: matrix.platform == 'Windows'
+              run: |
+                  unzip -o -q dist/*.whl zrun.pyd -d /tmp/whl
+                  python .github/check_imports.py /tmp/whl/zrun.pyd
+
             - uses: actions/upload-artifact@v4
               with:
                   name: wheel-${{ matrix.platform }}

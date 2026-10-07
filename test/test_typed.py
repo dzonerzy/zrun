@@ -5,7 +5,7 @@ import os
 
 import pytest
 import zrun
-from conftest import HERE, typed
+from conftest import HERE, shallow_python, typed
 
 
 def run(source, capsys):
@@ -167,7 +167,7 @@ print(fib(15), pick(3, 4, false), pick(xs[0], 2, false), pick(1, xs[1], true), a
             # (an error deep in typed recursion: its stack, each call's)
             ("deep_error", "fn f(n: int) -> int { if n == 0 { return 9223372036854775807 + n + 1; } return f(n - 1) + 1; }\nprint(f(6));\n"),
             # (the calls' limit reached in typed code: the same call failing)
-            ("too_deep", "fn f(n: int) -> int { return f(n + 1) + 1; }\nprint(f(0));\n"),
+            pytest.param("too_deep", "fn f(n: int) -> int { return f(n + 1) + 1; }\nprint(f(0));\n", marks=shallow_python),
             # (typed code calling generic code (a list: no typed entry for
             # it here) that fails, and back)
             ("through_generic", 'fn g(xs: list[int], i: int) -> int { return xs[i]; }\nfn f(n: int) -> int { if n == 0 { return g([1, 2], 5); } return f(n - 1); }\nprint(f(4));\n'),

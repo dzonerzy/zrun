@@ -301,6 +301,7 @@ Key implementation details:
 - Untyped code (Lua here) is 2.6-6x slower than a hand-written C interpreter; a program's top level isn't specialized as functions are.
 - What compiles is a subset of Python (see the guide); the rest runs as Python, correctly but slower.
 - The compiled-code cache has no size limit yet.
+- On Windows with Python 3.12 or 3.13, `mode="python"` stops at a few hundred nested calls of the language's functions with "call stack too deep", before `max_depth`. Those Pythons allow 3000 calls nested through C on Windows (10000 elsewhere), and a call run as Python is several. Compiled code and other Pythons go to `max_depth`.
 
 ## Project Structure
 

@@ -16,6 +16,16 @@ pub fn initVersion() error{Python}!void {
     minor = @intCast((try toInt(m)) orelse 10);
 }
 
+/// None, a new reference. Not inline: Python's None is data of its DLL,
+/// and on Windows an address of it known while compiling can be made a
+/// constant of the code (a switch's table), which the linker makes the
+/// address of its import slot instead (ci.yml checks the DLL for those).
+pub noinline fn newNone() *PyObject {
+    const o = py.Py_None();
+    py.Py_IncRef(o);
+    return o;
+}
+
 /// An object's type (Py_TYPE).
 pub inline fn typeOf(o: *PyObject) *py.PyTypeObject {
     return py.Py_TYPE(o).?;

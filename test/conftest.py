@@ -20,6 +20,15 @@ def _load_tiny():
 
 tiny = _load_tiny()
 
+# Python 3.12 and 3.13 on Windows allow 3000 calls nested through C (10000
+# elsewhere), and a call of a language run as Python is several: the
+# reference mode stops at a few hundred calls deep there, before zrun's
+# limit (compiled code doesn't)
+shallow_python = pytest.mark.skipif(
+    sys.platform == "win32" and sys.version_info[:2] in ((3, 12), (3, 13)),
+    reason="Python 3.12/3.13 on Windows: nested calls through C are limited to 3000",
+)
+
 # The typed language (examples/typed): typed.py imports typedlang.py from its folder
 sys.path.insert(0, os.path.join(HERE, "..", "examples", "typed"))
 import typed  # noqa: E402

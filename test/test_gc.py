@@ -25,6 +25,27 @@ def run(capsys):
 
 
 def _rss_kb():
+    if sys.platform == "win32":
+        # (the working set: GetProcessMemoryInfo's)
+        import ctypes
+        from ctypes import wintypes
+
+        class Counters(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+                (n, ctypes.c_size_t)
+                for n in ("PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                          "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage")
+            ]
+
+        c = Counters()
+        c.cb = ctypes.sizeof(c)
+        get = ctypes.WinDLL("psapi").GetProcessMemoryInfo
+        get.argtypes = [wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD]
+        current = ctypes.WinDLL("kernel32").GetCurrentProcess
+        current.restype = wintypes.HANDLE
+        if not get(current(), ctypes.byref(c), c.cb):
+            raise OSError("GetProcessMemoryInfo failed")
+        return c.WorkingSetSize // 1024
     with open("/proc/self/statm") as f:
         return int(f.read().split()[1]) * 4
 

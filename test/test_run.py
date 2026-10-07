@@ -5,7 +5,7 @@ import gc
 import pytest
 import zgram
 import zrun
-from conftest import tiny
+from conftest import shallow_python, tiny
 
 FIB = """
 fn fib(n) {
@@ -117,6 +117,7 @@ class TestErrors:
         with pytest.raises(zrun.Error, match="call stack too deep"):
             tiny.lang.load("fn f(n) { return f(n + 1); }\nf(0);\n").run()
 
+    @shallow_python
     def test_deep_but_allowed(self, run):
         src = "fn down(n) { if n == 0 { return 0; } return down(n - 1) + 1; }\nprint(down(900));\n"
         assert run(src) == "900\n"
