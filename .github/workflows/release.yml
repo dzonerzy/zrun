@@ -1,0 +1,114 @@
+name: Release
+
+# Push a tag like v0.1.0 (matching the version in pyproject.toml) to build,
+# test, publish to PyPI (as zrun-py) and create a GitHub release.
+on:
+    push:
+        tags: ["v*"]
+
+jobs:
+    check-version:
+        name: Check tag matches version
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - name: Compare tag with pyproject.toml and build.zig.zon
+              run: |
+                  TAG="${GITHUB_REF_NAME#v}"
+                  PYPROJECT=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+                  ZON=$(sed -n 's/^ *\.version = "\(.*\)",/\1/p' build.zig.zon)
+                  echo "tag=$TAG pyproject=$PYPROJECT build.zig.zon=$ZON"
+                  [ "$TAG" = "$PYPROJECT" ] && [ "$TAG" = "$ZON" ]
+
+    # The tagged commit was pushed to main too, and CI built and tested it
+    # there: wait for that run and release its wheels instead of building and
+    # testing them all over again. Its failure fails the release.
+    main-ci:
+        name: Wait for CI on the tagged commit
+        needs: check-version
+        runs-on: ubuntu-latest
+        permissions:
+            actions: read
+        outputs:
+            run-id: ${{ steps.find.outputs.run-id }}
+        steps:
+            - id: find
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  GH_REPO: ${{ github.repository }}
+              run: |
+                  # (the run appears a few seconds after the push)
+                  for i in $(seq 24); do
+                      ID=$(gh run list --workflow ci.yml --event push --commit "$GITHUB_SHA" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+                      [ -n "$ID" ] && break
+                      sleep 5
+                  done
+                  if [ -z "$ID" ]; then
+                      echo "no CI run on main for $GITHUB_SHA: building here"
+                      exit 0
+                  fi
+                  echo "CI run $ID"
+                  gh run watch "$ID" --exit-status --interval 15 > /dev/null
+                  echo "run-id=$ID" >> "$GITHUB_OUTPUT"
+
+    # Only for a tag on a commit CI didn't run on
+    ci:
+        needs: main-ci
+        if: needs.main-ci.outputs.run-id == ''
+        uses: ./.github/workflows/ci.yml
+
+    pypi:
+        name: Publish to PyPI
+        needs: [main-ci, ci]
+        if: ${{ !cancelled() && needs.main-ci.result == 'success' && (needs.ci.result == 'success' || needs.ci.result == 'skipped') }}
+        runs-on: ubuntu-latest
+        environment: pypi
+        permissions:
+            actions: read
+            # Trusted publishing, used when PYPI_API_TOKEN isn't set
+            id-token: write
+        steps:
+            - uses: actions/download-artifact@v4
+              with:
+                  pattern: wheel-*
+                  path: dist
+                  merge-multiple: true
+                  run-id: ${{ needs.main-ci.outputs.run-id || github.run_id }}
+                  github-token: ${{ github.token }}
+
+            - name: Publish
+              uses: pypa/gh-action-pypi-publish@release/v1
+              with:
+                  password: ${{ secrets.PYPI_API_TOKEN }}
+                  packages-dir: dist/
+
+    github-release:
+        name: GitHub release
+        needs: [main-ci, pypi]
+        if: ${{ !cancelled() && needs.pypi.result == 'success' }}
+        runs-on: ubuntu-latest
+        permissions:
+            actions: read
+            contents: write
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/download-artifact@v4
+              with:
+                  pattern: wheel-*
+                  path: dist
+                  merge-multiple: true
+                  run-id: ${{ needs.main-ci.outputs.run-id || github.run_id }}
+                  github-token: ${{ github.token }}
+
+            - name: Create release with this version's changelog
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  VERSION="${GITHUB_REF_NAME#v}"
+                  awk -v v="$VERSION" '
+                      $0 ~ "^## \\[" v "\\]" { found = 1; next }
+                      found && /^## \[/ { exit }
+                      found { print }
+                  ' CHANGELOG.md > notes.md
+                  gh release create "$GITHUB_REF_NAME" dist/*.whl --title "zrun $VERSION" --notes-file notes.md

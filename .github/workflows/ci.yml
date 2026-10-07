@@ -1,0 +1,108 @@
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+    workflow_call:
+    workflow_dispatch:
+
+jobs:
+    # One portable abi3 wheel per platform (cp310-abi3: CPython 3.10+). Both
+    # are built on Linux: the Windows wheel is cross-compiled. zrun links no
+    # LLVM of its own (it uses zgram's, through its capsule), so the build
+    # needs only Zig and the vendored headers. The tests below run each wheel
+    # on its own OS.
+    build:
+        name: Build wheel (${{ matrix.platform }})
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - platform: Linux
+                      target: ""
+                    - platform: Windows
+                      target: x86_64-windows
+        steps:
+            - uses: actions/checkout@v4
+
+            # Also caches Zig's build cache, one per target
+            - name: Setup Zig
+              uses: mlugg/setup-zig@v2
+              with:
+                  version: 0.16.0
+                  cache-key: ${{ matrix.platform }}
+
+            - name: Setup Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.10"
+
+            - name: Install PyOZ
+              run: python -m pip install "pyoz>=0.13.9"
+
+            - name: Build wheel
+              run: pyoz build --release ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+
+            - name: Check the extension really uses the Stable ABI
+              if: matrix.platform == 'Linux'
+              run: |
+                  unzip -o -q dist/*.whl zrun.so -d /tmp/whl
+                  nm -D /tmp/whl/zrun.so | grep -q " U PyType_FromSpec" || { echo "not an abi3 build"; exit 1; }
+
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: wheel-${{ matrix.platform }}
+                  path: dist/*.whl
+                  if-no-files-found: error
+
+    test:
+        name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+        needs: build
+        runs-on: ${{ matrix.os }}
+        timeout-minutes: 30
+        strategy:
+            fail-fast: false
+            matrix:
+                os: [ubuntu-latest, windows-latest]
+                python-version: ["3.10", "3.12", "3.14"]
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Setup Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: ${{ matrix.python-version }}
+
+            # The scan example's native library is built with Zig (its test
+            # is skipped without)
+            - name: Setup Zig
+              uses: mlugg/setup-zig@v2
+              with:
+                  version: 0.16.0
+
+            - uses: actions/download-artifact@v4
+              with:
+                  name: wheel-${{ runner.os }}
+                  path: dist
+
+            # A zgram or zrules release takes a few minutes to reach every PyPI
+            # mirror pip may ask: retry rather than fail on one that hasn't got it
+            - name: Install zgram and zrules
+              shell: bash
+              run: |
+                  for i in $(seq 10); do
+                      python -m pip install "zgram-py>=0.4.0" "zrules-py>=0.1.6" && exit 0
+                      echo "retrying in 30 s"
+                      sleep 30
+                  done
+                  exit 1
+
+            - name: Install wheel
+              shell: bash
+              run: python -m pip install --no-deps dist/*.whl && python -m pip install pytest pytest-timeout
+
+            - name: Run tests
+              timeout-minutes: 20
+              run: python -m pytest test -v -o faulthandler_timeout=300 --timeout=600
