@@ -1,5 +1,5 @@
 [build-system]
-requires = ["pyoz>=0.13.9"]
+requires = ["pyoz>=0.13.10"]
 build-backend = "pyoz.backend"
 
 [project]
@@ -13,7 +13,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Daniele Linguaglossa" }]
-dependencies = ["zgram-py>=0.4.0", "zrules-py>=0.1.6"]
+dependencies = ["zgram-py>=0.4.2", "zrules-py>=0.1.6"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

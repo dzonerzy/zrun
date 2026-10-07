@@ -7772,8 +7772,10 @@ const Gen = struct {
     /// A Python object for a known scalar (new reference).
     fn pyOf(self: *Gen, v: SVal) Error!*PyObject {
         return switch (v) {
-            // (ph.newNone: on Windows not a constant of the switch's table)
-            .none => ph.newNone(),
+            .none => blk: {
+                py.Py_IncRef(py.Py_None());
+                break :blk py.Py_None();
+            },
             .bool => |b| blk: {
                 const o = if (b) py.Py_True() else py.Py_False();
                 py.Py_IncRef(o);

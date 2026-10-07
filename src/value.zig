@@ -737,9 +737,9 @@ const HostKind = enum { identity, int, float, str, own };
 fn hostKind(o: *PyObject) HostKind {
     gil.ensure();
     const t = ph.typeOf(o);
-    if (py.c.PyType_IsSubtype(t, exact.int) != 0) return .int;
-    if (py.c.PyType_IsSubtype(t, exact.float) != 0) return .float;
-    if (py.c.PyType_IsSubtype(t, exact.str) != 0) return .str;
+    if (py.c.PyType_IsSubtype(t, exact.int()) != 0) return .int;
+    if (py.c.PyType_IsSubtype(t, exact.float()) != 0) return .float;
+    if (py.c.PyType_IsSubtype(t, exact.str()) != 0) return .str;
     const object = py.types.typeObject("PyBaseObject_Type");
     if (py.c.PyType_GetSlot(t, py.c.Py_tp_hash) == py.c.PyType_GetSlot(object, py.c.Py_tp_hash) and
         py.c.PyType_GetSlot(t, py.c.Py_tp_richcompare) == py.c.PyType_GetSlot(object, py.c.Py_tp_richcompare)) return .identity;
@@ -1223,14 +1223,27 @@ pub fn fromBorrowed(o: *PyObject) ?Value {
     return convert(o, false);
 }
 
-/// The types converted (exactly these)
+/// The types converted (exactly these). Read when used: Python's data, on
+/// Windows imported, its address known at run time only.
 const exact = struct {
-    const int = py.types.typeObject("PyLong_Type");
-    const float = py.types.typeObject("PyFloat_Type");
-    const str = py.types.typeObject("PyUnicode_Type");
-    const tuple = py.types.typeObject("PyTuple_Type");
-    const list = py.types.typeObject("PyList_Type");
-    const dict = py.types.typeObject("PyDict_Type");
+    inline fn int() *py.PyTypeObject {
+        return py.types.typeObject("PyLong_Type");
+    }
+    inline fn float() *py.PyTypeObject {
+        return py.types.typeObject("PyFloat_Type");
+    }
+    inline fn str() *py.PyTypeObject {
+        return py.types.typeObject("PyUnicode_Type");
+    }
+    inline fn tuple() *py.PyTypeObject {
+        return py.types.typeObject("PyTuple_Type");
+    }
+    inline fn list() *py.PyTypeObject {
+        return py.types.typeObject("PyList_Type");
+    }
+    inline fn dict() *py.PyTypeObject {
+        return py.types.typeObject("PyDict_Type");
+    }
 };
 
 /// (`unique`: the reference given is the only one, the containers it's
@@ -1255,7 +1268,7 @@ fn convert(o: *PyObject, unique: bool) ?Value {
     const ty = ph.typeOf(o);
     // (an int: plain; zrun.I64, what rt gives Python: the program's)
     const is_i64 = @as(*PyObject, @ptrCast(@alignCast(ty))) == types.I64;
-    if (ty == exact.int or is_i64) big: {
+    if (ty == exact.int() or is_i64) big: {
         var overflow: c_int = 0;
         const n = py.c.PyLong_AsLongLongAndOverflow(o, &overflow);
         // (beyond 64 bits: a Big within 128; beyond, Python's own, a host
@@ -1270,8 +1283,8 @@ fn convert(o: *PyObject, unique: bool) ?Value {
         }
         return if (is_i64) Value.int(n) else Value.pint(n);
     }
-    if (ty == exact.float) return Value.float(py.c.PyFloat_AsDouble(o));
-    if (ty == exact.str) str: {
+    if (ty == exact.float()) return Value.float(py.c.PyFloat_AsDouble(o));
+    if (ty == exact.str()) str: {
         const s = ph.utf8(o, "str") orelse {
             // (lone surrogates: not UTF-8, kept as the object)
             py.c.PyErr_Clear();
@@ -1283,7 +1296,7 @@ fn convert(o: *PyObject, unique: bool) ?Value {
         };
         return Value.obj(.str, &str.head);
     }
-    if (ty == exact.tuple) {
+    if (ty == exact.tuple()) {
         const n: usize = @intCast(py.c.PyTuple_Size(o));
         const t = newTuple(n) orelse {
             _ = py.c.PyErr_NoMemory();
@@ -1301,7 +1314,7 @@ fn convert(o: *PyObject, unique: bool) ?Value {
         }
         return Value.obj(.tuple, &t.head);
     }
-    if (unique and ty == exact.list) {
+    if (unique and ty == exact.list()) {
         const n: usize = @intCast(py.c.PyList_Size(o));
         const l = newList(n) orelse {
             _ = py.c.PyErr_NoMemory();
@@ -1317,7 +1330,7 @@ fn convert(o: *PyObject, unique: bool) ?Value {
         }
         return Value.obj(.list, &l.head);
     }
-    if (unique and ty == exact.dict) {
+    if (unique and ty == exact.dict()) {
         const d = newDict() orelse {
             _ = py.c.PyErr_NoMemory();
             return null;
