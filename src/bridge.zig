@@ -847,7 +847,11 @@ fn rtStore(self: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     const nv = (value.fromPython(v.?) orelse return null).checked();
     const old = slot.*;
     slot.* = nv;
-    if (old.tag != helpers.UNSET) value.decref(old);
+    // (a top-level variable's function, read without a reference: kept
+    // till the code's done)
+    const d = linkOf(r.ctx.?).data;
+    const top = if (d.symbolIndex(idx)) |si| d.homeOf(si) == program_mod.NONE else false;
+    if (top) r.ctx.?.bury(old) else if (old.tag != helpers.UNSET) value.decref(old);
     return none();
 }
 

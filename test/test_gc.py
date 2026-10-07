@@ -197,3 +197,46 @@ def test_a_language_in_a_cycle_is_collected():
     gone = make()
     gc.collect()
     assert gone() is None
+
+
+# (functions of the top level called without a reference of their own:
+# their variables stored to while they run, the old ones kept till the code's
+# done (Ctx.bury), then let go of)
+REBOUND = {
+    # (rebound by its own call, called again after)
+    "own_call": "fn g(n) { return n * 2; }\nfn f(n) { if n == 3 { f = g; } if n > 0 { return f(n - 1) + 1; } return 0; }\nprint(f(5), f(5));\n",
+    # (kept elsewhere before it's rebound: the copy its own)
+    "escaped": "fn g(n) { return n + 100; }\nfn f(n) { return n; }\nfn swap() { let h = f; f = g; return h(1) + f(1); }\nprint(swap(), f(2));\n",
+    # (rebound again and again while called)
+    "many": "fn a(n) { return n; }\nfn b(n) { return n + 1; }\nfn f(n) { let i = 0; let t = 0; while i < n { if i % 2 == 0 { a = b; } else { a = f; } t = t + i; i = i + 1; } return t; }\nfn g(n) { let t = 0; let i = 0; while i < n { t = t + a(1); i = i + 1; } return t + f(n); }\nprint(g(50));\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(REBOUND))
+def test_top_functions_rebound_while_called(name, capsys):
+    from conftest import tiny
+    from test_modes import same_in_every_mode
+    import gc
+
+    out, err = same_in_every_mode(tiny.lang, REBOUND[name], capsys)
+    assert err is None and out
+    # (nothing kept: the buried let go of as each run ends; its calls too)
+    p = tiny.lang.load(REBOUND[name], "prog")
+    counts = []
+    for _ in range(4):
+        p.run(mode="compiled")
+        gc.collect()
+        counts.append(zrun._blocks())
+    capsys.readouterr()
+    assert counts[3] == counts[2] == counts[1]
+    q = tiny.lang.load(REBOUND["own_call"], "prog")
+    q.run(mode="compiled")
+    before = None
+    for _ in range(4):
+        # (its run left f rebound to g: g's result)
+        assert q.call("f", 5) == 10
+        gc.collect()
+        now = zrun._blocks()
+        assert before is None or now == before
+        before = now
+    capsys.readouterr()

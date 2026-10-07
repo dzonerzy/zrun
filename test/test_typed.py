@@ -161,6 +161,41 @@ print(fib(15), pick(3, 4, false), pick(xs[0], 2, false), pick(1, xs[1], true), a
         # through the generic entries for arguments of their kinds)
         assert ir.count("define { i64, i64 } @zr_ir_t") == 3
 
+    @pytest.mark.parametrize(
+        "name, src",
+        [
+            # (an error deep in typed recursion: its stack, each call's)
+            ("deep_error", "fn f(n: int) -> int { if n == 0 { return 9223372036854775807 + n + 1; } return f(n - 1) + 1; }\nprint(f(6));\n"),
+            # (the calls' limit reached in typed code: the same call failing)
+            ("too_deep", "fn f(n: int) -> int { return f(n + 1) + 1; }\nprint(f(0));\n"),
+            # (typed code calling generic code (a list: no typed entry for
+            # it here) that fails, and back)
+            ("through_generic", 'fn g(xs: list[int], i: int) -> int { return xs[i]; }\nfn f(n: int) -> int { if n == 0 { return g([1, 2], 5); } return f(n - 1); }\nprint(f(4));\n'),
+            # (a typed function failing after typed calls returned)
+            ("after_calls", "fn h(n: int) -> int { return n; }\nfn f(n: int) -> int { let a = h(n) + h(n); return a + 9223372036854775807; }\nprint(f(3));\n"),
+        ],
+    )
+    def test_typed_errors_have_their_stacks(self, name, src, capsys):
+        # (typed entries keep the calls' depth in a register: the errors'
+        # stacks and the depth limit as the reference mode has them)
+        from test_modes import same_in_every_mode
+
+        # (hot enough for typed entries: run a few times first)
+        p = typed.lang.load(src, "prog")
+        for _ in range(3):
+            try:
+                p.run(mode="compiled")
+            except zrun.Error:
+                pass
+        capsys.readouterr()
+        out, err = same_in_every_mode(typed.lang, src, capsys)
+        assert err is not None
+        message, _, stack, _ = err
+        if name == "too_deep":
+            assert "call stack too deep" in message and len(stack) > 100
+        else:
+            assert len(stack) >= 1
+
     def test_not_a_mapping(self):
         with pytest.raises(TypeError):
             typed.lang.types(3)

@@ -1299,6 +1299,7 @@ pub const Compiler = struct {
         .{ "zr_call_site", "bpiplplp" },
         .{ "zr_host_jump", "bpi" },
         .{ "zr_host_failed", "bpil" },
+        .{ "zr_bury", "vpll" },
         .{ "zr_specialize", "vpl" },
         .{ "zr_speculate", "vpl" },
         .{ "zr_context", "bpp" },
@@ -1527,12 +1528,14 @@ pub const Compiler = struct {
         }
         // (external: modules compiled later, thunks, call them by name)
         if (fnode & TYPED != 0) {
-            // (`<prefix>_t<node>(ctx, env, recv, params...)`: its parameters
-            // plain values, of the kinds declared; its result returned, its
-            // tag typed_error for an error)
+            // (`<prefix>_t<node>(ctx, env, recv, depth, params...)`: its
+            // parameters plain values, of the kinds declared; its result
+            // returned, its tag typed_error for an error; the calls it's
+            // in (Ctx.depth: kept in a register, Ctx's set before code that
+            // may look at it: Gen.syncDepth))
             const n = self.typed_params.get(fnode & ~TYPED).?.?.len;
             const params = try self.a.alloc(ir.Type, typed_first + n);
-            @memcpy(params[0..typed_first], &[_]ir.Type{ t.ptr, t.ptr, t.ptr });
+            @memcpy(params[0..typed_first], &[_]ir.Type{ t.ptr, t.ptr, t.ptr, t.i64 });
             @memset(params[typed_first..], t.i64);
             const name = try std.fmt.allocPrint(self.a, "{s}_t{d}", .{ self.m.prefix, fnode & ~TYPED });
             return self.m.function(name, t.val, params, true);
@@ -1545,7 +1548,7 @@ pub const Compiler = struct {
     /// functions: the node with this bit.
     pub const TYPED: u32 = 1 << 30;
     /// A typed entry's first parameter of the function's own
-    const typed_first = 3;
+    const typed_first = 4;
     /// The tag a typed entry's result has when it failed (no value's)
     pub const typed_error: i64 = 0xFFFF0001;
 
@@ -1601,6 +1604,7 @@ pub const Compiler = struct {
             g.args = self.m.nullPtr();
             g.nargs = g.k(@intCast(self.typed_params.get(fnode).?.?.len));
             g.recv = g.f.param(2);
+            g.depth = g.f.param(3);
             // (its result returned: kept here till then)
             g.result = try g.f.alloca(self.m.t.val);
         } else {
@@ -1767,6 +1771,9 @@ const Gen = struct {
     /// A function's typed entry: its parameters are the LLVM function's,
     /// plain values of their declared kinds (Gen.typedParams)
     typed: bool = false,
+    /// In a typed entry: the calls it's in (its depth parameter), Ctx.depth
+    /// not kept up to date (syncDepth)
+    depth: ir.Value = null,
     /// The receiver and the extra arguments of the function being run
     /// (rt.receiver, rt.varargs): two hidden slots of its frame, or stack
     /// slots
@@ -1785,6 +1792,9 @@ const Gen = struct {
     /// them: errorTarget); and how many of them an error going to err_label
     /// leaves held (a try's in the middle of an expression)
     inflight: std.ArrayListUnmanaged(SVal) = .empty,
+    /// The last count taken in hot code (refcount): given back right after
+    /// (nothing between them in its block), neither is made
+    last_inc: ?struct { inst: ir.Value, tag: ir.Value, bits: ir.Value } = null,
     err_inflight: usize = 0,
     ret_label: ir.Block = null,
     /// rt.loop targets, innermost last
@@ -1846,7 +1856,18 @@ const Gen = struct {
     /// bools, nodes; one branch instead of a call).
     fn refcount(self: *Gen, dec: bool, tag: ir.Value, bits: ir.Value) Error!void {
         if (self.hot()) {
-            _ = self.call(if (dec) "zr_dec" else "zr_inc", &.{ tag, bits });
+            // (a count taken and given back with nothing between them, in
+            // the same block: neither; LLVM keeps both, each checking the
+            // object isn't immortal)
+            if (dec) if (self.last_inc) |li| {
+                self.last_inc = null;
+                if (li.tag == tag and li.bits == bits and L("LLVMGetLastInstruction")(self.f.current) == li.inst) {
+                    L("LLVMInstructionEraseFromParent")(li.inst);
+                    return;
+                }
+            };
+            const inst = self.call(if (dec) "zr_dec" else "zr_inc", &.{ tag, bits });
+            self.last_inc = if (dec) null else .{ .inst = inst, .tag = tag, .bits = bits };
             return;
         }
         const f = &self.f;
@@ -1884,7 +1905,19 @@ const Gen = struct {
 
     /// A runtime helper's call.
     fn call(self: *Gen, name: []const u8, args: []const ir.Value) ir.Value {
+        // (the counts' and frames' helpers don't look at the calls; the
+        // others may: an error's stack, a call, Python)
+        const plain = std.mem.startsWith(u8, name, "zr_inc") or std.mem.startsWith(u8, name, "zr_dec") or std.mem.startsWith(u8, name, "zr_frame_");
+        if (!plain) self.syncDepth();
         return self.f.callName(name, args);
+    }
+
+    /// In a typed entry: Ctx.depth set to the calls it's in (its depth
+    /// parameter), before code that may look at it runs (helpers, code out
+    /// of line); calls between typed entries keep it in a register.
+    fn syncDepth(self: *Gen) void {
+        const d = self.depth orelse return;
+        self.f.store(d, self.f.offset(self.ctx, @offsetOf(helpers.Ctx, "depth")));
     }
 
     /// A helper that can fail: called, then to the error exit on false.
@@ -1979,10 +2012,15 @@ const Gen = struct {
 
     /// The function's receiver (rt.receiver), in its slot: the call's, or
     /// (a call without one) the receiver of the function it was made in,
-    /// as the frames around it are searched in the reference mode.
+    /// as the frames around it are searched in the reference mode. In a
+    /// frame on the stack, borrowed (no count taken, none given back:
+    /// releaseFrame): the caller keeps the call's for the call, the frame
+    /// around keeps its own; a heap frame, which may outlive the call,
+    /// owns it.
     fn storeReceiver(self: *Gen) Error!void {
         const f = &self.f;
         const c = self.c;
+        const owns = self.frame != null;
         const has = f.icmp(jit_c.LLVMIntNE, self.recv, c.m.nullPtr());
         const given = try f.label("recv_given");
         const outer = try f.label("recv_outer");
@@ -1990,7 +2028,7 @@ const Gen = struct {
         try f.condBr(has, given, outer);
         try f.block(given);
         const v = try self.loadSlot(self.recv, .any);
-        try self.increfDyn(v);
+        if (owns) try self.increfDyn(v);
         try self.storeSlot(self.recv_slot, v);
         try f.br(join);
         try f.block(outer);
@@ -2006,7 +2044,7 @@ const Gen = struct {
             const tag = f.select(unset, self.k(0), ov.tag);
             const bits = f.select(unset, self.k(0), ov.bits);
             const d = Dyn{ .tag = tag, .bits = bits, .shape = .any };
-            try self.increfDyn(d);
+            if (owns) try self.increfDyn(d);
             try self.storeSlot(self.recv_slot, d);
         } else try self.storeSlot(self.recv_slot, self.noneDyn());
         try f.br(join);
@@ -2036,6 +2074,8 @@ const Gen = struct {
             return;
         }
         for (self.var_slots.items) |slot| {
+            // (the receiver borrowed: storeReceiver)
+            if (slot == self.recv_slot) continue;
             const v = try self.loadSlot(slot, .any);
             // (an unset slot holds no reference: decrefs ignore its tag)
             try self.refcount(true, v.tag, v.bits);
@@ -2835,6 +2875,41 @@ const Gen = struct {
             f.store(r.dyn.bits, f.field(self.c.m.t.val, kept, 1));
             r.dyn.state = state;
             try self.borrows.append(self.a(), .{ .sym = si, .state = state, .kept = kept });
+        } else if (r.dyn.heapish() and try self.topBorrowable(si)) {
+            // A function of the top level (the program's functions, called
+            // by name): read without a reference (its variable stored to
+            // while code runs buries it: storeVar, Ctx.bury), marked so;
+            // anything else as any value is
+            const t = self.c.m.t;
+            const state = try f.alloca(t.i64);
+            f.entryStore(self.k(2), state);
+            const kept = try f.alloca(t.val);
+            f.store(r.dyn.tag, kept);
+            f.store(r.dyn.bits, f.field(t.val, kept, 1));
+            const as_fn = try f.label("read_fn");
+            const as_other = try f.label("read_other");
+            const read = try f.label("read_done");
+            try f.condBr(f.icmp(jit_c.LLVMIntEQ, r.dyn.tag, self.k(@intFromEnum(value.Tag.function))), as_fn, as_other);
+            try f.block(as_fn);
+            // (marked the first time: no store after)
+            const flags_p = f.offset(f.intToPtr(r.dyn.bits), @offsetOf(value.Obj, "flags"));
+            const flags = f.load(t.i32, flags_p);
+            const mark = try f.label("read_mark");
+            const marked = try f.label("read_marked");
+            try f.condBr(f.icmp(jit_c.LLVMIntEQ, f.and_(flags, self.c.m.k32(value.FN_BORROWED)), self.c.m.k32(0)), mark, marked);
+            try f.block(mark);
+            f.store(f.or_(flags, self.c.m.k32(value.FN_BORROWED)), flags_p);
+            try f.br(marked);
+            try f.block(marked);
+            f.store(self.k(0), state);
+            try f.br(read);
+            try f.block(as_other);
+            try self.refcount(false, r.dyn.tag, r.dyn.bits);
+            f.store(self.k(1), state);
+            try f.br(read);
+            try f.block(read);
+            r.dyn.state = state;
+            try self.borrows.append(self.a(), .{ .sym = si, .state = state, .kept = kept });
         } else try self.increfDyn(r.dyn);
         // (one a function's definition binds: that function, most likely)
         if (r == .dyn and sym.node != NONE) {
@@ -2877,6 +2952,23 @@ const Gen = struct {
         const slot = try self.varSlot(si);
         const old = try self.loadSlot(slot, .any);
         try self.storeSlot(slot, v);
+        // (a top-level variable's function: read without a reference by
+        // code still running, maybe (loadVar), so buried, not let go of)
+        if (d.homeOf(si) == NONE) {
+            const f = &self.f;
+            const bury = try f.label("bury");
+            const release = try f.label("release_old");
+            const done = try f.label("stored");
+            try f.condBr(f.icmp(jit_c.LLVMIntEQ, old.tag, self.k(@intFromEnum(value.Tag.function))), bury, release);
+            try f.block(bury);
+            _ = self.call("zr_bury", &.{ self.ctx, old.tag, old.bits });
+            try f.br(done);
+            try f.block(release);
+            try self.refcount(true, old.tag, old.bits);
+            try f.br(done);
+            try f.block(done);
+            return;
+        }
         try self.refcount(true, old.tag, old.bits);
     }
 
@@ -2895,6 +2987,28 @@ const Gen = struct {
     }
 
     const max_borrows = 16;
+
+    /// Whether a value is one read without a reference from a variable of
+    /// the top level (topBorrowable).
+    fn topBorrowed(self: *Gen, v: SVal) bool {
+        if (v != .dyn) return false;
+        const state = v.dyn.state orelse return false;
+        for (self.borrows.items) |b| if (b.state == state) return self.c.data.homeOf(b.sym) == NONE;
+        return false;
+    }
+
+    /// Whether a variable's function can be read without a reference: a
+    /// variable of the top level read from a function's code (its stores
+    /// bury functions: storeVar, rt.store), read so in few places so far.
+    fn topBorrowable(self: *Gen, si: u32) Error!bool {
+        if (self.fnode == NONE or self.thunk or self.detached) return false;
+        if (self.c.data.homeOf(si) != NONE) return false;
+        var n: usize = 0;
+        for (self.borrows.items) |b| {
+            if (b.sym == si) n += 1;
+        }
+        return n < max_borrows;
+    }
 
     fn notAVariable(self: *Gen, idx: u32) Error!SVal {
         const msg = if (self.c.lang.analysis == null)
@@ -3092,11 +3206,13 @@ const Gen = struct {
         try f.condBr(f.icmp(jit_c.LLVMIntEQ, self.kindBits(n), want), forward, generic);
         try f.block(forward);
         const params = try self.a().alloc(ir.Value, Compiler.typed_first + n);
-        @memcpy(params[0..Compiler.typed_first], &[_]ir.Value{ self.ctx, self.env, self.recv });
+        // (the calls it's in: Ctx's, up to date in generic code)
+        const depth = f.load(t.i64, f.offset(self.ctx, @offsetOf(helpers.Ctx, "depth")));
+        @memcpy(params[0..Compiler.typed_first], &[_]ir.Value{ self.ctx, self.env, self.recv, depth });
         for (params[Compiler.typed_first..], 0..) |*q, i| q.* = f.load(t.i64, f.field(t.val, self.elem(self.args, i), 1));
         // (its type: as llvmFunction makes it, for n parameters)
         const types_ = try self.a().alloc(ir.Type, Compiler.typed_first + n);
-        @memcpy(types_[0..Compiler.typed_first], &[_]ir.Type{ t.ptr, t.ptr, t.ptr });
+        @memcpy(types_[0..Compiler.typed_first], &[_]ir.Type{ t.ptr, t.ptr, t.ptr, t.i64 });
         @memset(types_[Compiler.typed_first..], t.i64);
         const r = f.call(.{ .v = f.intToPtr(code), .ty = c.m.fnType(t.val, types_) }, params);
         const rtag = f.extract(r, 0);
@@ -4071,6 +4187,8 @@ const Gen = struct {
         // (its code sees the variables here through the frames)
         const fr = try self.frameForCall();
         const call_args = [_]ir.Value{ self.ctx, fr.frame, arr, self.k32(at), self.k32(self.currentOwner()), recv, varargs, self.out };
+        // (code out of line reads Ctx.depth)
+        self.syncDepth();
         const status = if (try self.siteOf(func, args, key, spec.semantic)) |site|
             try self.siteCall(site, fun, &call_args)
         else
@@ -6126,7 +6244,7 @@ const Gen = struct {
         // (a variable's value borrowed: borrowed again)
         if (v.dyn.state) |state| for (self.borrows.items) |b| {
             if (b.state == state) {
-                if (try self.borrowable(b.sym)) return .{ .dyn = try self.borrowAgain(v.dyn, b.sym) };
+                if (try self.borrowable(b.sym) or try self.topBorrowable(b.sym)) return .{ .dyn = try self.borrowAgain(v.dyn, b.sym) };
                 break;
             }
         };
@@ -6501,15 +6619,17 @@ const Gen = struct {
             if (try self.hostInline(inst, fv.py, items)) |v| return v;
             return self.hostCall(inst, fv.py, items);
         }
-        const fd = try self.materialize(fv, inst.node);
-        // The arguments, in a stack array
+        // (a function of the top level read without a reference: called so,
+        // kept for the call (buried if its variable's stored to: storeVar))
+        const fd = if (self.topBorrowed(fv)) fv.dyn else try self.materialize(fv, inst.node);
+        // The arguments, in a stack array (written where the call takes
+        // them so: directCall's typed entry takes them plain)
         const n = items.len;
         const arr = try self.valueSlots(n);
         const ds = try self.a().alloc(Dyn, n);
-        for (items, 0..) |item, i| {
-            ds[i] = try self.materialize(item, inst.node);
-            try self.storeSlot(self.elem(arr, i), ds[i]);
-        }
+        for (items, 0..) |item, i| ds[i] = try self.materialize(item, inst.node);
+        const direct = fd.func != NONE and n == try self.paramCount(fd.func);
+        if (!direct) try self.fillArgs(arr, ds);
         var recv_ptr = self.c.m.nullPtr();
         var recv_d: ?Dyn = null;
         if (receiver) |r| {
@@ -6518,15 +6638,14 @@ const Gen = struct {
             try self.storeSlot(p, recv_d.?);
             recv_ptr = p;
         }
-        const ok = if (fd.func != NONE and n == try self.paramCount(fd.func))
-            try self.directCall(inst, fd, arr, ds, recv_ptr)
-        else
-            self.call("zr_call", &.{ self.ctx, self.k32(inst.node), fd.tag, fd.bits, arr, self.k(@intCast(n)), recv_ptr, self.out });
+        const got: ?CallResult = if (direct) try self.directCall(inst, fd, arr, ds, recv_ptr) else null;
+        const ok = if (got) |g| g.ok else self.call("zr_call", &.{ self.ctx, self.k32(inst.node), fd.tag, fd.bits, arr, self.k(@intCast(n)), recv_ptr, self.out });
         // (the call borrowed them)
         for (ds) |d| try self.drop(.{ .dyn = d });
         if (recv_d) |r| try self.drop(.{ .dyn = r });
         try self.drop(.{ .dyn = fd });
         try self.check(ok);
+        if (got) |g| return .{ .dyn = .{ .tag = g.tag, .bits = g.bits, .shape = .any } };
         return .{ .dyn = try self.loadOut(.any) };
     }
 
@@ -6559,7 +6678,7 @@ const Gen = struct {
         // (containers known here made, once, as a call gives them: the
         // function sees one object, which it may keep, compare, change)
         const args = try self.a().alloc(SVal, items.len);
-        for (items, args) |x, *slot| slot.* = try self.checkedVal(if (isScalar(x) or x == .node or x == .py) x else .{ .dyn = try self.materialize(x, inst.node) });
+        for (items, args) |x, *slot| slot.* = try self.checkedVal(if (isScalar(x) or x == .node or x == .py or x == .dyn) x else .{ .dyn = try self.materialize(x, inst.node) });
         const idx = try self.c.objectIndex(o);
         // Its errors: worded as a host function's, then on as the code
         // around them goes
@@ -6657,6 +6776,7 @@ const Gen = struct {
         // (a helper's code: driver.Helper)
         const helper_ty = m.fnType(t.i32, &.{ t.ptr, t.ptr, t.ptr, t.i32, t.i32, t.ptr, t.ptr, t.ptr });
         const null_ptr = m.nullPtr();
+        self.syncDepth();
         const status = f.call(.{ .v = f.intToPtr(code), .ty = helper_ty }, &.{ self.ctx, null_ptr, arr, self.k32(inst.node), self.k32(0), null_ptr, null_ptr, self.out });
         const ok_direct = f.icmp(jit_c.LLVMIntEQ, status, m.k32(1));
         const direct_end = f.current;
@@ -6689,6 +6809,11 @@ const Gen = struct {
         return .{ .dyn = try self.loadOut(.any) };
     }
 
+    /// A call's arguments in its array (`arr`, as many as `ds`).
+    fn fillArgs(self: *Gen, arr: ir.Value, ds: []const Dyn) Error!void {
+        for (ds, 0..) |d, i| try self.storeSlot(self.elem(arr, i), d);
+    }
+
     /// The parameters a language function takes.
     fn paramCount(self: *Gen, fnode: u32) Error!usize {
         const spec = self.c.specOf(fnode) orelse return std.math.maxInt(usize);
@@ -6701,7 +6826,9 @@ const Gen = struct {
     /// function's and the stack has room (arguments of the kinds its typed
     /// entry takes: that, given them plain); anything else by zr_call. The
     /// call's status (an i1).
-    fn directCall(self: *Gen, inst: *Inst, fd: Dyn, arr: ir.Value, ds: []const Dyn, recv_ptr: ir.Value) Error!ir.Value {
+    const CallResult = struct { ok: ir.Value, tag: ir.Value, bits: ir.Value };
+
+    fn directCall(self: *Gen, inst: *Inst, fd: Dyn, arr: ir.Value, ds: []const Dyn, recv_ptr: ir.Value) Error!CallResult {
         const f = &self.f;
         const m = &self.c.m;
         const t = m.t;
@@ -6717,13 +6844,19 @@ const Gen = struct {
         const direct = try f.label("call_direct");
         const slow = try f.label("call_generic");
         const join = try f.label("call_done");
+        const done = try f.label("call_result");
+        // (the typed entry's int result: its block and bits)
+        var int_path: ?struct { end: ir.Block, bits: ir.Value } = null;
         try f.condBr(f.icmp(jit_c.LLVMIntEQ, fd.tag, self.k(@intFromEnum(value.Tag.function))), is_fn, slow);
         try f.block(is_fn);
         const fo = f.intToPtr(fd.bits);
         const its_code = f.load(t.i64, f.offset(fo, @offsetOf(value.Function, "code")));
         const ctx = self.ctx;
         const depth_p = f.offset(ctx, @offsetOf(helpers.Ctx, "depth"));
-        const depth = f.load(t.i64, depth_p);
+        // (in a typed entry, the calls it's in its parameter: Ctx's not
+        // read or written for a call of typed code)
+        const in_typed = self.depth != null;
+        const depth = self.depth orelse f.load(t.i64, depth_p);
         const room = f.load(t.i64, f.offset(ctx, @offsetOf(helpers.Ctx, "calls_room")));
         // (the stack's room is max_depth: below it, a call is allowed; and
         // the native stack's, above stack_low: else zr_call refuses it)
@@ -6737,7 +6870,8 @@ const Gen = struct {
         const at = f.at(L("LLVMArrayType2")(t.i8, @sizeOf(helpers.CallEntry)), entry, depth);
         f.store(f.load(t.ptr, f.offset(fo, @offsetOf(value.Function, "name"))), at);
         f.store(self.k32(inst.node), f.offset(at, @offsetOf(helpers.CallEntry, "node")));
-        f.store(f.add(depth, self.k(1)), depth_p);
+        const inner = f.add(depth, self.k(1));
+        if (!in_typed) f.store(inner, depth_p);
         const env = f.load(t.ptr, f.offset(fo, @offsetOf(value.Function, "env")));
         const generic_args = [_]ir.Value{ ctx, env, arr, self.k(@intCast(n)), recv_ptr, self.out };
         const st = if (typed) blk: {
@@ -6760,35 +6894,76 @@ const Gen = struct {
             const entry_code = try self.c.functionCode(fd.func | Compiler.TYPED);
             const first = Compiler.typed_first;
             const params = try self.a().alloc(ir.Value, first + n);
-            @memcpy(params[0..first], &[_]ir.Value{ ctx, env, recv_ptr });
+            @memcpy(params[0..first], &[_]ir.Value{ ctx, env, recv_ptr, inner });
             for (params[first..], ds) |*p, d| p.* = d.bits;
             const r = f.call(.{ .v = entry_code, .ty = (try self.c.llvmFunction(fd.func | Compiler.TYPED)).ty }, params);
-            // (its result where rt.call's goes)
             const rtag = f.extract(r, 0);
+            const rbits = f.extract(r, 1);
+            // (an int, the usual of typed code: its tag a constant from
+            // here, as rt.call gives it (an I64), the checks after it folded
+            // along this path)
+            const typed_int = try f.label("call_typed_int");
+            const typed_other = try f.label("call_typed_other");
+            try f.condBr(f.icmp(jit_c.LLVMIntEQ, f.or_(rtag, self.k(16)), self.k(@intCast(value.PINT_TAG))), typed_int, typed_other);
+            try f.block(typed_int);
+            if (!in_typed) f.store(depth, depth_p);
+            const int_end = f.current;
+            try f.br(done);
+            try f.block(typed_other);
+            // (its result where rt.call's goes)
             f.store(rtag, self.out);
-            f.store(f.extract(r, 1), f.field(t.val, self.out, 1));
+            f.store(rbits, f.field(t.val, self.out, 1));
             const st_typed = f.icmp(jit_c.LLVMIntNE, rtag, self.k(Compiler.typed_error));
             const typed_end = f.current;
             try f.br(entered);
             try f.block(generic_b);
+            // (generic code: Ctx's up to date for it; the arguments in their
+            // array)
+            if (in_typed) f.store(inner, depth_p);
+            try self.fillArgs(arr, ds);
             const st_generic = f.call(.{ .v = code, .ty = (try self.c.llvmFunction(fd.func)).ty }, &generic_args);
             const generic_end = f.current;
             try f.br(entered);
             try f.block(entered);
+            int_path = .{ .end = int_end, .bits = rbits };
             break :blk f.phi(t.i1, st_typed, typed_end, st_generic, generic_end);
-        } else f.call(.{ .v = code, .ty = (try self.c.llvmFunction(fd.func)).ty }, &generic_args);
-        f.store(depth, depth_p);
-        // (its result as rt.call gives it: an int an I64)
-        const out_tag = f.load(t.i64, self.out);
-        f.store(f.select(f.icmp(jit_c.LLVMIntEQ, out_tag, self.k(@intCast(value.PINT_TAG))), self.k(@intFromEnum(value.Tag.int)), out_tag), self.out);
+        } else blk: {
+            if (in_typed) f.store(inner, depth_p);
+            try self.fillArgs(arr, ds);
+            break :blk f.call(.{ .v = code, .ty = (try self.c.llvmFunction(fd.func)).ty }, &generic_args);
+        };
+        // (generic code's Ctx.depth its own again; a typed entry's isn't
+        // kept: syncDepth)
+        if (!in_typed) f.store(depth, depth_p);
         const direct_end = f.current;
         try f.br(join);
         try f.block(slow);
+        try self.fillArgs(arr, ds);
         const st2 = self.call("zr_call", &.{ self.ctx, self.k32(inst.node), fd.tag, fd.bits, arr, self.k(@intCast(n)), recv_ptr, self.out });
         const slow_end = f.current;
         try f.br(join);
+        // The status and the result, from each way: the typed entry's int
+        // as it returned it; the others' where rt.call's goes, as it gives
+        // them (an int an I64)
+        const others = try f.label("call_other_result");
         try f.block(join);
-        return f.phi(t.i1, st, direct_end, st2, slow_end);
+        const st_join = f.phi(t.i1, st, direct_end, st2, slow_end);
+        try f.br(others);
+        try f.block(others);
+        const out_tag = f.load(t.i64, self.out);
+        const o_tag = f.select(f.icmp(jit_c.LLVMIntEQ, out_tag, self.k(@intCast(value.PINT_TAG))), self.k(@intFromEnum(value.Tag.int)), out_tag);
+        const o_bits = f.load(t.i64, f.field(t.val, self.out, 1));
+        const others_end = f.current;
+        try f.br(done);
+        try f.block(done);
+        if (int_path) |ip| {
+            return .{
+                .ok = f.phiN(t.i1, &.{ m.k1(true), st_join }, &.{ ip.end, others_end }),
+                .tag = f.phiN(t.i64, &.{ self.k(@intFromEnum(value.Tag.int)), o_tag }, &.{ ip.end, others_end }),
+                .bits = f.phiN(t.i64, &.{ ip.bits, o_bits }, &.{ ip.end, others_end }),
+            };
+        }
+        return .{ .ok = st_join, .tag = o_tag, .bits = o_bits };
     }
 
     /// rt.call(f, args) with args only known at run time (all taken).

@@ -209,6 +209,14 @@ pub const unset = Value{ .tag = UNSET_TAG, .bits = 0 };
 /// which may outlive compiled code's references
 pub const HAS_PROXY: u32 = 1 << 31;
 
+/// A function compiled code read from a variable of the program's top
+/// level without a reference of its own (Gen.loadVar: calls of the
+/// program's functions count nothing): that variable stored to while
+/// compiled code runs, it isn't let go of but buried (Ctx.bury), kept till
+/// the code's done, so a read of it never outlives it. (Its head's flags:
+/// bits FunctionFlags leaves free.)
+pub const FN_BORROWED: u32 = 1 << 19;
+
 pub const Str = extern struct {
     head: Obj,
     /// Bytes (UTF-8) and code points

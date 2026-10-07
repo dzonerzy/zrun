@@ -96,6 +96,8 @@ pub const Api = struct {
     GetIntrinsicDeclaration: *const fn (ModuleRef, c_uint, [*c]Type, usize) callconv(.c) Value,
     AppendBasicBlockInContext: *const fn (Context, Value, Str) callconv(.c) BasicBlock,
     GetBasicBlockTerminator: *const fn (BasicBlock) callconv(.c) Value,
+    GetLastInstruction: *const fn (BasicBlock) callconv(.c) Value,
+    InstructionEraseFromParent: *const fn (Value) callconv(.c) void,
     CreateBuilderInContext: *const fn (Context) callconv(.c) Builder,
     DisposeBuilder: *const fn (Builder) callconv(.c) void,
     PositionBuilderAtEnd: *const fn (Builder, BasicBlock) callconv(.c) void,

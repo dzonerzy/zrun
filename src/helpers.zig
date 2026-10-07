@@ -69,13 +69,38 @@ pub const Ctx = struct {
     /// made only when something needs the object: exceptionOf)
     exc_class: ?*PyObject = null,
     exc_msg: std.ArrayListUnmanaged(u8) = .empty,
+    /// Functions read without a reference (value.FN_BORROWED) whose top
+    /// level variables were stored to while the code ran: their references
+    /// kept (bury) till it's done (drainGraveyard), so no read of one
+    /// outlives it
+    graveyard: std.ArrayListUnmanaged(Value) = .empty,
 
     /// The object at an index.
     pub fn object(self: *const Ctx, i: u64) *PyObject {
         return self.objects.items[i];
     }
 
+    /// A top-level variable's old value, let go of (taking its reference):
+    /// a function read without a reference kept till the code's done.
+    pub fn bury(self: *Ctx, v: Value) void {
+        if (v.tag == @intFromEnum(Tag.function) and v.ptr().flags & value.FN_BORROWED != 0) {
+            self.graveyard.append(allocator, v) catch {
+                // (no room to keep it: leaked, never freed under a read)
+                return;
+            };
+            return;
+        }
+        if (v.tag != UNSET) value.decref(v);
+    }
+
+    /// The code is done (it returned to Python): what it buried let go of.
+    pub fn drainGraveyard(self: *Ctx) void {
+        while (self.graveyard.pop()) |v| value.decref(v);
+    }
+
     pub fn deinit(self: *Ctx) void {
+        self.drainGraveyard();
+        self.graveyard.deinit(allocator);
         if (self.calls_room > 0) allocator.free(self.calls[0..self.calls_room]);
         self.calls_room = 0;
         self.clearError();
@@ -267,6 +292,11 @@ pub var pythonMessage: *const fn () ?*PyObject = undefined;
 // ======================================================================
 // Reference counts
 // ======================================================================
+
+/// A top-level variable's old function, stored over (Ctx.bury).
+export fn zr_bury(ctx: *Ctx, tag: u64, bits: u64) callconv(.c) void {
+    ctx.bury(.{ .tag = tag, .bits = bits });
+}
 
 // (the GIL taken by value.incref/decref for a Python object, theirs:
 // native values' counts touch no Python, and checking costs a thread-local)
@@ -2281,7 +2311,7 @@ const helper_names = [_][]const u8{
     "zr_call",     "zr_object",     "zr_frame_new",  "zr_frame_release", "zr_free",
     "zr_list",     "zr_tuple",      "zr_dict",       "zr_record",        "zr_is_record",
     "zr_getattr",  "zr_setattr",    "zr_getitem",    "zr_setitem",       "zr_items",
-    "zr_wrapping", "zr_read", "zr_native_fail", "zr_call_site", "zr_host_jump", "zr_host_failed",
+    "zr_wrapping", "zr_read", "zr_native_fail", "zr_call_site", "zr_host_jump", "zr_host_failed", "zr_bury",
     "zr_list_len", "zr_list_at",    "zr_append",     "zr_call_method",   "zr_call_python",
     "zr_is_type",  "zr_global",     "zr_format",     "zr_concat",        "zr_unpack",
     "zr_varargs",  "zr_record_new", "zr_isinstance", "zr_call_seq",      "zr_slice",
