@@ -194,7 +194,7 @@ pub fn objectOf(a: std.mem.Allocator, key: Key) ?[]u8 {
     if (givenObject(key)) |b| return a.dupe(u8, b) catch null;
     const path = pathFor(a, key) orelse return null;
     defer a.free(path);
-    return read(a, path);
+    return readObject(a, path);
 }
 
 /// The bytes of the file at `path` (owned by the caller), or null.
@@ -202,10 +202,98 @@ pub fn read(a: std.mem.Allocator, path: []const u8) ?[]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io(), path, a, .unlimited) catch null;
 }
 
+/// The cache's object at `path` (owned by the caller), or null; one found
+/// is used now (its time made now: the least recently used go first).
+pub fn readObject(a: std.mem.Allocator, path: []const u8) ?[]u8 {
+    const bytes = read(a, path) orelse return null;
+    // (Dir.setTimestampsNow doesn't compile in Zig 0.16: the same, spelled out)
+    std.Io.Dir.cwd().setTimestamps(io(), path, .{ .access_timestamp = .now, .modify_timestamp = .now }) catch {};
+    return bytes;
+}
+
 /// Keep an object at `path` (whole or not at all). Failing is fine:
 /// compiled again next time.
 pub fn write(path: []const u8, bytes: []const u8) void {
-    writeWhole(path, bytes) catch {};
+    writeWhole(path, bytes) catch return;
+    wrote(bytes.len);
+}
+
+// ----------------------------------------------------------------------
+// The cache's size
+// ----------------------------------------------------------------------
+
+/// The most the cache's objects take, in bytes (zrun.configure(cache_size=)):
+/// past it the least recently used go, down to 80% of it. 0: no limit.
+pub var limit: u64 = 1 << 30;
+
+/// Bytes written since the cache was last looked over (by this process)
+var written: u64 = 0;
+var looked_over = false;
+var size_lock: std.atomic.Mutex = .unlocked;
+
+/// After an object is written: the cache looked over the first time this
+/// process writes one, and each time it has written a tenth of the limit
+/// since (other processes write too: the first look sees theirs).
+fn wrote(n: usize) void {
+    if (limit == 0) return;
+    while (!size_lock.tryLock()) std.atomic.spinLoopHint();
+    defer size_lock.unlock();
+    written += n;
+    if (looked_over and written < limit / 10) return;
+    looked_over = true;
+    written = 0;
+    trim(limit);
+}
+
+const Entry = struct { name: []u8, size: u64, time: i96 };
+
+/// The cache down to 80% of `max` bytes if it's over `max`, the least
+/// recently used objects deleted first; files a write left behind (a
+/// process stopped while writing) deleted when they're an hour old. What
+/// can't be done is left (another process deleting the same, a file
+/// open on Windows).
+pub fn trim(max: u64) void {
+    const d = dir() orelse return;
+    const a = std.heap.c_allocator;
+    var folder = std.Io.Dir.cwd().openDir(io(), d, .{ .iterate = true }) catch return;
+    defer folder.close(io());
+    var entries: std.ArrayListUnmanaged(Entry) = .empty;
+    defer {
+        for (entries.items) |e| a.free(e.name);
+        entries.deinit(a);
+    }
+    const now = std.Io.Timestamp.now(io(), .real).nanoseconds;
+    const hour: i96 = 3600 * std.time.ns_per_s;
+    var total: u64 = 0;
+    var it = folder.iterate();
+    while (it.next(io()) catch return) |e| {
+        if (e.kind != .file) continue;
+        const tmp = std.mem.endsWith(u8, e.name, ".tmp");
+        if (!tmp and !std.mem.endsWith(u8, e.name, ".o")) continue;
+        const st = folder.statFile(io(), e.name, .{}) catch continue;
+        if (tmp) {
+            if (now - st.mtime.nanoseconds > hour) folder.deleteFile(io(), e.name) catch {};
+            continue;
+        }
+        total += st.size;
+        const name = a.dupe(u8, e.name) catch return;
+        entries.append(a, .{ .name = name, .size = st.size, .time = st.mtime.nanoseconds }) catch {
+            a.free(name);
+            return;
+        };
+    }
+    if (total <= max) return;
+    std.mem.sort(Entry, entries.items, {}, struct {
+        fn older(_: void, x: Entry, y: Entry) bool {
+            return x.time < y.time;
+        }
+    }.older);
+    const goal = max / 10 * 8;
+    for (entries.items) |e| {
+        if (total <= goal) break;
+        folder.deleteFile(io(), e.name) catch continue;
+        total -= e.size;
+    }
 }
 
 /// Write a file whole or not at all: written aside (a name of this

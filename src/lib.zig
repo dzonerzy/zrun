@@ -3433,9 +3433,23 @@ fn blocks() i64 {
     return pool.inUse();
 }
 
-/// zrun.configure(cache=None, perf_map=None, tiers=None): process-wide settings.
-fn configure(args: pyoz.Args(struct { cache: ?*PyObject = null, perf_map: ?*PyObject = null, tiers: ?*PyObject = null })) ?*PyObject {
+/// zrun.configure(cache=None, cache_size=None, perf_map=None, tiers=None):
+/// process-wide settings.
+fn configure(args: pyoz.Args(struct { cache: ?*PyObject = null, cache_size: ?*PyObject = null, perf_map: ?*PyObject = null, tiers: ?*PyObject = null })) ?*PyObject {
     const v = args.value;
+    if (optional(v.cache_size)) |s| {
+        const n = py.c.PyLong_AsLongLong(s);
+        if (n == -1 and py.c.PyErr_Occurred() != null) {
+            py.c.PyErr_Clear();
+            ph.raise(py.PyExc_TypeError(), "cache_size must be an int (bytes; 0: no limit)", .{});
+            return null;
+        }
+        if (n < 0) {
+            ph.raise(py.PyExc_ValueError(), "cache_size must be 0 (no limit) or more bytes, not {d}", .{n});
+            return null;
+        }
+        @import("cache.zig").limit = @intCast(n);
+    }
     if (optional(v.cache)) |c| {
         const s: @import("cache.zig").Setting = if (c == py.Py_True()) .default else if (c == py.Py_False()) .off else blk: {
             const path = ph.utf8(c, "cache") orelse {
@@ -3457,6 +3471,12 @@ fn configure(args: pyoz.Args(struct { cache: ?*PyObject = null, perf_map: ?*PyOb
         if (r < 0) return null;
         driver.tiers = r == 1;
     }
+    return none();
+}
+
+/// zrun.clear_cache(): the cache's objects deleted.
+fn clearCache() ?*PyObject {
+    @import("cache.zig").trim(0);
     return none();
 }
 
@@ -3483,7 +3503,8 @@ pub const Module = pyoz.module(.{
         pyoz.func("version", version, "Return the zrun version string"),
         pyoz.func("_blocks", blocks, "The values' blocks allocated and not freed (for tests)"),
         pyoz.func("collect", collect, "collect(): free the compiled code's values that only reference one another (reference cycles); how many were freed. Runs by itself as values are made, and at the end of a run."),
-        pyoz.kwfunc("configure", configure, "configure(cache=None, perf_map=None, tiers=None): process-wide settings (those not given stay). cache: True (the platform's place for caches: %LOCALAPPDATA%\\zrun\\Cache on Windows, ~/Library/Caches/zrun on macOS, $XDG_CACHE_HOME/zrun or ~/.cache/zrun elsewhere), False (no cache), or a directory; perf_map: name compiled functions for Linux's perf (/tmp/perf-<pid>.map); tiers: True (default: a program run compiled whose optimized code isn't cached is compiled fast first, optimized in the background, the optimized code running from the run after it's done) or False (optimized at once)."),
+        pyoz.func("clear_cache", clearCache, "clear_cache(): delete the compiled code kept in the cache."),
+        pyoz.kwfunc("configure", configure, "configure(cache=None, cache_size=None, perf_map=None, tiers=None): process-wide settings (those not given stay). cache: True (the platform's place for caches: %LOCALAPPDATA%\\zrun\\Cache on Windows, ~/Library/Caches/zrun on macOS, $XDG_CACHE_HOME/zrun or ~/.cache/zrun elsewhere), False (no cache), or a directory; cache_size: the most the cache takes, in bytes (default 1 GiB; 0: no limit): past it, the least recently used compiled code is deleted, down to 80% of it; perf_map: name compiled functions for Linux's perf (/tmp/perf-<pid>.map); tiers: True (default: a program run compiled whose optimized code isn't cached is compiled fast first, optimized in the background, the optimized code running from the run after it's done) or False (optimized at once)."),
     },
     .classes = &.{
         pyoz.class("Language", Language),

@@ -207,7 +207,7 @@ program = lang.load_compiled("rules.zrc")     # another process: nothing compile
 
 A compiled module holds the program's source and its compiled code. Loading it checks a hash of the language's definition (grammar, semantics, host functions): a module made for another version of the language, another zrun or another CPU is refused, not misrun.
 
-The compiled-code cache is in the platform's cache directory (`%LOCALAPPDATA%\zrun\Cache`, `~/Library/Caches/zrun`, `$XDG_CACHE_HOME/zrun` or `~/.cache/zrun`); `zrun.configure(cache=False)` or `cache="dir"` changes that.
+The compiled-code cache is in the platform's cache directory (`%LOCALAPPDATA%\zrun\Cache`, `~/Library/Caches/zrun`, `$XDG_CACHE_HOME/zrun` or `~/.cache/zrun`); `zrun.configure(cache=False)` or `cache="dir"` changes that. It takes at most 1 GiB (`zrun.configure(cache_size=bytes)`, 0 for no limit): past it, the compiled code used least recently is deleted, down to 80% of the limit. `zrun.clear_cache()` empties it.
 
 ## Sessions and the REPL
 
@@ -251,7 +251,7 @@ Every class and method has its documentation in `help()` (and in the `.pyi` stub
 | `lang.compile(source, output)`, `program.save(path)`, `lang.load_compiled(path)` | compiled modules |
 | `lang.session()`, `lang.repl()` | programs run one after another, sharing their names |
 | `zrun.Bytes(data)` | data read in place |
-| `zrun.configure(cache=, tiers=, perf_map=)` | process-wide settings |
+| `zrun.configure(cache=, cache_size=, tiers=, perf_map=)`, `zrun.clear_cache()` | process-wide settings; the compiled-code cache |
 | `zrun.collect()` | the cycle collector, now |
 | `zrun.Error`, `zrun.LoadError`, `zrun.CompileError`, `zrun.IntegerOverflow` | errors |
 
@@ -300,7 +300,6 @@ Key implementation details:
 - x86_64 only: the LLVM zgram ships targets x86-64. No macOS wheels yet.
 - Untyped code (Lua here) is 2.6-6x slower than a hand-written C interpreter; a program's top level isn't specialized as functions are.
 - What compiles is a subset of Python (see the guide); the rest runs as Python, correctly but slower.
-- The compiled-code cache has no size limit yet.
 - On Windows with Python 3.12 or 3.13, `mode="python"` stops at a few hundred nested calls of the language's functions with "call stack too deep", before `max_depth`. Those Pythons allow 3000 calls nested through C on Windows (10000 elsewhere), and a call run as Python is several. Compiled code and other Pythons go to `max_depth`.
 
 ## Project Structure

@@ -452,7 +452,7 @@ pub const Compiled = struct {
         }
         const path = cache.pathFor(allocator, key) orelse return null;
         defer allocator.free(path);
-        const bytes = cache.read(allocator, path) orelse return null;
+        const bytes = cache.readObject(allocator, path) orelse return null;
         defer allocator.free(bytes);
         if (llvm.loadObject(self.view, bytes, err)) |module| {
             self.cache_loaded += 1;
