@@ -72,7 +72,7 @@ Compiled code is kept between runs (on disk, by what it compiles). A program run
 pip install zrun-py
 ```
 
-Like every zsuite package, it is named `<name>-py` on PyPI; the module is `zrun`. It installs `zgram-py` 0.4.0 and `zrules-py` 0.1.6 or newer with it. Prebuilt wheels cover CPython 3.10+ on **x86_64 Linux** and **x86_64 Windows**.
+Like every zsuite package, it is named `<name>-py` on PyPI; the module is `zrun`. It installs `zgram-py` 0.5.0 and `zrules-py` 0.2.0 or newer with it. Prebuilt wheels cover CPython 3.10+ on **x86_64 Linux** and **x86_64 Windows**.
 
 ### From source
 
