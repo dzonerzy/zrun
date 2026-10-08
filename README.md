@@ -44,12 +44,12 @@ Part of zsuite: zgram (syntax), zrules (semantics), zrun (execution), zlsp (edit
 
 | Program | zrun, compiled | zrun, semantics as Python | Lua 5.4 |
 |---|---|---|---|
-| `fib(30)` | 0.040 s | 14.0 s | 0.025 s |
-| a numeric loop, 10 million times (`s = (s + i * i) % 1000003`) | 0.271 s | 44.6 s | 0.071 s |
-| binary trees, depth 14, 8 times | 0.088 s | 3.3 s | 0.022 s |
-| building a string of 200,000 numbers | 0.110 s | 1.0 s | 0.031 s |
+| `fib(30)` | 0.041 s | 15.8 s | 0.026 s |
+| a numeric loop, 10 million times (`s = (s + i * i) % 1000003`) | 0.119 s | 47.2 s | 0.075 s |
+| binary trees, depth 14, 8 times | 0.074 s | 3.7 s | 0.023 s |
+| building a string of 200,000 numbers | 0.064 s | 1.1 s | 0.037 s |
 
-Lua is dynamically typed and its semantics here are generic Python; zrun compiles them to 9-350x the speed of running them, within 1.6-4.1x of a hand-written C interpreter. (A loop LLVM can reduce, `s = s + i`, is worked out while compiling: no loop left to time.)
+Lua is dynamically typed and its semantics here are generic Python; zrun compiles them to 17-400x the speed of running them, within 1.6-3.2x of a hand-written C interpreter. (A loop LLVM can reduce, `s = s + i`, is worked out while compiling: no loop left to time.)
 
 ### An engine
 
