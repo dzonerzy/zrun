@@ -848,6 +848,8 @@ pub const Compiler = struct {
     layouts: std.AutoHashMapUnmanaged(u32, *Layout) = .empty,
     /// Slot of each symbol in its layout
     slot_of: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// Per symbol: a function refers to it (seenInFunction), worked out once
+    seen_in_function: ?[]bool = null,
     /// Language functions compiled or to compile
     compiled_fns: std.AutoHashMapUnmanaged(u32, void) = .empty,
     queue: std.ArrayListUnmanaged(u32) = .empty,
@@ -1520,6 +1522,26 @@ pub const Compiler = struct {
         return entry.value_ptr.*;
     }
 
+    /// Whether a function refers to a symbol (a node of it inside a
+    /// function node): a variable of the top level none does is seen by the
+    /// program's code alone (and through the frames: Python semantics,
+    /// code out of line, rt), so the program keeps it on the stack (Gen's
+    /// mirrors).
+    pub fn seenInFunction(self: *Compiler, si: u32) Error!bool {
+        if (self.seen_in_function == null) {
+            const d = self.data;
+            const marks = try self.a.alloc(bool, d.syms.len);
+            @memset(marks, false);
+            for (0..d.nodes.len) |i| {
+                const s = d.symbolIndex(@intCast(i)) orelse continue;
+                if (marks[s]) continue;
+                if (self.isFunctionNode(@intCast(i)) or self.enclosingFunction(@intCast(i)) != NONE) marks[s] = true;
+            }
+            self.seen_in_function = marks;
+        }
+        return self.seen_in_function.?[si];
+    }
+
     pub fn isFunctionNode(self: *const Compiler, idx: u32) bool {
         const rid = self.data.rule(idx);
         return rid < self.lang.functions.len and self.lang.functions[rid] != null;
@@ -1789,6 +1811,18 @@ const Gen = struct {
     /// (bindParams): their slots, and their borrows' states (0: still the
     /// caller's, not released when the function ends)
     param_borrows: std.ArrayListUnmanaged(struct { slot: ir.Value, state: ir.Value }) = .empty,
+    /// The program's code: by slot of the program's frame, the stack slot
+    /// keeping that variable (one no function refers to: seenInFunction),
+    /// null for the others. The frame has it where code that sees the frames
+    /// runs (spillMirrors before, reloadMirrors after) and when the
+    /// program's code ends; on the stack, LLVM keeps it in registers and
+    /// knows its kind from what's stored.
+    mirrors: []?ir.Value = &.{},
+    /// An rt over the program's frames was handed out (to a function
+    /// called next): the mirrors are in the frame, stores to them go there
+    /// too, until the next call returns (rt is valid while the call that got
+    /// it runs)
+    rt_out: bool = false,
     /// A function's typed entry: its parameters are the LLVM function's,
     /// plain values of their declared kinds (Gen.typedParams)
     typed: bool = false,
@@ -1930,7 +1964,18 @@ const Gen = struct {
         // others may: an error's stack, a call, Python)
         const plain = std.mem.startsWith(u8, name, "zr_inc") or std.mem.startsWith(u8, name, "zr_dec") or std.mem.startsWith(u8, name, "zr_frame_");
         if (!plain) self.syncDepth();
-        return self.f.callName(name, args);
+        const r = self.f.callName(name, args);
+        // (a call an rt handed out may be for: it has returned)
+        if (self.rt_out and (std.mem.startsWith(u8, name, "zr_call") or std.mem.eql(u8, name, "zr_builtin"))) self.rtReturned();
+        return r;
+    }
+
+    /// The call an rt over the program's frames was for has returned: the
+    /// mirrors as the frame has them now.
+    fn rtReturned(self: *Gen) void {
+        if (!self.rt_out) return;
+        self.rt_out = false;
+        self.reloadMirrors();
     }
 
     /// In a typed entry: Ctx.depth set to the calls it's in (its depth
@@ -1995,6 +2040,62 @@ const Gen = struct {
         }
     }
 
+    /// Most variables of the program kept on the stack (see `mirrors`)
+    const max_mirrors = 32;
+
+    /// The program's code: its variables no function refers to on the
+    /// stack, each with the value the frame has (set by an earlier run of a
+    /// session, or unset).
+    fn makeMirrors(self: *Gen) Error!void {
+        if (self.detached or self.thunk) return;
+        const f = &self.f;
+        const t = self.c.m.t;
+        const syms = self.layout.syms.items;
+        self.mirrors = try self.a().alloc(?ir.Value, syms.len);
+        @memset(self.mirrors, null);
+        var made: usize = 0;
+        for (syms, 0..) |si, slot| {
+            if (made == max_mirrors) break;
+            if (self.c.data.homeOf(si) != NONE or try self.c.seenInFunction(si)) continue;
+            const m = try f.alloca(t.val);
+            const p = f.offset(self.frame.?, 32 + 16 * @as(i64, @intCast(slot)));
+            f.store(f.load(t.i64, p), m);
+            f.store(f.load(t.i64, f.offset(p, 8)), f.field(t.val, m, 1));
+            self.mirrors[slot] = m;
+            made += 1;
+        }
+    }
+
+    /// The mirrors' values into the program's frame (the references
+    /// moved: the frame holds them now, the stack the same values).
+    fn spillMirrors(self: *Gen) void {
+        const f = &self.f;
+        const t = self.c.m.t;
+        for (self.mirrors, 0..) |m_, slot| {
+            const m = m_ orelse continue;
+            const p = f.offset(self.frame.?, 32 + 16 * @as(i64, @intCast(slot)));
+            f.store(f.load(t.i64, m), p);
+            f.store(f.load(t.i64, f.field(t.val, m, 1)), f.offset(p, 8));
+        }
+    }
+
+    /// The frame's values into the mirrors (code that ran may have stored
+    /// to them).
+    fn reloadMirrors(self: *Gen) void {
+        const f = &self.f;
+        const t = self.c.m.t;
+        for (self.mirrors, 0..) |m_, slot| {
+            const m = m_ orelse continue;
+            const p = f.offset(self.frame.?, 32 + 16 * @as(i64, @intCast(slot)));
+            f.store(f.load(t.i64, p), m);
+            f.store(f.load(t.i64, f.offset(p, 8)), f.field(t.val, m, 1));
+        }
+    }
+
+    fn hasMirrors(self: *const Gen) bool {
+        return self.mirrors.len != 0;
+    }
+
     fn prologue(self: *Gen) Error!void {
         const f = &self.f;
         const t = self.c.m.t;
@@ -2004,6 +2105,7 @@ const Gen = struct {
         const n = self.layout.syms.items.len;
         if (self.fnode == NONE) {
             self.frame = self.globals;
+            try self.makeMirrors();
         } else if (self.layout.heap) {
             // (and two hidden slots: the receiver, the extra arguments)
             self.frame = self.call("zr_frame_new", &.{ self.env, self.k(@intCast(n + 2)) });
@@ -2076,9 +2178,13 @@ const Gen = struct {
         const f = &self.f;
         try f.br(self.ret_label);
         try f.block(self.ret_label);
+        // (the program's variables in its frame, as it ended: sessions and
+        // calls of its functions see them there)
+        self.spillMirrors();
         try self.releaseFrame();
         if (self.typed) try f.ret(f.load(self.c.m.t.val, self.result)) else try f.ret(self.c.m.k1(true));
         try f.block(self.err_label);
+        self.spillMirrors();
         try self.releaseFrame();
         if (self.typed) {
             try self.storeSlot(self.result, .{ .tag = self.k(Compiler.typed_error), .bits = self.k(0), .shape = .any });
@@ -2444,6 +2550,12 @@ const Gen = struct {
                 const f = &self.f;
                 const owner = f.zext64(self.k32(self.currentOwner()));
                 const tag = f.or_(self.k(@intFromEnum(value.Tag.rt)), f.shl(owner, self.k(32)));
+                // (what it's given to reads the program's variables in its
+                // frame: there until the call it's for returns)
+                if (self.hasMirrors()) {
+                    self.spillMirrors();
+                    self.rt_out = true;
+                }
                 break :blk Dyn{ .tag = tag, .bits = f.ptrToInt(try self.currentFrame()), .shape = .any };
             },
             else => self.c.unsupported("a {s} can't be kept in a variable or passed as a value (node {d})", .{ @tagName(v), at }),
@@ -2764,6 +2876,10 @@ const Gen = struct {
         const home = c.data.homeOf(sym);
         const slot = c.slot_of.get(sym).?;
         if (home == self.fnode and self.frame == null) return self.var_slots.items[slot];
+        // (the program's, kept on the stack)
+        if (home == NONE and self.fnode == NONE and slot < self.mirrors.len) {
+            if (self.mirrors[slot]) |m| return m;
+        }
         const frame = try self.frameOf(home, "a variable of another function isn't reachable from here");
         return f.offset(frame, 32 + 16 * @as(i64, slot));
     }
@@ -2986,6 +3102,14 @@ const Gen = struct {
         const slot = try self.varSlot(si);
         const old = try self.loadSlot(slot, .any);
         try self.storeSlot(slot, v);
+        // (a mirror while an rt is out: in the frame too, where it's read)
+        if (self.rt_out) {
+            for (self.mirrors, 0..) |m, i| if (m == slot) {
+                const p = self.f.offset(self.frame.?, 32 + 16 * @as(i64, @intCast(i)));
+                self.f.store(v.tag, p);
+                self.f.store(v.bits, self.f.offset(p, 8));
+            };
+        }
         // (a top-level variable's function: read without a reference by
         // code still running, maybe (loadVar), so buried, not let go of)
         if (d.homeOf(si) == NONE) {
@@ -3650,7 +3774,9 @@ const Gen = struct {
             f.store(fr.frame, s);
             break :blk s;
         };
+        self.spillMirrors();
         const status = self.call("zr_run_value", &.{ self.ctx, self.k32(which), self.k32(at), d.tag, d.bits, slot, self.k32(owner), self.out });
+        self.reloadMirrors();
         if (made) |fr| try self.reloadFrame(fr);
         try self.drop(.{ .dyn = d });
         try self.statusJumps(status, at);
@@ -3785,7 +3911,10 @@ const Gen = struct {
             f.store(try self.currentFrame(), s);
             break :blk s;
         };
+        // (it sees the program's variables in its frame)
+        self.spillMirrors();
         const status = self.call("zr_py_semantic", &.{ self.ctx, self.k32(@intFromEnum(which)), self.k32(idx), slot, self.k32(owner), self.out });
+        self.reloadMirrors();
         try self.statusJumps(status, idx);
         return .{ .dyn = try self.loadOut(.any) };
     }
@@ -4248,12 +4377,15 @@ const Gen = struct {
         // (its code sees the variables here through the frames)
         const fr = try self.frameForCall();
         const call_args = [_]ir.Value{ self.ctx, fr.frame, arr, self.k32(at), self.k32(self.currentOwner()), recv, varargs, self.out };
-        // (code out of line reads Ctx.depth)
+        // (code out of line reads Ctx.depth, and the program's variables in
+        // its frame)
         self.syncDepth();
+        self.spillMirrors();
         const status = if (try self.siteOf(func, args, key, spec.semantic)) |site|
             try self.siteCall(site, fun, &call_args)
         else
             self.f.call(fun, &call_args);
+        self.reloadMirrors();
         if (fr.made) try self.reloadFrame(fr.frame);
         for (ds) |d| try self.drop(.{ .dyn = d });
         try self.statusJumps(status, at);
@@ -6843,6 +6975,9 @@ const Gen = struct {
         const null_ptr = m.nullPtr();
         self.syncDepth();
         const status = f.call(.{ .v = f.intToPtr(code), .ty = helper_ty }, &.{ self.ctx, null_ptr, arr, self.k32(inst.node), self.k32(0), null_ptr, null_ptr, self.out });
+        // (an rt among the arguments: read back after the call; the first
+        // call's way, zr_call_site, in call())
+        if (self.rt_out) self.reloadMirrors();
         const ok_direct = f.icmp(jit_c.LLVMIntEQ, status, m.k32(1));
         const direct_end = f.current;
         const not_ok = try f.label("host_not_ok");
@@ -6898,6 +7033,12 @@ const Gen = struct {
         const m = &self.c.m;
         const t = m.t;
         const n = ds.len;
+        // (an rt handed out for this call: the mirrors read back after it,
+        // on each way it's made; zr_call's in call())
+        const rt_was = self.rt_out;
+        defer if (rt_was) {
+            self.rt_out = false;
+        };
         const code = try self.c.functionCode(fd.func);
         const shapes = try self.typedParams(fd.func);
         // (arguments of the kinds its typed entry takes, or of kinds known
@@ -6987,6 +7128,8 @@ const Gen = struct {
             if (in_typed) f.store(inner, depth_p);
             try self.fillArgs(arr, ds);
             const st_generic = f.call(.{ .v = code, .ty = (try self.c.llvmFunction(fd.func)).ty }, &generic_args);
+            // (an rt among the arguments: the call it was for has returned)
+            if (rt_was) self.reloadMirrors();
             const generic_end = f.current;
             try f.br(entered);
             try f.block(entered);
@@ -6995,7 +7138,9 @@ const Gen = struct {
         } else blk: {
             if (in_typed) f.store(inner, depth_p);
             try self.fillArgs(arr, ds);
-            break :blk f.call(.{ .v = code, .ty = (try self.c.llvmFunction(fd.func)).ty }, &generic_args);
+            const st = f.call(.{ .v = code, .ty = (try self.c.llvmFunction(fd.func)).ty }, &generic_args);
+            if (rt_was) self.reloadMirrors();
+            break :blk st;
         };
         // (generic code's Ctx.depth its own again; a typed entry's isn't
         // kept: syncDepth)
