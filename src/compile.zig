@@ -2127,8 +2127,21 @@ const Gen = struct {
             const spec = self.c.specOf(self.fnode).?;
             if (spec.extra == .keep) {
                 const nparams = self.paramNodes(self.fnode, spec).len;
+                // (no arguments beyond the parameters, the usual: the empty
+                // tuple, without a call)
+                const extra = try f.label("varargs_extra");
+                const none = try f.label("varargs_none");
+                const done = try f.label("varargs_done");
+                try f.condBr(f.icmp(jit_c.LLVMIntUGT, self.nargs, self.k(@intCast(nparams))), extra, none);
+                try f.block(none);
+                f.store(self.k(@intFromEnum(value.Tag.tuple)), self.varargs_slot);
+                f.store(f.ptrToInt(self.c.m.ptrConst(@intFromPtr(helpers.empty_tuple.?))), f.field(t.val, self.varargs_slot, 1));
+                try f.br(done);
+                try f.block(extra);
                 try self.callCheck("zr_varargs", &.{ self.ctx, self.k32(self.fnode), self.args, self.nargs, self.k(@intCast(nparams)), self.out });
                 try self.storeSlot(self.varargs_slot, try self.loadOut(.tuple));
+                try f.br(done);
+                try f.block(done);
             }
         }
     }

@@ -821,7 +821,8 @@ pub const FunctionFlags = struct {
     }
 };
 
-var empty_tuple: ?*value.Tuple = null;
+/// The empty tuple, one for all (made by init(): compiled code names it)
+pub var empty_tuple: ?*value.Tuple = null;
 
 /// The arguments beyond a function's parameters, as a tuple (their own
 /// references), in `out` (extra="keep": rt.varargs).
