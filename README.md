@@ -224,7 +224,7 @@ One file runs the program, on a machine with no Python: in it are a Python runti
 
 Run, it unpacks itself once into the platform's cache directory (`zrun/exe/<its hash>`) and runs the program there with the Python it brought: the semantics run as Python, host functions and Python's modules work as they do anywhere. The program's arguments are `sys.argv[1:]`; a runtime error is printed and exits with 1, an error found loading with 2.
 
-The targets are `x86_64-linux` (glibc 2.17 or newer) and `x86_64-windows`, from either. For this machine, the compiled code is made when building; for the other, zrun, zgram and zrules come from PyPI (the same versions' wheels), and the program is compiled the first time it runs, then cached. Building downloads the runtime once (about 30 MB, kept in the cache directory under `zrun/build`). An executable takes 30 to 40 MB, about 100 MB unpacked. Starting it runs what the language's module does when imported: compiling its grammar is most of it (about 0.5 s for Lua's).
+The targets are `x86_64-linux` (glibc 2.17 or newer) and `x86_64-windows`, from either. For this machine, the compiled code is made when building; for the other, zrun, zgram and zrules come from PyPI (the same versions' wheels), and the program is compiled the first time it runs, then cached. Building downloads the runtime once (about 30 MB, kept in the cache directory under `zrun/build`). An executable takes 30 to 40 MB, about 100 MB unpacked. Its first run unpacks it and compiles the grammar (about 1.2 s for Lua's); later runs start in about 0.16 s (zgram keeps compiled grammars on disk).
 
 ## Sessions and the REPL
 
