@@ -39,7 +39,10 @@ class Table:
 
     def __init__(self):
         self.arr = []
-        self.hash = {}
+        # (made when a key outside the array part is first set: most tables
+        # are arrays or records of a few fields, and an empty dict is an
+        # object made, counted and freed for nothing)
+        self.hash = None
         self.meta = None
 
     def get(self, key):
@@ -48,12 +51,16 @@ class Table:
         if type(key) is int or isinstance(key, int) and not isinstance(key, bool):
             if 1 <= key <= len(self.arr):
                 return self.arr[key - 1]
-        return self.hash.get(key)
+        h = self.hash
+        if h is None:
+            return None
+        return h.get(key)
 
     def set(self, key, value):
         if type(key) is float and key.is_integer():
             key = int(key)
         arr = self.arr
+        h = self.hash
         if isinstance(key, int) and not isinstance(key, bool):
             n = len(arr)
             if 1 <= key <= n:
@@ -64,27 +71,36 @@ class Table:
                 return
             if key == n + 1:
                 if value is None:
-                    self.hash.pop(key, None)
+                    if h is not None:
+                        h.pop(key, None)
                     return
                 arr.append(value)
-                self.hash.pop(key, None)
-                # (the keys right after it move to the array part)
-                nxt = key + 1
-                while nxt in self.hash:
-                    arr.append(self.hash.pop(nxt))
-                    nxt += 1
+                if h is not None:
+                    h.pop(key, None)
+                    # (the keys right after it move to the array part)
+                    nxt = key + 1
+                    while nxt in h:
+                        arr.append(h.pop(nxt))
+                        nxt += 1
                 return
         if value is None:
-            self.hash.pop(key, None)
+            if h is not None:
+                h.pop(key, None)
         else:
-            self.hash[key] = value
+            if h is None:
+                h = {}
+                self.hash = h
+            h[key] = value
 
     def length(self):
         if self.arr:
             return len(self.arr)
+        h = self.hash
+        if h is None:
+            return 0
         # a border in the hash part
         n = 0
-        while self.hash.get(n + 1) is not None:
+        while h.get(n + 1) is not None:
             n += 1
         return n
 
@@ -98,22 +114,27 @@ class Table:
             if isinstance(key, int) and not isinstance(key, bool) and 1 <= key <= len(arr):
                 i = key
             else:
-                keys = list(self.hash)
+                h = self.hash
+                if h is None:
+                    return "bad"
+                keys = list(h)
                 try:
                     j = keys.index(key) + 1
                 except ValueError:
                     return "bad"
                 for k in keys[j:]:
-                    if self.hash[k] is not None:
-                        return (k, self.hash[k])
+                    if h[k] is not None:
+                        return (k, h[k])
                 return None
         while i < len(arr):
             if arr[i] is not None:
                 return (i + 1, arr[i])
             i += 1
-        for k, v in self.hash.items():
-            if v is not None:
-                return (k, v)
+        h = self.hash
+        if h is not None:
+            for k, v in h.items():
+                if v is not None:
+                    return (k, v)
         return None
 
 

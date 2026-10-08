@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 - **Floor division and modulo of ints are inline** in compiled code (Python's semantics: the result rounded toward minus infinity, the remainder the divisor's sign), the helper only for a divisor of 0 or, for `//`, -1. The Lua example's integer `//` and `%` no longer wrap results to 64 bits through arithmetic beyond them (floor division and modulo of 64-bit ints fit, but for minint // -1, wrapped as Lua's). Lua's `s = (s + i * i) % 1000003` ten million times: 0.12 s, was 0.34 (Lua 5.4: 0.07).
+- **Helpers compiled out of line count references inline**, as functions' and loops' code does: they run for each call of the code calling them. The Lua example's tables make their hash part when a key outside the array part is first set (an array or a constructor's table: two objects, not three). Binary trees, depth 14, 8 times: 0.088 s, was 0.141.
 
 ## [0.3.0] - 2026-10-08
 

@@ -1911,7 +1911,8 @@ const Gen = struct {
     /// counts inline. (Elsewhere, calls: each inline one is blocks for
     /// LLVM to compile.)
     fn hot(self: *const Gen) bool {
-        return self.fnode != NONE or self.loop_level > 0 or self.specialized;
+        // (a helper out of line runs for each call of the code calling it)
+        return self.fnode != NONE or self.loop_level > 0 or self.specialized or self.detached;
     }
 
     /// A value's count up (or down): inline in hot code; else a call,
