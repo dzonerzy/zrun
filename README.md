@@ -367,6 +367,7 @@ test/
   test_state.py         # Module state the semantics change, made native
   test_scopes.py        # Block scopes and closures
   test_tail.py          # rt.tail_call: tail calls in every mode
+  test_methods.py       # Records' methods called on values known only at run time
   test_gc.py            # The cycle collector, leaks, functions rebound while called
   test_cache.py         # The compiled-code cache between processes
   test_tiers.py         # Fast code first, optimized in the background
