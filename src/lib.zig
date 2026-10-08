@@ -2755,7 +2755,65 @@ const Runtime = struct {
         return self.callValue(v.f, tuple, optional(v.receiver));
     }
 
+    /// `rt.tail_call(f, args, receiver=None)`: return what calling f with
+    /// the arguments returns, the function being run left first (its frame
+    /// gone: a chain of tail calls takes no more depth). Raises
+    /// zrun.TailCall, carrying the call, for the call running the function
+    /// to make (callValue); at the top level, no function to leave: the
+    /// call made here and its result returned (rt.Return).
+    pub fn tail_call(self: *Runtime, a: pyoz.Args(struct { f: *PyObject, args: *PyObject, receiver: ?*PyObject = null })) ?*PyObject {
+        const v = a.value;
+        const tuple = py.c.PySequence_Tuple(v.args) orelse return null;
+        defer py.Py_DecRef(tuple);
+        const recv = optional(v.receiver);
+        if (self._calls.items.len == 0) {
+            const r = self.callValue(v.f, tuple, recv) orelse return null;
+            defer py.Py_DecRef(r);
+            const exc = py.c.PyObject_CallFunctionObjArgs(ztypes.Return, r, @as(?*PyObject, null)) orelse return null;
+            defer py.Py_DecRef(exc);
+            py.c.PyErr_SetObject(ztypes.Return, exc);
+            return null;
+        }
+        const exc = py.c.PyObject_CallFunctionObjArgs(ztypes.TailCall, v.f, tuple, recv orelse py.Py_None(), @as(?*PyObject, null)) orelse return null;
+        defer py.Py_DecRef(exc);
+        py.c.PyErr_SetObject(ztypes.TailCall, exc);
+        return null;
+    }
+
+    /// Call `f` (a function of the program or a host function); a function
+    /// ending with rt.tail_call: the call it left made here, at the same
+    /// depth, its call site this one, and so on.
     fn callValue(self: *Runtime, f: *PyObject, args: *PyObject, receiver: ?*PyObject) ?*PyObject {
+        const at = self._at;
+        var cur_f = ref(f);
+        var cur_args = ref(args);
+        var cur_recv: ?*PyObject = if (receiver) |r| ref(r) else null;
+        while (true) {
+            const r = self.callValueOnce(cur_f, cur_args, cur_recv);
+            py.Py_DecRef(cur_f);
+            py.Py_DecRef(cur_args);
+            if (cur_recv) |x| py.Py_DecRef(x);
+            if (r != null or ztypes.pendingControl() != .tail) return r;
+            // (the call the exception carries: (f, args, receiver))
+            var t: ?*PyObject = null;
+            var e: ?*PyObject = null;
+            var tb: ?*PyObject = null;
+            py.c.PyErr_Fetch(@ptrCast(&t), @ptrCast(&e), @ptrCast(&tb));
+            py.c.PyErr_NormalizeException(@ptrCast(&t), @ptrCast(&e), @ptrCast(&tb));
+            defer inline for (.{ t, e, tb }) |o| {
+                if (o) |held| py.Py_DecRef(held);
+            };
+            const exc_args = py.c.PyObject_GetAttrString(e orelse return null, "args") orelse return null;
+            defer py.Py_DecRef(exc_args);
+            cur_f = ref(py.c.PyTuple_GetItem(exc_args, 0) orelse return null);
+            cur_args = ref(py.c.PyTuple_GetItem(exc_args, 1).?);
+            const rv = py.c.PyTuple_GetItem(exc_args, 2).?;
+            cur_recv = if (rv == py.Py_None()) null else ref(rv);
+            self._at = at;
+        }
+    }
+
+    fn callValueOnce(self: *Runtime, f: *PyObject, args: *PyObject, receiver: ?*PyObject) ?*PyObject {
         if (objects.asFunction(f)) |fo| return self.callFunction(fo, args, receiver);
         if (py.PyCallable_Check(f)) {
             const all = if (receiver) |r| prepend(r, args) orelse return null else ref(args);
@@ -2868,7 +2926,7 @@ const Runtime = struct {
         defer py.Py_DecRef(body);
         if (self.execObj(body)) return none();
         if (ztypes.pendingControl() == .ret) return ztypes.takeReturn();
-        if (ztypes.pendingControl() != .none) {
+        if (ztypes.pendingControl() == .brk or ztypes.pendingControl() == .cont) {
             // Break or Continue outside a loop: an error of the language
             py.c.PyErr_Clear();
             return self.fail(self._at, "break or continue outside a loop", .{});
@@ -3267,6 +3325,8 @@ const Runtime = struct {
     pub const function__params__ = "node";
     pub const call__doc__: [*:0]const u8 = "Call a function of the program, or a host function, with a list of arguments.";
     pub const call__params__ = "f, args";
+    pub const tail_call__doc__: [*:0]const u8 = "Return what calling f with the arguments returns, the function being run left first (its frame given up: a chain of tail calls takes no depth). Never returns. At the top level, a call whose result is returned.";
+    pub const tail_call__params__ = "f, args";
     pub const error__doc__: [*:0]const u8 = "Stop the program with a runtime error at the node.";
     pub const kind__doc__: [*:0]const u8 = "A node's kind (also when it has a field named kind).";
     pub const kind__params__ = "node";

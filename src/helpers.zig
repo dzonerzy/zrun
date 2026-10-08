@@ -74,6 +74,12 @@ pub const Ctx = struct {
     /// kept (bury) till it's done (drainGraveyard), so no read of one
     /// outlives it
     graveyard: std.ArrayListUnmanaged(Value) = .empty,
+    /// The call rt.tail_call left for the caller to make, its frame gone
+    /// (the function's result tagged TAIL_TAG meanwhile): the function,
+    /// its arguments (a tuple or a list), its receiver (owned; none: none)
+    tail_f: Value = Value.none_v,
+    tail_args: Value = Value.none_v,
+    tail_recv: ?Value = null,
 
     /// The object at an index.
     pub fn object(self: *const Ctx, i: u64) *PyObject {
@@ -863,10 +869,91 @@ pub export fn zr_function(ctx: *Ctx, code: Code, env: ?*value.Frame, node: u32, 
     return true;
 }
 
+/// A function's result standing for a call it left to its caller
+/// (rt.tail_call: Ctx.tail_f...)
+pub const TAIL_TAG: u64 = 0xFFFF0002;
+
 /// Call a function value (the program's, or a host one) with arguments
 /// (borrowed); the result in `out`. `node`: the node calling (errors, the
-/// stack).
+/// stack). A function ending with rt.tail_call: the call it left made
+/// here, after its frame's gone, and so on (zr_tail_resolve).
 pub export fn zr_call(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Value, nargs: u64, receiver: ?*const Value, out: *Value) callconv(.c) bool {
+    if (!callOnce(ctx, node, ft, fb, args, nargs, receiver, out)) return false;
+    if (out.tag != TAIL_TAG) return true;
+    return zr_tail_resolve(ctx, node, out);
+}
+
+/// rt.tail_call(f, args, receiver) in a function: the call kept for its
+/// caller to make (references of its own taken).
+export fn zr_tail_set(ctx: *Ctx, ft: u64, fb: u64, at: u64, ab: u64, recv: ?*const Value) callconv(.c) void {
+    const f = Value{ .tag = ft, .bits = fb };
+    const a = Value{ .tag = at, .bits = ab };
+    value.incref(f);
+    value.incref(a);
+    ctx.tail_f = f;
+    ctx.tail_args = a;
+    ctx.tail_recv = if (recv) |r| blk: {
+        value.incref(r.*);
+        break :blk r.*;
+    } else null;
+}
+
+/// The pending tail call moved to `keep` (3 values: the function, the
+/// arguments, the receiver or TAIL_TAG for none) while code that may make
+/// calls of its own runs (a finally on the way out).
+export fn zr_tail_take(ctx: *Ctx, keep: [*]Value) callconv(.c) void {
+    keep[0] = ctx.tail_f;
+    keep[1] = ctx.tail_args;
+    keep[2] = ctx.tail_recv orelse .{ .tag = TAIL_TAG, .bits = 0 };
+    ctx.tail_f = Value.none_v;
+    ctx.tail_args = Value.none_v;
+    ctx.tail_recv = null;
+}
+
+/// The tail call zr_tail_take moved, pending again.
+export fn zr_tail_put(ctx: *Ctx, keep: [*]const Value) callconv(.c) void {
+    ctx.tail_f = keep[0];
+    ctx.tail_args = keep[1];
+    ctx.tail_recv = if (keep[2].tag == TAIL_TAG) null else keep[2];
+}
+
+/// The pending tail call given up (a handler of the semantics' caught it).
+export fn zr_tail_clear(ctx: *Ctx) callconv(.c) void {
+    value.decref(ctx.tail_f);
+    value.decref(ctx.tail_args);
+    if (ctx.tail_recv) |r| value.decref(r);
+    ctx.tail_f = Value.none_v;
+    ctx.tail_args = Value.none_v;
+    ctx.tail_recv = null;
+}
+
+/// The call a function left with rt.tail_call (its result in `out` tagged
+/// TAIL_TAG), made at the depth of the call it ended (`node`'s), and the
+/// one that one leaves, until one returns: its result in `out`.
+pub export fn zr_tail_resolve(ctx: *Ctx, node: u32, out: *Value) callconv(.c) bool {
+    while (out.tag == TAIL_TAG) {
+        const f = ctx.tail_f;
+        const a = ctx.tail_args;
+        const r = ctx.tail_recv;
+        ctx.tail_f = Value.none_v;
+        ctx.tail_args = Value.none_v;
+        ctx.tail_recv = null;
+        defer {
+            value.decref(f);
+            value.decref(a);
+            if (r) |x| value.decref(x);
+        }
+        const items: []const Value = switch (a.kind()) {
+            .list => @as(*value.List, @ptrCast(@alignCast(a.ptr()))).slice(),
+            .tuple => @as(*value.Tuple, @ptrCast(@alignCast(a.ptr()))).slice(),
+            else => return fail(ctx, node, "rt.tail_call's arguments must be a list or a tuple", .{}),
+        };
+        if (!callOnce(ctx, node, f.tag, f.bits, items.ptr, items.len, if (r) |*x| x else null, out)) return false;
+    }
+    return true;
+}
+
+fn callOnce(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Value, nargs: u64, receiver: ?*const Value, out: *Value) bool {
     const f = Value{ .tag = ft, .bits = fb };
     switch (f.kind()) {
         .function => {
@@ -2334,7 +2421,7 @@ const helper_names = [_][]const u8{
     "zr_is_type",  "zr_global",     "zr_format",     "zr_concat",        "zr_unpack",
     "zr_varargs",  "zr_record_new", "zr_isinstance", "zr_call_seq",      "zr_slice",
     "zr_type",     "zr_builtin",    "zr_range",      "zr_cell",          "zr_frame_of",
-    "zr_extend_items",
+    "zr_extend_items", "zr_tail_set", "zr_tail_resolve", "zr_tail_take", "zr_tail_put", "zr_tail_clear",
 };
 
 /// The names compiled code calls them by, and their addresses

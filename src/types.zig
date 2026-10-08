@@ -25,6 +25,7 @@ pub var Return: *PyObject = undefined;
 pub var Break: *PyObject = undefined;
 pub var Continue: *PyObject = undefined;
 pub var Throw: *PyObject = undefined;
+pub var TailCall: *PyObject = undefined;
 /// int's tp_new, to make I64 instances (calling int.__new__ is refused
 /// for a subclass with its own __new__)
 var int_new: py.c.newfunc = null;
@@ -69,6 +70,7 @@ fn initTypes(module: *PyObject) !void {
     Return = try newException(module, "Return", py.PyExc_Exception(), "raise rt.Return(value): return from the function being run.");
     Break = try newException(module, "Break", py.PyExc_Exception(), "raise rt.Break(): leave the loop rt.loop() is running.");
     Continue = try newException(module, "Continue", py.PyExc_Exception(), "raise rt.Continue(): go on with the loop's next iteration.");
+    TailCall = try newException(module, "TailCall", py.PyExc_Exception(), "What rt.tail_call() raises, leaving the function being run: its caller makes the call. Not raised by semantics themselves.");
     Throw = try pythonClass(module, "Throw",
         \\class Throw(Exception):
         \\    """raise rt.Throw(value, message=None): an error of the language,
@@ -260,7 +262,7 @@ var i64_spec = py.c.PyType_Spec{
 // Control flow
 // ----------------------------------------------------------------------
 
-pub const Control = enum { none, ret, brk, cont };
+pub const Control = enum { none, ret, brk, cont, tail };
 
 /// Which control flow exception is being raised, if one is.
 pub fn pendingControl() Control {
@@ -268,6 +270,7 @@ pub fn pendingControl() Control {
     if (py.c.PyErr_ExceptionMatches(Return) != 0) return .ret;
     if (py.c.PyErr_ExceptionMatches(Break) != 0) return .brk;
     if (py.c.PyErr_ExceptionMatches(Continue) != 0) return .cont;
+    if (py.c.PyErr_ExceptionMatches(TailCall) != 0) return .tail;
     return .none;
 }
 

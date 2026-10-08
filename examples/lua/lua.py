@@ -456,16 +456,22 @@ def call_args(node, rt):
     return explist(args, rt)
 
 
-def call_results(node, rt):
-    """A call expression's results, as call_raw gives them."""
+def call_target(node, rt):
+    """What a call expression calls and with what: (function, arguments)."""
     if node.kind == "method_call":
         obj = rt.eval(node.target)
         f = index(rt, node, obj, node.method.text)
         if not is_function(f) and metamethod(f, "__call") is None:
             lua_error(rt, node, "attempt to call a %s value (method '%s')" % (type_name(f), node.method.text))
-        return call_raw(rt, node, f, [obj] + call_args(node, rt))
+        return f, [obj] + call_args(node, rt)
     f = rt.eval(node.target)
-    return call_raw(rt, node, f, call_args(node, rt))
+    return f, call_args(node, rt)
+
+
+def call_results(node, rt):
+    """A call expression's results, as call_raw gives them."""
+    f, args = call_target(node, rt)
+    return call_raw(rt, node, f, args)
 
 
 def call_values(node, rt):
@@ -699,6 +705,18 @@ def for_in(node, rt):
 @lang.exec("retstat")
 def retstat(node, rt):
     kids = node.children
+    # `return f(x)`: a tail call, as Lua's (the function's frame given up
+    # first: a chain of them takes no stack); a library function's call
+    # is made as any other
+    if kids and kids[0].kind == "explist":
+        exps = kids[0].children
+        if len(exps) == 1 and (exps[0].kind == "call" or exps[0].kind == "method_call"):
+            f, args = call_target(exps[0], rt)
+            if isinstance(f, zrun.Function):
+                rt.tail_call(f, args)
+            if isinstance(f, Method):
+                rt.tail_call(f.fn, args[1:], receiver=args[0] if args else None)
+            raise rt.Return(call_raw(rt, exps[0], f, args))
     vals = explist_of(kids[0], rt) if kids and kids[0].kind == "explist" else []
     # (one value, not nil: itself, no list made (call_raw's callers take
     # it so); nil stays a list: None is a function's end, no value)

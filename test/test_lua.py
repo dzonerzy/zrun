@@ -30,6 +30,28 @@ def test_like_real_lua(name, mode, capsys):
     assert capsys.readouterr().out == expected
 
 
+def test_typed_entries_and_thunks_apart(capsys):
+    # (two functions made hot one after the other: the second's typed entry
+    # was named as a thunk of the first's code, which LLVM refused)
+    src = """local function count(n, acc)
+  if n == 0 then return acc end
+  return count(n - 1, acc + 1)
+end
+for i = 1, 4 do print(count(500, 0)) end
+local Counter = {}
+Counter.__index = Counter
+function Counter.new() return setmetatable({n = 0}, Counter) end
+function Counter:run(k)
+  if k == 0 then return self.n end
+  self.n = self.n + 1
+  return self:run(k - 1)
+end
+for i = 1, 4 do print(Counter.new():run(500)) end
+"""
+    lua.run(src, "hot.lua", mode="compiled")
+    assert capsys.readouterr().out == "500\n" * 8
+
+
 def test_all_native():
     # every Lua semantic is compiled: none runs as Python (the ones that
     # would are learned while compiling: lang.python_semantics())

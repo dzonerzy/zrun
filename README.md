@@ -151,6 +151,7 @@ What `rt` offers:
 | `rt.eval(x)`, `rt.exec(x)` | run a child node (or each of a list) |
 | `rt.load(name)`, `rt.store(name, v)` | the variable a name node refers to |
 | `rt.function(node)`, `rt.call(f, args, receiver=None)` | make and call functions (the program's or a host function) |
+| `rt.tail_call(f, args, receiver=None)` | return what calling `f` returns, the function's frame given up first: chains of tail calls take no depth |
 | `rt.loop(body)` | run a loop's body once: `False` if it broke out |
 | `raise rt.Return(v)`, `rt.Break()`, `rt.Continue()` | control flow |
 | `raise rt.Throw(value)`, `rt.error(node, message)` | the language's errors |
@@ -158,6 +159,8 @@ What `rt` offers:
 | `rt.scope(node)`, `rt.symbol(node)`, `rt.type_of(node)`, `rt.fresh(node)` | zrules' view of names and types; new loop variables each time round |
 | `rt.u8(data, i)` ... `rt.i64be(data, i)` | integers read from data, bounds checked |
 | `rt.wrapping_add(a, b)`, `_sub`, `_mul`, `_shl`, `_shr`, `_ushr` | 64-bit arithmetic that wraps around |
+
+Tail calls are the language's to decide: a semantic calls `rt.tail_call(f, args)` where the language returns a call's result as it is (Lua's `return f(x)`), and the function is left before the call is made, in every mode, so `return loop(n - 1)` runs in constant stack and errors' call stacks keep one frame for the chain. The semantics' `finally` blocks run before the call; an `except` catching `zrun.TailCall` (or `Exception`) takes it, the call not made. At the top level, outside any function, it's a call whose result is returned.
 
 Integers are 64-bit and checked: an overflow is a runtime error at the node (`zrun.IntegerOverflow`), not a silent wraparound; the `wrapping_` functions are for languages that want one (Lua, hashes).
 
@@ -363,6 +366,7 @@ test/
   test_boundary.py      # Values crossing between compiled code and Python
   test_state.py         # Module state the semantics change, made native
   test_scopes.py        # Block scopes and closures
+  test_tail.py          # rt.tail_call: tail calls in every mode
   test_gc.py            # The cycle collector, leaks, functions rebound while called
   test_cache.py         # The compiled-code cache between processes
   test_tiers.py         # Fast code first, optimized in the background

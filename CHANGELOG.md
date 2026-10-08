@@ -5,6 +5,14 @@ All notable changes to zrun are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Tail calls: `rt.tail_call(f, args, receiver=None)`.** Returns what calling `f` returns, the function being run left first: a chain of tail calls takes no depth, in every mode (compiled code gives the frame up and its caller makes the call; the reference mode raises `zrun.TailCall` for the call running it). The semantics' `finally` blocks run before the call, an `except` catching `zrun.TailCall` takes it; at the top level it's a call. The Lua example makes `return f(x)` one, as Lua does: `count(200000)` written as tail recursion runs (examples/lua/tests/tailcalls.lua, its output Lua 5.4's).
+
+### Fixed
+- A program in which a function got a typed entry (it got hot) and code ran out of line for a semantic run as Python could be refused by LLVM ("duplicate definition of symbol"): typed entries and that code were named alike.
+
 ## [0.2.0] - 2026-10-08
 
 Requires zgram 0.5.0 (compiled grammars kept on disk: a program starts in a fraction of the time) and zrules 0.2.0.

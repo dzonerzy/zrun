@@ -288,7 +288,8 @@ fn fromPythonError(ctx: *Ctx, idx: u32, out: *Value) i32 {
             py.c.PyErr_Clear();
             return 4;
         },
-        .none => {},
+        // (the bridge's rt.tail_call makes its call: none comes this way)
+        .none, .tail => {},
     }
     return pythonFailure(ctx, idx);
 }
@@ -751,6 +752,19 @@ fn run(r: *RuntimeObject, x: *PyObject, which: compile_mod.Which, loop: bool) ?*
             py.c.PyErr_SetNone(types.Continue);
             return null;
         },
+        // (an rt.tail_call: Python's in between, no frame to leave: the
+        // call made here, its result returned)
+        5 => {
+            out = .{ .tag = helpers.TAIL_TAG, .bits = 0 };
+            if (!helpers.zr_tail_resolve(ctx, r.at, &out)) return raiseCompiledError(ctx);
+            defer value.decref(out);
+            const v = value.toPython(out, ctx.node_maker) orelse return null;
+            defer py.Py_DecRef(v);
+            const exc = py.c.PyObject_CallFunctionObjArgs(types.Return, v, @as(?*PyObject, null)) orelse return null;
+            defer py.Py_DecRef(exc);
+            py.c.PyErr_SetObject(types.Return, exc);
+            return null;
+        },
         else => return raiseCompiledError(ctx),
     }
 }
@@ -923,6 +937,18 @@ fn rtCall(self: ?*PyObject, args: ?*PyObject, kwargs: ?*PyObject) callconv(.c) ?
     if (!helpers.zr_call(ctx, r.at, fv.tag, fv.bits, vals.ptr, n, if (has_recv) &recv_v else null, &out)) return raiseCompiledError(ctx);
     defer value.decref(out);
     return value.toPython(out, ctx.node_maker);
+}
+
+/// rt.tail_call(f, args, receiver=None) of a semantic run as Python: the
+/// call made here, its result returned (raise rt.Return): what it returns
+/// is the same, without the frame given up first.
+fn rtTailCall(self: ?*PyObject, args: ?*PyObject, kwargs: ?*PyObject) callconv(.c) ?*PyObject {
+    const v = rtCall(self, args, kwargs) orelse return null;
+    defer py.Py_DecRef(v);
+    const exc = py.c.PyObject_CallFunctionObjArgs(types.Return, v, @as(?*PyObject, null)) orelse return null;
+    defer py.Py_DecRef(exc);
+    py.c.PyErr_SetObject(types.Return, exc);
+    return null;
 }
 
 // -- errors and what's known of nodes --
@@ -1118,6 +1144,7 @@ var methods = [_]py.c.PyMethodDef{
     method("store", rtStore, py.c.METH_VARARGS),
     method("function", rtFunction, py.c.METH_O),
     method("call", rtCall, py.c.METH_VARARGS | py.c.METH_KEYWORDS),
+    method("tail_call", rtTailCall, py.c.METH_VARARGS | py.c.METH_KEYWORDS),
     method("error", rtError, py.c.METH_VARARGS | py.c.METH_KEYWORDS),
     method("kind", rtKind, py.c.METH_O),
     method("text", rtText, py.c.METH_O),

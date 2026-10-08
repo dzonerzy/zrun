@@ -126,7 +126,7 @@ pub const Dyn = struct {
     }
 };
 
-pub const RtMethod = enum { eval, exec, loop, load, store, function, call, @"error", kind, text, span, scope, symbol, type_of, node_at, fresh, wrapping_add, wrapping_sub, wrapping_mul, wrapping_shl, wrapping_shr, wrapping_ushr, @"u8", @"i8", u16le, u16be, i16le, i16be, u32le, u32be, i32le, i32be, u64le, u64be, i64le, i64be, Return, Break, Continue };
+pub const RtMethod = enum { eval, exec, loop, load, store, function, call, tail_call, @"error", kind, text, span, scope, symbol, type_of, node_at, fresh, wrapping_add, wrapping_sub, wrapping_mul, wrapping_shl, wrapping_shr, wrapping_ushr, @"u8", @"i8", u16le, u16be, i16le, i16be, u32le, u32be, i32le, i32be, u64le, u64be, i64le, i64be, Return, Break, Continue };
 
 /// A list known at compile time (its items may be dynamic): mutable, with
 /// identity (aliases see changes)
@@ -1254,7 +1254,8 @@ pub const Compiler = struct {
     pub fn compileThunk(self: *Compiler, idx: u32, which: Which, owner: u32) Error![:0]const u8 {
         try self.newModule();
         self.thunks += 1;
-        const name = try std.fmt.allocPrintSentinel(self.a, "{s}_t{d}", .{ self.m.prefix, self.thunks }, 0);
+        // (`_th`: typed entries are `_t<node>`)
+        const name = try std.fmt.allocPrintSentinel(self.a, "{s}_th{d}", .{ self.m.prefix, self.thunks }, 0);
         const t = self.m.t;
         const fun = try self.m.function(name, t.i32, &.{ t.ptr, t.ptr, t.ptr }, true);
         // (the function around the code: the owner's, through the scopes)
@@ -1315,6 +1316,11 @@ pub const Compiler = struct {
         .{ "zr_truthy", "bll" },
         .{ "zr_function", "bpppiplp" },
         .{ "zr_call", "bpillplpp" },
+        .{ "zr_tail_set", "vpllllp" },
+        .{ "zr_tail_resolve", "bpip" },
+        .{ "zr_tail_take", "vpp" },
+        .{ "zr_tail_put", "vpp" },
+        .{ "zr_tail_clear", "vp" },
         .{ "zr_call_site", "bpiplplp" },
         .{ "zr_host_jump", "bpi" },
         .{ "zr_host_failed", "bpil" },
@@ -1770,6 +1776,7 @@ const TryFrame = struct {
     catch_return: ?usize = null,
     catch_break: ?usize = null,
     catch_continue: ?usize = null,
+    catch_tail: ?usize = null,
 
     fn catches(self: *const TryFrame, kind: RtMethod) ?usize {
         if (!self.catching) return null;
@@ -1777,6 +1784,7 @@ const TryFrame = struct {
             .Return => self.catch_return,
             .Break => self.catch_break,
             .Continue => self.catch_continue,
+            .tail_call => self.catch_tail,
             else => null,
         };
     }
@@ -3954,6 +3962,15 @@ const Gen = struct {
         try f.block(err);
         try f.br(try self.errorTarget());
         try f.block(control);
+        // (5: a tail call pending, finished here: finishTail)
+        const is_tail = try f.label("raised_tail_call");
+        const jumps = try f.label("raised_jump");
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, status, self.c.m.k32(5)), is_tail, jumps);
+        try f.block(is_tail);
+        try self.finishTail(at);
+        try f.block(try f.label("after_tail"));
+        try f.br(done);
+        try f.block(jumps);
         const is_return = try f.label("raised_return");
         const loop_ctl = try f.label("raised_loop");
         try f.condBr(f.icmp(jit_c.LLVMIntEQ, status, self.c.m.k32(2)), is_return, loop_ctl);
@@ -4026,6 +4043,78 @@ const Gen = struct {
         self.err_inflight = saved_inflight;
         self.tries.clearRetainingCapacity();
         try self.tries.appendSlice(self.a(), saved);
+    }
+
+    /// rt.tail_call(f, args, receiver=None): return what calling f returns,
+    /// this function's frame gone first: the call kept in the Ctx
+    /// (zr_tail_set), the result tagged TAIL_TAG, the caller makes it
+    /// (zr_tail_resolve); out of a thunk (code out of line), its status 5,
+    /// its caller going on with it (statusJumps). Through the semantics'
+    /// try statements as the reference mode's zrun.TailCall goes: their
+    /// finally run, a handler of it (`except Exception`) taking it. At the
+    /// top level, no frame to leave: the call made here, then a return of
+    /// its result.
+    fn tailCall(self: *Gen, inst: *Inst, fv: SVal, args_v: SVal, receiver: ?SVal) Error!void {
+        if (self.fnode == NONE and !self.thunk) {
+            const r = try self.dynCall(inst, fv, args_v, receiver);
+            try self.returnWith(try self.materialize(r, inst.node), inst.node);
+        } else {
+            const fd = try self.materialize(fv, inst.node);
+            const ad = try self.materialize(args_v, inst.node);
+            var recv_ptr = self.c.m.nullPtr();
+            var recv_d: ?Dyn = null;
+            if (receiver) |r| {
+                recv_d = try self.materialize(r, inst.node);
+                const p = try self.valSlot();
+                try self.storeSlot(p, recv_d.?);
+                recv_ptr = p;
+            }
+            _ = self.call("zr_tail_set", &.{ self.ctx, fd.tag, fd.bits, ad.tag, ad.bits, recv_ptr });
+            if (recv_d) |r| try self.drop(.{ .dyn = r });
+            try self.drop(.{ .dyn = ad });
+            try self.drop(.{ .dyn = fd });
+            try self.finishTail(inst.node);
+        }
+        if (inst.dyn_depth == 0) inst.done = true;
+        try self.f.block(try self.f.label("after_tail_call"));
+    }
+
+    /// A tail call pending in the Ctx (zr_tail_set), left by this code:
+    /// through its try statements (a handler of zrun.TailCall taking it,
+    /// the call given up; their finally run, the call set aside meanwhile:
+    /// they may make tail calls of their own), then out of a function (its
+    /// frame released, its result TAIL_TAG), a thunk (status 5), or, at
+    /// the top level, made here and its result returned.
+    fn finishTail(self: *Gen, at: u32) Error!void {
+        const f = &self.f;
+        const caught = for (self.tries.items) |fr| {
+            if (fr.catches(.tail_call) != null) break true;
+        } else false;
+        if (caught) {
+            _ = self.call("zr_tail_clear", &.{self.ctx});
+            _ = try self.leaveTries(0, .tail_call, null);
+            return;
+        }
+        if (self.tries.items.len > 0) {
+            const keep = try self.valueSlots(3);
+            _ = self.call("zr_tail_take", &.{ self.ctx, keep });
+            _ = try self.leaveTries(0, .tail_call, null);
+            _ = self.call("zr_tail_put", &.{ self.ctx, keep });
+        }
+        if (self.thunk) {
+            try self.releaseAbove(0);
+            self.releaseScopesAbove(self.base_scopes);
+            try f.ret(self.c.m.k32(5));
+        } else if (self.fnode == NONE) {
+            f.store(self.k(@bitCast(helpers.TAIL_TAG)), self.out);
+            try self.check(self.call("zr_tail_resolve", &.{ self.ctx, self.k32(at), self.out }));
+            try self.returnWith(try self.loadOut(.any), at);
+        } else {
+            try self.releaseAbove(0);
+            self.releaseScopesAbove(0);
+            try self.storeSlot(self.result, .{ .tag = self.k(@bitCast(helpers.TAIL_TAG)), .bits = self.k(0), .shape = .any });
+            try f.br(self.ret_label);
+        }
     }
 
     fn returnWith(self: *Gen, d: Dyn, at: u32) Error!void {
@@ -4835,6 +4924,7 @@ const Gen = struct {
                 if (fr.catch_return == null) fr.catch_return = i;
                 if (fr.catch_break == null) fr.catch_break = i;
                 if (fr.catch_continue == null) fr.catch_continue = i;
+                if (fr.catch_tail == null) fr.catch_tail = i;
                 continue;
             };
             const cls: *PyObject = switch (try self.expr(inst, te)) {
@@ -4862,6 +4952,7 @@ const Gen = struct {
             if (fr.catch_return == null and py.c.PyObject_IsSubclass(types_.Return, cls) == 1) fr.catch_return = i;
             if (fr.catch_break == null and py.c.PyObject_IsSubclass(types_.Break, cls) == 1) fr.catch_break = i;
             if (fr.catch_continue == null and py.c.PyObject_IsSubclass(types_.Continue, cls) == 1) fr.catch_continue = i;
+            if (fr.catch_tail == null and py.c.PyObject_IsSubclass(types_.TailCall, cls) == 1) fr.catch_tail = i;
             if (py.c.PyErr_Occurred() != null) return error.Python;
         }
         const catcher = try f.label("except");
@@ -4951,6 +5042,7 @@ const Gen = struct {
             .Return => types_.Return,
             .Break => types_.Break,
             .Continue => types_.Continue,
+            .tail_call => types_.TailCall,
             else => null,
         };
     }
@@ -6553,7 +6645,7 @@ const Gen = struct {
             return self.callHelper(func, inst.node, full);
         }
         for (kws) |kw| {
-            if (callee == .rt_method and callee.rt_method == .call and std.mem.eql(u8, kw.name, "receiver")) {
+            if (callee == .rt_method and (callee.rt_method == .call or callee.rt_method == .tail_call) and std.mem.eql(u8, kw.name, "receiver")) {
                 receiver = try self.operand(inst, kw.value);
             } else if (callee == .rt_method and callee.rt_method == .@"error" and std.mem.eql(u8, kw.name, "code")) {
                 // (the code isn't kept by compiled errors yet: reported as runtime)
@@ -6578,7 +6670,7 @@ const Gen = struct {
         const c = self.c;
         const want: usize = switch (m) {
             .eval, .exec, .loop, .load, .function, .kind, .text, .span, .scope, .symbol, .type_of, .node_at, .fresh => 1,
-            .store, .call, .wrapping_add, .wrapping_sub, .wrapping_mul, .wrapping_shl, .wrapping_shr, .wrapping_ushr => 2,
+            .store, .call, .tail_call, .wrapping_add, .wrapping_sub, .wrapping_mul, .wrapping_shl, .wrapping_shr, .wrapping_ushr => 2,
             .@"u8", .@"i8", .u16le, .u16be, .i16le, .i16be, .u32le, .u32be, .i32le, .i32be, .u64le, .u64be, .i64le, .i64be => 2,
             .@"error" => 2,
             .Return => if (args.len == 0) 0 else 1,
@@ -6616,6 +6708,10 @@ const Gen = struct {
                 return .none;
             },
             .call => return self.dynCall(inst, args[0], args[1], receiver),
+            .tail_call => {
+                try self.tailCall(inst, args[0], args[1], receiver);
+                return .none;
+            },
             .wrapping_add => return self.wrapping(inst, .add, args[0], args[1]),
             .wrapping_sub => return self.wrapping(inst, .sub, args[0], args[1]),
             .wrapping_mul => return self.wrapping(inst, .mul, args[0], args[1]),
@@ -6923,7 +7019,7 @@ const Gen = struct {
         defer py.Py_DecRef(code);
         const names = ph.attr(code, "co_names") orelse return error.Python;
         defer py.Py_DecRef(names);
-        for ([_][*:0]const u8{ "Return", "Break", "Continue" }) |n| {
+        for ([_][*:0]const u8{ "Return", "Break", "Continue", "tail_call" }) |n| {
             const s = py.c.PyUnicode_FromString(n) orelse return error.Python;
             defer py.Py_DecRef(s);
             const r = py.c.PySequence_Contains(names, s);
@@ -7170,9 +7266,21 @@ const Gen = struct {
         // them (an int an I64)
         const others = try f.label("call_other_result");
         try f.block(join);
-        const st_join = f.phi(t.i1, st, direct_end, st2, slow_end);
+        const st_call = f.phi(t.i1, st, direct_end, st2, slow_end);
+        // (a function ending with rt.tail_call: the call it left, made now
+        // its frame's gone (zr_call's own made it already); the Ctx's depth
+        // the caller's for it, a typed entry's in a register)
+        const tail_b = try f.label("call_tail");
+        const is_tail = f.and_(st_call, f.icmp(jit_c.LLVMIntEQ, f.load(t.i64, self.out), self.k(@bitCast(helpers.TAIL_TAG))));
+        const join_end = f.current;
+        try f.condBr(is_tail, tail_b, others);
+        try f.block(tail_b);
+        if (self.depth) |d| f.store(d, f.offset(self.ctx, @offsetOf(helpers.Ctx, "depth")));
+        const st_tail = self.call("zr_tail_resolve", &.{ self.ctx, self.k32(inst.node), self.out });
+        const tail_end = f.current;
         try f.br(others);
         try f.block(others);
+        const st_join = f.phi(t.i1, st_call, join_end, st_tail, tail_end);
         const out_tag = f.load(t.i64, self.out);
         const o_tag = f.select(f.icmp(jit_c.LLVMIntEQ, out_tag, self.k(@intCast(value.PINT_TAG))), self.k(@intFromEnum(value.Tag.int)), out_tag);
         const o_bits = f.load(t.i64, f.field(t.val, self.out, 1));
