@@ -317,9 +317,8 @@ Key implementation details:
 
 ## Known Issues
 
-- Executables (a program with zrun's runtime, without Python) are planned, not built.
 - x86_64 only: the LLVM zgram ships targets x86-64. No macOS wheels yet.
-- Untyped code (Lua here) is 2.6-6x slower than a hand-written C interpreter; a program's top level isn't specialized as functions are.
+- Untyped code (Lua here) is 1.6-3.2x slower than a hand-written C interpreter; most of what's left is the memory management of short-lived objects.
 - What compiles is a subset of Python (see the guide); the rest runs as Python, correctly but slower.
 - On Windows with Python 3.12 or 3.13, `mode="python"` stops at a few hundred nested calls of the language's functions with "call stack too deep", before `max_depth`. Those Pythons allow 3000 calls nested through C on Windows (10000 elsewhere), and a call run as Python is several. Compiled code and other Pythons go to `max_depth`.
 
