@@ -1019,10 +1019,13 @@ fn recordGetattro(o: ?*PyObject, name: ?*PyObject) callconv(.c) ?*PyObject {
         return out(p, r.fields()[i]);
     }
     if (std.mem.eql(u8, n, "__class__")) return ref(recordClass(r) orelse return py.c.PyObject_GenericGetAttr(o, name));
-    // The class's: methods bound to the proxy, as an instance's would be
+    // The class's, as an instance's attribute would be: the attribute in
+    // the class (through its bases) as it is there, its __get__ applied
+    // (a function: bound to the proxy; a staticmethod: its function; a
+    // classmethod: bound to the class; a property: its value)
     const cls = recordClass(r) orelse return py.c.PyObject_GenericGetAttr(o, name);
-    const attr = py.c.PyObject_GetAttr(cls, name.?) orelse {
-        py.c.PyErr_Clear();
+    const attr = classAttribute(cls, name.?) orelse {
+        if (py.c.PyErr_Occurred() != null) return null;
         ph.raise(py.PyExc_AttributeError(), "'{s}' object has no attribute '{s}'", .{ r.rtype.name, n });
         return null;
     };
@@ -1031,6 +1034,24 @@ fn recordGetattro(o: ?*PyObject, name: ?*PyObject) callconv(.c) ?*PyObject {
         return py.c.PyObject_CallMethod(attr, "__get__", "OO", o.?, cls);
     }
     return ref(attr);
+}
+
+/// `name` in the class's dict or its bases', as defined there (not through
+/// the descriptor protocol): a new reference, or null (none; or an error,
+/// raised).
+fn classAttribute(cls: *PyObject, name: *PyObject) ?*PyObject {
+    const mro = py.c.PyObject_GetAttrString(cls, "__mro__") orelse return null;
+    defer py.Py_DecRef(mro);
+    const n = py.c.PyTuple_Size(mro);
+    var i: py.c.Py_ssize_t = 0;
+    while (i < n) : (i += 1) {
+        const c = py.c.PyTuple_GetItem(mro, i) orelse return null;
+        const d = py.c.PyObject_GetAttrString(c, "__dict__") orelse return null;
+        defer py.Py_DecRef(d);
+        if (py.c.PyObject_GetItem(d, name)) |found| return found;
+        py.c.PyErr_Clear();
+    }
+    return null;
 }
 
 fn recordSetattro(o: ?*PyObject, name: ?*PyObject, v: ?*PyObject) callconv(.c) c_int {

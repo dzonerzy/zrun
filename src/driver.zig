@@ -92,6 +92,12 @@ pub const Compiled = struct {
     /// The compiled code of Python functions the code calls (null: Python
     /// runs it)
     called: std.AutoHashMapUnmanaged(CalledKey, ?Helper) = .empty,
+    /// Records' methods called by name (record_type, the name's Str): the
+    /// class's function (borrowed: the class keeps it), null for anything
+    /// else (a staticmethod, a property...: Python finds those)
+    methods: std.AutoHashMapUnmanaged(MethodKey, ?*PyObject) = .empty,
+
+    pub const MethodKey = struct { rtype: *const value.RecordType, name: *const value.Str };
 
     const ThunkKey = struct { node: u32, which: compile_mod.Which, owner: u32 };
 
@@ -180,6 +186,7 @@ pub const Compiled = struct {
         for (self.texts) |t| if (t) |s| value.decref(value.Value.obj(.str, &s.head));
         if (self.texts.len > 0) allocator.free(self.texts);
         self.called.deinit(allocator);
+        self.methods.deinit(allocator);
         self.names.deinit(allocator);
         for (self.compiler.objects.items) |o| py.Py_DecRef(o);
         self.compiler.m.deinit();

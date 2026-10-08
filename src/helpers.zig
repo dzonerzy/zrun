@@ -1695,6 +1695,8 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
             if (x.tag == value.UNSET_TAG) break;
             return zr_call(ctx, node, x.tag, x.bits, args, n, null, out);
         }
+        // (a method of its class: its compiled code, the record self)
+        if (@import("bridge.zig").recordMethod(ctx, node, v, name, args[0..n], out)) |ok| return ok;
     }
     // A str's common methods, natively (an ASCII one: Unicode's case
     // rules are Python's)

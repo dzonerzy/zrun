@@ -514,13 +514,6 @@ pub fn compiledCall(ctx: *Ctx, node: u32, callee: *PyObject, args: []const Value
     if (args.len > 63) return null;
     const pt = compile_mod.pyFunctionType() orelse return null;
     if (ph.typeOf(callee) != @as(*py.c.PyTypeObject, @ptrCast(@alignCast(pt)))) return null;
-    // (a closure: one code for all of them, the function given last)
-    const closure_obj = py.c.PyObject_GetAttrString(callee, "__closure__") orelse {
-        py.c.PyErr_Clear();
-        return null;
-    };
-    py.Py_DecRef(closure_obj);
-    const closure = closure_obj != py.Py_None();
     var mask: u64 = 0;
     var frame: ?*value.Frame = null;
     var owner: u32 = 0;
@@ -536,7 +529,21 @@ pub fn compiledCall(ctx: *Ctx, node: u32, callee: *PyObject, args: []const Value
         given[n] = if (checked) a.checked() else a;
         n += 1;
     }
-    const code = lk.compiled.calledCode(callee, args.len, mask, closure) orelse {
+    // (a function called before, not a closure: its code by the function,
+    // no attribute looked up (the program keeps the function, and so its
+    // address, for the code); a closure's is by its code object)
+    const known = lk.compiled.called.get(.{ .func = callee, .nargs = args.len, .rt_mask = mask });
+    var closure = false;
+    if (known == null) {
+        // (a closure: one code for all of them, the function given last)
+        const closure_obj = py.c.PyObject_GetAttrString(callee, "__closure__") orelse {
+            py.c.PyErr_Clear();
+            return null;
+        };
+        py.Py_DecRef(closure_obj);
+        closure = closure_obj != py.Py_None();
+    }
+    const code = (if (known) |k| k else lk.compiled.calledCode(callee, args.len, mask, closure)) orelse {
         if (helpers.collecting) {
             if (ph.attr(callee, "__qualname__")) |nm| {
                 defer py.Py_DecRef(nm);
@@ -590,6 +597,64 @@ pub fn hostCode(ctx: *Ctx, callee: *PyObject, nargs: usize) ?@import("driver.zig
 
 /// obj.name(args) where obj.name is a Python function, or a bound method
 /// of one (its object first): by its compiled code (compiledCall).
+/// `r.name(args)` of a record whose class defines `name` as a plain
+/// function: its compiled code called with the record as self, the method
+/// found once per class (no Python object made for the record, the bound
+/// method or the name); null if not so (Python's way then). With the GIL.
+pub fn recordMethod(ctx: *Ctx, node: u32, rec: Value, name: *const value.Str, args: []const Value, out: *Value) ?bool {
+    const link = ctx.link orelse return null;
+    const lk: *const Link = @ptrCast(@alignCast(link));
+    if (args.len >= 63) return null;
+    const r: *value.Record = @ptrCast(@alignCast(rec.ptr()));
+    const key: driver.Compiled.MethodKey = .{ .rtype = r.rtype, .name = name };
+    const found: ?*PyObject = if (lk.compiled.methods.get(key)) |f| f else blk: {
+        const f = classFunction(r.rtype.py_class orelse return null, name.bytes());
+        lk.compiled.methods.put(allocator, key, f) catch return null;
+        break :blk f;
+    };
+    const func = found orelse return null;
+    var all: [64]Value = undefined;
+    all[0] = rec;
+    @memcpy(all[1 .. args.len + 1], args);
+    return compiledCall(ctx, node, func, all[0 .. args.len + 1], false, out);
+}
+
+/// What `cls.name` is in the class (through its bases) if it's a plain
+/// function (a method), else null (a staticmethod, a classmethod, a
+/// property, anything else, or nothing). Borrowed: the class keeps it.
+pub fn classFunction(cls: *PyObject, name: []const u8) ?*PyObject {
+    const pt = compile_mod.pyFunctionType() orelse return null;
+    const mro = py.c.PyObject_GetAttrString(cls, "__mro__") orelse {
+        py.c.PyErr_Clear();
+        return null;
+    };
+    defer py.Py_DecRef(mro);
+    const key = ph.newString(name) orelse {
+        py.c.PyErr_Clear();
+        return null;
+    };
+    defer py.Py_DecRef(key);
+    const n = py.c.PyTuple_Size(mro);
+    var i: py.c.Py_ssize_t = 0;
+    while (i < n) : (i += 1) {
+        const c = py.c.PyTuple_GetItem(mro, i) orelse return null;
+        const d = py.c.PyObject_GetAttrString(c, "__dict__") orelse {
+            py.c.PyErr_Clear();
+            return null;
+        };
+        defer py.Py_DecRef(d);
+        const found = py.c.PyObject_GetItem(d, key) orelse {
+            py.c.PyErr_Clear();
+            continue;
+        };
+        // (the class's own reference keeps it: the class lives as long as
+        // the compiled program's record type)
+        py.Py_DecRef(found);
+        return if (ph.typeOf(found) == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(pt)))) found else null;
+    }
+    return null;
+}
+
 pub fn compiledMethod(ctx: *Ctx, node: u32, m: *PyObject, args: []const Value, checked: bool, out: *Value) ?bool {
     if (args.len >= 63) return null;
     const pt = compile_mod.pyMethodType() orelse return null;

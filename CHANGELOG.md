@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance
 - **Floor division and modulo of ints are inline** in compiled code (Python's semantics: the result rounded toward minus infinity, the remainder the divisor's sign), the helper only for a divisor of 0 or, for `//`, -1. The Lua example's integer `//` and `%` no longer wrap results to 64 bits through arithmetic beyond them (floor division and modulo of 64-bit ints fit, but for minint // -1, wrapped as Lua's). Lua's `s = (s + i * i) % 1000003` ten million times: 0.12 s, was 0.34 (Lua 5.4: 0.07).
 - **Helpers compiled out of line count references inline**, as functions' and loops' code does: they run for each call of the code calling them. The Lua example's tables make their hash part when a key outside the array part is first set (an array or a constructor's table: two objects, not three). Binary trees, depth 14, 8 times: 0.088 s, was 0.141.
+- **A Python function compiled code called before is found by the function** (no `__closure__` or `__code__` looked up for each call), and **a record's method called where its class isn't known while compiling** runs its compiled code directly, the method found once per class (no Python object made for the record, the bound method or the name). Lua building a string of 200,000 numbers: 0.066 s, was 0.093.
+
+### Fixed
+- A staticmethod of a record's class, called on a record (`r.helper(x)`), was given the record as its first argument: compiled code took it for a method, and a record seen from Python bound it to the record. Records' class attributes are now looked up as Python does (the attribute as the class defines it, its `__get__` applied): staticmethods, classmethods and properties as on the class's instances.
 
 ## [0.3.0] - 2026-10-08
 

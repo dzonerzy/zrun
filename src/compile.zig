@@ -6463,19 +6463,16 @@ const Gen = struct {
         defer py.Py_DecRef(globals);
         var out: std.ArrayListUnmanaged(MethodCandidate) = .empty;
         const pt = try pyTypes();
-        const key = ph.newString(name) orelse return error.Python;
-        defer py.Py_DecRef(key);
         var pos: py.Py_ssize_t = 0;
         var gk: ?*PyObject = null;
         var v: ?*PyObject = null;
         while (py.c.PyDict_Next(globals, &pos, @ptrCast(&gk), @ptrCast(&v)) != 0) {
             if (!try isInstanceOf(v.?, @ptrCast(@alignCast(py.types.typeObject("PyType_Type"))))) continue;
             const rtype = try recordOf(v.?) orelse continue;
-            const m = py.c.PyObject_GetAttr(v.?, key) orelse {
-                py.c.PyErr_Clear();
-                continue;
-            };
-            defer py.Py_DecRef(m);
+            // (the class's own attribute, a plain function: a method; a
+            // staticmethod reads as a function too through the class, but
+            // takes no self)
+            const m = @import("bridge.zig").classFunction(v.?, name) orelse continue;
             if (!try isInstanceOf(m, pt.function)) continue;
             // (one the front can't read: not a candidate, Python runs it)
             const func = self.helperFunction(m) catch |e| switch (e) {
