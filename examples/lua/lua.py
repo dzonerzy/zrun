@@ -990,16 +990,18 @@ def arith_numbers(rt, node, op, x, y):
             return rt.wrapping_sub(x, y)
         if op == "*":
             return rt.wrapping_mul(x, y)
-        xi = int(x)
-        yi = int(y)
+        # (floor division and modulo of 64-bit ints fit 64 bits, but for
+        # minint // -1: wrapped, as Lua's, without arithmetic beyond 64 bits)
         if op == "//":
-            if yi == 0:
+            if y == 0:
                 lua_error(rt, node, "attempt to divide by zero")
-            return wrap(xi // yi)
+            if y == -1:
+                return rt.wrapping_sub(0, x)
+            return x // y
         if op == "%":
-            if yi == 0:
+            if y == 0:
                 lua_error(rt, node, "attempt to perform 'n%0'")
-            return wrap(xi % yi)
+            return x % y
     fx = float(x)
     fy = float(y)
     if op == "+":

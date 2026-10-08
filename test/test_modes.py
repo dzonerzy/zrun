@@ -45,6 +45,10 @@ while i < 15 { print(fib(i)); i = i + 1; }
     "strings": 'let s = "a" + "b";\nprint(s, s + "c");\n',
     "no_return_value": "fn f() { return; }\nprint(f());\n",
     "arith": "print(7 / 2, 7 % 3, -7 / 2, -7 % 3, 2 * 3 - 4, 10 - 2 - 3);\n",
+    # (floor division and modulo of ints, inline in compiled code: signs,
+    # -1, the 64-bit ends; values from a function, not folded)
+    "divmod": "fn d(a, b) { print(a / b, a % b); }\n"
+    + "".join(f"d({a}, {b});\n" for a in (7, -7, 0, 9223372036854775807, -9223372036854775807) for b in (2, -2, 1, -1, 3, 9223372036854775807)),
     "compare": "print(1 < 2, 2 <= 1, 3 == 3, 3 != 3, 1 > 0, 0 >= 1);\n",
     "neg": "let x = 5;\nprint(-x, - -x);\n",
     "nested_calls": "fn add(a, b) { return a + b; }\nfn mul(a, b) { return a * b; }\nprint(add(mul(2, 3), add(1, mul(4, 5))));\n",

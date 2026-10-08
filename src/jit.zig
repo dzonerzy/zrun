@@ -109,6 +109,8 @@ pub const Api = struct {
     BuildAdd: *const fn (Builder, Value, Value, Str) callconv(.c) Value,
     BuildSub: *const fn (Builder, Value, Value, Str) callconv(.c) Value,
     BuildMul: *const fn (Builder, Value, Value, Str) callconv(.c) Value,
+    BuildSDiv: *const fn (Builder, Value, Value, Str) callconv(.c) Value,
+    BuildSRem: *const fn (Builder, Value, Value, Str) callconv(.c) Value,
     BuildAnd: *const fn (Builder, Value, Value, Str) callconv(.c) Value,
     BuildOr: *const fn (Builder, Value, Value, Str) callconv(.c) Value,
     BuildXor: *const fn (Builder, Value, Value, Str) callconv(.c) Value,

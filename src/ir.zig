@@ -352,6 +352,18 @@ pub const Function = struct {
         return L("LLVMBuildSub")(self.b, a, b, "");
     }
 
+    /// a / b, truncating (b neither 0 nor, for minint, -1)
+    pub fn sdiv(self: *Function, a: Value, b: Value) Value {
+        self.open();
+        return L("LLVMBuildSDiv")(self.b, a, b, "");
+    }
+
+    /// a's remainder by b, its sign a's (b not 0)
+    pub fn srem(self: *Function, a: Value, b: Value) Value {
+        self.open();
+        return L("LLVMBuildSRem")(self.b, a, b, "");
+    }
+
     /// a * b, wrapping around
     pub fn mul(self: *Function, a: Value, b: Value) Value {
         self.open();

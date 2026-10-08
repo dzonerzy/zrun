@@ -8023,6 +8023,39 @@ const Gen = struct {
             const bits = f.phi(i64t, res, fast_end, g.bits, slow_end);
             return dyn(tag_v, bits, .any);
         }
+        // Floor division and modulo of ints, as Python's: inline for a
+        // divisor that's neither 0 (the error) nor -1 for // (minint // -1
+        // overflows): the helper's then
+        if (canBeInt(ld) and canBeInt(rd) and (op == .floordiv or op == .mod)) {
+            const fast = try f.label("int_div");
+            const slow = try f.label("generic");
+            const join = try f.label("joined");
+            const nonzero = f.icmp(jit_c.LLVMIntNE, rd.bits, self.k(0));
+            const safe = if (op == .mod) nonzero else f.and_(nonzero, f.icmp(jit_c.LLVMIntNE, rd.bits, self.k(-1)));
+            try f.condBr(f.and_(try self.intGuard(ld, rd), safe), fast, slow);
+            try f.block(fast);
+            const tag = f.and_(ld.tag, rd.tag);
+            // (truncating, then one step toward minus infinity where the
+            // remainder's sign isn't the divisor's)
+            const q = f.sdiv(ld.bits, rd.bits);
+            const rem = f.srem(ld.bits, rd.bits);
+            const adjust = f.and_(f.icmp(jit_c.LLVMIntNE, rem, self.k(0)), f.icmp(jit_c.LLVMIntSLT, f.xor(rem, rd.bits), self.k(0)));
+            const res = if (op == .mod)
+                f.select(adjust, f.add(rem, rd.bits), rem)
+            else
+                f.select(adjust, f.sub(q, self.k(1)), q);
+            const fast_end = f.current;
+            try f.br(join);
+            try f.block(slow);
+            const g = try self.binaryHelper(inst, op, ld, rd);
+            const slow_end = f.current;
+            try f.br(join);
+            try f.block(join);
+            const i64t = self.c.m.t.i64;
+            const tag_v = f.phi(i64t, tag, fast_end, g.tag, slow_end);
+            const bits = f.phi(i64t, res, fast_end, g.bits, slow_end);
+            return dyn(tag_v, bits, .any);
+        }
         return .{ .dyn = try self.binaryHelper(inst, op, ld, rd) };
     }
 
