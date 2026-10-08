@@ -54,9 +54,15 @@ zrun.configure(cache=os.path.join(HERE, "cache"))
 lang = getattr(__import__({module!r}, fromlist=["_"]), {attr!r})
 SOURCE = os.path.join(HERE, "program", {name!r})
 COMPILED = os.path.join(HERE, "program.zrc")
+SETUP = {setup!r}
 
 
 def load():
+    # (the language's setup, given the program's path and arguments: Lua's
+    # `arg`)
+    if SETUP is not None:
+        module, _, func = SETUP.partition(":")
+        getattr(__import__(module, fromlist=["_"]), func)({name!r}, sys.argv[1:])
     if os.path.exists(COMPILED):
         try:
             return lang.load_compiled(COMPILED)
@@ -291,7 +297,7 @@ def launcher(target, source, into):
         return f.read()
 
 
-def build_executable(language, source, output, target=None, path=None, python=None, launcher_source=None):
+def build_executable(language, source, output, target=None, path=None, python=None, setup=None, launcher_source=None):
     """The executable: see the module's doc. Returns its path."""
     import zrun
 
@@ -303,6 +309,12 @@ def build_executable(language, source, output, target=None, path=None, python=No
         raise ValueError("no Python 3.%d runtime: 3.10 to 3.14" % minor)
     module, attr, spec = language_of(language)
     lang = getattr(importlib.import_module(module), attr)
+    if setup is not None:
+        if not isinstance(setup, str) or ":" not in setup:
+            raise TypeError("setup must be 'module:function' (a function of a module beside the language's)")
+        smod, _, sfunc = setup.partition(":")
+        if not callable(getattr(importlib.import_module(smod), sfunc, None)):
+            raise ValueError("setup: %s has no function %s" % (smod, sfunc))
     if os.path.exists(source):
         name = os.path.basename(source)
         with open(source, encoding="utf-8") as f:
@@ -325,7 +337,7 @@ def build_executable(language, source, output, target=None, path=None, python=No
         packages(target, os.path.join(root, "site"))
         bring_module(spec, os.path.join(root, "site"))
         with open(os.path.join(root, "main.py"), "w", encoding="utf-8") as f:
-            f.write(MAIN.format(module=module, attr=attr, name=name))
+            f.write(MAIN.format(module=module, attr=attr, name=name, setup=setup))
         payload = pack(root, executables)
         head = launcher(target, launcher_source, tmp)
         digest = hashlib.sha256(payload).digest()

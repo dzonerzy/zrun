@@ -219,13 +219,13 @@ pip install "zrun-py[exe]"        # with the ziglang package: Zig, to link the l
 ```
 
 ```python
-zrun.build_executable("lua:lang", "fib.lua", "fib")                          # ./fib: for this machine
+zrun.build_executable("lua:lang", "fib.lua", "fib", setup="lua:set_args")    # ./fib: for this machine, `arg` its arguments
 zrun.build_executable(lua.lang, "fib.lua", "fib", target="x86_64-windows")   # fib.exe, made on Linux
 ```
 
 One file runs the program, on a machine with no Python: in it are a Python runtime ([python-build-standalone](https://github.com/astral-sh/python-build-standalone)'s, 3.10 to 3.14: `python="3.12"`, by default the one building), zrun, zgram and zrules, the language's module with the Python modules beside it (or its package), the program and its compiled code. The language is given as `"module:attribute"` or as the `Language` itself (an attribute of a module imported). The program's errors are found when building (`zrun.LoadError`).
 
-Run, it unpacks itself once into the platform's cache directory (`zrun/exe/<its hash>`) and runs the program there with the Python it brought: the semantics run as Python, host functions and Python's modules work as they do anywhere. The program's arguments are `sys.argv[1:]`; a runtime error is printed and exits with 1, an error found loading with 2.
+Run, it unpacks itself once into the platform's cache directory (`zrun/exe/<its hash>`) and runs the program there with the Python it brought: the semantics run as Python, host functions and Python's modules work as they do anywhere. The program's arguments are `sys.argv[1:]`, and `setup="module:function"` names a function (of a module beside the language's) called with the program's path and its arguments before it runs: `setup="lua:set_args"` makes Lua's `arg`. A runtime error is printed and exits with 1, an error found loading with 2.
 
 The targets are `x86_64-linux` (glibc 2.17 or newer) and `x86_64-windows`, from either. For this machine, the compiled code is made when building; for the other, zrun, zgram and zrules come from PyPI (the same versions' wheels), and the program is compiled the first time it runs, then cached. Building downloads the runtime once (about 30 MB, kept in the cache directory under `zrun/build`). An executable takes 30 to 40 MB, about 100 MB unpacked. Its first run unpacks it and compiles the grammar (about 1.2 s for Lua's); later runs start in about 0.16 s (zgram keeps compiled grammars on disk).
 

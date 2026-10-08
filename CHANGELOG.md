@@ -5,6 +5,11 @@ All notable changes to zrun are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`build_executable(..., setup="module:function")`**: a function of a module beside the language's, called with the program's path and its arguments before it runs in the executable. The Lua example's `lua:set_args` makes `arg` from them.
+
 ## [0.3.0] - 2026-10-08
 
 ### Added

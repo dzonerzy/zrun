@@ -73,6 +73,18 @@ def test_errors_exit_1(tiny_path, tmp_path):
 
 @pytest.mark.slow
 @needs_zig
+def test_setup_gets_the_arguments(monkeypatch, tmp_path):
+    # (Lua's `arg`, set by lua.set_args from the executable's arguments)
+    monkeypatch.syspath_prepend(os.path.join(HERE, "..", "examples", "lua"))
+    exe = zrun.build_executable("lua:lang", 'print(#arg, arg[0], arg[1], arg[2])\n', str(tmp_path / "args"), path="args.lua", setup="lua:set_args")
+    r = run(exe, tmp_path / "cache", "one", "two")
+    assert (r.returncode, r.stdout) == (0, "2\targs.lua\tone\ttwo\n")
+    with pytest.raises(ValueError, match="no function"):
+        zrun.build_executable("lua:lang", "print(1)\n", str(tmp_path / "x"), setup="lua:missing")
+
+
+@pytest.mark.slow
+@needs_zig
 def test_errors_found_when_building(tiny_path, tmp_path):
     with pytest.raises(zrun.LoadError):
         zrun.build_executable(tiny_path, "print(;", str(tmp_path / "bad"))

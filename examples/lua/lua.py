@@ -2397,13 +2397,19 @@ def string_gsub(rt, node, args):
 # ----------------------------------------------------------------------
 
 
-def run(source, path="input", mode="python", args=()):
-    """Run a script; `arg` is its path (arg[0]) and arguments."""
+def set_args(path, args):
+    """`arg`: the script's path (arg[0]) and its arguments (an executable's
+    setup: zrun.build_executable(..., setup="lua:set_args"))."""
     a = Table()
     a.set(0, path)
     for i, v in enumerate(args, 1):
         a.set(i, v)
     G.set("arg", a)
+
+
+def run(source, path="input", mode="python", args=()):
+    """Run a script; `arg` is its path (arg[0]) and arguments."""
+    set_args(path, args)
     lang.load(source, path).run(mode=mode)
 
 
