@@ -288,7 +288,7 @@ def _host_lang():
     @lang.host
     def picky(x):
         if x < 0:
-            raise ValueError("negative: %d" % x)
+            raise ValueError(f"negative: {x}")
         return x * 2
 
     @lang.host

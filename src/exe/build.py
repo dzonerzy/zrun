@@ -86,7 +86,7 @@ except zrun.Error as e:
 def host_target():
     machine = platform.machine().lower()
     if machine not in ("x86_64", "amd64"):
-        raise ValueError("executables are made for x86-64: this machine is %s" % machine)
+        raise ValueError(f"executables are made for x86-64: this machine is {machine}")
     return "x86_64-windows" if sys.platform == "win32" else "x86_64-linux"
 
 
@@ -107,7 +107,7 @@ def fetch(url, name):
     path = os.path.join(cache_dir(), name)
     if os.path.exists(path):
         return path
-    tmp = "%s.%d.tmp" % (path, os.getpid())
+    tmp = f"{path}.{os.getpid()}.tmp"
     with urllib.request.urlopen(url) as r, open(tmp, "wb") as f:
         shutil.copyfileobj(r, f)
     os.replace(tmp, path)
@@ -140,8 +140,8 @@ def python_runtime(target, version, into):
     `into`/python, links as the files they lead to (made the same on every
     platform: Windows' file names and links aren't Linux's). Returns the
     executables' paths (`python/...`)."""
-    name = "cpython-%s+%s-%s-install_only_stripped.tar.gz" % (version, RELEASE, TRIPLES[target])
-    base = "https://github.com/astral-sh/python-build-standalone/releases/download/%s/" % RELEASE
+    name = f"cpython-{version}+{RELEASE}-{TRIPLES[target]}-install_only_stripped.tar.gz"
+    base = f"https://github.com/astral-sh/python-build-standalone/releases/download/{RELEASE}/"
     path = fetch(base + name, name)
     sums = fetch(base + "SHA256SUMS", "SHA256SUMS-" + RELEASE)
     with open(sums, encoding="utf-8") as f:
@@ -150,7 +150,7 @@ def python_runtime(target, version, into):
         got = hashlib.sha256(f.read()).hexdigest()
     if wanted.get(name) != got:
         os.remove(path)
-        raise ValueError("the Python runtime downloaded (%s) isn't the release's: try again" % name)
+        raise ValueError(f"the Python runtime downloaded ({name}) isn't the release's: try again")
     files, links, executables = {}, {}, set()
     with tarfile.open(path) as t:
         for m in t.getmembers():
@@ -202,16 +202,16 @@ def packages(target, site):
     versions = {"zrun-py": zrun.version(), "zgram-py": zgram.version(), "zrules-py": zrules.version()}
     for _, dist in PACKAGES:
         # (PyPI's list of the version's files: its abi3 wheel for the platform)
-        with urllib.request.urlopen("https://pypi.org/pypi/%s/%s/json" % (dist, versions[dist])) as r:
+        with urllib.request.urlopen(f"https://pypi.org/pypi/{dist}/{versions[dist]}/json") as r:
             files = json.load(r)["urls"]
-        wheels = [f for f in files if f["filename"].endswith("-abi3-%s.whl" % WHEEL_PLATFORMS[target])]
+        wheels = [f for f in files if f["filename"].endswith(f"-abi3-{WHEEL_PLATFORMS[target]}.whl")]
         if not wheels:
-            raise ValueError("PyPI has no %s %s wheel for %s" % (dist, versions[dist], target))
+            raise ValueError(f"PyPI has no {dist} {versions[dist]} wheel for {target}")
         wheel = fetch(wheels[0]["url"], wheels[0]["filename"])
         with open(wheel, "rb") as f:
             if hashlib.sha256(f.read()).hexdigest() != wheels[0]["digests"]["sha256"]:
                 os.remove(wheel)
-                raise ValueError("the wheel downloaded (%s) isn't PyPI's: try again" % wheels[0]["filename"])
+                raise ValueError(f"the wheel downloaded ({wheels[0]['filename']}) isn't PyPI's: try again")
         with zipfile.ZipFile(wheel) as z:
             for item in z.namelist():
                 # (the modules, not the wheel's metadata)
@@ -238,7 +238,7 @@ def language_of(language):
         raise TypeError("language must be a zrun.Language or 'module:attribute'")
     spec = importlib.util.find_spec(module)
     if spec is None or spec.origin is None:
-        raise ValueError("can't find the module %s" % module)
+        raise ValueError(f"can't find the module {module}")
     return module, attr, spec
 
 
@@ -299,14 +299,12 @@ def launcher(target, source, into):
 
 def build_executable(language, source, output, target=None, path=None, python=None, setup=None, launcher_source=None):
     """The executable: see the module's doc. Returns its path."""
-    import zrun
-
     target = target or host_target()
     if target not in TRIPLES:
-        raise ValueError("target must be one of %s, not %r" % (", ".join(sorted(TRIPLES)), target))
+        raise ValueError(f"target must be one of {', '.join(sorted(TRIPLES))}, not {target!r}")
     minor = int(str(python).split(".")[1]) if python else sys.version_info[1]
     if minor not in PYTHONS:
-        raise ValueError("no Python 3.%d runtime: 3.10 to 3.14" % minor)
+        raise ValueError(f"no Python 3.{minor} runtime: 3.10 to 3.14")
     module, attr, spec = language_of(language)
     lang = getattr(importlib.import_module(module), attr)
     if setup is not None:
@@ -314,7 +312,7 @@ def build_executable(language, source, output, target=None, path=None, python=No
             raise TypeError("setup must be 'module:function' (a function of a module beside the language's)")
         smod, _, sfunc = setup.partition(":")
         if not callable(getattr(importlib.import_module(smod), sfunc, None)):
-            raise ValueError("setup: %s has no function %s" % (smod, sfunc))
+            raise ValueError(f"setup: {smod} has no function {sfunc}")
     if os.path.exists(source):
         name = os.path.basename(source)
         with open(source, encoding="utf-8") as f:
@@ -344,7 +342,7 @@ def build_executable(language, source, output, target=None, path=None, python=No
         footer = MAGIC + struct.pack("<QQ", len(head), len(payload)) + digest
         if target.endswith("windows") and not output.lower().endswith(".exe"):
             output += ".exe"
-        out = "%s.%d.tmp" % (output, os.getpid())
+        out = f"{output}.{os.getpid()}.tmp"
         with open(out, "wb") as f:
             f.write(head)
             f.write(payload)

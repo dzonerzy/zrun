@@ -7,7 +7,6 @@ import subprocess
 import sys
 
 import pytest
-import zrun
 from conftest import HERE, tiny
 
 PROGRAM = """

@@ -381,8 +381,9 @@ def make_lang():
                 out.append(str(e))
             # (a str method's result known when compiling, not a constant:
             # bytes, kept for the code)
-            out.append(len("héllo".encode("utf-8")))
-            out.append("ab".encode())
+            # (both spellings: what's tested is that each compiles)
+            out.append(len("héllo".encode("utf-8")))  # noqa: UP012
+            out.append("ab".encode())  # noqa: UP012
             return out
         if name == "frozenkeys":
             # frozen dataclasses compared by value as keys: made here or by

@@ -5,6 +5,11 @@ All notable changes to zrun are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Performance
+- **f-strings format strs and ints natively** in compiled code (`f"{name}"`, `f"{n}"`, `f"{n:d}"`, with `!s` too): no call into Python; other values and format specs are Python's, as before. The Lua example's messages and number formatting use f-strings.
+
 ## [0.4.0] - 2026-10-08
 
 ### Added

@@ -31,7 +31,7 @@ shallow_python = pytest.mark.skipif(
 
 # The typed language (examples/typed): typed.py imports typedlang.py from its folder
 sys.path.insert(0, os.path.join(HERE, "..", "examples", "typed"))
-import typed  # noqa: E402
+import typed  # noqa: E402, F401  (the tests import it from here)
 
 
 def pytest_addoption(parser):

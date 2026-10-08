@@ -103,7 +103,7 @@ def test_size_limited(tmp_path):
     # ago and less long ago; a write a stopped process left, old, and one
     # being written now)
     for i in range(10):
-        f = folder / ("%064x.o" % i)
+        f = folder / f"{i:064x}.o"
         f.write_bytes(b"x" * ours)
         _old(f, 10_000 - i * 100)
     (folder / "stale.o.1.tmp").write_bytes(b"x" * 10)
@@ -118,7 +118,7 @@ def test_size_limited(tmp_path):
     # (down to 80% of the limit: the oldest deleted first, the newest and
     # what this run made kept)
     assert _size(tmp_path) <= limit * 8 // 10
-    kept = [i for i in range(10) if "%064x.o" % i in files]
+    kept = [i for i in range(10) if f"{i:064x}.o" in files]
     assert kept == [7, 8, 9]
     assert "stale.o.1.tmp" not in files and "fresh.o.2.tmp" in files
     # (this run's: still there, loaded the next time)
@@ -135,17 +135,17 @@ def test_a_hit_is_a_use(tmp_path):
         _old(tmp_path / f, 100_000)
     small = _size(tmp_path)
     for i in range(5):
-        f = tmp_path / ("%064x.o" % i)
+        f = tmp_path / f"{i:064x}.o"
         f.write_bytes(b"x" * (small * 2))
         _old(f, 1000)
     _, cache = run(str(tmp_path), PROGRAM)
     assert cache["loaded"] > 0
-    assert all(os.path.getmtime(tmp_path / f) > os.path.getmtime(tmp_path / ("%064x.o" % 0)) for f in ours)
+    assert all(os.path.getmtime(tmp_path / f) > os.path.getmtime(tmp_path / f"{0:064x}.o") for f in ours)
     # (a run that compiles something, the limit under what's there: the
     # others go, ours stay (with room for what that run compiles))
     run(str(tmp_path), PROGRAM.replace("twice(21)", "twice(22)"), cache_size=small * 4)
     files = set(os.listdir(tmp_path))
-    assert ours <= files and not any("%064x.o" % i in files for i in range(5))
+    assert ours <= files and not any(f"{i:064x}.o" in files for i in range(5))
 
 
 def test_clear_cache(tmp_path):

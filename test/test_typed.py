@@ -96,8 +96,6 @@ class TestTypes:
     PROGRAM = "fn half(x: float) -> float { return x; }\nprint(half(4), 1 + 2);\n"
 
     def outcomes(self, source):
-        from test_modes import outcome
-
         out = {}
         for mode in ("python", "compiled"):
             program = typed.lang.load(source, "prog")

@@ -207,7 +207,7 @@ def fmt_float(x):
         return "inf"
     if x == -math.inf:
         return "-inf"
-    s = "%.14g" % x
+    s = f"{x:.14g}"
     if all(c in "-0123456789" for c in s):
         s += ".0"
     return s
@@ -317,7 +317,7 @@ def where(rt, node):
     if node is None:
         return ""
     name = rt.path if rt.path is not None else "input"
-    return "%s:%d: " % (name, node.line)
+    return f"{name}:{node.line}: "
 
 
 def lua_error(rt, node, message):
@@ -334,13 +334,14 @@ def describe(rt, node):
     if k == "paren":
         return describe(rt, node.children[0])
     if k == "var":
-        return " (%s '%s')" % ("local" if rt.scope(node) is not None else "global", node.text)
+        scope = "local" if rt.scope(node) is not None else "global"
+        return f" ({scope} '{node.text}')"
     if k == "member":
-        return " (field '%s')" % node.name.text
+        return f" (field '{node.name.text}')"
     if k == "method_call":
-        return " (method '%s')" % node.method.text
+        return f" (method '{node.method.text}')"
     if k == "string":
-        return " (constant '%s')" % string_value(node.text)
+        return f" (constant '{string_value(node.text)}')"
     return ""
 
 
@@ -379,7 +380,7 @@ def index(rt, node, obj, key):
         else:
             h = metamethod(obj, "__index")
             if h is None:
-                lua_error(rt, node, "attempt to index a %s value%s" % (type_name(obj), describe(rt, target_of(node))))
+                lua_error(rt, node, f"attempt to index a {type_name(obj)} value{describe(rt, target_of(node))}")
         if is_function(h):
             return call_one(rt, node, h, [obj, key])
         obj = h
@@ -411,7 +412,7 @@ def setindex(rt, node, obj, key, value):
         else:
             h = metamethod(obj, "__newindex")
             if h is None:
-                lua_error(rt, node, "attempt to index a %s value%s" % (type_name(obj), describe(rt, target_of(node))))
+                lua_error(rt, node, f"attempt to index a {type_name(obj)} value{describe(rt, target_of(node))}")
         if is_function(h):
             call(rt, node, h, [obj, key, value])
             return
@@ -438,7 +439,7 @@ def call_raw(rt, node, f, args):
     h = metamethod(f, "__call")
     if h is not None:
         return call_raw(rt, node, h, [f] + args)
-    lua_error(rt, node, "attempt to call a %s value%s" % (type_name(f), describe(rt, target_of(node))))
+    lua_error(rt, node, f"attempt to call a {type_name(f)} value{describe(rt, target_of(node))}")
 
 
 def as_list(r):
@@ -483,7 +484,7 @@ def call_target(node, rt):
         obj = rt.eval(node.target)
         f = index(rt, node, obj, node.method.text)
         if not is_function(f) and metamethod(f, "__call") is None:
-            lua_error(rt, node, "attempt to call a %s value (method '%s')" % (type_name(f), node.method.text))
+            lua_error(rt, node, f"attempt to call a {type_name(f)} value (method '{node.method.text}')")
         return f, [obj] + call_args(node, rt)
     f = rt.eval(node.target)
     return f, call_args(node, rt)
@@ -663,7 +664,7 @@ def for_num(node, rt):
     body = node.children[-1]
     for what, v in (("initial value", start), ("limit", limit), ("step", step)):
         if not is_number(v):
-            lua_error(rt, node, "bad 'for' %s (number expected, got %s)" % (what, type_name(v)))
+            lua_error(rt, node, f"bad 'for' {what} (number expected, got {type_name(v)})")
     if is_int(start) and is_int(step):
         if step == 0:
             lua_error(rt, node, "'for' step is zero")
@@ -978,7 +979,7 @@ def arith(rt, node, op, a, b):
         return call_one(rt, node, h, [a, b])
     # (Lua blames the first operand that isn't a number)
     bad, badv = (node.left, a) if not is_number(a) else (node.right, b)
-    lua_error(rt, node, "attempt to perform arithmetic on a %s value%s" % (type_name(badv), describe(rt, bad)))
+    lua_error(rt, node, f"attempt to perform arithmetic on a {type_name(badv)} value{describe(rt, bad)}")
 
 
 def string_arith(event):
@@ -997,7 +998,7 @@ def string_arith(event):
             h = metamethod(b, event)
             if h is not None:
                 return call(rt, node, h, [a, b])
-        lua_error(rt, node, "attempt to %s a '%s' with a '%s'" % (event[2:], type_name(a), type_name(b)))
+        lua_error(rt, node, f"attempt to {event[2:]} a '{type_name(a)}' with a '{type_name(b)}'")
 
     return Builtin(event, fn)
 
@@ -1074,7 +1075,7 @@ def bitwise(rt, node, op, a, b):
         badv = a if x is None else b
         if is_number(badv):
             lua_error(rt, node, "number has no integer representation")
-        lua_error(rt, node, "attempt to perform bitwise operation on a %s value%s" % (type_name(badv), describe(rt, node.left if x is None else node.right)))
+        lua_error(rt, node, f"attempt to perform bitwise operation on a {type_name(badv)} value{describe(rt, node.left if x is None else node.right)}")
     x = int(x)
     y = int(y)
     # (of two ints of 64 bits, & | ~ give one)
@@ -1108,7 +1109,7 @@ def concat(rt, node, a, b):
         return call_one(rt, node, h, [a, b])
     bad = a if not (isinstance(a, str) or is_number(a)) else b
     badn = node.left if bad is a else node.right
-    lua_error(rt, node, "attempt to concatenate a %s value%s" % (type_name(bad), describe(rt, badn)))
+    lua_error(rt, node, f"attempt to concatenate a {type_name(bad)} value{describe(rt, badn)}")
 
 
 def raw_equal(a, b):
@@ -1137,8 +1138,8 @@ def compare_error(rt, node, a, b):
     ta = type_name(a)
     tb = type_name(b)
     if ta == tb:
-        lua_error(rt, node, "attempt to compare two %s values" % ta)
-    lua_error(rt, node, "attempt to compare %s with %s" % (ta, tb))
+        lua_error(rt, node, f"attempt to compare two {ta} values")
+    lua_error(rt, node, f"attempt to compare {ta} with {tb}")
 
 
 def less(rt, node, a, b):
@@ -1179,7 +1180,7 @@ def unop_exp(node, rt):
             h = metamethod(v, "__unm")
             if h is not None:
                 return call_one(rt, node, h, [v, v])
-            lua_error(rt, node, "attempt to perform arithmetic on a %s value%s" % (type_name(v), describe(rt, node.operand)))
+            lua_error(rt, node, f"attempt to perform arithmetic on a {type_name(v)} value{describe(rt, node.operand)}")
         if is_int(x):
             return wrap(-int(x))
         return -x
@@ -1191,14 +1192,14 @@ def unop_exp(node, rt):
             return call_one(rt, node, h, [v])
         if isinstance(v, Table):
             return v.length()
-        lua_error(rt, node, "attempt to get length of a %s value%s" % (type_name(v), describe(rt, node.operand)))
+        lua_error(rt, node, f"attempt to get length of a {type_name(v)} value{describe(rt, node.operand)}")
     # ~
     x = to_integer(v) if is_number(v) or isinstance(v, str) else None
     if x is None:
         h = metamethod(v, "__bnot")
         if h is not None:
             return call_one(rt, node, h, [v, v])
-        lua_error(rt, node, "attempt to perform bitwise operation on a %s value%s" % (type_name(v), describe(rt, node.operand)))
+        lua_error(rt, node, f"attempt to perform bitwise operation on a {type_name(v)} value{describe(rt, node.operand)}")
     return wrap(~int(x))
 
 
@@ -1251,7 +1252,7 @@ def arg_error(rt, node, i, fname, message):
         name = call_name(node) or fname
         if node.kind == "method_call":
             i -= 1
-    lua_error(rt, node, "bad argument #%d to '%s' (%s)" % (i + 1, name, message))
+    lua_error(rt, node, f"bad argument #{i + 1} to '{name}' ({message})")
 
 
 def call_name(node):
@@ -1551,7 +1552,7 @@ def table_concat(rt, node, args):
     for k in range(i, j + 1):
         v = t.get(k)
         if not (isinstance(v, str) or is_number(v)):
-            lua_error(rt, node, "invalid value (at index %d) in table for 'concat'" % k)
+            lua_error(rt, node, f"invalid value (at index {k}) in table for 'concat'")
         parts.append(tostring(rt, node, v))
     return [sep.join(parts)]
 
@@ -1809,7 +1810,7 @@ def io_write(rt, node, args):
         v = args[i]
         # (numbers as C's printf writes them: floats without Lua's ".0")
         if type(v) is float:
-            write("%.14g" % v)
+            write(f"{v:.14g}")
         else:
             write(arg(rt, node, args, i, "write", "string"))
     return []
@@ -1921,7 +1922,7 @@ def format_q(rt, node, v):
             elif ch == "\0":
                 out.append("\\0")
             elif ord(ch) < 32 or ord(ch) == 127:
-                out.append("\\%d" % ord(ch))
+                out.append(f"\\{ord(ch)}")
             else:
                 out.append(ch)
         out.append('"')
@@ -1935,7 +1936,7 @@ def format_q(rt, node, v):
             return "-1e9999"
         if v != v:
             return "(0/0)"
-        return float.hex(v) if not v.is_integer() else "%d.0" % v if abs(v) < 1e16 else float.hex(v)
+        return float.hex(v) if not v.is_integer() else f"{int(v)}.0" if abs(v) < 1e16 else float.hex(v)
     return tostring(rt, node, v)
 
 
@@ -1967,7 +1968,7 @@ def string_format(rt, node, args):
             while j < n and fmt[j].isdigit():
                 j += 1
         if j >= n:
-            lua_error(rt, node, "invalid conversion '%%%s' to 'format'" % fmt[i:j])
+            lua_error(rt, node, f"invalid conversion '%{fmt[i:j]}' to 'format'")
         spec = fmt[i:j]
         conv = fmt[j]
         i = j + 1
@@ -2263,7 +2264,7 @@ def match_balance(ms, s, p):
 def match_capture(ms, s, n):
     n -= 1
     if n < 0 or n >= ms.level or ms.capture[n][1] == CAP_UNFINISHED:
-        lua_error(ms.rt, ms.node, "invalid capture index %%%d" % (n + 1))
+        lua_error(ms.rt, ms.node, f"invalid capture index %{n + 1}")
     start, length = ms.capture[n]
     cap = ms.src[start : start + length]
     if ms.src[s : s + len(cap)] == cap:
@@ -2275,7 +2276,7 @@ def get_capture(ms, i, s, e):
     if i >= ms.level:
         if i == 0:
             return ms.src[s:e]
-        lua_error(ms.rt, ms.node, "invalid capture index %%%d" % (i + 1))
+        lua_error(ms.rt, ms.node, f"invalid capture index %{i + 1}")
     start, length = ms.capture[i]
     if length == CAP_POSITION:
         return start + 1
@@ -2401,7 +2402,7 @@ def string_gsub(rt, node, args):
                 elif isinstance(v, str) or is_number(v):
                     out.append(tostring(rt, node, v))
                 else:
-                    lua_error(rt, node, "invalid replacement value (a %s)" % type_name(v))
+                    lua_error(rt, node, f"invalid replacement value (a {type_name(v)})")
         if e is not None and e > s:
             s = e
         elif s < len(src):

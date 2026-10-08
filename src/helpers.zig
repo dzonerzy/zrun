@@ -2374,8 +2374,25 @@ export fn zr_is_type(t: u64, bits: u64, code: u32) callconv(.c) bool {
 
 /// A value formatted for an f-string ({v!conversion:spec}), as Python does.
 export fn zr_format(ctx: *Ctx, node: u32, t: u64, bits: u64, conversion: u32, spec: *const value.Str, out: *Value) callconv(.c) bool {
-    gil.ensure();
     const v = Value{ .tag = t, .bits = bits };
+    // (`{s}` of a str, `{n}` or `{n:d}` of an int, with no conversion or
+    // `!s`: natively, as Python formats them; anything else Python's)
+    if (conversion == 0 or conversion == 's') {
+        const sp = spec.bytes();
+        if (v.kind() == .str and sp.len == 0) {
+            value.incref(v);
+            out.* = v;
+            return true;
+        }
+        if (v.kind() == .int and (sp.len == 0 or std.mem.eql(u8, sp, "d"))) {
+            var buf: [24]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{d}", .{v.asInt()}) catch unreachable;
+            const r = value.newStr(s) orelse return oomFail(ctx, node);
+            out.* = Value.obj(.str, &r.head);
+            return true;
+        }
+    }
+    gil.ensure();
     var objs: [1]*PyObject = undefined;
     if (!objects(ctx, &.{v}, &objs)) return failPython(ctx, node);
     var o = objs[0];
