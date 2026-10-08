@@ -40,7 +40,7 @@ Part of zsuite: zgram (syntax), zrules (semantics), zrun (execution), zlsp (edit
 
 ### A real language
 
-[examples/lua](https://github.com/dzonerzy/zrun/tree/main/examples/lua) is Lua 5.4: a grammar in zgram, its static rules in zrules, and about 2,300 lines of semantics in Python (values, metatables, closures, varargs, the string, table and math libraries, `pcall`). It passes its test programs in both modes. Compiled against the same semantics run as Python, and against Lua's own interpreter (PUC-Rio's, written in C):
+[examples/lua](https://github.com/dzonerzy/zrun/tree/main/examples/lua) is a subset of Lua 5.4: a grammar in zgram, its static rules in zrules, and about 2,300 lines of semantics in Python (values, metatables, closures, varargs, tail calls, most of the string, table and math libraries, `pcall`; no coroutines, `goto`, `load` or `utf8`: [what's in it](https://github.com/dzonerzy/zrun/tree/main/examples/lua#whats-implemented)). Its test programs give real Lua 5.4's output in both modes. Compiled against the same semantics run as Python, and against Lua's own interpreter (PUC-Rio's, written in C):
 
 | Program | zrun, compiled | zrun, semantics as Python | Lua 5.4 |
 |---|---|---|---|
@@ -359,7 +359,7 @@ test/
   test_run.py           # Running programs: semantics as Python
   test_front.py         # Semantics read from their Python source
   test_typed.py         # The typed language: structs, methods, typed entries, errors
-  test_lua.py           # Lua 5.4's test programs, like real Lua, in every mode
+  test_lua.py           # the Lua example's test programs, as real Lua runs them, in every mode
   test_engine.py        # program.call, map(), zrun.Bytes, native host functions
   test_scan.py          # A YARA-like engine: threads, map(), compiled modules
   test_boundary.py      # Values crossing between compiled code and Python
@@ -375,7 +375,7 @@ test/
   test_session.py       # Sessions and the REPL
 examples/tiny/          # A small language: the quick start
 examples/typed/         # A typed language: structs, methods, lists, optionals
-examples/lua/           # Lua 5.4, with its test programs; a REPL
+examples/lua/           # a subset of Lua 5.4, with its test programs; a REPL
 examples/scan/          # A YARA-like rule language: an engine, native host functions
 docs/                   # The guide to writing fast semantics
 build.zig               # Zig build configuration
