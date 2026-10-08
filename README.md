@@ -209,6 +209,23 @@ A compiled module holds the program's source and its compiled code. Loading it c
 
 The compiled-code cache is in the platform's cache directory (`%LOCALAPPDATA%\zrun\Cache`, `~/Library/Caches/zrun`, `$XDG_CACHE_HOME/zrun` or `~/.cache/zrun`); `zrun.configure(cache=False)` or `cache="dir"` changes that. It takes at most 1 GiB (`zrun.configure(cache_size=bytes)`, 0 for no limit): past it, the compiled code used least recently is deleted, down to 80% of the limit. `zrun.clear_cache()` empties it.
 
+## Executables
+
+```bash
+pip install "zrun-py[exe]"        # with the ziglang package: Zig, to link the launcher
+```
+
+```python
+zrun.build_executable("lua:lang", "fib.lua", "fib")                          # ./fib: for this machine
+zrun.build_executable(lua.lang, "fib.lua", "fib", target="x86_64-windows")   # fib.exe, made on Linux
+```
+
+One file runs the program, on a machine with no Python: in it are a Python runtime ([python-build-standalone](https://github.com/astral-sh/python-build-standalone)'s, 3.10 to 3.14: `python="3.12"`, by default the one building), zrun, zgram and zrules, the language's module with the Python modules beside it (or its package), the program and its compiled code. The language is given as `"module:attribute"` or as the `Language` itself (an attribute of a module imported). The program's errors are found when building (`zrun.LoadError`).
+
+Run, it unpacks itself once into the platform's cache directory (`zrun/exe/<its hash>`) and runs the program there with the Python it brought: the semantics run as Python, host functions and Python's modules work as they do anywhere. The program's arguments are `sys.argv[1:]`; a runtime error is printed and exits with 1, an error found loading with 2.
+
+The targets are `x86_64-linux` (glibc 2.17 or newer) and `x86_64-windows`, from either. For this machine, the compiled code is made when building; for the other, zrun, zgram and zrules come from PyPI (the same versions' wheels), and the program is compiled the first time it runs, then cached. Building downloads the runtime once (about 30 MB, kept in the cache directory under `zrun/build`). An executable takes 30 to 40 MB, about 100 MB unpacked. Starting it runs what the language's module does when imported: compiling its grammar is most of it (about 0.5 s for Lua's).
+
 ## Sessions and the REPL
 
 ```python
@@ -249,6 +266,7 @@ Every class and method has its documentation in `help()` (and in the `.pyi` stub
 | `program.call(name, *args, context=None)`, `program.map(name, items, threads=None)` | an engine's entry points |
 | `program.report()`, `lang.python_semantics()` | what to look at to make it faster |
 | `lang.compile(source, output)`, `program.save(path)`, `lang.load_compiled(path)` | compiled modules |
+| `zrun.build_executable(language, source, output, target=None, python=None)` | the program as one executable file |
 | `lang.session()`, `lang.repl()` | programs run one after another, sharing their names |
 | `zrun.Bytes(data)` | data read in place |
 | `zrun.configure(cache=, cache_size=, tiers=, perf_map=)`, `zrun.clear_cache()` | process-wide settings; the compiled-code cache |
@@ -332,6 +350,8 @@ src/
   native.zig            # Native host functions (zrun.native.v1)
   wrapping.zig          # rt.wrapping_add and the other 64-bit wrapping operations
   pyhelp.zig            # Helpers over the Python C API
+  exe/build.py          # zrun.build_executable(): the runtime, the packages, the payload
+  exe/launcher.zig      # An executable's start: unpacks its payload, runs its Python
 test/
   test_modes.py         # Differential tests: every program in every mode
   test_run.py           # Running programs: semantics as Python
@@ -347,6 +367,7 @@ test/
   test_cache.py         # The compiled-code cache between processes
   test_tiers.py         # Fast code first, optimized in the background
   test_aot.py           # Compiled modules
+  test_exe.py           # Executables
   test_session.py       # Sessions and the REPL
 examples/tiny/          # A small language: the quick start
 examples/typed/         # A typed language: structs, methods, lists, optionals

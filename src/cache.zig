@@ -206,8 +206,10 @@ pub fn read(a: std.mem.Allocator, path: []const u8) ?[]u8 {
 /// is used now (its time made now: the least recently used go first).
 pub fn readObject(a: std.mem.Allocator, path: []const u8) ?[]u8 {
     const bytes = read(a, path) orelse return null;
-    // (Dir.setTimestampsNow doesn't compile in Zig 0.16: the same, spelled out)
-    std.Io.Dir.cwd().setTimestamps(io(), path, .{ .access_timestamp = .now, .modify_timestamp = .now }) catch {};
+    // (through the file: Zig 0.16's Dir.setTimestamps isn't there on Windows)
+    const f = std.Io.Dir.cwd().openFile(io(), path, .{ .mode = .read_write }) catch return bytes;
+    defer f.close(io());
+    f.setTimestampsNow(io()) catch {};
     return bytes;
 }
 

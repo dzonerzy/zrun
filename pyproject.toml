@@ -14,6 +14,8 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Daniele Linguaglossa" }]
 dependencies = ["zgram-py>=0.4.2", "zrules-py>=0.1.6"]
+# zrun.build_executable(): Zig, to link an executable's launcher
+optional-dependencies = { exe = ["ziglang>=0.16"] }
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

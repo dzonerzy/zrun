@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **The cache's size is limited**: 1 GiB by default, `zrun.configure(cache_size=bytes)` (0: no limit). A process compiling code looks the cache over when it first writes to it and after each tenth of the limit it writes: past the limit, the compiled code used least recently goes, down to 80% of the limit (code loaded from the cache counts as used). Files a stopped process left half-written are deleted after an hour.
 - **`zrun.clear_cache()`**: the cache emptied.
+- **Executables**: `zrun.build_executable(language, source, output, target=None, python=None)` makes one file running the program on a machine with no Python: a Python runtime (python-build-standalone's, 3.10 to 3.14), zrun, zgram, zrules, the language's module, the program and its compiled code, behind a small launcher that unpacks them once into the cache directory. For `x86_64-linux` and `x86_64-windows`, built from either. Needs the `ziglang` package (`pip install zrun-py[exe]`).
+
+### Fixed
+- A compiled module is loaded where the language's files have moved (another install, another directory): their paths were in the definition's hash.
 
 ### Performance
 - **Typed functions taking lists get a typed entry** from their declaration, as those taking ints, floats and bools have: called directly from typed code, the list given borrowed (no reference counted per call, unless the function stores to the parameter). Arguments read from variables stay borrowed for the call. A typed function summing a 10-item list, called in a loop: 0.44 ns per item (C: 0.21), was 0.71.

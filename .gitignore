@@ -9,6 +9,9 @@ __pycache__/
 *$py.class
 *.so
 *.pyd
+*.dll
+*.lib
+*.pdb
 .Python
 build/
 develop/

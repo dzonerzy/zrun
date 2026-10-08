@@ -3480,6 +3480,37 @@ fn clearCache() ?*PyObject {
     return none();
 }
 
+/// The builder of executables (exe/build.py), run once when first asked for.
+var exe_builder: ?*PyObject = null;
+
+/// zrun.build_executable(language, source, output, target=None, path=None,
+/// python=None): exe/build.py's, given the launcher's source.
+fn buildExecutable(args: pyoz.Args(struct { language: *PyObject, source: *PyObject, output: *PyObject, target: ?*PyObject = null, path: ?*PyObject = null, python: ?*PyObject = null })) ?*PyObject {
+    const v = args.value;
+    const ns = exe_builder orelse blk: {
+        const n = @import("compile.zig").runPython(@embedFile("exe/build.py")) orelse return null;
+        exe_builder = n;
+        break :blk n;
+    };
+    const build = py.c.PyDict_GetItemString(ns, "build_executable") orelse return null;
+    const launcher = ph.newString(@embedFile("exe/launcher.zig")) orelse return null;
+    defer py.Py_DecRef(launcher);
+    const pos = py.c.PyTuple_New(3) orelse return null;
+    defer py.Py_DecRef(pos);
+    for ([_]*PyObject{ v.language, v.source, v.output }, 0..) |o, i| {
+        _ = py.c.PyTuple_SetItem(pos, @intCast(i), ref(o));
+    }
+    const kw = py.c.PyDict_New() orelse return null;
+    defer py.Py_DecRef(kw);
+    if (py.c.PyDict_SetItemString(kw, "launcher_source", launcher) != 0) return null;
+    inline for (.{ "target", "path", "python" }) |name| {
+        if (optional(@field(v, name))) |o| {
+            if (py.c.PyDict_SetItemString(kw, name, o) != 0) return null;
+        }
+    }
+    return py.c.PyObject_Call(build, pos, kw);
+}
+
 fn moduleInit(module: *PyObject) callconv(.c) c_int {
     ph.initVersion() catch return -1;
     if (ztypes.init(module) != 0) return -1;
@@ -3504,6 +3535,7 @@ pub const Module = pyoz.module(.{
         pyoz.func("_blocks", blocks, "The values' blocks allocated and not freed (for tests)"),
         pyoz.func("collect", collect, "collect(): free the compiled code's values that only reference one another (reference cycles); how many were freed. Runs by itself as values are made, and at the end of a run."),
         pyoz.func("clear_cache", clearCache, "clear_cache(): delete the compiled code kept in the cache."),
+        pyoz.kwfunc("build_executable", buildExecutable, "build_executable(language, source, output, target=None, path=None, python=None): one executable file running the program: a Python runtime, zrun and its packages, the language's module (and the modules beside it), the program and its compiled code. language: the Language, or 'module:attribute'; source: the program's text or its file; target: 'x86_64-linux' or 'x86_64-windows' (default: this machine's); python: '3.10' ... '3.14' (default: this one's). Needs the ziglang package (pip install zrun-py[exe]); downloads the runtime (python-build-standalone's) once. Returns the executable's path."),
         pyoz.kwfunc("configure", configure, "configure(cache=None, cache_size=None, perf_map=None, tiers=None): process-wide settings (those not given stay). cache: True (the platform's place for caches: %LOCALAPPDATA%\\zrun\\Cache on Windows, ~/Library/Caches/zrun on macOS, $XDG_CACHE_HOME/zrun or ~/.cache/zrun elsewhere), False (no cache), or a directory; cache_size: the most the cache takes, in bytes (default 1 GiB; 0: no limit): past it, the least recently used compiled code is deleted, down to 80% of it; perf_map: name compiled functions for Linux's perf (/tmp/perf-<pid>.map); tiers: True (default: a program run compiled whose optimized code isn't cached is compiled fast first, optimized in the background, the optimized code running from the run after it's done) or False (optimized at once)."),
     },
     .classes = &.{

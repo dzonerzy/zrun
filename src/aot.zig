@@ -147,7 +147,9 @@ pub const definition_source =
     \\        h.update(b"\0")
     \\    def code_object(c):
     \\        for name in FIELDS:
-    \\            text(getattr(c, name, None))
+    \\            v = getattr(c, name, None)
+    \\            # (the file's name, not where it is: the same semantics moved)
+    \\            text(v.replace("\\", "/").rsplit("/", 1)[-1] if name == "co_filename" and isinstance(v, str) else v)
     \\        for k in c.co_consts:
     \\            if hasattr(k, "co_code"):
     \\                code_object(k)

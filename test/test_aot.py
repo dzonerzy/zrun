@@ -94,6 +94,36 @@ def test_refused_for_another_definition(tmp_path, change):
     assert "another definition of the language" in out["refused"]
 
 
+MOVED = r"""
+import importlib.util, json, sys
+import zrun
+zrun.configure(cache=False)
+spec = importlib.util.spec_from_file_location("tiny_moved", {path!r})
+tiny = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(tiny)
+try:
+    tiny.lang.load_compiled({module!r})
+    print(json.dumps("loaded"))
+except ValueError as e:
+    print(json.dumps(str(e)))
+"""
+
+
+def test_loaded_where_the_language_moved(tmp_path):
+    # (the language's files elsewhere, the same: an executable's, an
+    # install's)
+    module = tmp_path / "fib.zrc"
+    tiny.lang.compile(PROGRAM, str(module))
+    moved = tmp_path / "elsewhere" / "tiny.py"
+    moved.parent.mkdir()
+    moved.write_text(open(tiny.__file__, encoding="utf-8").read(), encoding="utf-8")
+    script = tmp_path / "moved.py"
+    script.write_text(MOVED.format(path=str(moved), module=str(module)))
+    r = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=os.environ, timeout=600)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip().splitlines()[-1] == '"loaded"'
+
+
 def test_not_a_module(tmp_path):
     bad = tmp_path / "bad.zrc"
     bad.write_bytes(b"not a module at all")

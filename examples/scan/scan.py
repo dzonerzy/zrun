@@ -188,7 +188,8 @@ CAPSULE = b"zrun.native.v1"
 
 def _library():
     src = os.path.join(HERE, "scanlib.zig")
-    out = os.path.join(HERE, "scanlib.so")
+    # (named for the platform: another's beside it isn't taken for this one's)
+    out = os.path.join(HERE, "scanlib.dll" if sys.platform == "win32" else "scanlib.so")
     if not os.path.exists(out) or os.path.getmtime(out) < os.path.getmtime(src):
         subprocess.run(["zig", "build-lib", "-dynamic", "-OReleaseFast", "-femit-bin=" + out, src], check=True, cwd=HERE)
     return ctypes.CDLL(out)
