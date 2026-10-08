@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Typed functions taking lists get a typed entry** from their declaration, as those taking ints, floats and bools have: called directly from typed code, the list given borrowed (no reference counted per call, unless the function stores to the parameter). Arguments read from variables stay borrowed for the call. A typed function summing a 10-item list, called in a loop: 0.44 ns per item (C: 0.21), was 0.71.
 - **The program's variables no function refers to are kept on the stack** while its code runs: in registers, their kinds known from what's stored, the checks on them folded. They are in the program's frame wherever code that sees the frames runs (semantics run as Python, code out of line, an `rt` handed out) and when the program ends. Lua's `for i = 1, 10000000 do s = s + i end` at the top level: 340 instructions an iteration before; LLVM now works the loop out.
 - A function taking extra arguments (`extra="keep"`) called with none gets the empty tuple without a call.
+- **Lists of numbers only aren't tracked by the cycle collector** (as CPython's containers of atoms): made and freed without its bookkeeping, tracked once they may hold a container. Collections go through fewer objects.
+- **Lua example: a function returning one value returns it, not a list of one** (a call taking its first result makes no list; `nil` alone and several values stay a list). `fib(30)`: 0.040 s, was 0.068 (Lua 5.4: 0.025). From Python, `program.call()` of such a function gives the value.
 
 ## [0.1.0] - 2026-10-08
 

@@ -212,7 +212,7 @@ def tostring(rt, node, v):
     if isinstance(v, Table):
         mm = metamethod(v, "__tostring")
         if mm is not None:
-            s = one(call(rt, node, mm, [v]))
+            s = call_one(rt, node, mm, [v])
             if not isinstance(s, str):
                 lua_error(rt, node, "'__tostring' must return a string")
             return s
@@ -360,7 +360,7 @@ def index(rt, node, obj, key):
             if h is None:
                 lua_error(rt, node, "attempt to index a %s value%s" % (type_name(obj), describe(rt, target_of(node))))
         if is_function(h):
-            return one(call(rt, node, h, [obj, key]))
+            return call_one(rt, node, h, [obj, key])
         obj = h
     lua_error(rt, node, "'__index' chain too long; possible loop")
 
@@ -403,21 +403,46 @@ def setindex(rt, node, obj, key, value):
 # ----------------------------------------------------------------------
 
 
-def call(rt, node, f, args):
-    """Call a Lua value with arguments: its results (a list). `node` is the
-    call expression, or None for a call made by the library (pcall's)."""
+def call_raw(rt, node, f, args):
+    """Call a Lua value with arguments: its results as a function returns
+    them (retstat): a list, one value not nil as itself, or None for none
+    (a function's end reached). `node` is the call expression, or None for
+    a call made by the library (pcall's)."""
     if isinstance(f, zrun.Function):
-        r = rt.call(f, args)
-        return r if isinstance(r, list) else []
+        return rt.call(f, args)
     if isinstance(f, Builtin):
         return f.fn(rt, node, args)
     if isinstance(f, Method):
-        r = rt.call(f.fn, args[1:], receiver=args[0] if args else None)
-        return r if isinstance(r, list) else []
+        return rt.call(f.fn, args[1:], receiver=args[0] if args else None)
     h = metamethod(f, "__call")
     if h is not None:
-        return call(rt, node, h, [f] + args)
+        return call_raw(rt, node, h, [f] + args)
     lua_error(rt, node, "attempt to call a %s value%s" % (type_name(f), describe(rt, target_of(node))))
+
+
+def as_list(r):
+    """A call's results (call_raw's) as a list."""
+    if isinstance(r, list):
+        return r
+    return [] if r is None else [r]
+
+
+def first(r):
+    """A call's first result (call_raw's), nil if none."""
+    if isinstance(r, list):
+        return r[0] if r else None
+    return r
+
+
+def call(rt, node, f, args):
+    """Call a Lua value with arguments: its results (a list)."""
+    return as_list(call_raw(rt, node, f, args))
+
+
+def call_one(rt, node, f, args):
+    """Call a Lua value with arguments: its first result (no list made for
+    a function returning one value)."""
+    return first(call_raw(rt, node, f, args))
 
 
 def call_args(node, rt):
@@ -431,16 +456,21 @@ def call_args(node, rt):
     return explist(args, rt)
 
 
-def call_values(node, rt):
-    """A call expression's results (all of them)."""
+def call_results(node, rt):
+    """A call expression's results, as call_raw gives them."""
     if node.kind == "method_call":
         obj = rt.eval(node.target)
         f = index(rt, node, obj, node.method.text)
         if not is_function(f) and metamethod(f, "__call") is None:
             lua_error(rt, node, "attempt to call a %s value (method '%s')" % (type_name(f), node.method.text))
-        return call(rt, node, f, [obj] + call_args(node, rt))
+        return call_raw(rt, node, f, [obj] + call_args(node, rt))
     f = rt.eval(node.target)
-    return call(rt, node, f, call_args(node, rt))
+    return call_raw(rt, node, f, call_args(node, rt))
+
+
+def call_values(node, rt):
+    """A call expression's results (all of them)."""
+    return as_list(call_results(node, rt))
 
 
 def values(node, rt):
@@ -670,6 +700,12 @@ def for_in(node, rt):
 def retstat(node, rt):
     kids = node.children
     vals = explist_of(kids[0], rt) if kids and kids[0].kind == "explist" else []
+    # (one value, not nil: itself, no list made (call_raw's callers take
+    # it so); nil stays a list: None is a function's end, no value)
+    if len(vals) == 1:
+        v = vals[0]
+        if v is not None:
+            raise rt.Return(v)
     raise rt.Return(vals)
 
 
@@ -841,7 +877,7 @@ def table(node, rt):
 
 @lang.eval(["call", "method_call"])
 def call_exp(node, rt):
-    return one(call_values(node, rt))
+    return first(call_results(node, rt))
 
 
 @lang.eval("index")
@@ -900,7 +936,7 @@ def arith(rt, node, op, a, b):
     if h is None:
         h = metamethod(b, event)
     if h is not None:
-        return one(call(rt, node, h, [a, b]))
+        return call_one(rt, node, h, [a, b])
     # (Lua blames the first operand that isn't a number)
     bad, badv = (node.left, a) if not is_number(a) else (node.right, b)
     lua_error(rt, node, "attempt to perform arithmetic on a %s value%s" % (type_name(badv), describe(rt, bad)))
@@ -993,7 +1029,7 @@ def bitwise(rt, node, op, a, b):
         if h is None:
             h = metamethod(b, BIT_EVENTS[op])
         if h is not None:
-            return one(call(rt, node, h, [a, b]))
+            return call_one(rt, node, h, [a, b])
         badv = a if x is None else b
         if is_number(badv):
             lua_error(rt, node, "number has no integer representation")
@@ -1028,7 +1064,7 @@ def concat(rt, node, a, b):
     if h is None:
         h = metamethod(b, "__concat")
     if h is not None:
-        return one(call(rt, node, h, [a, b]))
+        return call_one(rt, node, h, [a, b])
     bad = a if not (isinstance(a, str) or is_number(a)) else b
     badn = node.left if bad is a else node.right
     lua_error(rt, node, "attempt to concatenate a %s value%s" % (type_name(bad), describe(rt, badn)))
@@ -1052,7 +1088,7 @@ def equal(rt, node, a, b):
         if h is None:
             h = metamethod(b, "__eq")
         if h is not None:
-            return truthy(one(call(rt, node, h, [a, b])))
+            return truthy(call_one(rt, node, h, [a, b]))
     return False
 
 
@@ -1073,7 +1109,7 @@ def less(rt, node, a, b):
     if h is None:
         h = metamethod(b, "__lt")
     if h is not None:
-        return truthy(one(call(rt, node, h, [a, b])))
+        return truthy(call_one(rt, node, h, [a, b]))
     compare_error(rt, node, a, b)
 
 
@@ -1086,7 +1122,7 @@ def less_equal(rt, node, a, b):
     if h is None:
         h = metamethod(b, "__le")
     if h is not None:
-        return truthy(one(call(rt, node, h, [a, b])))
+        return truthy(call_one(rt, node, h, [a, b]))
     compare_error(rt, node, a, b)
 
 
@@ -1101,7 +1137,7 @@ def unop_exp(node, rt):
         if x is None:
             h = metamethod(v, "__unm")
             if h is not None:
-                return one(call(rt, node, h, [v, v]))
+                return call_one(rt, node, h, [v, v])
             lua_error(rt, node, "attempt to perform arithmetic on a %s value%s" % (type_name(v), describe(rt, node.operand)))
         if is_int(x):
             return wrap(-int(x))
@@ -1111,7 +1147,7 @@ def unop_exp(node, rt):
             return len(v.encode("utf-8"))
         h = metamethod(v, "__len")
         if h is not None:
-            return one(call(rt, node, h, [v]))
+            return call_one(rt, node, h, [v])
         if isinstance(v, Table):
             return v.length()
         lua_error(rt, node, "attempt to get length of a %s value%s" % (type_name(v), describe(rt, node.operand)))
@@ -1120,7 +1156,7 @@ def unop_exp(node, rt):
     if x is None:
         h = metamethod(v, "__bnot")
         if h is not None:
-            return one(call(rt, node, h, [v, v]))
+            return call_one(rt, node, h, [v, v])
         lua_error(rt, node, "attempt to perform bitwise operation on a %s value%s" % (type_name(v), describe(rt, node.operand)))
     return wrap(~int(x))
 
@@ -1488,7 +1524,7 @@ def table_sort(rt, node, args):
 
     def lt(a, b):
         if comp is not None:
-            return truthy(one(call(rt, node, comp, [a, b])))
+            return truthy(call_one(rt, node, comp, [a, b]))
         return less(rt, node, a, b)
 
     # (merge sort: a comparison function that isn't a strict order still
@@ -2318,7 +2354,7 @@ def string_gsub(rt, node, args):
                 if isinstance(repl, Table):
                     v = index(rt, node, repl, caps[0])
                 else:
-                    v = one(call(rt, node, repl, caps))
+                    v = call_one(rt, node, repl, caps)
                 if v is None or v is False:
                     out.append(whole)
                 elif isinstance(v, str) or is_number(v):
@@ -2356,6 +2392,7 @@ def run(source, path="input", mode="python", args=()):
 def show(values):
     """What a REPL entry returned (`return ...`), as print shows it (a
     table's __tostring aside: no program runs to call it)."""
+    values = as_list(values)
     if values:
         write("\t".join("table: 0x%014x" % (id(v) & 0xFFFFFFFFFFFFFF) if isinstance(v, Table) else tostring(None, None, v) for v in values) + "\n")
 

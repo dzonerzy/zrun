@@ -142,6 +142,24 @@ pub inline fn alloc(size: usize) ?[*]u8 {
     return mem + head_size;
 }
 
+/// A container's memory, `size` bytes, not tracked: one that can't be in a
+/// cycle yet (a list of numbers only); track() it once it can.
+pub inline fn allocUntracked(size: usize) ?[*]u8 {
+    const mem = pool.allocIn(pool.current(), head_size + size) orelse return null;
+    const h: *Head = @ptrCast(@alignCast(mem));
+    h.* = .{};
+    return mem + head_size;
+}
+
+/// An untracked container tracked from now, in this thread's young
+/// generation (no collection here: it's due at the next container made).
+pub noinline fn track(o: *Obj) void {
+    const s = &pool.current().gc;
+    s.ready();
+    link(&s.young, headOf(o));
+    s.young_count += 1;
+}
+
 /// (a thread's first container: its lists made; a collection due)
 noinline fn prepare(s: *State) void {
     s.ready();

@@ -116,9 +116,28 @@ def test_cycles_in_map_workers():
     program.map("make", range(20000), threads=4)
     rss = _rss_kb()
     for _ in range(20):
-        # (a Lua function's results: a list)
-        assert program.map("make", range(20000), threads=4) == [[i] for i in range(20000)]
+        # (a Lua function's one result, not nil: itself)
+        assert program.map("make", range(20000), threads=4) == list(range(20000))
     assert _rss_kb() - rss < 30_000
+
+
+def test_a_list_of_numbers_joining_a_cycle(run):
+    # (a table's array part starts with numbers, untracked; given the
+    # table itself it's tracked, its cycle collected)
+    program = lua.lang.load(
+        """
+        for i = 1, 5000 do
+          local t = {1, 2.5, 3}
+          t[4] = t
+        end
+        print("made")
+        """,
+        "numbers.lua",
+    )
+    run(program)
+    before = zrun._blocks()
+    assert run(program) == "made\n"
+    assert zrun._blocks() == before
 
 
 def test_a_long_cycle(run):

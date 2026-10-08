@@ -590,10 +590,15 @@ pub inline fn listStored(l: *List, v: Value) void {
         LIST_INTS
     else if (v.tag == @intFromEnum(Tag.float)) LIST_FLOATS else 0;
     l.head.flags &= ~(LIST_KINDS & ~keep);
+    // (a list is tracked by the cycle collector once it may hold a
+    // container: until then, of numbers only, it can't be in a cycle)
+    if (l.head.flags & LIST_KINDS == 0 and gc.headOf(&l.head).next == null and l.head.rc < IMMORTAL) gc.track(&l.head);
 }
 
+/// A new list, empty, room for `cap` items; untracked by the cycle
+/// collector while it holds numbers only (listStored)
 pub fn newList(cap: usize) ?*List {
-    const l: *List = @ptrCast(@alignCast(gc.alloc(list_block) orelse return null));
+    const l: *List = @ptrCast(@alignCast(gc.allocUntracked(list_block) orelse return null));
     l.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.list), .flags = LIST_KINDS }, .len = 0, .cap = list_inline, .items = listInline(l) };
     if (cap > list_inline) {
         const items = allocator.alloc(Value, cap) catch {
