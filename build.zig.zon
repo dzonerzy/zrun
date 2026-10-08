@@ -1,6 +1,6 @@
 .{
     .name = .zrun,
-    .version = "0.4.0",
+    .version = "0.4.1",
     .fingerprint = 0x8af1e236c84c491b,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
