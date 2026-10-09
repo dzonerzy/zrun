@@ -473,6 +473,46 @@ pub export fn zr_raise(ctx: *Ctx, at: u32, t: u64, bits: u64) callconv(.c) bool 
     return pythonFailure(ctx, at) != 0;
 }
 
+/// `raise exc from cause` in compiled code: exc (a class made an instance)
+/// with its __cause__ (None: no context shown, as `from None`), raised as
+/// zr_raise raises it. Always false.
+pub export fn zr_raise_from(ctx: *Ctx, at: u32, t: u64, bits: u64, ct: u64, cb: u64) callconv(.c) bool {
+    gil.allowBegin();
+    defer gil.allowEnd();
+    const o = value.toPython(.{ .tag = t, .bits = bits }, ctx.node_maker) orelse return pythonFailure(ctx, at) != 0;
+    defer py.Py_DecRef(o);
+    const cause = value.toPython(.{ .tag = ct, .bits = cb }, ctx.node_maker) orelse return pythonFailure(ctx, at) != 0;
+    defer py.Py_DecRef(cause);
+    const base = py.c.PyExc_BaseException;
+    const is_type = py.c.PyObject_IsInstance(o, @ptrCast(@alignCast(py.types.typeObject("PyType_Type")))) == 1;
+    // (the exception: a class's instance, made now)
+    const exc = if (is_type and py.c.PyObject_IsSubclass(o, base) == 1) (py.c.PyObject_CallNoArgs(o) orelse return pythonFailure(ctx, at) != 0) else blk: {
+        if (py.c.PyObject_IsInstance(o, base) != 1) {
+            ph.raise(py.PyExc_TypeError(), "exceptions must derive from BaseException", .{});
+            return pythonFailure(ctx, at) != 0;
+        }
+        py.Py_IncRef(o);
+        break :blk o;
+    };
+    defer py.Py_DecRef(exc);
+    // (its cause: an exception, a class's instance, or None)
+    const cause_exc: ?*PyObject = if (cause == py.Py_None()) null else if (py.c.PyObject_IsInstance(cause, base) == 1) blk: {
+        py.Py_IncRef(cause);
+        break :blk cause;
+    } else if (py.c.PyObject_IsInstance(cause, @ptrCast(@alignCast(py.types.typeObject("PyType_Type")))) == 1 and py.c.PyObject_IsSubclass(cause, base) == 1)
+        (py.c.PyObject_CallNoArgs(cause) orelse return pythonFailure(ctx, at) != 0)
+    else {
+        ph.raise(py.PyExc_TypeError(), "exception causes must derive from BaseException", .{});
+        return pythonFailure(ctx, at) != 0;
+    };
+    // (PyException_SetCause takes the reference; it marks the context
+    // suppressed too)
+    py.c.PyException_SetCause(exc, cause_exc);
+    if (cause_exc == null) if (py.c.PyObject_SetAttrString(exc, "__suppress_context__", py.Py_True()) != 0) return pythonFailure(ctx, at) != 0;
+    py.c.PyErr_SetObject(@ptrCast(@alignCast(ph.typeOf(exc))), exc);
+    return pythonFailure(ctx, at) != 0;
+}
+
 /// `except cls:` in compiled code: whether the error being raised is one
 /// (objects[cls_index]: a class or a tuple of them). An error of the
 /// compiled code itself is a zrun.Error, as Python code above would see it.
@@ -1394,7 +1434,7 @@ pub export fn zr_speculate(ctx: *Ctx, fnode: u64) callconv(.c) void {
 }
 
 /// The bridge's helpers, by name (for the JIT)
-pub fn symbols() [10]struct { []const u8, usize } {
+pub fn symbols() [11]struct { []const u8, usize } {
     return .{
         .{ "zr_specialize", @intFromPtr(&zr_specialize) },
         .{ "zr_speculate", @intFromPtr(&zr_speculate) },
@@ -1406,5 +1446,6 @@ pub fn symbols() [10]struct { []const u8, usize } {
         .{ "zr_exc_matches", @intFromPtr(&zr_exc_matches) },
         .{ "zr_exc_catch", @intFromPtr(&zr_exc_catch) },
         .{ "zr_control_value", @intFromPtr(&zr_control_value) },
+        .{ "zr_raise_from", @intFromPtr(&zr_raise_from) },
     };
 }

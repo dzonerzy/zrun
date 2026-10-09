@@ -339,6 +339,16 @@ fn stablePy(o: *PyObject) error{Python}!bool {
     return r == 1;
 }
 
+/// A constant the source may have that compiled code holds as Python's
+/// object: bytes, complex, `...` (immutable, exactly those types)
+fn isSourceConstant(o: *PyObject) bool {
+    const t = ph.typeOf(o);
+    inline for (.{ "PyBytes_Type", "PyComplex_Type", "PyEllipsis_Type" }) |name| {
+        if (t == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject(name))))) return true;
+    }
+    return false;
+}
+
 /// An exception class (raised, caught: what strict mode still lets reach
 /// Python, an error being the way out of the code)
 fn isExceptionClass(o: *PyObject) bool {
@@ -1477,6 +1487,8 @@ pub const Compiler = struct {
         .{ "zr_call_plain", "bpillplpp" },
         .{ "zr_int_base_of", "bpilllllp" },
         .{ "zr_float_hex", "bpilllp" },
+        .{ "zr_delitem", "bpillll" },
+        .{ "zr_raise_from", "bpillll" },
         .{ "zr_range", "bpiplp" },
         .{ "zr_is_type", "blli" },
         .{ "zr_format", "bpillipp" },
@@ -2685,7 +2697,9 @@ const Gen = struct {
                 const b = try self.c.bigConst(value.bigOf(o).?);
                 break :blk .{ .tag = self.k(@intFromEnum(value.Tag.big)), .bits = self.c.m.addrInt(@intFromPtr(b)), .shape = .any };
             } else blk: {
-                if (self.c.lang.strict and !isExceptionClass(o)) try self.strictRefuses("uses {s}, a Python object, as a value", .{try self.pyName(o)});
+                // (a constant of the source's, bytes, complex or `...`: only
+                // held, what's done with it checked where it's done)
+                if (self.c.lang.strict and !isExceptionClass(o) and !isSourceConstant(o)) try self.strictRefuses("uses {s}, a Python object, as a value", .{try self.pyName(o)});
                 const idx = try self.c.objectIndex(o);
                 _ = self.call("zr_object", &.{ self.ctx, self.k(@intCast(idx)), self.out });
                 break :blk try self.loadOut(.any);
@@ -4421,7 +4435,7 @@ const Gen = struct {
     /// semantics' module's pure functions (pureFunction).
     fn pureExpr(e: *const front.Expr, globals: *PyObject) Error!bool {
         switch (e.kind) {
-            .int, .big, .float, .str, .bool, .none, .local, .global => return true,
+            .int, .big, .object, .float, .str, .bool, .none, .local, .global => return true,
             .attr => |x| return pureExpr(x.obj, globals),
             .index => |x| return try pureExpr(x.obj, globals) and try pureExpr(x.index, globals),
             .binary => |x| return try pureExpr(x.left, globals) and try pureExpr(x.right, globals),
@@ -5063,6 +5077,7 @@ const Gen = struct {
                 // data, not unrolled again)
                 if (unroll and entry == null) try long_loops.put(std.heap.c_allocator, w.test_, {});
                 try self.prepareDynamic(inst, &.{w.body});
+                try self.prepareDynamicExpr(inst, w.test_);
                 const head = try self.f.label("while");
                 const body = try self.f.label("body");
                 const els = try self.f.label("whileelse");
@@ -5103,6 +5118,33 @@ const Gen = struct {
                 try self.raise(inst, v, s.pos);
             },
             .try_ => |t| try self.tryStmt(inst, t),
+            .seq => |ss| try self.stmts(inst, ss),
+            // del of a local known here: unset from here (a read after it,
+            // the compile error Python's UnboundLocalError is at run time);
+            // one in a slot (assigned in run-time control flow): not compiled
+            .del_local => |slot| switch (inst.locals[slot]) {
+                .slot => return self.c.unsupportedAt(inst.func, s.pos, "`del` of a variable assigned in run-time control flow isn't compiled", .{}),
+                .unset => return self.c.unsupportedAt(inst.func, s.pos, "`del` of {s}, which has no value here", .{inst.func.locals[slot]}),
+                .static => try self.releaseLocal(inst, slot),
+            },
+            .del_item => |d| {
+                const od = try self.materializeToChange(try self.expr(inst, d.obj), inst.node);
+                const kd = try self.materialize(try self.expr(inst, d.index), inst.node);
+                const ok = self.call("zr_delitem", &.{ self.ctx, self.k32(inst.node), od.tag, od.bits, kd.tag, kd.bits });
+                try self.drop(.{ .dyn = kd });
+                try self.drop(.{ .dyn = od });
+                try self.check(ok);
+            },
+            .raise_from => |r| {
+                const ed = try self.materialize(try self.expr(inst, r.exc), inst.node);
+                const cd = try self.materialize(try self.expr(inst, r.cause), inst.node);
+                _ = self.call("zr_raise_from", &.{ self.ctx, self.k32(inst.node), ed.tag, ed.bits, cd.tag, cd.bits });
+                try self.drop(.{ .dyn = cd });
+                try self.drop(.{ .dyn = ed });
+                try self.f.br(try self.errorTarget());
+                if (inst.dyn_depth == 0) inst.done = true;
+                try self.f.block(try self.f.label("after_raise"));
+            },
             .assert_ => |as| {
                 const t = try self.truth(try self.expr(inst, as.test_), inst.node);
                 const msg: []const u8 = if (as.msg) |m| blk: {
@@ -5163,6 +5205,16 @@ const Gen = struct {
                 try self.toSlot(inst, slot.*);
             } else try body_locals.append(self.a(), slot.*);
         }
+        // (a known list or dict the body reads, read after it too: made a
+        // run-time one in the body, the paths an error takes out of it
+        // wouldn't see it; a slot of its own now)
+        var body_reads = std.AutoHashMapUnmanaged(u32, void).empty;
+        collectReads(t.body, &.{}, &body_reads, self.a()) catch return error.OutOfMemory;
+        var reads_it = body_reads.keyIterator();
+        while (reads_it.next()) |slot| if (read.contains(slot.*)) switch (inst.locals[slot.*]) {
+            .static => |v| if (v == .list or v == .dict) try self.toSlot(inst, slot.*),
+            else => {},
+        };
 
         const fr = try self.a().create(TryFrame);
         fr.* = .{
@@ -5349,6 +5401,14 @@ const Gen = struct {
     fn prepareDynamic(self: *Gen, inst: *Inst, bodies: []const []const front.Stmt) Error!void {
         var set = std.AutoHashMapUnmanaged(u32, void).empty;
         for (bodies) |b| collectAssigned(b, &set, self.a()) catch return error.OutOfMemory;
+        var it = set.keyIterator();
+        while (it.next()) |slot| try self.toSlot(inst, slot.*);
+    }
+
+    /// The same for the locals an expression assigns (`:=` in a loop's test).
+    fn prepareDynamicExpr(self: *Gen, inst: *Inst, e: *const front.Expr) Error!void {
+        var set = std.AutoHashMapUnmanaged(u32, void).empty;
+        exprAssigns(e, &set, self.a()) catch return error.OutOfMemory;
         var it = set.keyIterator();
         while (it.next()) |slot| try self.toSlot(inst, slot.*);
     }
@@ -5887,7 +5947,7 @@ const Gen = struct {
         switch (e.kind) {
             // (a literal of the semantic's: a plain int; a big one, Python's)
             .int => |n| return .{ .pint = n },
-            .big => |o| {
+            .big, .object => |o| {
                 _ = try c.objectIndex(o);
                 return .{ .py = o };
             },
@@ -5928,6 +5988,16 @@ const Gen = struct {
                 return self.attr(inst, obj, x.name, e.pos);
             },
             .call => |x| return self.callExpr(inst, x.func, x.args, x.keywords, e.pos),
+            // (x := value): stored, and the expression's value (a reference
+            // each)
+            .named => |x| {
+                const v = try self.expr(inst, x.value);
+                if (v == .dyn) try self.increfDyn(v.dyn);
+                try self.assign(inst, .{ .local = x.slot }, v, e.pos);
+                return v;
+            },
+            .starred => return c.unsupportedAt(inst.func, e.pos, "*unpacking is compiled among a call's arguments only", .{}),
+            .import_ => |x| return self.importValue(inst, x, e.pos),
             // A function defined in a semantic or helper (lambda lifted:
             // front.Reader.nestedDef): a helper, given its arguments and the
             // variables around it that it reads
@@ -6986,9 +7056,45 @@ const Gen = struct {
             if (isBuiltin(callee.py, "any")) return self.allAny(inst, args_e[0].kind.gen_exp, true, pos);
             try self.inflight.append(self.a(), callee);
         }
-        // (arguments in order, as Python evaluates them)
-        const args = try self.a().alloc(SVal, args_e.len);
-        for (args, args_e) |*slot, ae| slot.* = try self.operand(inst, ae);
+        // (arguments in order, as Python evaluates them; *x's items in its
+        // place: x known here, its items; known only at run time, a run-time
+        // list of them all, the call made with it)
+        var arg_list: std.ArrayListUnmanaged(SVal) = .empty;
+        var spread_list: ?Dyn = null;
+        for (args_e) |ae| {
+            if (ae.kind != .starred) {
+                const v = try self.operand(inst, ae);
+                if (spread_list) |l| {
+                    _ = try self.methodCall(inst, .{ .dyn = l }, "append", &.{v}, pos);
+                } else try arg_list.append(self.a(), v);
+                continue;
+            }
+            const v = try self.operand(inst, ae.kind.starred);
+            const known: ?[]const SVal = switch (v) {
+                .tuple => |t| t,
+                .list => |l| if (l.frozen == null) l.items.items else null,
+                else => null,
+            };
+            if (known) |items| if (spread_list == null) {
+                for (items) |x| try arg_list.append(self.a(), try self.copyOf(x));
+                if (v == .tuple) try self.drop(v);
+                continue;
+            };
+            // (from here, a run-time list: what came before in it)
+            if (spread_list == null) {
+                spread_list = try self.buildSequence("zr_list", arg_list.items, inst.node, .list);
+                arg_list.clearRetainingCapacity();
+            }
+            try self.drop(try self.methodCall(inst, .{ .dyn = spread_list.? }, "extend", &.{v}, pos));
+        }
+        const args = arg_list.items;
+        if (spread_list) |l| {
+            self.taken(mark);
+            if (kws.len > 0) return c.unsupportedAt(inst.func, pos, "keyword arguments with *args known only at run time aren't compiled", .{});
+            const plain_helper = callee == .py and try isInstanceOf(callee.py, (try pyTypes()).function);
+            if (callee == .dyn or (callee == .py and !plain_helper)) return self.seqCall(inst, callee, .{ .dyn = l }, null);
+            return c.unsupportedAt(inst.func, pos, "*args known only at run time to this function isn't compiled (its arguments' count is needed when compiling)", .{});
+        }
         var receiver: ?SVal = null;
         // A helper's keyword arguments: in their parameters' places
         if (kws.len > 0 and callee == .py and try isInstanceOf(callee.py, (try pyTypes()).function)) {
@@ -7904,6 +8010,61 @@ const Gen = struct {
         return b == o;
     }
 
+    /// What an `import` inside a semantic binds, imported now (once, as the
+    /// module's own imports are): the module (`import a.b`: `a`; `as`:
+    /// `a.b`), or its attribute (`from m import x`: a submodule `m.x` if
+    /// m has no x); a relative one from the function's package. A constant.
+    fn importValue(self: *Gen, inst: *Inst, x: @FieldType(front.Expr.Kind, "import_"), pos: front.Pos) Error!SVal {
+        const c = self.c;
+        const importlib = py.c.PyImport_ImportModule("importlib") orelse return error.Python;
+        defer py.Py_DecRef(importlib);
+        // (a relative name: resolved with the function's package)
+        const name_o = ph.newString(x.module) orelse return error.Python;
+        defer py.Py_DecRef(name_o);
+        var full = name_o;
+        py.Py_IncRef(full);
+        defer py.Py_DecRef(full);
+        if (x.module.len > 0 and x.module[0] == '.') {
+            const globals = ph.attr(inst.func.py_function, "__globals__") orelse return error.Python;
+            defer py.Py_DecRef(globals);
+            const package = py.c.PyDict_GetItemString(globals, "__package__") orelse py.Py_None();
+            const util = py.c.PyImport_ImportModule("importlib.util") orelse return error.Python;
+            defer py.Py_DecRef(util);
+            const resolved = py.c.PyObject_CallMethod(util, "resolve_name", "(OO)", name_o, package) orelse return c.unsupportedAt(inst.func, pos, "the relative import of {s} can't be resolved here", .{x.module});
+            py.Py_DecRef(full);
+            full = resolved;
+        }
+        const module = py.c.PyObject_CallMethod(importlib, "import_module", "(O)", full) orelse return error.Python;
+        defer py.Py_DecRef(module);
+        var obj: *PyObject = undefined;
+        if (x.attr) |attr_name| {
+            const key = ph.newString(attr_name) orelse return error.Python;
+            defer py.Py_DecRef(key);
+            obj = py.c.PyObject_GetAttr(module, key) orelse blk: {
+                // (not an attribute: its submodule, as `from` imports it)
+                py.c.PyErr_Clear();
+                const sub = std.fmt.allocPrint(self.a(), "{s}.{s}", .{ ph.utf8(full, "module") orelse return error.Python, attr_name }) catch return error.OutOfMemory;
+                const sub_o = ph.newString(sub) orelse return error.Python;
+                defer py.Py_DecRef(sub_o);
+                break :blk py.c.PyObject_CallMethod(importlib, "import_module", "(O)", sub_o) orelse return error.Python;
+            };
+        } else if (x.leaf) {
+            py.Py_IncRef(module);
+            obj = module;
+        } else {
+            // (import a.b binds a: the top package, sys.modules')
+            const text = ph.utf8(full, "module") orelse return error.Python;
+            const top_name = text[0 .. std.mem.indexOfScalar(u8, text, '.') orelse text.len];
+            const top_o = ph.newString(top_name) orelse return error.Python;
+            defer py.Py_DecRef(top_o);
+            obj = py.c.PyImport_Import(top_o) orelse return error.Python;
+        }
+        defer py.Py_DecRef(obj);
+        const v = try self.constant(obj, inst.node);
+        if (v == .py) _ = try c.objectIndex(obj);
+        return v;
+    }
+
     /// `x` of `x.encode()`, `x.encode("utf-8")` (UTF-8 by any of its
     /// names), or null.
     fn encodedUtf8(e: *const front.Expr) ?*const front.Expr {
@@ -7976,7 +8137,7 @@ const Gen = struct {
             const pure = [_][*:0]const u8{ "int", "float", "str", "bool", "len", "abs", "min", "max", "round", "repr", "ord", "chr", "hex", "oct", "bin", "divmod", "pow", "hash" };
             const is_pure = for (pure) |name| {
                 if (isBuiltin(o, name)) break true;
-            } else isMathFunction(o);
+            } else isMathFunction(o) or isModuleAttr(o, "os", "fspath");
             if (is_pure) {
                 const tuple = py.c.PyTuple_New(@intCast(args.len)) orelse return error.Python;
                 defer py.Py_DecRef(tuple);
@@ -8046,17 +8207,17 @@ const Gen = struct {
             }
         }
         // int(), float(), len(), abs(), str(), bool(), list(), math.floor(),
-        // math.ceil() of a run-time value (or of a known one Python refused
+        // math.ceil(), os.fspath() of a run-time value (or of a known one Python refused
         // above: its error when the code runs): natively where it can be
         // (zr_builtin)
         if (args.len == 1 and args[0] == .dyn and isBuiltin(o, "len")) return .{ .dyn = try self.lenInline(inst, o, args[0].dyn) };
         if (args.len == 1 and (args[0] == .dyn or isScalar(args[0]) or args[0] == .list or args[0] == .dict)) {
             inline for (@typeInfo(helpers.Builtin).@"enum".fields) |fd| {
-                const of_math = comptime std.mem.eql(u8, fd.name, "floor") or std.mem.eql(u8, fd.name, "ceil");
+                const module: ?[*:0]const u8 = comptime if (std.mem.eql(u8, fd.name, "floor") or std.mem.eql(u8, fd.name, "ceil")) "math" else if (std.mem.eql(u8, fd.name, "fspath")) "os" else null;
                 // (a known list or dict: id()'s only, made the run-time
                 // object every reference to it is from then)
                 const takes_containers = comptime std.mem.eql(u8, fd.name, "id");
-                if ((args[0] != .list and args[0] != .dict or takes_containers) and (if (of_math) isModuleAttr(o, "math", fd.name) else isBuiltin(o, fd.name))) {
+                if ((args[0] != .list and args[0] != .dict or takes_containers) and (if (module) |m| isModuleAttr(o, m, fd.name) else isBuiltin(o, fd.name))) {
                     const d = try self.materialize(args[0], inst.node);
                     const idx = try c.objectIndex(o);
                     const ok = self.call("zr_builtin", &.{ self.ctx, self.k32(inst.node), self.k32(fd.value), self.k(@intCast(idx)), d.tag, d.bits, self.out });
@@ -8202,7 +8363,9 @@ const Gen = struct {
             if (v.isStatic()) return .{ .bool = false };
             return self.isType(v.dyn, 8);
         }
-        const codes = [_]struct { [*:0]const u8, u32 }{ .{ "int", 0 }, .{ "float", 1 }, .{ "str", 2 }, .{ "bool", 3 }, .{ "list", 4 }, .{ "tuple", 5 }, .{ "dict", 6 } };
+        // (bytes, bytearray, complex, set, frozenset: no native value is
+        // one, a Python object may be)
+        const codes = [_]struct { [*:0]const u8, u32 }{ .{ "int", 0 }, .{ "float", 1 }, .{ "str", 2 }, .{ "bool", 3 }, .{ "list", 4 }, .{ "tuple", 5 }, .{ "dict", 6 }, .{ "bytes", 9 }, .{ "bytearray", 10 }, .{ "complex", 11 }, .{ "set", 12 }, .{ "frozenset", 13 } };
         for (codes) |entry| if (isBuiltin(o, entry[0])) {
             if (v.isStatic()) return .{ .bool = switch (entry[1]) {
                 0 => v == .int or v == .pint or v == .bool,
@@ -8258,10 +8421,14 @@ const Gen = struct {
             5 => &.{@intFromEnum(T.tuple)},
             6 => &.{@intFromEnum(T.dict)},
             8 => &.{@intFromEnum(T.function)},
+            9...13 => &.{},
             else => unreachable,
         };
-        var native = f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intCast(tags[0])));
-        for (tags[1..]) |t| native = f.or_(native, f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intCast(t))));
+        var native = self.c.m.k1(false);
+        for (tags, 0..) |t, i| {
+            const is = f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intCast(t)));
+            native = if (i == 0) is else f.or_(native, is);
+        }
         const native64 = f.zext64(native);
         const host = try f.label("is_host");
         const join = try f.label("is_joined");
@@ -9250,23 +9417,43 @@ const Gen = struct {
 };
 
 /// The locals a statement list assigns (or mutates through), anywhere in it.
+/// The locals an expression's walruses store to (`x := value`): those
+/// localReads gives as written
+fn exprAssigns(e: *const front.Expr, set: *std.AutoHashMapUnmanaged(u32, void), a: Allocator) !void {
+    var reads: std.ArrayListUnmanaged(LocalRead) = .empty;
+    try localReads(e, false, &reads, a);
+    for (reads.items) |r| if (r.e == null) try set.put(a, r.slot, {});
+}
+
 fn collectAssigned(body: []const front.Stmt, set: *std.AutoHashMapUnmanaged(u32, void), a: Allocator) !void {
     for (body) |s| switch (s.kind) {
-        .assign => |x| for (x.targets) |t| try collectTarget(t, set, a),
-        .aug => |x| try collectTarget(x.target, set, a),
+        .assign => |x| {
+            for (x.targets) |t| try collectTarget(t, set, a);
+            try exprAssigns(x.value, set, a);
+        },
+        .aug => |x| {
+            try collectTarget(x.target, set, a);
+            try exprAssigns(x.value, set, a);
+        },
         .for_ => |x| {
             try collectTarget(x.target, set, a);
+            try exprAssigns(x.iter, set, a);
             try collectAssigned(x.body, set, a);
             try collectAssigned(x.else_, set, a);
         },
         .if_ => |x| {
+            try exprAssigns(x.test_, set, a);
             try collectAssigned(x.body, set, a);
             try collectAssigned(x.else_, set, a);
         },
         .while_ => |x| {
+            try exprAssigns(x.test_, set, a);
             try collectAssigned(x.body, set, a);
             try collectAssigned(x.else_, set, a);
         },
+        .return_, .raise_ => |e| if (e) |x| try exprAssigns(x, set, a),
+        .del_local => |slot| try set.put(a, slot, {}),
+        .seq => |ss| try collectAssigned(ss, set, a),
         .try_ => |x| {
             try collectAssigned(x.body, set, a);
             try collectAssigned(x.else_, set, a);
@@ -9276,7 +9463,10 @@ fn collectAssigned(body: []const front.Stmt, set: *std.AutoHashMapUnmanaged(u32,
                 try collectAssigned(h.body, set, a);
             }
         },
-        .expr => |e| try collectMutated(e, set, a),
+        .expr => |e| {
+            try collectMutated(e, set, a);
+            try exprAssigns(e, set, a);
+        },
         else => {},
     };
 }
@@ -9337,6 +9527,17 @@ fn collectReads(body: []const front.Stmt, skip: []const front.Stmt, set: *std.Au
             }
         },
         .break_, .continue_, .pass => {},
+        // (a del: the local's value given up, as a read of it)
+        .del_local => |slot| try set.put(a, slot, {}),
+        .del_item => |x| {
+            try exprReads(x.obj, set, a);
+            try exprReads(x.index, set, a);
+        },
+        .raise_from => |x| {
+            try exprReads(x.exc, set, a);
+            try exprReads(x.cause, set, a);
+        },
+        .seq => |ss| try collectReads(ss, skip, set, a),
     };
 }
 
@@ -9550,7 +9751,12 @@ const FoldedSize = struct {
                     n += countStmt(y);
                 };
             },
-            .break_, .continue_, .pass => {},
+            .break_, .continue_, .pass, .del_local => {},
+            .del_item => |x| n += countExpr(x.obj) + countExpr(x.index),
+            .raise_from => |x| n += countExpr(x.exc) + countExpr(x.cause),
+            .seq => |ss| for (ss) |y| {
+                n += countStmt(y);
+            },
         }
         return n;
     }
@@ -9558,7 +9764,7 @@ const FoldedSize = struct {
     fn countExpr(e: *const front.Expr) usize {
         var n: usize = 1;
         switch (e.kind) {
-            .int, .big, .float, .str, .bool, .none, .global, .local, .outline => {},
+            .int, .big, .object, .float, .str, .bool, .none, .global, .local, .outline => {},
             .attr => |x| n += countExpr(x.obj),
             .index => |x| n += countExpr(x.obj) + countExpr(x.index),
             .slice => |x| {
@@ -9575,6 +9781,9 @@ const FoldedSize = struct {
             .call_nested => |x| for (x.args) |y| {
                 n += countExpr(y);
             },
+            .named => |x| n += countExpr(x.value),
+            .starred => |x| n += countExpr(x),
+            .import_ => {},
             .binary => |x| n += countExpr(x.left) + countExpr(x.right),
             .unary => |x| n += countExpr(x.operand),
             .and_, .or_, .list, .tuple => |xs| for (xs) |y| {
@@ -9688,6 +9897,17 @@ fn stmtLocalReads(s: front.Stmt, plain: bool, out: *std.ArrayListUnmanaged(Local
             }
         },
         .break_, .continue_, .pass => {},
+        // (a del: the local written, as a store is)
+        .del_local => |slot| try out.append(a, .{ .slot = slot, .e = null, .plain = false }),
+        .del_item => |x| {
+            try localReads(x.obj, false, out, a);
+            try localReads(x.index, false, out, a);
+        },
+        .raise_from => |x| {
+            try localReads(x.exc, plain, out, a);
+            try localReads(x.cause, plain, out, a);
+        },
+        .seq => |ss| for (ss) |y| try stmtLocalReads(y, plain, out, a),
     }
 }
 
@@ -9707,7 +9927,7 @@ fn localReads(e: *const front.Expr, plain: bool, out: *std.ArrayListUnmanaged(Lo
     switch (e.kind) {
         .local => |slot| try out.append(a, .{ .slot = slot, .e = e, .plain = plain }),
         // (.outline: only in the compiler's own statements, never read here)
-        .int, .big, .float, .str, .bool, .none, .global, .outline => {},
+        .int, .big, .object, .float, .str, .bool, .none, .global, .outline => {},
         .attr => |x| try localReads(x.obj, plain, out, a),
         .index => |x| {
             try localReads(x.obj, plain, out, a);
@@ -9723,6 +9943,13 @@ fn localReads(e: *const front.Expr, plain: bool, out: *std.ArrayListUnmanaged(Lo
             for (x.keywords) |k| try localReads(k.value, plain, out, a);
         },
         .call_nested => |x| for (x.args) |y| try localReads(y, plain, out, a),
+        // (x := value: x written, as a store is)
+        .named => |x| {
+            try localReads(x.value, false, out, a);
+            try out.append(a, .{ .slot = x.slot, .e = null, .plain = false });
+        },
+        .starred => |x| try localReads(x, false, out, a),
+        .import_ => {},
         .binary => |x| {
             try localReads(x.left, plain, out, a);
             try localReads(x.right, plain, out, a);
@@ -9803,7 +10030,7 @@ fn exprReads(e: *const front.Expr, set: *std.AutoHashMapUnmanaged(u32, void), a:
     switch (e.kind) {
         .local => |slot| try set.put(a, slot, {}),
         // (.outline reads the parameters, which its `if` doesn't assign)
-        .int, .big, .float, .str, .bool, .none, .global, .outline => {},
+        .int, .big, .object, .float, .str, .bool, .none, .global, .outline => {},
         .attr => |x| {
             if (reads_ignoring_args) |s| if (x.obj.kind == .local and x.obj.kind.local == s and std.mem.eql(u8, x.name, "args")) return;
             try exprReads(x.obj, set, a);
@@ -9822,6 +10049,13 @@ fn exprReads(e: *const front.Expr, set: *std.AutoHashMapUnmanaged(u32, void), a:
             for (x.keywords) |k| try exprReads(k.value, set, a);
         },
         .call_nested => |x| for (x.args) |y| try exprReads(y, set, a),
+        // (x := value: x's value given up too, as a read)
+        .named => |x| {
+            try set.put(a, x.slot, {});
+            try exprReads(x.value, set, a);
+        },
+        .starred => |x| try exprReads(x, set, a),
+        .import_ => {},
         .binary => |x| {
             try exprReads(x.left, set, a);
             try exprReads(x.right, set, a);

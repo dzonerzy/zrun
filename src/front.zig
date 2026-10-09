@@ -6,12 +6,13 @@
 //! The subset: values (int, float, str, bool, None, lists, tuples, dicts,
 //! records), assignment (also to fields and items, augmented), if, while,
 //! for, break, continue, return, raise (rt's control flow and errors),
-//! assert, pass; expressions with operators, comparisons, conditional
-//! expressions, comprehensions and f-strings; calls (rt, other semantics,
-//! helper functions of the module, records, builtins, methods of values).
-//! Outside it: try, with, lambda, nested def and class, yield, await,
-//! global and nonlocal, del, star arguments, walrus. A construct outside the
-//! subset is an error at its line, when the semantic is registered.
+//! assert, pass, try, del, import, a def called where it's defined;
+//! expressions with operators, comparisons, conditional expressions,
+//! comprehensions, f-strings and `:=`; calls (rt, other semantics, helper
+//! functions of the module, records, builtins, methods of values), `*args`
+//! among their arguments. Outside it: with, lambda, a def used as a value,
+//! a nested class, yield, await, global and nonlocal. A construct outside
+//! the subset is an error at its line, when the semantic is registered.
 //!
 //! Module-level names (helper functions, record classes, constants) are
 //! kept by name: they are resolved when a program is compiled, since a
@@ -39,6 +40,9 @@ pub const Expr = struct {
         /// An int literal beyond 64 bits (a reference kept for as long as
         /// the language: functions read are)
         big: *PyObject,
+        /// Another constant (bytes, complex, `...`): Python's object, kept
+        /// the same
+        object: *PyObject,
         float: f64,
         str: []const u8,
         bool: bool,
@@ -57,6 +61,15 @@ pub const Expr = struct {
         /// its arguments and then the variables around it that it reads
         /// (as they are when it's called: what a closure reads then)
         call_nested: struct { func: *const Function, args: []const *Expr },
+        /// `(name := value)`: value, stored to the local `slot` too
+        named: struct { slot: u32, value: *Expr },
+        /// `*value` among a call's arguments: its items there
+        starred: *Expr,
+        /// What an `import` inside the function binds, imported when the
+        /// code compiles (as a module's own import, done once): the module
+        /// `module` (its top package unless `leaf`: `import a.b` binds
+        /// `a`), or its attribute `attr` (`from module import attr`)
+        import_: struct { module: []const u8, attr: ?[]const u8 = null, leaf: bool = true },
         binary: struct { op: BinOp, left: *Expr, right: *Expr },
         unary: struct { op: UnaryOp, operand: *Expr },
         and_: []const *Expr,
@@ -119,6 +132,15 @@ pub const Stmt = struct {
         break_,
         continue_,
         pass,
+        /// `del name` of a local: unset from here
+        del_local: u32,
+        /// `del obj[index]`
+        del_item: struct { obj: *Expr, index: *Expr },
+        /// `raise exc from cause`
+        raise_from: struct { exc: *Expr, cause: *Expr },
+        /// Statements run in turn (one Python statement read as several:
+        /// `import a, b`, `del x, y`)
+        seq: []const Stmt,
     };
 };
 
@@ -379,6 +401,23 @@ const Reader = struct {
             try self.defs.append(self.alloc(), try self.strAttr(s, "name"));
             return;
         }
+        // (what an import binds, what a del deletes: locals; a walrus's
+        // targets in its expressions too)
+        try self.collectNamed(s);
+        if (eq(k, "Import") or eq(k, "ImportFrom")) {
+            const names = try listAttr(s, "names");
+            defer py.Py_DecRef(names);
+            const n: usize = @intCast(py.c.PyList_Size(names));
+            for (0..n) |i| _ = try self.declare(try self.importBound(py.c.PyList_GetItem(names, @intCast(i)).?, eq(k, "Import")));
+            return;
+        }
+        if (eq(k, "Delete")) {
+            const targets = try listAttr(s, "targets");
+            defer py.Py_DecRef(targets);
+            const n: usize = @intCast(py.c.PyList_Size(targets));
+            for (0..n) |i| try self.collectTarget(py.c.PyList_GetItem(targets, @intCast(i)).?);
+            return;
+        }
         if (eq(k, "Assign")) {
             const targets = try listAttr(s, "targets");
             defer py.Py_DecRef(targets);
@@ -418,6 +457,42 @@ const Reader = struct {
                 try self.collectAssigned(body);
             }
         }
+    }
+
+    /// The targets of the walrus expressions of a statement (its own, not
+    /// those of a def, lambda or class in it): locals of the function
+    fn collectNamed(self: *Reader, node: *PyObject) ReadError!void {
+        const ast_mod = py.c.PyImport_ImportModule("ast") orelse return error.Python;
+        defer py.Py_DecRef(ast_mod);
+        const kids_it = py.c.PyObject_CallMethod(ast_mod, "iter_child_nodes", "(O)", node) orelse return error.Python;
+        defer py.Py_DecRef(kids_it);
+        const kids = py.c.PySequence_List(kids_it) orelse return error.Python;
+        defer py.Py_DecRef(kids);
+        const n: usize = @intCast(py.c.PyList_Size(kids));
+        for (0..n) |i| {
+            const kid = py.c.PyList_GetItem(kids, @intCast(i)).?;
+            const k = try kindOf(kid);
+            if (eq(k, "FunctionDef") or eq(k, "AsyncFunctionDef") or eq(k, "Lambda") or eq(k, "ClassDef")) continue;
+            // (a statement in it: its own visit, from collectAssigned)
+            if (isStatement(k)) continue;
+            if (eq(k, "NamedExpr")) {
+                const t = ph.attr(kid, "target") orelse return error.Python;
+                defer py.Py_DecRef(t);
+                _ = try self.declare(try self.strAttr(t, "id"));
+            }
+            try self.collectNamed(kid);
+        }
+    }
+
+    /// The name an import's alias binds: `as` its own; `import a.b` binds
+    /// `a`; `from m import x` binds `x`
+    fn importBound(self: *Reader, alias: *PyObject, plain_import: bool) ReadError![]const u8 {
+        const as_o = ph.attr(alias, "asname") orelse return error.Python;
+        defer py.Py_DecRef(as_o);
+        if (as_o != py.Py_None()) return self.strAttr(alias, "asname");
+        const name = try self.strAttr(alias, "name");
+        if (plain_import) if (std.mem.indexOfScalar(u8, name, '.')) |dot| return name[0..dot];
+        return name;
     }
 
     fn collectTarget(self: *Reader, t: *PyObject) ReadError!void {
@@ -490,8 +565,65 @@ const Reader = struct {
             if (eq(k, "Raise")) {
                 const cause = ph.attr(s, "cause") orelse return error.Python;
                 defer py.Py_DecRef(cause);
-                if (cause != py.Py_None()) return self.unsupported(pos, "`raise ... from ...` can't be compiled", .{});
+                if (cause != py.Py_None()) break :blk .{ .raise_from = .{ .exc = try self.exprAttr(s, "exc"), .cause = try self.expr(cause) } };
                 break :blk .{ .raise_ = try self.optExprAttr(s, "exc") };
+            }
+            if (eq(k, "Delete")) {
+                const targets = try listAttr(s, "targets");
+                defer py.Py_DecRef(targets);
+                const n: usize = @intCast(py.c.PyList_Size(targets));
+                const out = try self.alloc().alloc(Stmt, n);
+                for (out, 0..) |*o, i| {
+                    const t = py.c.PyList_GetItem(targets, @intCast(i)).?;
+                    const tk = try kindOf(t);
+                    o.pos = try self.posOf(t);
+                    if (eq(tk, "Name")) {
+                        const name = try self.strAttr(t, "id");
+                        o.kind = .{ .del_local = self.lookupLocal(name) orelse try self.declare(name) };
+                    } else if (eq(tk, "Subscript")) {
+                        const sl = ph.attr(t, "slice") orelse return error.Python;
+                        defer py.Py_DecRef(sl);
+                        if (eq(try kindOf(sl), "Slice")) return self.unsupported(o.pos, "`del` of a slice can't be compiled", .{});
+                        o.kind = .{ .del_item = .{ .obj = try self.exprAttr(t, "value"), .index = try self.indexExpr(sl) } };
+                    } else return self.unsupported(o.pos, "`del` of {s} can't be compiled", .{tk});
+                }
+                break :blk if (n == 1) out[0].kind else .{ .seq = out };
+            }
+            if (eq(k, "Import") or eq(k, "ImportFrom")) {
+                const plain = eq(k, "Import");
+                var module: []const u8 = "";
+                if (!plain) {
+                    // (a relative one: its dots before the name, resolved
+                    // with the function's package when compiling)
+                    const level: usize = @intCast(try intAttrOr(s, "level", 0));
+                    const m = ph.attr(s, "module") orelse return error.Python;
+                    defer py.Py_DecRef(m);
+                    const base = if (m == py.Py_None()) "" else try self.strAttr(s, "module");
+                    const dots = try self.alloc().alloc(u8, level + base.len);
+                    @memset(dots[0..level], '.');
+                    @memcpy(dots[level..], base);
+                    module = dots;
+                }
+                const names = try listAttr(s, "names");
+                defer py.Py_DecRef(names);
+                const n: usize = @intCast(py.c.PyList_Size(names));
+                const out = try self.alloc().alloc(Stmt, n);
+                for (out, 0..) |*o, i| {
+                    const alias = py.c.PyList_GetItem(names, @intCast(i)).?;
+                    const name = try self.strAttr(alias, "name");
+                    if (eq(name, "*")) return self.unsupported(pos, "`from ... import *` can't be compiled", .{});
+                    const as_o = ph.attr(alias, "asname") orelse return error.Python;
+                    defer py.Py_DecRef(as_o);
+                    const bound = try self.importBound(alias, plain);
+                    const value = try self.new(pos, .{ .import_ = if (plain)
+                        .{ .module = name, .leaf = as_o != py.Py_None() }
+                    else
+                        .{ .module = module, .attr = name } });
+                    const targets = try self.alloc().alloc(Target, 1);
+                    targets[0] = .{ .local = self.lookupLocal(bound) orelse try self.declare(bound) };
+                    o.* = .{ .pos = pos, .kind = .{ .assign = .{ .targets = targets, .value = value } } };
+                }
+                break :blk if (n == 1) out[0].kind else .{ .seq = out };
             }
             if (eq(k, "Assert")) break :blk .{ .assert_ = .{ .test_ = try self.exprAttr(s, "test"), .msg = try self.optExprAttr(s, "msg") } };
             if (eq(k, "Try")) {
@@ -684,6 +816,22 @@ const Reader = struct {
         return out;
     }
 
+    /// A call's positional arguments, `*x` among them (starred)
+    fn callArgs(self: *Reader, call: *PyObject) ReadError![]const *Expr {
+        const l = try listAttr(call, "args");
+        defer py.Py_DecRef(l);
+        const n: usize = @intCast(py.c.PyList_Size(l));
+        const out = try self.alloc().alloc(*Expr, n);
+        for (out, 0..) |*o, i| {
+            const item = py.c.PyList_GetItem(l, @intCast(i)).?;
+            o.* = if (eq(try kindOf(item), "Starred"))
+                try self.new(try self.posOf(item), .{ .starred = try self.exprAttr(item, "value") })
+            else
+                try self.expr(item);
+        }
+        return out;
+    }
+
     fn new(self: *Reader, pos: Pos, kind: Expr.Kind) ReadError!*Expr {
         const e = try self.alloc().create(Expr);
         e.* = .{ .pos = pos, .kind = kind };
@@ -741,7 +889,7 @@ const Reader = struct {
                 };
             }
             const func = try self.exprAttr(e, "func");
-            const args = try self.exprList(e, "args");
+            const args = try self.callArgs(e);
             const kws = try listAttr(e, "keywords");
             defer py.Py_DecRef(kws);
             const n: usize = @intCast(py.c.PyList_Size(kws));
@@ -754,6 +902,16 @@ const Reader = struct {
                 kw.* = .{ .name = try self.strAttr(item, "arg"), .value = try self.exprAttr(item, "value") };
             }
             return self.new(pos, .{ .call = .{ .func = func, .args = args, .keywords = keywords } });
+        }
+        // (x := value): the function's local x (a comprehension's too)
+        if (eq(k, "NamedExpr")) {
+            const t = ph.attr(e, "target") orelse return error.Python;
+            defer py.Py_DecRef(t);
+            const name = try self.strAttr(t, "id");
+            const slot = for (self.locals.items, 0..) |l, i| {
+                if (eq(l, name)) break @as(u32, @intCast(i));
+            } else try self.declare(name);
+            return self.new(pos, .{ .named = .{ .slot = slot, .value = try self.exprAttr(e, "value") } });
         }
         if (eq(k, "BinOp")) {
             const op = ph.attr(e, "op") orelse return error.Python;
@@ -835,7 +993,8 @@ const Reader = struct {
             const s = ph.utf8(v, "a string") orelse return error.Python;
             return self.new(pos, .{ .str = try self.alloc().dupe(u8, s) });
         }
-        return self.unsupported(pos, "this constant (bytes, complex, ...) can't be compiled", .{});
+        py.Py_IncRef(v);
+        return self.new(pos, .{ .object = v });
     }
 
     fn generators(self: *Reader, e: *PyObject) ReadError![]const Generator {
@@ -1079,6 +1238,23 @@ const Dumper = struct {
             .break_ => try self.print("break\n", .{}),
             .continue_ => try self.print("continue\n", .{}),
             .pass => try self.print("pass\n", .{}),
+            .del_local => |slot| try self.print("del {s}#{d}\n", .{ self.f.locals[slot], slot }),
+            .del_item => |d| {
+                try self.print("del ", .{});
+                try self.expr(d.obj);
+                try self.print("[", .{});
+                try self.expr(d.index);
+                try self.print("]\n", .{});
+            },
+            .raise_from => |r| {
+                try self.print("raise ", .{});
+                try self.expr(r.exc);
+                try self.print(" from ", .{});
+                try self.expr(r.cause);
+                try self.print("\n", .{});
+            },
+            // (the first where this one's indented already)
+            .seq => |ss| for (ss, 0..) |x, i| try self.stmt(x, if (i == 0) 0 else depth),
         }
     }
 
@@ -1128,6 +1304,18 @@ const Dumper = struct {
                 };
                 try self.print("{s}", .{text});
             },
+            .object => |v| {
+                const s = py.c.PyObject_Repr(v) orelse {
+                    py.c.PyErr_Clear();
+                    return self.print("<constant>", .{});
+                };
+                defer py.Py_DecRef(s);
+                const text = ph.utf8(s, "constant") orelse {
+                    py.c.PyErr_Clear();
+                    return self.print("<constant>", .{});
+                };
+                try self.print("{s}", .{text});
+            },
             .float => |v| try self.print("{d}", .{v}),
             .str => |v| try self.print("\"{s}\"", .{v}),
             .bool => |v| try self.print("{s}", .{if (v) "True" else "False"}),
@@ -1160,6 +1348,18 @@ const Dumper = struct {
                 try self.print("{s}<nested>(", .{c.func.name});
                 try self.list(c.args);
                 try self.print(")", .{});
+            },
+            .named => |n| {
+                try self.print("({s}#{d} := ", .{ self.f.locals[n.slot], n.slot });
+                try self.expr(n.value);
+                try self.print(")", .{});
+            },
+            .starred => |x| {
+                try self.print("*", .{});
+                try self.expr(x);
+            },
+            .import_ => |m| {
+                if (m.attr) |name| try self.print("import {s}.{s}", .{ m.module, name }) else try self.print("import {s}{s}", .{ m.module, if (m.leaf) "" else " (top)" });
             },
             .call => |c| {
                 try self.expr(c.func);
@@ -1310,6 +1510,13 @@ fn isKind(obj: *PyObject, name: []const u8) ReadError!bool {
 
 fn listAttr(obj: *PyObject, name: [*:0]const u8) ReadError!*PyObject {
     return ph.attr(obj, name) orelse error.Python;
+}
+
+/// Whether an AST class name is a statement's
+fn isStatement(k: []const u8) bool {
+    const stmts = [_][]const u8{ "Expr", "Assign", "AugAssign", "AnnAssign", "If", "While", "For", "Return", "Raise", "Assert", "Try", "Break", "Continue", "Pass", "Delete", "Import", "ImportFrom", "With", "Global", "Nonlocal", "Match", "AsyncFor", "AsyncWith", "TryStar" };
+    for (stmts) |s| if (eq(s, k)) return true;
+    return false;
 }
 
 fn contains(names: []const []const u8, name: []const u8) bool {

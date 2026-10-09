@@ -1477,7 +1477,10 @@ fn hostFailed(ctx: *Ctx, node: u32, f: *PyObject) bool {
 
 /// A host object of the program (a host function...) as a value.
 export fn zr_object(ctx: *Ctx, idx: u64, out: *Value) callconv(.c) void {
-    gil.ensure(@src());
+    // (a count, not Python running: strict mode looks at what's done with
+    // it; compiling refused the objects it shouldn't hold)
+    gil.allowBegin();
+    defer gil.allowEnd();
     const o = ctx.object(idx);
     py.Py_IncRef(o);
     out.* = .{ .tag = @intFromEnum(Tag.host), .bits = @intFromPtr(o) };
@@ -1676,6 +1679,40 @@ fn index(i: i64, len: u64) ?usize {
     const k = if (i < 0) i + n else i;
     if (k < 0 or k >= n) return null;
     return @intCast(k);
+}
+
+/// del v[k]: a dict's key, a list's item at an int, natively; one missing,
+/// Python's error (its words: KeyError(k), IndexError); anything else as
+/// Python deletes it
+export fn zr_delitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    const k = Value{ .tag = kt, .bits = kb };
+    switch (v.kind()) {
+        .dict => if (value.hashable(k)) {
+            if (value.dictDelete(@ptrCast(@alignCast(v.ptr())), k)) return true;
+        },
+        .list => if (isInt(k)) {
+            const l: *value.List = @ptrCast(@alignCast(v.ptr()));
+            if (index(k.asInt(), l.len)) |i| {
+                const items = l.items.?;
+                const gone = items[i];
+                std.mem.copyForwards(Value, items[i .. l.len - 1], items[i + 1 .. l.len]);
+                l.len -= 1;
+                value.decref(gone);
+                return true;
+            }
+        },
+        else => {},
+    }
+    // (missing, or not one of these: as Python does it, its error its own)
+    if (v.kind() == .dict or v.kind() == .list) gil.allowBegin() else gil.ensureAt(@src(), node, null);
+    defer if (v.kind() == .dict or v.kind() == .list) gil.allowEnd();
+    var objs: [2]*PyObject = undefined;
+    if (!objects(ctx, node, &.{ v, k }, &objs)) return failPython(ctx, node);
+    defer py.Py_DecRef(objs[0]);
+    defer py.Py_DecRef(objs[1]);
+    if (py.c.PyObject_DelItem(objs[0], objs[1]) != 0) return failPython(ctx, node);
+    return true;
 }
 
 /// v[k]
@@ -2833,7 +2870,7 @@ export fn zr_range(ctx: *Ctx, node: u32, args: [*]const Value, n: u64, out: *[3]
 /// The builtins zr_builtin does natively, by code
 /// The builtins zr_builtin does natively for native values (floor and ceil:
 /// math's)
-pub const Builtin = enum(u32) { int, float, len, abs, str, bool, list, floor, ceil, chr, ord, id };
+pub const Builtin = enum(u32) { int, float, len, abs, str, bool, list, floor, ceil, chr, ord, id, fspath };
 
 /// A builtin of one argument (`code`), natively for native values, as
 /// Python does it; anything else (and the errors) by the builtin itself
@@ -2850,7 +2887,7 @@ export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64,
                 out.* = v;
                 return true;
             },
-            .list, .ord, .chr, .id => {},
+            .list, .ord, .chr, .id, .fspath => {},
             .abs => if (x != std.math.minInt(i128)) {
                 out.* = value.intValue(if (x < 0) -x else x) orelse return oomFail(ctx, node);
                 return true;
@@ -3053,6 +3090,12 @@ export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64,
         // (id(): see idOf)
         .id => if (idOf(v)) |x| {
             out.* = Value.pint(x);
+            return true;
+        },
+        // (os.fspath() of a str: itself)
+        .fspath => if (v.kind() == .str) {
+            value.incref(v);
+            out.* = v;
             return true;
         },
         // (list() of a list or tuple: a new list of its items)
@@ -3564,6 +3607,11 @@ export fn zr_global(ctx: *Ctx, node: u32, globals_index: u64, name: *const value
 
 /// isinstance(v, <a builtin type>): by tag (int, float, str, bool, list,
 /// tuple, dict); `code` says which.
+/// Whether a Python object is of a builtin type (or a subclass of it).
+fn ofType(o: *PyObject, comptime name: [:0]const u8) bool {
+    return py.c.PyType_IsSubtype(ph.typeOf(o), @ptrCast(@alignCast(py.types.typeObject(name)))) != 0;
+}
+
 export fn zr_is_type(t: u64, bits: u64, code: u32) callconv(.c) bool {
     const v = Value{ .tag = t, .bits = bits };
     // (a Python object: of the type or a subclass of it)
@@ -3578,6 +3626,11 @@ export fn zr_is_type(t: u64, bits: u64, code: u32) callconv(.c) bool {
             5 => py.PyTuple_Check(o),
             6 => py.PyDict_Check(o),
             8 => @import("objects.zig").asFunction(o) != null,
+            9 => ofType(o, "PyBytes_Type"),
+            10 => ofType(o, "PyByteArray_Type"),
+            11 => ofType(o, "PyComplex_Type"),
+            12 => ofType(o, "PySet_Type"),
+            13 => ofType(o, "PyFrozenSet_Type"),
             else => false,
         };
     }
@@ -3676,6 +3729,7 @@ const helper_names = [_][]const u8{
     "zr_extend_items", "zr_tail_set", "zr_tail_resolve", "zr_tail_take", "zr_tail_put", "zr_tail_clear",
     "zr_int_base", "zr_utf8_len", "zr_min_max", "zr_math", "zr_huge_int", "zr_dict_view",
     "zr_new_exception", "zr_call_plain", "zr_int_base_of", "zr_float_hex",
+    "zr_delitem",
 };
 
 /// The names compiled code calls them by, and their addresses
