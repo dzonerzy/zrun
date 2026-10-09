@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance
 - **More of Python compiled natively**, the same results and errors as the reference mode (an error's words Python's own: its function called for them):
   - `int(s, base)` of an ASCII str, `chr()`, `ord()`, `id()` (of any value: an object's address, None's, True's and False's CPython's; a number's, odd and from its bits), `list()` of a list, tuple, dict or str, `min()` and `max()` of numbers and strs, `len(s.encode("utf-8"))` (no bytes made);
-  - `math.floor`, `ceil`, `sqrt`, `fabs`, `degrees`, `radians`, `isnan`, `isinf`, `isfinite`, `copysign`, and on Linux `fmod`, `exp`, `log`, `log2`, `log10`, the trigonometric and hyperbolic functions, `expm1`, `log1p`, `atan2`, `pow` (from the process's libm: CPython's, the same to the last bit); math's functions of known numbers decided when compiling;
+  - `math.floor`, `ceil`, `sqrt`, `fabs`, `degrees`, `radians`, `isnan`, `isinf`, `isfinite`, `copysign`, `modf`, and on Linux `fmod`, `exp`, `log`, `log2`, `log10`, the trigonometric and hyperbolic functions, `expm1`, `log1p`, `atan2`, `pow` (from the process's libm: CPython's, the same to the last bit); math's functions of known numbers decided when compiling;
   - `list + list`, `tuple + tuple`, a list, tuple or str times an int;
   - a list's and tuple's `index()` and `count()`;
   - `for ... in d.items()` (`keys()`, `values()`) of a dict known only at run time (a dict changed while the loop runs isn't the RuntimeError Python's view raises);

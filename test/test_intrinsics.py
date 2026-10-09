@@ -257,6 +257,14 @@ def math_one(a, b):
     return math.radians(a)
 
 
+def math_modf(a, b):
+    return math.modf(a)
+
+
+def test_math_modf():
+    same_in_both(_program(math_modf), [(x, 0) for x in (2.5, -2.5, -3.0, 3.0, 0.0, -0.0, 1e300, float("inf"), float("-inf"), float("nan"), 7, True)])
+
+
 def math_two(a, b):
     return (math.copysign(a, b), math.fmod(a, b), math.atan2(a, b), math.pow(a, b))
 

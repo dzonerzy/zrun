@@ -8042,7 +8042,7 @@ const Gen = struct {
                 try self.dropArray(arr, args.len);
                 try self.check(ok);
                 const f: helpers.MathFn = @enumFromInt(fd.value);
-                return SVal{ .dyn = try self.loadOut(if (f == .isnan or f == .isinf or f == .isfinite) .bool else .any) };
+                return SVal{ .dyn = try self.loadOut(if (f == .isnan or f == .isinf or f == .isfinite) .bool else if (f == .modf) .tuple else .any) };
             }
         }
         // int(), float(), len(), abs(), str(), bool(), list(), math.floor(),

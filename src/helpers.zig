@@ -3150,7 +3150,7 @@ fn pythonsErrorOf(ctx: *Ctx, node: u32, callee_index: u64, args: [*]const Value,
 /// atan2, pow: two arguments; isnan, isinf, isfinite: a bool). Those from
 /// `exp` on are the C library's, natively only where it's the one Python
 /// runs with (Linux: the same libm, so the same results to the last bit).
-pub const MathFn = enum(u32) { sqrt, fabs, degrees, radians, isnan, isinf, isfinite, copysign, fmod, exp, log, log2, log10, sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, asinh, acosh, atanh, expm1, log1p, atan2, pow };
+pub const MathFn = enum(u32) { sqrt, fabs, degrees, radians, isnan, isinf, isfinite, copysign, modf, fmod, exp, log, log2, log10, sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, asinh, acosh, atanh, expm1, log1p, atan2, pow };
 
 pub fn mathArity(f: MathFn) u32 {
     return switch (f) {
@@ -3162,7 +3162,7 @@ pub fn mathArity(f: MathFn) u32 {
 /// Whether math's `f` is the C library's (zr_math: from the process's libm)
 fn needsLibm(f: MathFn) bool {
     return switch (f) {
-        .sqrt, .fabs, .degrees, .radians, .isnan, .isinf, .isfinite, .copysign => false,
+        .sqrt, .fabs, .degrees, .radians, .isnan, .isinf, .isfinite, .copysign, .modf => false,
         else => true,
     };
 }
@@ -3224,6 +3224,16 @@ export fn zr_math(ctx: *Ctx, node: u32, code: u32, callee_index: u64, n: u64, ar
             });
             return true;
         },
+        // (its fraction and its whole part, both with its sign: C's modf)
+        .modf => {
+            const whole = if (std.math.isInf(x) or std.math.isNan(x)) x else @trunc(x);
+            const fraction = if (std.math.isNan(x)) x else std.math.copysign(if (std.math.isInf(x)) 0.0 else x - whole, x);
+            const t = value.newTuple(2) orelse return oomFail(ctx, node);
+            t.slice()[0] = Value.float(fraction);
+            t.slice()[1] = Value.float(whole);
+            out.* = Value.obj(.tuple, &t.head);
+            return true;
+        },
         else => {},
     }
     const r: f64 = switch (f) {
@@ -3233,7 +3243,7 @@ export fn zr_math(ctx: *Ctx, node: u32, code: u32, callee_index: u64, n: u64, ar
         .degrees => x * (@as(f64, 180.0) / @as(f64, std.math.pi)),
         .radians => x * (@as(f64, std.math.pi) / @as(f64, 180.0)),
         .copysign => std.math.copysign(x, y),
-        .isnan, .isinf, .isfinite => unreachable,
+        .isnan, .isinf, .isfinite, .modf => unreachable,
         // (the C library's, by the name: Libm's field)
         inline else => |g| blk: {
             const func = @field(lm, @tagName(g));
