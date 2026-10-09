@@ -339,6 +339,19 @@ fn stablePy(o: *PyObject) error{Python}!bool {
     return r == 1;
 }
 
+/// The error kinds an except's class (or tuple of classes) is, a bit each
+/// (errors.kind_unknown: one isn't a kind: Python decides)
+fn kindMask(cls: *PyObject) u64 {
+    const errors = @import("errors.zig");
+    if (ph.typeOf(cls) == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyTuple_Type"))))) {
+        var m: u64 = 0;
+        for (0..@intCast(py.c.PyTuple_Size(cls))) |i| m |= kindMask(py.c.PyTuple_GetItem(cls, @intCast(i)).?);
+        return m;
+    }
+    const k = errors.kindOfClass(cls) orelse return errors.kind_unknown;
+    return errors.bit(k);
+}
+
 /// A constant the source may have that compiled code holds as Python's
 /// object: bytes, complex, `...` (immutable, exactly those types)
 fn isSourceConstant(o: *PyObject) bool {
@@ -1471,7 +1484,7 @@ pub const Compiler = struct {
         .{ "zr_call_seq", "bpillllpp" },
         .{ "zr_raise", "bpill" },
         .{ "zr_slice", "bpillllllllp" },
-        .{ "zr_exc_matches", "bpl" },
+        .{ "zr_exc_matches", "bpll" },
         .{ "zr_exc_catch", "bpip" },
         .{ "zr_control_value", "bpillp" },
         .{ "zr_type", "vllp" },
@@ -1483,7 +1496,7 @@ pub const Compiler = struct {
         .{ "zr_math", "bpiillpp" },
         .{ "zr_huge_int", "bll" },
         .{ "zr_dict_view", "bpiillp" },
-        .{ "zr_new_exception", "bpilplp" },
+        .{ "zr_new_exception", "bpiliplp" },
         .{ "zr_call_plain", "bpillplpp" },
         .{ "zr_int_base_of", "bpilllllp" },
         .{ "zr_float_hex", "bpilllp" },
@@ -1494,6 +1507,7 @@ pub const Compiler = struct {
         .{ "zr_inplace", "bpiillllp" },
         .{ "zr_lib", "bpiilplip" },
         .{ "zr_sorted", "bpillllllip" },
+        .{ "zr_type_name", "bpillp" },
         .{ "zr_set_global", "bpilpll" },
         .{ "zr_raise_from", "bpillll" },
         .{ "zr_range", "bpiplp" },
@@ -1552,9 +1566,9 @@ pub const Compiler = struct {
         const python = try f.label("python");
         const done = try f.label("done");
         // (counted: str..function (4-9), a Big (13), Bytes (14), a Closure
-        // (15), a set (16))
+        // (15), a set (16), an exception (17))
         const k = f.sub(tag, m.k64(4));
-        const big_or_bytes = f.icmp(jit_c.LLVMIntULT, f.sub(tag, m.k64(@intFromEnum(value.Tag.big))), m.k64(4));
+        const big_or_bytes = f.icmp(jit_c.LLVMIntULT, f.sub(tag, m.k64(@intFromEnum(value.Tag.big))), m.k64(5));
         try f.condBr(f.or_(f.icmp(jit_c.LLVMIntULT, k, m.k64(6)), big_or_bytes), counted, other);
         try f.block(counted);
         const p = f.intToPtr(bits);
@@ -5378,6 +5392,9 @@ const Gen = struct {
         // The handlers' classes (known when compiling: an object index; null
         // for a bare except), and the jumps they catch
         const classes = try self.a().alloc(?usize, t.handlers.len);
+        // (and the kinds they are, for an error of the native code: matched
+        // natively; errors.kind_unknown: a class not among them)
+        const masks = try self.a().alloc(u64, t.handlers.len);
         const types_ = @import("types.zig");
         for (t.handlers, 0..) |h, i| {
             fr.handler_blocks[i] = try f.label("handler");
@@ -5414,6 +5431,7 @@ const Gen = struct {
                 else => return c.unsupportedAt(inst.func, h.pos, "an except's classes must be known when compiling", .{}),
             };
             classes[i] = try c.objectIndex(cls);
+            masks[i] = kindMask(cls);
             // (a handler of one jump whose name is used as `name.args` only:
             // the jump's value kept, natively)
             const kind: ?RtMethod = if (cls == types_.Return) .Return else if (cls == types_.Break) .Break else if (cls == types_.Continue) .Continue else null;
@@ -5469,7 +5487,7 @@ const Gen = struct {
             const next = try f.label("next_handler");
             if (classes[i]) |idx| {
                 const yes = try f.label("matched");
-                try f.condBr(self.call("zr_exc_matches", &.{ self.ctx, self.k(@intCast(idx)) }), yes, next);
+                try f.condBr(self.call("zr_exc_matches", &.{ self.ctx, self.k(@intCast(idx)), self.k(@bitCast(masks[i])) }), yes, next);
                 try f.block(yes);
             }
             try self.callCheck("zr_exc_catch", &.{ self.ctx, self.k32(inst.node), self.out });
@@ -5826,11 +5844,13 @@ const Gen = struct {
     /// raise rt.Return(v) / rt.Break() / rt.Continue(): jumps; raise of
     /// anything else (rt.Throw(...), ValueError(...)): at run time.
     fn raise(self: *Gen, inst: *Inst, v: SVal, pos: front.Pos) Error!void {
-        _ = pos;
         const ctl = switch (v) {
             .control => |x| x,
             else => {
-                const d = try self.materialize(v, inst.node);
+                // (a class compiled code knows natively, raised as a class:
+                // its instance of no arguments, natively)
+                const known: ?SVal = if (v == .py) (if (@import("errors.zig").kindOfClass(v.py) != null) try self.pyCall(inst, v.py, &.{}, pos) else null) else null;
+                const d = try self.materialize(known orelse v, inst.node);
                 _ = self.call("zr_raise", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits });
                 try self.drop(.{ .dyn = d });
                 try self.f.br(try self.errorTarget());
@@ -6202,6 +6222,21 @@ const Gen = struct {
             },
             .global => |name| return self.global(inst, name, e.pos),
             .attr => |x| {
+                // type(v).__name__: natively (zr_type_name)
+                if (std.mem.eql(u8, x.name, "__name__") and x.obj.kind == .call and x.obj.kind.call.args.len == 1 and x.obj.kind.call.keywords.len == 0 and x.obj.kind.call.func.kind == .global) {
+                    const callee = try self.global(inst, x.obj.kind.call.func.kind.global, e.pos);
+                    if (callee == .py and isBuiltin(callee.py, "type")) {
+                        const v = try self.expr(inst, x.obj.kind.call.args[0]);
+                        if (v == .dyn) {
+                            const ok = self.call("zr_type_name", &.{ self.ctx, self.k32(inst.node), v.dyn.tag, v.dyn.bits, self.out });
+                            try self.drop(v);
+                            try self.check(ok);
+                            return .{ .dyn = try self.loadOut(.str) };
+                        }
+                        const t = (try self.builtinCall(inst, callee.py, &.{v}, e.pos)).?;
+                        return self.attr(inst, t, x.name, e.pos);
+                    }
+                }
                 const obj = try self.expr(inst, x.obj);
                 return self.attr(inst, obj, x.name, e.pos);
             },
@@ -8379,8 +8414,12 @@ const Gen = struct {
         if (self.c.lang.strict and !isExceptionClass(o)) try self.strictRefuses("calls the Python function {s}()", .{try self.pyName(o)});
         const idx = try self.c.objectIndex(o);
         const arr = try self.valueArray(args, inst.node);
-        // (an exception class: an error being made, zr_new_exception)
-        const ok = self.call(if (isExceptionClass(o)) "zr_new_exception" else "zr_call_python", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), arr, self.k(@intCast(args.len)), self.out });
+        // (an exception class: an error being made, zr_new_exception; one
+        // compiled code knows (errors.Kind): natively)
+        const ok = if (isExceptionClass(o)) blk: {
+            const kind: u32 = if (@import("errors.zig").kindOfClass(o)) |ek| @intFromEnum(ek) else helpers.no_kind;
+            break :blk self.call("zr_new_exception", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), self.k32(kind), arr, self.k(@intCast(args.len)), self.out });
+        } else self.call("zr_call_python", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), arr, self.k(@intCast(args.len)), self.out });
         try self.dropArray(arr, args.len);
         try self.check(ok);
         return .{ .dyn = try self.loadOut(.any) };

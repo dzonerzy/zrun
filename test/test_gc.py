@@ -113,7 +113,10 @@ def test_cycles_of_calls():
 def test_cycles_in_map_workers():
     program = lua.lang.load(CALLED, "mapped.lua")
     program.call("make", 0)
-    program.map("make", range(20000), threads=4)
+    # (a few rounds first: on a cold cache, the code compiled for them is
+    # optimized in the background meanwhile, memory of its own)
+    for _ in range(3):
+        program.map("make", range(20000), threads=4)
     rss = _rss_kb()
     for _ in range(20):
         # (a Lua function's one result, not nil: itself)

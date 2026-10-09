@@ -1478,6 +1478,11 @@ const Program = struct {
         return Runtime.errorObject(self, idx, message, "runtime", entries.items);
     }
 
+    fn makeErrorObject(raw: *anyopaque, idx: u32, message: []const u8) ?*PyObject {
+        const self: *Program = @ptrCast(@alignCast(raw));
+        return Runtime.errorObject(self, idx, message, "runtime", &.{});
+    }
+
     fn makeNodeObject(raw: *anyopaque, idx: u32) ?*PyObject {
         const self: *Program = @ptrCast(@alignCast(raw));
         return objects.newNode(self._state.?, self.ctx(), idx);
@@ -1561,7 +1566,7 @@ const Program = struct {
             .error_object = &linkErrorObject,
         };
         var ectx = helpers.Ctx{
-            .node_maker = .{ .ctx = self, .make_fn = &makeNodeObject, .owner = Module.selfObject(Program, self) },
+            .node_maker = .{ .ctx = self, .make_fn = &makeNodeObject, .owner = Module.selfObject(Program, self), .error_fn = &makeErrorObject },
             .objects = &c.compiler.objects,
             .program = c.id,
             .max_depth = self.language()._max_depth,

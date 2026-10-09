@@ -239,6 +239,10 @@ inline fn eachChild(o: *Obj, ctx: anytype, comptime f: anytype) void {
         @intFromEnum(Tag.record) => for (@as(*value.Record, @ptrCast(@alignCast(o))).fields()) |v| child(v, ctx, f),
         @intFromEnum(Tag.function) => if (@as(*value.Function, @ptrCast(@alignCast(o))).env) |e| frameChild(e, ctx, f),
         @intFromEnum(Tag.closure) => if (@as(*value.Closure, @ptrCast(@alignCast(o))).env) |e| frameChild(e, ctx, f),
+        @intFromEnum(Tag.exc) => {
+            const e: *value.Exc = @ptrCast(@alignCast(o));
+            inline for (.{ "args", "value", "message", "cause" }) |fd| child(@field(e, fd), ctx, f);
+        },
         value.KIND_FRAME => {
             const fr: *value.Frame = @ptrCast(@alignCast(o));
             if (fr.parent) |p| frameChild(p, ctx, f);
@@ -250,7 +254,7 @@ inline fn eachChild(o: *Obj, ctx: anytype, comptime f: anytype) void {
 
 /// A container's tag: list..function (5-9), closure, set
 inline fn isContainer(tag: u64) bool {
-    return tag -% @intFromEnum(Tag.list) < 5 or tag -% @intFromEnum(Tag.closure) < 2;
+    return tag -% @intFromEnum(Tag.list) < 5 or tag -% @intFromEnum(Tag.closure) < 3;
 }
 
 inline fn child(v: Value, ctx: anytype, comptime f: anytype) void {
@@ -453,6 +457,10 @@ fn references(o: *Obj, out: *std.ArrayListUnmanaged(Value)) !void {
             try out.append(ca, Value.obj(.str, &f.name.head));
         },
         @intFromEnum(Tag.closure) => if (@as(*value.Closure, @ptrCast(@alignCast(o))).env) |e| try Add.frame(out, e),
+        @intFromEnum(Tag.exc) => {
+            const e: *value.Exc = @ptrCast(@alignCast(o));
+            inline for (.{ "args", "value", "message", "cause" }) |fd| try Add.value_(out, @field(e, fd));
+        },
         value.KIND_FRAME => {
             const f: *value.Frame = @ptrCast(@alignCast(o));
             if (f.parent) |p| try Add.frame(out, p);

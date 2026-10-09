@@ -23,6 +23,7 @@ const helpers = @import("helpers.zig");
 const value = @import("value.zig");
 const gil = @import("gil.zig");
 const types = @import("types.zig");
+const errors = @import("errors.zig");
 const program_mod = @import("program.zig");
 const grammar_mod = @import("grammar.zig");
 const compile_mod = @import("compile.zig");
@@ -399,8 +400,17 @@ fn raiseCompiledError(ctx: *Ctx) ?*PyObject {
     }
     // (a Python exception behind it: raised as itself, as in the reference
     // mode)
-    if (ctx.exc != null or ctx.exc_class != null) {
+    if (ctx.exc != null or ctx.exc_kind != null) {
         const e = ctx.exceptionOf() orelse return null;
+        // (an rt.Throw of the native code's: the zrun.Error it is, where it
+        // was raised, as recordThrow gives a Python one)
+        if (ctx.exc_kind == .Throw and ctx.exc_value != null) {
+            const link = linkOf(ctx);
+            if (link.error_object(link.program, ctx.err_node, ctx.err_msg.items, ctx.err_stack.items)) |err| {
+                defer py.Py_DecRef(err);
+                if (py.c.PyObject_SetAttrString(e, "_zrun_error", err) != 0) py.c.PyErr_Clear();
+            } else py.c.PyErr_Clear();
+        }
         py.c.PyErr_SetObject(@ptrCast(@alignCast(ph.typeOf(e))), e);
         py.Py_DecRef(e);
         ctx.clearError();
@@ -455,10 +465,12 @@ fn newRuntime(ctx: *Ctx, frame_slot: **value.Frame, owner: u32, at: u32) ?*PyObj
 /// goes up to whoever catches it, anything else is the run's error, worded
 /// as the reference mode does). Always false.
 pub export fn zr_raise(ctx: *Ctx, at: u32, t: u64, bits: u64) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    // (an exception value: natively)
+    if (v.kind() == .exc) return helpers.raiseExc(ctx, at, v);
     // (an error: Python's exceptions still, what strict mode allows)
     gil.allowBegin();
     defer gil.allowEnd();
-    const v = Value{ .tag = t, .bits = bits };
     const o = value.toPython(v, ctx.node_maker) orelse return pythonFailure(ctx, at) != 0;
     defer py.Py_DecRef(o);
     const base = py.c.PyExc_BaseException;
@@ -477,6 +489,15 @@ pub export fn zr_raise(ctx: *Ctx, at: u32, t: u64, bits: u64) callconv(.c) bool 
 /// with its __cause__ (None: no context shown, as `from None`), raised as
 /// zr_raise raises it. Always false.
 pub export fn zr_raise_from(ctx: *Ctx, at: u32, t: u64, bits: u64, ct: u64, cb: u64) callconv(.c) bool {
+    // (an exception value from one, or None: natively, its cause kept)
+    if (t == @intFromEnum(value.Tag.exc) and (ct == @intFromEnum(value.Tag.exc) or ct == @intFromEnum(value.Tag.none))) {
+        const e: *value.Exc = @ptrFromInt(bits);
+        const cause = Value{ .tag = ct, .bits = cb };
+        value.incref(cause);
+        value.decref(e.cause);
+        e.cause = cause;
+        return helpers.raiseExc(ctx, at, .{ .tag = t, .bits = bits });
+    }
     gil.allowBegin();
     defer gil.allowEnd();
     const o = value.toPython(.{ .tag = t, .bits = bits }, ctx.node_maker) orelse return pythonFailure(ctx, at) != 0;
@@ -516,14 +537,13 @@ pub export fn zr_raise_from(ctx: *Ctx, at: u32, t: u64, bits: u64, ct: u64, cb: 
 /// `except cls:` in compiled code: whether the error being raised is one
 /// (objects[cls_index]: a class or a tuple of them). An error of the
 /// compiled code itself is a zrun.Error, as Python code above would see it.
-pub export fn zr_exc_matches(ctx: *Ctx, cls_index: u64) callconv(.c) bool {
+pub export fn zr_exc_matches(ctx: *Ctx, cls_index: u64, kinds: u64) callconv(.c) bool {
+    // (an error of the native code: by its kind, natively (one without a
+    // kind: a zrun.Error))
+    if (ctx.pending == null and ctx.exc == null) return errors.matches(ctx.exc_kind orelse .ZrunError, kinds);
     gil.allowBegin();
     defer gil.allowEnd();
-    const cls = ctx.object(cls_index);
-    const r = if (ctx.pending orelse ctx.exc) |e|
-        py.c.PyObject_IsInstance(e, cls)
-    else
-        py.c.PyObject_IsSubclass(ctx.exc_class orelse types.Error, cls);
+    const r = py.c.PyObject_IsInstance((ctx.pending orelse ctx.exc).?, ctx.object(cls_index));
     if (r < 0) py.c.PyErr_Clear();
     return r == 1;
 }
@@ -531,10 +551,12 @@ pub export fn zr_exc_matches(ctx: *Ctx, cls_index: u64) callconv(.c) bool {
 /// The error being raised, caught (`except ... as e`): the exception
 /// object in `out` (a host value), the error cleared.
 pub export fn zr_exc_catch(ctx: *Ctx, at: u32, out: *Value) callconv(.c) bool {
+    // (an error of the native code: an exception value, natively)
+    if (helpers.caughtValue(ctx, out)) |ok| return ok;
     gil.allowBegin();
     defer gil.allowEnd();
     var exc: *PyObject = undefined;
-    if (ctx.pending != null or ctx.exc != null or ctx.exc_class != null) {
+    if (ctx.pending != null or ctx.exc != null or ctx.exc_kind != null) {
         exc = ctx.exceptionOf() orelse {
             py.c.PyErr_Clear();
             ctx.clearError();
@@ -1019,6 +1041,16 @@ fn rtStore(self: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
 /// natively (zr_call_method), as CompiledRuntime's do it; true / false (an
 /// error at `at`); null for another method (Python's).
 pub fn rtValueMethod(ctx: *Ctx, at: u32, rv: Value, name: []const u8, args: []const Value, out: *Value) ?bool {
+    // (rt.scope(node): the scope the name it uses is of, the program's
+    // symbols say; None: a global, or no name)
+    if (std.mem.eql(u8, name, "scope") and args.len == 1 and args[0].kind() == .node) {
+        const d = linkOf(ctx).data;
+        out.* = Value.none_v;
+        const si = d.symbolIndex(@intCast(args[0].bits)) orelse return true;
+        const s = d.syms[si].scope;
+        if (s != NONE and s < d.nodes.len) out.* = .{ .tag = @intFromEnum(value.Tag.node), .bits = s };
+        return true;
+    }
     const store = std.mem.eql(u8, name, "store") and args.len == 2;
     if (!store and !(std.mem.eql(u8, name, "load") and args.len == 1)) return null;
     if (args[0].kind() != .node) return null;

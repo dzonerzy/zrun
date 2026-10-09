@@ -39,6 +39,32 @@ def same_in_both(p, cases):
         assert outcome(p, "compiled", a, b) == outcome(p, "python", a, b), (a, b)
 
 
+def formatted(a, b):
+    return f"{a:{b}}"
+
+
+def test_format_specs():
+    # (the mini-language natively: ints, floats, strs; Python's errors)
+    import random
+
+    rng = random.Random(11)
+    values = [0, 7, -42, 123456789, 2**62, 0.0, -0.0, 1.5, -2.25, 1e-7, 123456.789, 1e300, float("inf"), float("-inf"), float("nan"), "abc", "héllo", ""]
+    specs = []
+    for _ in range(400):
+        s = ""
+        if rng.random() < 0.3:
+            s += rng.choice(["", "*", "é"]) + rng.choice("<>=^")
+        s += rng.choice(["", "", "+", "-", " "])
+        s += rng.choice(["", "", "#"])
+        s += rng.choice(["", "", "0"])
+        s += rng.choice(["", "", "8", "12", "1"])
+        s += rng.choice(["", "", ",", "_"])
+        s += rng.choice(["", "", ".0", ".3", ".14"])
+        s += rng.choice(["", "d", "x", "X", "o", "b", "e", "E", "f", "F", "g", "G", "%", "s"])
+        specs.append(s)
+    same_in_both(_program(formatted), [(v, s) for v in values for s in specs[:60]] + [(rng.choice(values), s) for s in specs])
+
+
 def int_base(a, b):
     return int(a, b)
 

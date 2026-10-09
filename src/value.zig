@@ -56,10 +56,35 @@ pub const Tag = enum(u64) {
     /// A function a semantic made (a lambda, a nested def as a value:
     /// Closure)
     closure = 15,
-    /// A set: a Dict whose values aren't used (None)
+    /// A set (set.zig's Set)
     set = 16,
+    /// An exception of a class compiled code knows natively (errors.Kind:
+    /// Exc)
+    exc = 17,
     _,
 };
+
+/// An exception natively: its kind (errors.Kind), its arguments (a tuple),
+/// for an rt.Throw its value and message, for a zrun.Error its message and
+/// node; its __cause__ (None: none)
+pub const Exc = extern struct {
+    head: Obj,
+    kind: u32,
+    node: u32,
+    args: Value,
+    value: Value,
+    message: Value,
+    cause: Value,
+};
+
+pub fn newExc(kind: u32, args: Value, val: Value, message: Value, node: u32) ?*Exc {
+    const e: *Exc = @ptrCast(@alignCast(gc.alloc(@sizeOf(Exc)) orelse return null));
+    incref(args);
+    incref(val);
+    incref(message);
+    e.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.exc) }, .kind = kind, .node = node, .args = args, .value = val, .message = message, .cause = Value.none_v };
+    return e;
+}
 
 /// A function a semantic or helper made (front.Function.closure): its code
 /// (compiled the first time it's called), the heap frame of the run it was
@@ -531,7 +556,7 @@ pub const KIND_FRAME: u32 = 100;
 /// not kind(): reference counts are most of what code does with values)
 /// The counted tags: str..function (4-9), Big, Bytes, Closure, Set; a bit
 /// each
-pub const counted_mask: u64 = 0x3F0 | (1 << @intFromEnum(Tag.big)) | (1 << @intFromEnum(Tag.bytes)) | (1 << @intFromEnum(Tag.closure)) | (1 << @intFromEnum(Tag.set));
+pub const counted_mask: u64 = 0x3F0 | (1 << @intFromEnum(Tag.big)) | (1 << @intFromEnum(Tag.bytes)) | (1 << @intFromEnum(Tag.closure)) | (1 << @intFromEnum(Tag.set)) | (1 << @intFromEnum(Tag.exc));
 
 pub inline fn counted(tag: u64) bool {
     return tag < 32 and (counted_mask >> @intCast(tag)) & 1 != 0;
@@ -604,6 +629,10 @@ pub const Freezer = struct {
             .record => for (@as(*Record, @ptrCast(@alignCast(o))).fields()) |x| if (x.tag != UNSET_TAG) try self.value(x),
             .function => if (@as(*Function, @ptrCast(@alignCast(o))).env) |e| try self.frame(e),
             .closure => if (@as(*Closure, @ptrCast(@alignCast(o))).env) |e| try self.frame(e),
+            .exc => {
+                const e: *Exc = @ptrCast(@alignCast(o));
+                inline for (.{ "args", "value", "message", "cause" }) |f| try self.value(@field(e, f));
+            },
             else => {},
         }
     }
@@ -643,6 +672,10 @@ fn dropReferences(o: *Obj) void {
             decref(Value.obj(.str, &f.name.head));
         },
         @intFromEnum(Tag.closure) => if (@as(*Closure, @ptrCast(@alignCast(o))).env) |e| decrefFrame(e),
+        @intFromEnum(Tag.exc) => {
+            const e: *Exc = @ptrCast(@alignCast(o));
+            inline for (.{ "args", "value", "message", "cause" }) |f| decref(@field(e, f));
+        },
         KIND_FRAME => {
             const f: *Frame = @ptrCast(@alignCast(o));
             for (f.slots()) |s| decref(s);
@@ -674,6 +707,7 @@ pub fn freeBlock(o: *Obj) void {
         @intFromEnum(Tag.record) => gc.free(o, @sizeOf(Record) + @as(*Record, @ptrCast(@alignCast(o))).rtype.fields.len * @sizeOf(Value)),
         @intFromEnum(Tag.function) => gc.free(o, @sizeOf(Function)),
         @intFromEnum(Tag.closure) => gc.free(o, @sizeOf(Closure)),
+        @intFromEnum(Tag.exc) => gc.free(o, @sizeOf(Exc)),
         KIND_FRAME => gc.free(o, @sizeOf(Frame) + @as(*Frame, @ptrCast(@alignCast(o))).len * @sizeOf(Value)),
         else => {},
     }
@@ -695,7 +729,7 @@ pub fn free(tag: Tag, o: *Obj) void {
             freeListItems(l);
             gc.free(o, list_block);
         },
-        .tuple, .dict, .record, .function, .closure, .set => {
+        .tuple, .dict, .record, .function, .closure, .set, .exc => {
             dropReferences(o);
             freeBlock(o);
         },
@@ -884,6 +918,7 @@ pub fn typeName(v: Value) []const u8 {
         },
         .function, .closure => "function",
         .set => "set",
+        .exc => @as(@import("errors.zig").Kind, @enumFromInt(@as(*Exc, @ptrCast(@alignCast(v.ptr()))).kind)).name(),
         .node => "Node",
         .host => "object",
         .rt => "CompiledRuntime",
@@ -1416,6 +1451,30 @@ pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
                 }
             }
             return out;
+        },
+        // (an exception: its class's instance, of its arguments (an
+        // rt.Throw: its value and message), its cause)
+        .exc => {
+            const e: *Exc = @ptrCast(@alignCast(v.ptr()));
+            const kind: @import("errors.zig").Kind = @enumFromInt(e.kind);
+            // (a zrun.Error: the program's, at its node)
+            if (kind == .ZrunError) if (nodeObject.error_fn) |make| if (e.message.kind() == .str)
+                return make(nodeObject.ctx, e.node, @as(*Str, @ptrCast(e.message.ptr())).bytes());
+            const cls = kind.pyClass() orelse {
+                ph.raise(py.PyExc_RuntimeError(), "zrun: the class of {s} wasn't found", .{kind.name()});
+                return null;
+            };
+            const args = toPython(e.args, nodeObject) orelse return null;
+            defer py.Py_DecRef(args);
+            const o = py.c.PyObject_Call(cls, args, null) orelse return null;
+            if (e.cause.kind() != .none) {
+                const cause = toPython(e.cause, nodeObject) orelse {
+                    py.Py_DecRef(o);
+                    return null;
+                };
+                py.c.PyException_SetCause(o, cause);
+            }
+            return o;
         },
         // (a semantic's lambda or nested def: compiled code's only)
         .closure => {
