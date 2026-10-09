@@ -70,6 +70,10 @@ def _language(strict):
     def assign(node, rt):
         rt.store(node.name, rt.eval(node.value))
 
+    @lang.exec("Return")
+    def return_(node, rt):
+        raise rt.Return(rt.eval(node.value))
+
     return lang
 
 
@@ -119,3 +123,60 @@ def test_strict_is_part_of_the_definition(tmp_path):
     lax.lang.compile(FIB, path)
     with pytest.raises(Exception, match="definition"):
         tiny.lang.load_compiled(path)
+
+
+def produce(rt, node):
+    # (a helper raising the jump: caught by the semantic calling it)
+    raise rt.Return(rt.eval(node.left) * 10)
+
+
+def test_a_jump_caught_by_its_value():
+    # `except rt.Return as r` using r.args only: the jump's value, natively
+    for strict in (True, False):
+        lang = _language(strict)
+
+        @lang.eval("BinOp")
+        def binop(node, rt):
+            try:
+                produce(rt, node)
+            except rt.Return as r:
+                got = r.args[0]
+            return got + rt.eval(node.right)
+
+        p = lang.load("let x = 4 + 2;\nfn f(a, b) { return a + b; }", "jump.tiny")
+        p.run(mode="compiled")
+        assert p.call("f", 4, 2) == 42
+
+
+def test_a_jump_caught_as_an_exception():
+    # (its name used otherwise: Python's exception, as before; not strict)
+    lang = _language(False)
+
+    @lang.eval("BinOp")
+    def binop(node, rt):
+        try:
+            produce(rt, node)
+        except rt.Return as r:
+            e = r
+        return e.args[0] + rt.eval(node.right)
+
+    p = lang.load("fn f(a, b) { return a + b; }", "jump.tiny")
+    p.run(mode="compiled")
+    assert p.call("f", 4, 2) == 42
+
+
+def test_type_of_a_known_value():
+    # `type(v) is float` with v known: decided while compiling
+    lang = _language(True)
+
+    @lang.eval("BinOp")
+    def binop(node, rt):
+        v = 2.5
+        if type(v) is float and type(v) is not int:
+            return rt.eval(node.left) + rt.eval(node.right)
+        return 0
+
+    p = lang.load("let x = 40 + 2;\nfn f(a, b) { return a + b; }", "type.tiny")
+    p.run(mode="compiled")
+    assert p.call("f", 40, 2) == 42
+    assert p.call("f", 40, 2, mode="python") == 42

@@ -1463,6 +1463,7 @@ pub const Compiler = struct {
         .{ "zr_slice", "bpillllllllp" },
         .{ "zr_exc_matches", "bpl" },
         .{ "zr_exc_catch", "bpip" },
+        .{ "zr_control_value", "bpillp" },
         .{ "zr_type", "vllp" },
         .{ "zr_cell", "bpilllp" },
         .{ "zr_builtin", "bpiilllp" },
@@ -1874,6 +1875,10 @@ const TryFrame = struct {
     /// it caught a jump)
     handler_blocks: []ir.Block,
     caught: []ir.Value,
+    /// Handlers of rt.Return / Break / Continue only whose name is used
+    /// only as `name.args` (Gen.controlHandler): their slot holds the
+    /// jump's value, not an exception
+    control_only: []bool = &.{},
     /// The handler catching rt.Return / rt.Break / rt.Continue (jumps in
     /// compiled code; exceptions caught by an `except` in Python), if any
     catch_return: ?usize = null,
@@ -1901,6 +1906,10 @@ const Gen = struct {
     /// Where in its semantic the code being made is (the statement or
     /// expression: strict mode's errors say it)
     pos: front.Pos = .{},
+    /// Code made for a value that's a Python object (a host value: run
+    /// only for one), being made: what strict mode lets be compiled, the
+    /// run's error if it ever runs (gil.ensure)
+    host_fallback: u32 = 0,
     /// The function's parameters: the context; the globals (the top
     /// level), or the frame around, the arguments, the receiver and the
     /// result slot (a language function)
@@ -4123,7 +4132,18 @@ const Gen = struct {
         while (i > stop) {
             i -= 1;
             const fr = self.tries.items[i];
-            if (ctl) |kind| if (fr.catches(kind)) |h| {
+            if (ctl) |kind| if (fr.catches(kind)) |h| if (fr.control_only[h]) {
+                // (a handler of the jump only, using its value only: the
+                // value (owned, the handler's from now), no exception)
+                try self.releaseAbove(fr.depth);
+                self.releaseScopesAbove(fr.scope_depth);
+                try self.dropTemp(fr.caught[h]);
+                try self.storeSlot(fr.caught[h], if (kind == .Return) ret orelse self.noneDyn() else self.noneDyn());
+                if (kind != .Return) if (ret) |r| try self.drop(.{ .dyn = r });
+                try self.f.br(fr.handler_blocks[h]);
+                try self.f.block(try self.f.label("after_jump"));
+                return true;
+            } else {
                 // (the exception Python would have raised, for `as e`:
                 // rt.Return(value), rt.Break(), rt.Continue(); borrowing
                 // the value)
@@ -5115,7 +5135,6 @@ const Gen = struct {
         parts[1] = t.finally;
         for (t.handlers, parts[2..]) |h, *p| p.* = h.body;
         try self.prepareDynamic(inst, parts);
-        for (t.handlers) |h| if (h.name) |slot| try self.toSlot(inst, slot);
         var assigned = std.AutoHashMapUnmanaged(u32, void).empty;
         collectAssigned(t.body, &assigned, self.a()) catch return error.OutOfMemory;
         var read = std.AutoHashMapUnmanaged(u32, void).empty;
@@ -5142,7 +5161,11 @@ const Gen = struct {
             .outer_inflight = self.err_inflight,
             .handler_blocks = try self.a().alloc(ir.Block, t.handlers.len),
             .caught = try self.a().alloc(ir.Value, t.handlers.len),
+            .control_only = try self.a().alloc(bool, t.handlers.len),
         };
+        @memset(fr.control_only, false);
+        // (the jump each control-only handler catches)
+        const control_kinds = try self.a().alloc(RtMethod, t.handlers.len);
         // The handlers' classes (known when compiling: an object index; null
         // for a bare except), and the jumps they catch
         const classes = try self.a().alloc(?usize, t.handlers.len);
@@ -5182,6 +5205,13 @@ const Gen = struct {
                 else => return c.unsupportedAt(inst.func, h.pos, "an except's classes must be known when compiling", .{}),
             };
             classes[i] = try c.objectIndex(cls);
+            // (a handler of one jump whose name is used as `name.args` only:
+            // the jump's value kept, natively)
+            const kind: ?RtMethod = if (cls == types_.Return) .Return else if (cls == types_.Break) .Break else if (cls == types_.Continue) .Continue else null;
+            if (kind) |jump| if (h.name) |slot| if (!try readsBesidesArgs(h.body, slot, self.a())) {
+                fr.control_only[i] = true;
+                control_kinds[i] = jump;
+            };
             // (rt.Return, rt.Break, rt.Continue are exceptions in Python)
             if (fr.catch_return == null and py.c.PyObject_IsSubclass(types_.Return, cls) == 1) fr.catch_return = i;
             if (fr.catch_break == null and py.c.PyObject_IsSubclass(types_.Break, cls) == 1) fr.catch_break = i;
@@ -5189,6 +5219,9 @@ const Gen = struct {
             if (fr.catch_tail == null and py.c.PyObject_IsSubclass(types_.TailCall, cls) == 1) fr.catch_tail = i;
             if (py.c.PyErr_Occurred() != null) return error.Python;
         }
+        // (the handlers' names: slots, as every path into a handler sees
+        // them; a control-only one's is the jump's value, known in it)
+        for (t.handlers, fr.control_only) |h, only| if (h.name) |slot| if (!only) try self.toSlot(inst, slot);
         const catcher = try f.label("except");
         fr.catcher = catcher;
         const handled = try f.label("handled");
@@ -5231,6 +5264,12 @@ const Gen = struct {
                 try f.block(yes);
             }
             try self.callCheck("zr_exc_catch", &.{ self.ctx, self.k32(inst.node), self.out });
+            // (a control-only handler's: the exception's value, as a jump
+            // gives it)
+            if (fr.control_only[i]) {
+                const exc = try self.loadOut(.any);
+                try self.callCheck("zr_control_value", &.{ self.ctx, self.k32(inst.node), exc.tag, exc.bits, self.out });
+            }
             try self.storeSlot(fr.caught[i], try self.loadOut(.any));
             try f.br(fr.handler_blocks[i]);
             try f.block(next);
@@ -5241,14 +5280,23 @@ const Gen = struct {
         // The handlers (reached from an error, or a jump they catch)
         for (t.handlers, 0..) |h, i| {
             try f.block(fr.handler_blocks[i]);
-            if (h.name) |slot| {
+            // (a control-only handler's name: the jump, its value borrowed
+            // from the slot while the handler runs; what it was before, after)
+            var outer_local: ?Local = null;
+            if (h.name) |slot| if (fr.control_only[i]) {
+                outer_local = inst.locals[slot];
+                const v = try self.a().create(SVal);
+                v.* = .{ .dyn = try self.loadSlot(fr.caught[i], .any) };
+                inst.locals[slot] = .{ .static = .{ .control = .{ .kind = control_kinds[i], .value = v } } };
+            } else {
                 const e = try self.loadSlot(fr.caught[i], .any);
                 try self.increfDyn(e);
                 try self.assign(inst, .{ .local = slot }, .{ .dyn = e }, h.pos);
-            }
+            };
             try self.caught.append(self.a(), fr.caught[i]);
             try self.stmts(inst, h.body);
             _ = self.caught.pop();
+            if (outer_local) |l| inst.locals[h.name.?] = l;
             try self.dropTemp(fr.caught[i]);
             try f.br(handled);
         }
@@ -6449,6 +6497,15 @@ const Gen = struct {
                 const cands = try self.fieldCandidates(inst, name, false);
                 if (cands.len > 0) return self.recordField(inst, d, name, cands);
                 return .{ .dyn = try self.genericGetattr(inst, d, name) };
+            },
+            // A jump caught (an except's name: Gen.tryStmt): its arguments,
+            // as Python's exception has them (rt.Return(value): (value,))
+            .control => |x| {
+                if (!eq(u8, name, "args")) return c.unsupportedAt(inst.func, pos, "'{s}' of a caught rt.{s} isn't compiled (`.args` is)", .{ name, @tagName(x.kind) });
+                const v = x.value orelse return .{ .tuple = &.{} };
+                const items = try self.a().alloc(SVal, 1);
+                items[0] = try self.copyOf(v.*);
+                return .{ .tuple = items };
             },
             else => return c.unsupportedAt(inst.func, pos, "'{s}' of a {s} isn't compiled yet (only called, as a method)", .{ name, @tagName(obj) }),
         }
@@ -7733,7 +7790,7 @@ const Gen = struct {
     /// Language(strict=True): code calling into Python (`what` it is) a
     /// compile error at the semantic's line, saying why; nothing otherwise.
     fn strictRefuses(self: *Gen, comptime what: []const u8, args: anytype) Error!void {
-        if (!self.c.lang.strict) return;
+        if (!self.c.lang.strict or self.host_fallback > 0) return;
         const fmt = "strict: " ++ what ++ " (it would run in Python)";
         if (self.insts.items.len == 0) return self.c.unsupported(fmt, args);
         return self.c.unsupportedAt(self.insts.items[self.insts.items.len - 1].func, self.pos, fmt, args);
@@ -8111,9 +8168,12 @@ const Gen = struct {
         const fast_end = f.current;
         try f.br(join);
         try f.block(slow);
+        // (for a Python object only)
+        self.host_fallback += 1;
         const ta = (try self.builtinCall(inst, type_obj, &.{va}, pos)).?;
         const tb = if (vb) |bv| (try self.builtinCall(inst, type_obj, &.{bv}, pos)).? else SVal{ .py = cls.? };
         const r = try self.materialize(try self.compare(inst, op, ta, tb), inst.node);
+        self.host_fallback -= 1;
         const slow_end = f.current;
         try f.br(join);
         try f.block(join);
@@ -8477,10 +8537,12 @@ const Gen = struct {
                     .none => true,
                     .bool => |b| b == r.bool,
                     .node => |n| n == r.node,
+                    .py => |o| o == r.py,
                     else => false,
                 };
-                // (anything known that isn't None is not None)
-                if (l == .none or r == .none or same) return .{ .bool = if (op == .is) same else !same };
+                // (anything known that isn't None is not None; two Python
+                // objects known: the same one or not, `type(1) is float`)
+                if (l == .none or r == .none or same or (l == .py and r == .py)) return .{ .bool = if (op == .is) same else !same };
             }
             if (isScalar(l) and isScalar(r)) {
                 const x = try self.pyOf(l);
@@ -9520,12 +9582,29 @@ fn targetReads(t: front.Target, set: *std.AutoHashMapUnmanaged(u32, void), a: Al
     }
 }
 
+/// readsBesidesArgs(): the local whose reads as `local.args` collectReads
+/// leaves out, while it looks
+var reads_ignoring_args: ?u32 = null;
+
+/// Whether `body` reads local `slot` other than as `slot.args` (an except's
+/// name for a jump: only its value used, Gen.tryStmt)
+fn readsBesidesArgs(body: []const front.Stmt, slot: u32, a: Allocator) Allocator.Error!bool {
+    var set = std.AutoHashMapUnmanaged(u32, void).empty;
+    reads_ignoring_args = slot;
+    defer reads_ignoring_args = null;
+    try collectReads(body, &.{}, &set, a);
+    return set.contains(slot);
+}
+
 fn exprReads(e: *const front.Expr, set: *std.AutoHashMapUnmanaged(u32, void), a: Allocator) Allocator.Error!void {
     switch (e.kind) {
         .local => |slot| try set.put(a, slot, {}),
         // (.outline reads the parameters, which its `if` doesn't assign)
         .int, .big, .float, .str, .bool, .none, .global, .outline => {},
-        .attr => |x| try exprReads(x.obj, set, a),
+        .attr => |x| {
+            if (reads_ignoring_args) |s| if (x.obj.kind == .local and x.obj.kind.local == s and std.mem.eql(u8, x.name, "args")) return;
+            try exprReads(x.obj, set, a);
+        },
         .index => |x| {
             try exprReads(x.obj, set, a);
             try exprReads(x.index, set, a);

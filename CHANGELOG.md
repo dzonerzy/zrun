@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`@zrun.comptime`**: a function whose result depends only on its arguments, its author says. Compiled code calling it with values known when compiling (constants, the tree's fields, other such results) calls it then, once for those values in the process: its result is a constant of the code, whatever Python is in the function (the compilable subset or not). Lists, dicts and tuples in a result are native all through at run time and read-only (a semantic changing one runs as Python). With values known only at run time it's called as any function is; the reference mode calls it as ever. A table built from the spec while compiling, looked up by the code at run time: no Python.
 
 ### Performance
+- **`except rt.Return as r` using `r.args` only is native**: the jump's value kept in the handler, no Python exception made (the same for rt.Break and rt.Continue). The Lua example's chunk (a `return` at the top level) needs no Python for it. A handler using the name otherwise gets the exception, as before.
+- **`x is y` of two Python objects known when compiling is decided then**: `type(1.5) is float` makes no Python object at run time.
 - **Helpers with native paths no longer take the GIL first**: unpacking a list or tuple, methods of strs, lists and dicts done natively, `int()`, `str()`, `abs()`, `bool()`, `len()` of native values. Code running them on several threads (`map()`) doesn't take turns for them.
 
 ### Fixed

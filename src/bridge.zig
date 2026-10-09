@@ -507,6 +507,26 @@ pub export fn zr_exc_catch(ctx: *Ctx, at: u32, out: *Value) callconv(.c) bool {
     return true;
 }
 
+/// An rt.Return, Break or Continue caught as an exception (zr_exc_catch's,
+/// an owned reference) by an except of the jump only (Gen.tryStmt): its
+/// value in `out` (rt.Return(value)'s; None), the exception given up.
+pub export fn zr_control_value(ctx: *Ctx, at: u32, t: u64, bits: u64, out: *Value) callconv(.c) bool {
+    // (an error's way: what strict mode allows)
+    gil.allowBegin();
+    defer gil.allowEnd();
+    const exc: *PyObject = @ptrFromInt(bits);
+    _ = t;
+    defer py.Py_DecRef(exc);
+    const args = py.c.PyObject_GetAttrString(exc, "args") orelse return pythonFailure(ctx, at) != 0;
+    defer py.Py_DecRef(args);
+    if (py.c.PyTuple_Size(args) < 1) {
+        out.* = Value.none_v;
+        return true;
+    }
+    out.* = value.fromBorrowed(py.c.PyTuple_GetItem(args, 0).?) orelse return pythonFailure(ctx, at) != 0;
+    return true;
+}
+
 /// A Python function compiled code calls (`f(args)`, a library function
 /// of the language...): by its compiled code (made the first time), the
 /// rt values among the arguments giving it the frames to run in.
@@ -1326,7 +1346,7 @@ pub export fn zr_speculate(ctx: *Ctx, fnode: u64) callconv(.c) void {
 }
 
 /// The bridge's helpers, by name (for the JIT)
-pub fn symbols() [9]struct { []const u8, usize } {
+pub fn symbols() [10]struct { []const u8, usize } {
     return .{
         .{ "zr_specialize", @intFromPtr(&zr_specialize) },
         .{ "zr_speculate", @intFromPtr(&zr_speculate) },
@@ -1337,5 +1357,6 @@ pub fn symbols() [9]struct { []const u8, usize } {
         .{ "zr_raise", @intFromPtr(&zr_raise) },
         .{ "zr_exc_matches", @intFromPtr(&zr_exc_matches) },
         .{ "zr_exc_catch", @intFromPtr(&zr_exc_catch) },
+        .{ "zr_control_value", @intFromPtr(&zr_control_value) },
     };
 }
