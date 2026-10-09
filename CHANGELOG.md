@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - a builtin given known values it refuses (a branch the code never takes): its error when the code runs, not a call to Python;
   - `s[i]` of a str that isn't ASCII (an index of its code points made the first time it's indexed: O(1), as Python's);
   - `for ... in enumerate(items, start)`, the start known when compiling;
+  - `str(x)`, `f"{x}"`, `f"{x!r}"` of a float (its shortest digits in Python's layout: the same as repr()), a bool, None;
+  - `fmt % args` (printf-style): `%d %i %u %o %x %X %c %s %r %%`, and on Linux `%e %E %f %F %g %G` (C's printf: correctly rounded, the same digits as CPython's), flags, widths and precisions (`*` too), as Python's str formats them (`0` with a precision, zeros for `inf`);
+  - `float.hex(x)`, `x.hex()`; `int(s, base)` with a base known only at run time;
   - str methods of any str, not only ASCII ones: `find`, `rfind`, `index`, `rindex`, `count` (with a start and an end), `startswith` and `endswith` (a tuple too), `replace`, `split` (a separator, or whitespace; a maxsplit), `strip`, `lstrip`, `rstrip` (whitespace Python's, or the characters given), `join`; `float(s)` of a str (its syntax Python's, the number correctly rounded); a float's `is_integer()`.
 
   The Lua example's numeric loop (`math.floor`, `min`): 0.099 s, was 0.119. Of the Lua test programs in strict mode, seven go into Python only to print.

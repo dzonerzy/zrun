@@ -597,6 +597,11 @@ export fn zr_binary(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u6
             else => {},
         }
     }
+    // fmt % args: printf-style, natively (percentFormat); what it doesn't
+    // do, and the errors, Python's
+    if (op == .mod and a.kind() == .str) {
+        if (percentFormat(ctx, node, @ptrCast(a.ptr()), b, out)) |ok| return ok;
+    }
     if (op == .add and a.kind() == .str and b.kind() == .str) {
         const x: *value.Str = @ptrCast(a.ptr());
         const y: *value.Str = @ptrCast(b.ptr());
@@ -635,6 +640,241 @@ export fn zr_binary(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u6
     }
     // Anything else: Python's result (or error) for the same objects
     return pythonBinary(ctx, node, op, a, b, out);
+}
+
+extern "c" fn snprintf(buf: [*]u8, n: usize, fmt: [*:0]const u8, ...) c_int;
+
+/// fmt % arg, printf-style, as Python's str formats it: %d %i %u (a float
+/// truncated), %o %x %X (`#`: 0o, 0x, 0X), %c, %s, %r, %%, and on Linux %e
+/// %E %f %F %g %G (C's printf there: correctly rounded, as CPython's own
+/// conversion); flags `-+ 0#` (`0` with a precision too, as Python has
+/// it), a width and a precision (or `*`). Null for what isn't done here
+/// (%(key)s, values that aren't numbers or strs, an error: Python's then,
+/// its words).
+fn percentFormat(ctx: *Ctx, node: u32, fmt_s: *value.Str, arg: Value, out: *Value) ?bool {
+    const f = fmt_s.bytes();
+    const one = [1]Value{arg};
+    const args: []const Value = if (arg.kind() == .tuple) itemsOfSeq(arg) else if (arg.kind() == .dict or arg.kind() == .host) return null else &one;
+    var next: usize = 0;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    var i: usize = 0;
+    while (i < f.len) {
+        const pct = std.mem.indexOfScalarPos(u8, f, i, '%') orelse {
+            buf.appendSlice(allocator, f[i..]) catch return oomFail(ctx, node);
+            break;
+        };
+        buf.appendSlice(allocator, f[i..pct]) catch return oomFail(ctx, node);
+        i = pct + 1;
+        if (i >= f.len) return null;
+        if (f[i] == '(') return null;
+        // flags
+        var left = false;
+        var plus = false;
+        var space = false;
+        var alt = false;
+        var zero = false;
+        while (i < f.len) : (i += 1) switch (f[i]) {
+            '-' => left = true,
+            '+' => plus = true,
+            ' ' => space = true,
+            '#' => alt = true,
+            '0' => zero = true,
+            else => break,
+        };
+        // width, precision (or *: the next argument, an int)
+        var width: usize = 0;
+        var prec: ?usize = null;
+        inline for (.{ false, true }) |is_prec| {
+            if (!is_prec or (i < f.len and f[i] == '.')) {
+                if (is_prec) i += 1;
+                var n: usize = 0;
+                if (i < f.len and f[i] == '*') {
+                    if (next >= args.len or !isInt(args[next])) return null;
+                    const w = args[next].asInt();
+                    next += 1;
+                    i += 1;
+                    if (w < 0) {
+                        if (is_prec) return null;
+                        left = true;
+                    }
+                    n = @intCast(@abs(w));
+                } else while (i < f.len and std.ascii.isDigit(f[i])) : (i += 1) {
+                    n = n * 10 + (f[i] - '0');
+                    if (n > 1 << 20) return null;
+                }
+                if (is_prec) prec = n else width = n;
+            }
+        }
+        while (i < f.len and (f[i] == 'h' or f[i] == 'l' or f[i] == 'L')) i += 1;
+        if (i >= f.len) return null;
+        const conv = f[i];
+        i += 1;
+        if (conv == '%') {
+            buf.append(allocator, '%') catch return oomFail(ctx, node);
+            continue;
+        }
+        if (next >= args.len) return null;
+        const v = args[next];
+        next += 1;
+        // The text, and for a number its sign (or prefix) apart: what `0`
+        // pads after
+        var tbuf: [512]u8 = undefined;
+        var head: []const u8 = "";
+        var text: []const u8 = undefined;
+        var numeric = true;
+        var hb: [4]u8 = undefined;
+        switch (conv) {
+            'd', 'i', 'u', 'o', 'x', 'X' => {
+                var huge: ?f64 = null;
+                const n: i128 = switch (v.kind()) {
+                    .bool, .int, .big => value.wide(v) orelse @as(i128, v.asInt()),
+                    .float => if (conv == 'd' or conv == 'i' or conv == 'u') blk: {
+                        const x = v.asFloat();
+                        if (!std.math.isFinite(x)) return null;
+                        // (beyond 128 bits: its exact digits, C's printf's)
+                        if (@abs(x) >= 1.7e38) {
+                            if (@import("builtin").os.tag != .linux) return null;
+                            huge = x;
+                            break :blk if (x < 0) -1 else 1;
+                        }
+                        break :blk @intFromFloat(@trunc(x));
+                    } else return null,
+                    else => return null,
+                };
+                const mag: u128 = @abs(n);
+                var w = std.Io.Writer.fixed(&tbuf);
+                if (huge) |x| {
+                    const got = snprintf(&tbuf, tbuf.len, "%.0f", @abs(x));
+                    if (got < 0 or @as(usize, @intCast(got)) >= tbuf.len) return null;
+                    w.end = @intCast(got);
+                } else switch (conv) {
+                    'o' => w.print("{o}", .{mag}) catch return null,
+                    'x' => w.print("{x}", .{mag}) catch return null,
+                    'X' => w.print("{X}", .{mag}) catch return null,
+                    else => w.print("{d}", .{mag}) catch return null,
+                }
+                var digits = w.buffered();
+                // (the precision: the least digits)
+                if (prec) |p| if (digits.len < p) {
+                    if (p > tbuf.len - 1) return null;
+                    const pad = p - digits.len;
+                    std.mem.copyBackwards(u8, tbuf[pad..p], digits);
+                    @memset(tbuf[0..pad], '0');
+                    digits = tbuf[0..p];
+                };
+                var hn: usize = 0;
+                if (n < 0) {
+                    hb[0] = '-';
+                    hn = 1;
+                } else if (plus) {
+                    hb[0] = '+';
+                    hn = 1;
+                } else if (space) {
+                    hb[0] = ' ';
+                    hn = 1;
+                }
+                if (alt and (conv == 'o' or conv == 'x' or conv == 'X')) {
+                    hb[hn] = '0';
+                    hb[hn + 1] = if (conv == 'o') 'o' else conv;
+                    hn += 2;
+                }
+                head = hb[0..hn];
+                text = digits;
+            },
+            'e', 'E', 'f', 'F', 'g', 'G' => {
+                if (@import("builtin").os.tag != .linux) return null;
+                const x: f64 = switch (v.kind()) {
+                    .float => v.asFloat(),
+                    .bool, .int => @floatFromInt(v.asInt()),
+                    else => return null,
+                };
+                // (C's printf: the digits, no sign (ours, Python's flags);
+                // `#` its alternate form, the same as Python's)
+                var cf: [16]u8 = undefined;
+                const cfs = std.fmt.bufPrintZ(&cf, "%{s}.*{c}", .{ if (alt) "#" else "", conv }) catch return null;
+                const p: c_int = @intCast(prec orelse 6);
+                const got = snprintf(&tbuf, tbuf.len, cfs.ptr, p, @abs(x));
+                if (got < 0 or @as(usize, @intCast(got)) >= tbuf.len) return null;
+                text = tbuf[0..@intCast(got)];
+                var hn: usize = 0;
+                if (std.math.signbit(x) and !std.math.isNan(x)) {
+                    hb[0] = '-';
+                    hn = 1;
+                } else if (plus) {
+                    hb[0] = '+';
+                    hn = 1;
+                } else if (space) {
+                    hb[0] = ' ';
+                    hn = 1;
+                }
+                head = hb[0..hn];
+            },
+            'c' => {
+                numeric = false;
+                if (v.kind() == .str) {
+                    const s: *value.Str = @ptrCast(v.ptr());
+                    if (s.chars != 1) return null;
+                    text = s.bytes();
+                } else if (isInt(v)) {
+                    const cp = v.asInt();
+                    if (cp < 0 or cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF)) return null;
+                    const n = std.unicode.utf8Encode(@intCast(cp), &tbuf) catch return null;
+                    text = tbuf[0..n];
+                } else return null;
+            },
+            's', 'r' => {
+                numeric = false;
+                if (v.kind() == .str) {
+                    const s: *value.Str = @ptrCast(v.ptr());
+                    if (conv == 's') {
+                        text = s.bytes();
+                    } else {
+                        // (repr of an ASCII str only: the others' escapes
+                        // are Unicode's to say)
+                        if (s.chars != s.len) return null;
+                        text = pyRepr(s.bytes(), &tbuf) orelse return null;
+                    }
+                } else if (v.kind() == .int or v.kind() == .big) {
+                    var w = std.Io.Writer.fixed(&tbuf);
+                    w.print("{d}", .{value.wide(v) orelse @as(i128, v.asInt())}) catch return null;
+                    text = w.buffered();
+                } else if (plainStr(v)) |ps| {
+                    text = ps.of(tbuf[0..40]);
+                } else return null;
+                // (a precision: its first characters)
+                if (prec) |p| {
+                    var at: usize = 0;
+                    var k: usize = 0;
+                    while (at < text.len and k < p) : (k += 1) at += std.unicode.utf8ByteSequenceLength(text[at]) catch 1;
+                    text = text[0..at];
+                }
+            },
+            else => return null,
+        }
+        // The width: spaces before (after, `-`), or zeros after the sign
+        // for a number (`0`)
+        const len = head.len + (std.unicode.utf8CountCodepoints(text) catch text.len);
+        const pad = if (width > len) width - len else 0;
+        if (left) {
+            buf.appendSlice(allocator, head) catch return oomFail(ctx, node);
+            buf.appendSlice(allocator, text) catch return oomFail(ctx, node);
+            buf.appendNTimes(allocator, ' ', pad) catch return oomFail(ctx, node);
+        } else if (zero and numeric) {
+            buf.appendSlice(allocator, head) catch return oomFail(ctx, node);
+            buf.appendNTimes(allocator, '0', pad) catch return oomFail(ctx, node);
+            buf.appendSlice(allocator, text) catch return oomFail(ctx, node);
+        } else {
+            buf.appendNTimes(allocator, ' ', pad) catch return oomFail(ctx, node);
+            buf.appendSlice(allocator, head) catch return oomFail(ctx, node);
+            buf.appendSlice(allocator, text) catch return oomFail(ctx, node);
+        }
+    }
+    // (arguments left over: Python's TypeError)
+    if (next != args.len) return null;
+    const r = value.newStr(buf.items) orelse return oomFail(ctx, node);
+    out.* = Value.obj(.str, &r.head);
+    return true;
 }
 
 /// A list's or tuple's items
@@ -1901,10 +2141,16 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
             }
         }
     }
-    // A float's is_integer()
+    // A float's is_integer(), hex()
     if (v.kind() == .float and n == 0 and std.mem.eql(u8, name.bytes(), "is_integer")) {
         const x = v.asFloat();
         out.* = Value.boolean(std.math.isFinite(x) and @floor(x) == x);
+        return true;
+    }
+    if (v.kind() == .float and n == 0 and std.mem.eql(u8, name.bytes(), "hex")) {
+        var buf: [32]u8 = undefined;
+        const r = value.newStr(floatHex(v.asFloat(), &buf)) orelse return oomFail(ctx, node);
+        out.* = Value.obj(.str, &r.head);
         return true;
     }
     // rt.load(), rt.store() of an rt handed over: natively
@@ -2748,6 +2994,13 @@ export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64,
                 out.* = Value.obj(.str, &r.head);
                 return true;
             },
+            // (a float, a bool, None: as Python writes them)
+            .float, .bool, .none => {
+                var buf: [40]u8 = undefined;
+                const r = value.newStr(plainStr(v).?.of(&buf)) orelse return oomFail(ctx, node);
+                out.* = Value.obj(.str, &r.head);
+                return true;
+            },
             else => {},
         },
         .bool => switch (v.kind()) {
@@ -2856,6 +3109,29 @@ export fn zr_huge_int(t: u64, bits: u64) callconv(.c) bool {
     if (v.kind() == .big) return true;
     if (v.kind() != .host) return false;
     return ph.typeOf(@ptrFromInt(bits)) == py.types.typeObject("PyLong_Type");
+}
+
+/// The str() of a float, a bool or None (each its repr too), as Python
+/// writes it, made into a buffer; null for another value
+const PlainStr = union(enum) {
+    float: f64,
+    text: []const u8,
+
+    fn of(self: PlainStr, buf: *[40]u8) []const u8 {
+        return switch (self) {
+            .float => |x| value.floatRepr(x, buf),
+            .text => |t| t,
+        };
+    }
+};
+
+fn plainStr(v: Value) ?PlainStr {
+    return switch (v.kind()) {
+        .float => .{ .float = v.asFloat() },
+        .bool => .{ .text = if (v.asInt() != 0) "True" else "False" },
+        .none => .{ .text = "None" },
+        else => null,
+    };
 }
 
 /// A builtin (objects[callee_index]) given a value it refuses: called by
@@ -3151,6 +3427,45 @@ export fn zr_int_base(ctx: *Ctx, node: u32, callee_index: u64, t: u64, bits: u64
     return zr_call_python(ctx, node, callee_index, &args, 2, out);
 }
 
+/// int(v, base), the base known only at run time: zr_int_base's, for a
+/// base of 0 or 2 to 36; another, Python's error, its words
+export fn zr_int_base_of(ctx: *Ctx, node: u32, callee_index: u64, t: u64, bits: u64, bt: u64, bb: u64, out: *Value) callconv(.c) bool {
+    const b = Value{ .tag = bt, .bits = bb };
+    if (isInt(b)) {
+        const base = b.asInt();
+        if (base == 0 or (base >= 2 and base <= 36)) return zr_int_base(ctx, node, callee_index, t, bits, @intCast(base), out);
+    }
+    const args = [2]Value{ .{ .tag = t, .bits = bits }, b };
+    return pythonsErrorOf(ctx, node, callee_index, &args, 2, out);
+}
+
+/// float.hex(x): x's exact value in hexadecimal, as CPython writes it
+/// (`0x1.8000000000000p+1`: 13 digits of the fraction; a subnormal's
+/// `0x0.` with the exponent -1022), into `buf`
+fn floatHex(x: f64, buf: *[32]u8) []const u8 {
+    if (std.math.isNan(x)) return "nan";
+    if (std.math.isInf(x)) return if (x < 0) "-inf" else "inf";
+    const bits: u64 = @bitCast(x);
+    const neg = bits >> 63 != 0;
+    const exp_bits: u64 = (bits >> 52) & 0x7ff;
+    const frac = bits & ((@as(u64, 1) << 52) - 1);
+    if (exp_bits == 0 and frac == 0) return if (neg) "-0x0.0p+0" else "0x0.0p+0";
+    const lead: u8 = if (exp_bits == 0) '0' else '1';
+    const e: i64 = if (exp_bits == 0) -1022 else @as(i64, @intCast(exp_bits)) - 1023;
+    return std.fmt.bufPrint(buf, "{s}0x{c}.{x:0>13}p{c}{d}", .{ if (neg) "-" else "", lead, frac, @as(u8, if (e < 0) '-' else '+'), @abs(e) }) catch "nan";
+}
+
+/// float.hex(v) (objects[callee_index]: float.hex) of a float: natively;
+/// anything else, Python's
+export fn zr_float_hex(ctx: *Ctx, node: u32, callee_index: u64, t: u64, bits: u64, out: *Value) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    if (v.kind() != .float) return zr_call_python(ctx, node, callee_index, @ptrCast(&v), 1, out);
+    var buf: [32]u8 = undefined;
+    const r = value.newStr(floatHex(v.asFloat(), &buf)) orelse return oomFail(ctx, node);
+    out.* = Value.obj(.str, &r.head);
+    return true;
+}
+
 /// len(v.encode("utf-8")): a str's length in bytes (a str is its UTF-8
 /// bytes); anything else as Python does it.
 export fn zr_utf8_len(ctx: *Ctx, node: u32, t: u64, bits: u64, out: *Value) callconv(.c) bool {
@@ -3290,6 +3605,16 @@ export fn zr_format(ctx: *Ctx, node: u32, t: u64, bits: u64, conversion: u32, sp
             return true;
         }
     }
+    // (`{x}`, `{x!s}`, `{x!r}` of a float, a bool, None: their str, the same
+    // as their repr)
+    if ((conversion == 0 or conversion == 's' or conversion == 'r') and spec.len == 0) {
+        if (plainStr(v)) |text| {
+            var b: [40]u8 = undefined;
+            const r = value.newStr(text.of(&b)) orelse return oomFail(ctx, node);
+            out.* = Value.obj(.str, &r.head);
+            return true;
+        }
+    }
     gil.ensureAt(@src(), node, null);
     var objs: [1]*PyObject = undefined;
     if (!objects(ctx, node,&.{v}, &objs)) return failPython(ctx, node);
@@ -3340,7 +3665,7 @@ const helper_names = [_][]const u8{
     "zr_type",     "zr_builtin",    "zr_range",      "zr_cell",          "zr_frame_of",
     "zr_extend_items", "zr_tail_set", "zr_tail_resolve", "zr_tail_take", "zr_tail_put", "zr_tail_clear",
     "zr_int_base", "zr_utf8_len", "zr_min_max", "zr_math", "zr_huge_int", "zr_dict_view",
-    "zr_new_exception", "zr_call_plain",
+    "zr_new_exception", "zr_call_plain", "zr_int_base_of", "zr_float_hex",
 };
 
 /// The names compiled code calls them by, and their addresses

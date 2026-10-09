@@ -622,18 +622,10 @@ fn types() type {
 var helpers_defined = false;
 var next_id: u64 = 0;
 
-/// The last Python function compiled code called that couldn't be
-/// compiled (it runs as Python), and why: what strict mode's message says
-/// of a call to it (uncompiledReason)
-var uncompiled_fn: ?*PyObject = null;
-var uncompiled_why: [256]u8 = undefined;
-var uncompiled_len: usize = 0;
-
+/// A Python function compiled code called that couldn't be compiled (it
+/// runs as Python), and why: what strict mode's message says of a call to
+/// it (uncompiledReason), report()'s python_functions
 fn noteUncompiled(o: *PyObject, why: []const u8) void {
-    uncompiled_fn = o;
-    uncompiled_len = @min(why.len, uncompiled_why.len);
-    @memcpy(uncompiled_why[0..uncompiled_len], why[0..uncompiled_len]);
-    // (and for report(): every one, by the function)
     const slot = uncompiled.getOrPut(allocator, o) catch return;
     if (!slot.found_existing) py.Py_IncRef(o) else allocator.free(slot.value_ptr.*);
     slot.value_ptr.* = allocator.dupe(u8, why) catch "";
@@ -646,8 +638,7 @@ pub var uncompiled: std.AutoArrayHashMapUnmanaged(*PyObject, []const u8) = .empt
 /// Why the Python function `o` couldn't be compiled, if it's the last one
 /// that couldn't (a call to it went into Python)
 pub fn uncompiledReason(o: ?*PyObject) ?[]const u8 {
-    if (o == null or o != uncompiled_fn) return null;
-    return uncompiled_why[0..uncompiled_len];
+    return uncompiled.get(o orelse return null);
 }
 
 /// Code shared by the loads of one program in the process (its language,

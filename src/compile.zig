@@ -1475,6 +1475,8 @@ pub const Compiler = struct {
         .{ "zr_dict_view", "bpiillp" },
         .{ "zr_new_exception", "bpilplp" },
         .{ "zr_call_plain", "bpillplpp" },
+        .{ "zr_int_base_of", "bpilllllp" },
+        .{ "zr_float_hex", "bpilllp" },
         .{ "zr_range", "bpiplp" },
         .{ "zr_is_type", "blli" },
         .{ "zr_format", "bpillipp" },
@@ -7919,6 +7921,18 @@ const Gen = struct {
         return ce.func.kind.attr.obj;
     }
 
+    /// Whether `o` is the builtin type `type_name`'s attribute `name`
+    /// (float.hex...)
+    fn isTypeAttr(o: *PyObject, comptime type_name: [:0]const u8, name: [*:0]const u8) bool {
+        const t: *PyObject = @ptrCast(@alignCast(py.types.typeObject(type_name)));
+        const x = py.c.PyObject_GetAttrString(t, name) orelse {
+            py.c.PyErr_Clear();
+            return false;
+        };
+        defer py.Py_DecRef(x);
+        return x == o;
+    }
+
     /// Whether `o` is module `module`'s `name` (math.floor...)
     fn isModuleAttr(o: *PyObject, module: [*:0]const u8, name: [*:0]const u8) bool {
         const m = py.c.PyImport_ImportModule(module) orelse {
@@ -7975,15 +7989,37 @@ const Gen = struct {
                 py.c.PyErr_Clear();
             }
         }
-        // int(x, base), the base known: natively (zr_int_base)
-        if (args.len == 2 and isBuiltin(o, "int") and (args[0] == .dyn or isScalar(args[0]))) if (intOf(args[1])) |base| if (base == 0 or (base >= 2 and base <= 36)) {
+        // int(x, base), the base known: natively (zr_int_base); known only
+        // at run time: zr_int_base_of
+        if (args.len == 2 and isBuiltin(o, "int") and (args[0] == .dyn or isScalar(args[0]))) {
+            if (intOf(args[1])) |base| if (base == 0 or (base >= 2 and base <= 36)) {
+                const d = try self.materialize(args[0], inst.node);
+                const idx = try c.objectIndex(o);
+                const ok = self.call("zr_int_base", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), d.tag, d.bits, self.k32(@intCast(base)), self.out });
+                try self.drop(.{ .dyn = d });
+                try self.check(ok);
+                return SVal{ .dyn = try self.loadOut(.any) };
+            };
+            if (args[1] == .dyn) {
+                const d = try self.materialize(args[0], inst.node);
+                const bd = args[1].dyn;
+                const idx = try c.objectIndex(o);
+                const ok = self.call("zr_int_base_of", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), d.tag, d.bits, bd.tag, bd.bits, self.out });
+                try self.drop(.{ .dyn = d });
+                try self.drop(args[1]);
+                try self.check(ok);
+                return SVal{ .dyn = try self.loadOut(.any) };
+            }
+        }
+        // float.hex(x): natively (zr_float_hex)
+        if (args.len == 1 and (args[0] == .dyn or isScalar(args[0])) and isTypeAttr(o, "PyFloat_Type", "hex")) {
             const d = try self.materialize(args[0], inst.node);
             const idx = try c.objectIndex(o);
-            const ok = self.call("zr_int_base", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), d.tag, d.bits, self.k32(@intCast(base)), self.out });
+            const ok = self.call("zr_float_hex", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), d.tag, d.bits, self.out });
             try self.drop(.{ .dyn = d });
             try self.check(ok);
             return SVal{ .dyn = try self.loadOut(.any) };
-        };
+        }
         // min(a, b, ...), max(a, b, ...): natively for numbers and strs
         // (zr_min_max)
         if (args.len >= 2) inline for (.{ .{ "min", 0 }, .{ "max", 1 } }) |m| if (isBuiltin(o, m[0])) {

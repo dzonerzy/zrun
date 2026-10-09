@@ -10,8 +10,8 @@ import zrun
 from test_strict import tiny
 
 
-def _program(compute):
-    lang = zrun.Language(tiny.PARSER, tiny.RULES)
+def _program(compute, strict=False):
+    lang = zrun.Language(tiny.PARSER, tiny.RULES, strict=strict)
     lang.function("FuncDef")
 
     @lang.exec("Return")
@@ -158,6 +158,82 @@ def test_float_of_a_str():
     p = _program(float_of)
     texts = ("1.5", " -2.25e3 ", "1_000.5", "1__0", "1_", "_1", ".5", "1.", ".", "inf", "-Infinity", "NaN", "nan ", "1e", "1e+5", "0x10", "　1.0\xa0", "", "3.141592653589793238462643383279", "1e400", "2.5e-324", "12abc")
     same_in_both(p, [(t, b) for t in texts for b in (0, 1)])
+
+
+def float_text(a, b):
+    if b == 0:
+        return str(a)
+    return f"{a}|{a!r}|{True}|{None}"
+
+
+def test_str_of_floats():
+    # (their shortest digits and Python's layout: random bit patterns, and
+    # the edges of fixed and exponential notation)
+    import random
+    import struct
+
+    rng = random.Random(1234)
+    xs = [struct.unpack("<d", struct.pack("<Q", rng.getrandbits(64)))[0] for _ in range(50000)]
+    xs += [0.0, -0.0, 1.0, 0.1, 1e15, 1e16, 9999999999999998.0, 1e-4, 1e-5, 123456789.123, 5e-324, 1.7976931348623157e308, float("inf"), float("-inf"), float("nan"), 2.5, 100.0]
+    xs = [x for x in xs if x == x] + [float("nan")]
+    # (strict: done natively, no Python)
+    p = _program(float_text, strict=True)
+    p.run(mode="compiled")
+    assert p.map("f", [(x, 0) for x in xs]) == [str(x) for x in xs]
+    assert p.map("f", [(x, 1) for x in xs[:2000]]) == [f"{x}|{x!r}|True|None" for x in xs[:2000]]
+
+
+FORMATS = (
+    "%d", "%5d", "%-5d|", "%05d", "%+d", "% d", "%.3d", "%05.3d", "%x", "%#x", "%X", "%#o", "%o", "%i", "%u",
+    "%f", "%.2f", "%10.3f", "%-10.1f|", "%+.1f", "%010.2f", "%e", "%.3E", "%g", "%.3g", "%#g", "%G", "%F",
+    "%s", "%10s", "%-6s|", "%.2s", "%r", "%c", "%%d", "[%s]", "%*d", "%.*f", "%-*s|",
+)
+
+
+def percent(a, b):
+    fmt = FORMATS[b]
+    if "*" in fmt:
+        return fmt % (7, a)
+    return fmt % a
+
+
+def test_percent_format():
+    p = _program(percent)
+    values = (0, 42, -42, 255, 2**40, -7, True, 3.7, -2.675, 2.675, 0.0, -0.0, 1e300, 1.5e-7, 123456.789, float("inf"), float("nan"), "ab", "é", "", "a'b", 65)
+    cases = [(v, i) for i in range(len(FORMATS)) for v in values]
+    same_in_both(p, cases)
+    # (those Python formats, natively: strict, no Python; but a repr of a
+    # str not ASCII, its escapes Unicode's)
+    strict = _program(percent, strict=True)
+    for v, i in cases:
+        try:
+            want = percent(v, i)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if FORMATS[i] == "%r" and isinstance(v, str) and not v.isascii():
+            continue
+        try:
+            got = strict.call("f", v, i)
+        except zrun.StrictError as e:
+            raise AssertionError(f"{FORMATS[i]!r} % {v!r}: {e}") from None
+        assert got == want, (v, FORMATS[i])
+
+
+def hex_of(a, b):
+    return (float.hex(a), a.hex()) if b == 0 else int(a, b)
+
+
+def test_float_hex_and_int_bases():
+    import random
+    import struct
+
+    rng = random.Random(99)
+    xs = [struct.unpack("<d", struct.pack("<Q", rng.getrandbits(64)))[0] for _ in range(20000)]
+    xs = [x for x in xs if x == x] + [0.0, -0.0, 1.0, 0.5, 5e-324, 2.2250738585072014e-308, 1.7976931348623157e308, float("inf"), float("-inf")]
+    p = _program(hex_of, strict=True)
+    assert p.map("f", [(x, 0) for x in xs]) == [(x.hex(), x.hex()) for x in xs]
+    # (the base known only at run time)
+    same_in_both(_program(hex_of), [("ff", 16), ("z", 36), ("0b11", 0), ("12", 1), ("12", 37), ("12", -1), ("777", 8)])
 
 
 def math_one(a, b):

@@ -235,6 +235,60 @@ pub const Str = extern struct {
     }
 };
 
+/// repr(x) of a float as Python writes it (str() the same): its shortest
+/// digits that read back as it, fixed point while the point is within
+/// them (from 1e-4 to below 1e16: `0.0001`, `1000000000000000.0`, always a
+/// digit after the point), else exponential (`1e+16`, `1.5e-05`: two
+/// exponent digits at least); `nan`, `inf`, `-inf`.
+pub fn floatRepr(x: f64, buf: *[40]u8) []const u8 {
+    if (std.math.isNan(x)) return "nan";
+    if (std.math.isInf(x)) return if (x < 0) "-inf" else "inf";
+    // (the shortest digits, Ryu's: "d.ddde±x")
+    var sci: [32]u8 = undefined;
+    const s = std.fmt.float.render(&sci, x, .{ .mode = .scientific }) catch return "nan";
+    var i: usize = 0;
+    const neg = s[0] == '-';
+    if (neg) i = 1;
+    var digits: [24]u8 = undefined;
+    var nd: usize = 0;
+    while (i < s.len and s[i] != 'e') : (i += 1) {
+        if (s[i] == '.') continue;
+        digits[nd] = s[i];
+        nd += 1;
+    }
+    const exp = std.fmt.parseInt(i32, s[i + 1 ..], 10) catch 0;
+    // (trailing zeros aren't digits of it)
+    while (nd > 1 and digits[nd - 1] == '0') nd -= 1;
+    const decpt: i32 = exp + 1;
+    var w = std.Io.Writer.fixed(buf);
+    if (neg) w.writeByte('-') catch {};
+    if (decpt <= -4 or decpt > 16) {
+        w.writeByte(digits[0]) catch {};
+        if (nd > 1) {
+            w.writeByte('.') catch {};
+            w.writeAll(digits[1..nd]) catch {};
+        }
+        const e = decpt - 1;
+        w.print("e{c}{d:0>2}", .{ @as(u8, if (e < 0) '-' else '+'), @abs(e) }) catch {};
+    } else if (decpt <= 0) {
+        w.writeAll("0.") catch {};
+        for (0..@intCast(-decpt)) |_| w.writeByte('0') catch {};
+        w.writeAll(digits[0..nd]) catch {};
+    } else {
+        const p: usize = @intCast(decpt);
+        if (p >= nd) {
+            w.writeAll(digits[0..nd]) catch {};
+            for (0..p - nd) |_| w.writeByte('0') catch {};
+            w.writeAll(".0") catch {};
+        } else {
+            w.writeAll(digits[0..p]) catch {};
+            w.writeByte('.') catch {};
+            w.writeAll(digits[p..nd]) catch {};
+        }
+    }
+    return w.buffered();
+}
+
 const index_step = 64;
 
 /// The byte offset of code point `i` (below its count) of a str: an ASCII
