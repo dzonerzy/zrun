@@ -2544,6 +2544,23 @@ pub export fn zr_host_failed(ctx: *Ctx, node: u32, idx: u64) callconv(.c) bool {
 
 pub fn hostCodeFailed(ctx: *Ctx, f: *PyObject) bool {
     if (!ctx.failed) return false;
+    if (comptime standalone) {
+        // (the stand-in's name; the native error's class and words)
+        const name = @import("standalone.zig").nameOf(f);
+        const type_name = if (ctx.exc_kind) |k| k.name() else "Error";
+        const old = allocator.dupe(u8, if (ctx.exc_kind != null) ctx.exc_msg.items else ctx.err_msg.items) catch return false;
+        defer allocator.free(old);
+        ctx.err_msg.clearRetainingCapacity();
+        ctx.err_msg.print(allocator, "{s}: {s}: {s}", .{ name, type_name, old }) catch {};
+        if (ctx.exc_kind != null and ctx.exc_kind != .Throw) {
+            ctx.exc_kind = .ZrunError;
+            ctx.exc_msg.clearRetainingCapacity();
+            ctx.exc_msg.appendSlice(allocator, ctx.err_msg.items) catch {};
+            if (ctx.exc_value) |v| value.decref(v);
+            ctx.exc_value = null;
+        }
+        return false;
+    }
     gil.allowBegin();
     defer gil.allowEnd();
     var name_buf: [128]u8 = undefined;
@@ -3904,6 +3921,10 @@ fn isPySpace(c: u8) bool {
 /// len(), zip()... of run-time values): a host object of the program.
 export fn zr_call_python(ctx: *Ctx, node: u32, callee_index: u64, args: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
     const callee = ctx.object(callee_index);
+    // (a standalone program: no Python to do it)
+    if (comptime standalone) {
+        return fail(ctx, node, "{s}() of these arguments ({d}) needs Python, which a standalone program hasn't", .{ @import("standalone.zig").nameOf(callee), n });
+    }
     gil.ensureAt(@src(), node, callee);
     if (collecting) {
         var b: [64]u8 = undefined;
@@ -4925,7 +4946,8 @@ pub fn findLibm() void {
     if (libm_looked) return;
     libm_looked = true;
     if (@import("builtin").os.tag != .linux) return;
-    const h = std.c.dlopen("libm.so.6", .{ .LAZY = true, .NOLOAD = true }) orelse return;
+    // (Python's, loaded already; a standalone program's, loaded now)
+    const h = std.c.dlopen("libm.so.6", .{ .LAZY = true, .NOLOAD = !standalone }) orelse return;
     var t: Libm = undefined;
     inline for (@typeInfo(Libm).@"struct".fields) |fd| {
         const p = std.c.dlsym(h, fd.name) orelse return;
@@ -4952,8 +4974,16 @@ fn floatOf(v: Value) ?f64 {
 export fn zr_math(ctx: *Ctx, node: u32, code: u32, callee_index: u64, n: u64, args: [*]const Value, out: *Value) callconv(.c) bool {
     const f: MathFn = @enumFromInt(code);
     var xs: [2]f64 = undefined;
-    for (args[0..n], 0..) |a, i| xs[i] = floatOf(a) orelse return zr_call_python(ctx, node, callee_index, args, n, out);
-    if (needsLibm(f) and libm == null) return zr_call_python(ctx, node, callee_index, args, n, out);
+    for (args[0..n], 0..) |a, i| xs[i] = floatOf(a) orelse {
+        if (comptime standalone) return failAs(ctx, node, .TypeError, null, "must be real number, not {s}", .{value.typeName(a)});
+        return zr_call_python(ctx, node, callee_index, args, n, out);
+    };
+    // (a standalone program: the C library's, loaded now)
+    if (comptime standalone) findLibm();
+    if (needsLibm(f) and libm == null) {
+        if (comptime standalone) return fail(ctx, node, "math.{s}(): the C library's math functions aren't found", .{@tagName(f)});
+        return zr_call_python(ctx, node, callee_index, args, n, out);
+    }
     const lm = libm orelse undefined;
     const x = xs[0];
     const y = xs[1];
@@ -4998,7 +5028,19 @@ export fn zr_math(ctx: *Ctx, node: u32, code: u32, callee_index: u64, n: u64, ar
         any_nan = any_nan or std.math.isNan(a);
         all_finite = all_finite and std.math.isFinite(a);
     }
-    if ((std.math.isNan(r) and !any_nan) or (std.math.isInf(r) and all_finite)) return pythonsErrorOf(ctx, node, callee_index, args, n, out);
+    if ((std.math.isNan(r) and !any_nan) or (std.math.isInf(r) and all_finite)) {
+        // (without Python, CPython's errors: a pole or a NaN a domain
+        // error, an overflow a range error)
+        if (comptime standalone) {
+            const pole = switch (f) {
+                .log, .log2, .log10, .atanh, .pow => true,
+                else => false,
+            };
+            if (std.math.isNan(r) or pole) return failAs(ctx, node, .ValueError, null, "math domain error", .{});
+            return failAs(ctx, node, .OverflowError, null, "math range error", .{});
+        }
+        return pythonsErrorOf(ctx, node, callee_index, args, n, out);
+    }
     out.* = Value.float(r);
     return true;
 }

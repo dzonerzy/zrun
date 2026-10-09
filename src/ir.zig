@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const value = @import("value.zig");
+const image = @import("image.zig");
 const jit = @import("jit.zig");
 const c = jit.c;
 const L = jit.f;
@@ -52,8 +53,29 @@ pub const Module = struct {
     addrs: std.AutoHashMapUnmanaged(usize, Value) = .empty,
     syms: std.ArrayListUnmanaged(Sym) = .empty,
     counter: ?*u32 = null,
+    /// What each address is (a standalone build's: the program's, across
+    /// its modules), said where the code takes it; null: not kept
+    notes: ?*std.AutoHashMapUnmanaged(usize, image.Note) = null,
 
     pub const Sym = struct { name: [:0]const u8, addr: u64 };
+
+    /// What an address the code takes is (kept for a standalone build).
+    pub fn note(self: *Module, addr: usize, what: image.Note) void {
+        const n = self.notes orelse return;
+        n.put(self.gpa, addr, what) catch @panic("out of memory");
+    }
+
+    /// ptrConst of an address, saying what it is
+    pub fn ptrOf(self: *Module, addr: usize, what: image.Note) Value {
+        self.note(addr, what);
+        return self.ptrConst(addr);
+    }
+
+    /// addrInt of an address, saying what it is
+    pub fn addrOf(self: *Module, addr: usize, what: image.Note) Value {
+        self.note(addr, what);
+        return self.addrInt(addr);
+    }
 
     pub fn init(gpa: Allocator, prefix: []const u8) Module {
         const ctx = L("LLVMContextCreate")();
@@ -215,7 +237,7 @@ pub const Module = struct {
     pub fn string(self: *Module, bytes: []const u8) !Value {
         if (self.strings.get(bytes)) |g| return g;
         const s = value.literal(bytes) orelse return error.OutOfMemory;
-        const g = self.ptrConst(@intFromPtr(s));
+        const g = self.ptrOf(@intFromPtr(s), .str);
         try self.strings.put(self.gpa, try self.gpa.dupe(u8, bytes), g);
         return g;
     }

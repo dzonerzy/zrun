@@ -12,4 +12,5 @@ comptime {
     _ = @import("gc.zig");
     _ = @import("set.zig");
     _ = @import("image.zig");
+    _ = @import("standalone.zig");
 }

@@ -1454,6 +1454,37 @@ const Program = struct {
         return out;
     }
 
+    /// `program.native_objects()`: the program compiled ahead of time to run
+    /// without Python (a strict language's), as object files to link with
+    /// zrun's runtime (libzrun_rt.a): a list of bytes (zrun.build_native
+    /// links them).
+    pub fn native_objects(self: *Program) ?*PyObject {
+        if (!self.language()._strict) {
+            ph.raise(ztypes.CompileError, "a program runs without Python only in a strict language: zrun.Language(..., strict=True)", .{});
+            return null;
+        }
+        const s = self.seed() orelse return null;
+        const path: []const u8 = if (self._path) |p| (if (p == py.Py_None()) "<program>" else ph.utf8(p, "path") orelse return null) else "<program>";
+        const b = driver.buildStandalone(self.ctx().data, self.langView(), &self.language()._python, ztypes.CompileError, &s, 2, @intCast(self.language()._max_depth), path) orelse return null;
+        defer {
+            b.deinit();
+            std.heap.c_allocator.destroy(b);
+        }
+        const list = py.c.PyList_New(0) orelse return null;
+        for (b.objects.items) |o| {
+            const bytes = py.c.PyBytes_FromStringAndSize(o.ptr, @intCast(o.len)) orelse {
+                py.Py_DecRef(list);
+                return null;
+            };
+            defer py.Py_DecRef(bytes);
+            if (py.c.PyList_Append(list, bytes) != 0) {
+                py.Py_DecRef(list);
+                return null;
+            }
+        }
+        return list;
+    }
+
     /// `program.compiled_ir()`: the LLVM IR the program compiles to (before
     /// LLVM optimizes it), as text.
     pub fn compiled_ir(self: *Program) ?*PyObject {
@@ -2050,6 +2081,7 @@ const Program = struct {
     pub const save__params__ = "path";
     pub const report__doc__: [*:0]const u8 = "report(): what to look at to make the compiled program faster: python_crossings (where compiled code went through Python, in the last run with report=True), module_state, cache (modules loaded / compiled), code ('fast', 'optimized' or None), optimizing, gil_taken, speculated (typed entries made for functions' argument kinds).";
     pub const compiled_ir__doc__: [*:0]const u8 = "compiled_ir(): the LLVM IR the program compiles to (before LLVM optimizes it), as text.";
+    pub const native_objects__doc__: [*:0]const u8 = "native_objects(): the program compiled ahead of time to run without Python (a strict language's: zrun.CompileError otherwise), as object files to link with zrun's runtime, libzrun_rt.a: a list of bytes. zrun.build_native() links them.";
     pub const source__doc__: [*:0]const u8 = "The program's source.";
     pub const tree__doc__: [*:0]const u8 = "The zgram Tree.";
     pub const analysis__doc__: [*:0]const u8 = "The zrules Analysis (None without rules).";

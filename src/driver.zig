@@ -20,6 +20,8 @@ const jit_f = llvm.f;
 const cache = @import("cache.zig");
 const program_mod = @import("program.zig");
 const grammar_mod = @import("grammar.zig");
+const standalone_build = @import("standalone_build.zig");
+const Aot = standalone_build.Aot;
 
 const allocator = std.heap.c_allocator;
 
@@ -44,6 +46,68 @@ fn markPython(set: *PythonSet, s: *PyObject, reason: []const u8) bool {
     };
     return true;
 }
+
+/// What nodes known only at run time are read with (bridge.nodeAttr):
+/// their attributes' names worked out, their texts and kinds as values
+pub const NodeCache = struct {
+    /// Node attributes by name (attrOf), nodes' texts (textStr)
+    attrs: std.AutoHashMapUnmanaged(*const value.Str, Attr) = .empty,
+    texts: []?*value.Str = &.{},
+    /// Kind and rule names as values (node.kind of a node known only at
+    /// run time), looked up once (value.literal: immortal)
+    names: std.AutoHashMapUnmanaged(u32, *value.Str) = .empty,
+
+    pub fn deinit(self: *NodeCache) void {
+        self.attrs.deinit(allocator);
+        for (self.texts) |t| if (t) |s| value.decref(value.Value.obj(.str, &s.head));
+        if (self.texts.len > 0) allocator.free(self.texts);
+        self.names.deinit(allocator);
+    }
+
+    /// A kind's (or rule's) name as a str value (borrowed: immortal).
+    pub fn nameStr(self: *NodeCache, text: []const u8, rid: u32, is_kind: bool) ?*value.Str {
+        const key = rid | (@as(u32, @intFromBool(is_kind)) << 31);
+        if (self.names.get(key)) |s| return s;
+        // (the process's: a kind kept in module state outlives the program)
+        const s = value.literal(text) orelse return null;
+        self.names.put(allocator, key, s) catch return null;
+        return s;
+    }
+
+    /// What a node's attribute is (bridge.nodeAttr): a labelled field, or
+    /// one every node has
+    pub const Attr = union(enum) { field: u8, kind, rule, text, start, end, line, column, index, parent, children, other };
+
+    /// The attribute a name (a literal's str: one per name, immortal) is,
+    /// worked out once (null: out of memory).
+    pub fn attrOf(self: *NodeCache, name: *const value.Str, g: *const grammar_mod.Grammar) ?Attr {
+        if (self.attrs.get(name)) |a| return a;
+        const s = name.bytes();
+        // (a label first: a grammar may have one named `text`...)
+        const attr: Attr = if (g.field_ids.get(s)) |f| .{ .field = f } else blk: {
+            const t = std.meta.stringToEnum(std.meta.Tag(Attr), s) orelse break :blk .other;
+            break :blk switch (t) {
+                .field, .other => .other,
+                inline else => |tt| @unionInit(Attr, @tagName(tt), {}),
+            };
+        };
+        self.attrs.put(allocator, name, attr) catch return null;
+        return attr;
+    }
+
+    /// A node's text as a str (borrowed: kept for the program, a reference
+    /// of its own: one kept after the program lives on).
+    pub fn textStr(self: *NodeCache, idx: u32, d: *const program_mod.Data) ?*value.Str {
+        if (self.texts.len == 0) {
+            self.texts = allocator.alloc(?*value.Str, d.nodes.len) catch return null;
+            @memset(self.texts, null);
+        }
+        if (self.texts[idx]) |s| return s;
+        const s = value.newStr(d.text(idx)) orelse return null;
+        self.texts[idx] = s;
+        return s;
+    }
+};
 
 pub const Compiled = struct {
     /// The compiler's memory, and the compiler (kept: thunks are compiled
@@ -83,12 +147,8 @@ pub const Compiled = struct {
     /// there's no cache to have them from
     keys: std.ArrayListUnmanaged(cache.Key) = .empty,
     kept_objects: std.AutoHashMapUnmanaged(cache.Key, []u8) = .empty,
-    /// Node attributes by name (attrOf), nodes' texts (textStr)
-    attrs: std.AutoHashMapUnmanaged(*const value.Str, Attr) = .empty,
-    texts: []?*value.Str = &.{},
-    /// Kind and rule names as values (node.kind of a node known only at
-    /// run time), looked up once (value.literal: immortal)
-    names: std.AutoHashMapUnmanaged(u32, *value.Str) = .empty,
+    /// What nodes known only at run time are read with (bridge.nodeAttr)
+    nodes: NodeCache = .{},
     /// The compiled code of Python functions the code calls (null: Python
     /// runs it)
     called: std.AutoHashMapUnmanaged(CalledKey, ?Helper) = .empty,
@@ -124,50 +184,6 @@ pub const Compiled = struct {
         return &self.runs[@as(usize, node) * 2 + @intFromEnum(which)];
     }
     const CalledKey = struct { func: *PyObject, nargs: usize, rt_mask: u64 };
-
-    /// A kind's (or rule's) name as a str value (borrowed: immortal).
-    pub fn nameStr(self: *Compiled, text: []const u8, rid: u32, is_kind: bool) ?*value.Str {
-        const key = rid | (@as(u32, @intFromBool(is_kind)) << 31);
-        if (self.names.get(key)) |s| return s;
-        // (the process's: a kind kept in module state outlives the program)
-        const s = value.literal(text) orelse return null;
-        self.names.put(allocator, key, s) catch return null;
-        return s;
-    }
-
-    /// What a node's attribute is (bridge.nodeAttr): a labelled field, or
-    /// one every node has
-    pub const Attr = union(enum) { field: u8, kind, rule, text, start, end, line, column, index, parent, children, other };
-
-    /// The attribute a name (a literal's str: one per name, immortal) is,
-    /// worked out once (null: out of memory).
-    pub fn attrOf(self: *Compiled, name: *const value.Str, g: *const grammar_mod.Grammar) ?Attr {
-        if (self.attrs.get(name)) |a| return a;
-        const s = name.bytes();
-        // (a label first: a grammar may have one named `text`...)
-        const attr: Attr = if (g.field_ids.get(s)) |f| .{ .field = f } else blk: {
-            const t = std.meta.stringToEnum(std.meta.Tag(Attr), s) orelse break :blk .other;
-            break :blk switch (t) {
-                .field, .other => .other,
-                inline else => |tt| @unionInit(Attr, @tagName(tt), {}),
-            };
-        };
-        self.attrs.put(allocator, name, attr) catch return null;
-        return attr;
-    }
-
-    /// A node's text as a str (borrowed: kept for the program, a reference
-    /// of its own: one kept after the program lives on).
-    pub fn textStr(self: *Compiled, idx: u32, d: *const program_mod.Data) ?*value.Str {
-        if (self.texts.len == 0) {
-            self.texts = allocator.alloc(?*value.Str, d.nodes.len) catch return null;
-            @memset(self.texts, null);
-        }
-        if (self.texts[idx]) |s| return s;
-        const s = value.newStr(d.text(idx)) orelse return null;
-        self.texts[idx] = s;
-        return s;
-    }
 
     /// The Python objects the code refers to (owned), by index
     pub fn objects(self: *const Compiled) []*PyObject {
@@ -215,13 +231,10 @@ pub const Compiled = struct {
         self.kept_objects.deinit(allocator);
         self.thunks.deinit(allocator);
         if (self.runs.len > 0) allocator.free(self.runs);
-        self.attrs.deinit(allocator);
+        self.nodes.deinit();
         self.special.deinit(allocator);
-        for (self.texts) |t| if (t) |s| value.decref(value.Value.obj(.str, &s.head));
-        if (self.texts.len > 0) allocator.free(self.texts);
         self.called.deinit(allocator);
         self.methods.deinit(allocator);
-        self.names.deinit(allocator);
         for (self.compiler.objects.items) |o| py.Py_DecRef(o);
         self.compiler.m.deinit();
         self.compiler.deinit(allocator);
@@ -756,7 +769,7 @@ fn defineHelpers(view: *const llvm.LlvmView) bool {
 /// can't be compiled is run as Python, and the program compiled again.
 /// False with an exception (zrun.CompileError when it can't be compiled
 /// even so).
-fn build(out: *Compiled, data: *program_mod.Data, lang: compile_mod.LangView, prefix: []const u8, compile_error: *PyObject) bool {
+fn build(out: *Compiled, data: *program_mod.Data, lang: compile_mod.LangView, prefix: []const u8, compile_error: *PyObject, aot: ?*Aot) bool {
     var force_heap = false;
     // (functions whose code needs their frame: theirs on the heap)
     var heap_fns: std.ArrayListUnmanaged(u32) = .empty;
@@ -764,6 +777,11 @@ fn build(out: *Compiled, data: *program_mod.Data, lang: compile_mod.LangView, pr
     while (true) {
         out.failure = .{};
         out.compiler = compile_mod.Compiler.init(out.arena.allocator(), data, lang, prefix, &out.failure);
+        // (a standalone build's notes: each attempt's own)
+        if (aot) |x| {
+            x.* = .{};
+            out.compiler.aot = x;
+        }
         out.compiler.force_heap = force_heap;
         out.compiler.heap_fns = heap_fns.items;
         out.compiler.compileProgram() catch |e| {
@@ -817,7 +835,7 @@ fn build(out: *Compiled, data: *program_mod.Data, lang: compile_mod.LangView, pr
 /// A program's IR made (its compiler's module, not compiled yet), for
 /// LLVM's level `opt` (0: compiled fast, 2: optimized): null with an
 /// exception (zrun.CompileError when the semantics can't be compiled).
-fn prepare(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject, seed: *const [32]u8, opt: u32) ?*Compiled {
+fn prepare(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject, seed: *const [32]u8, opt: u32, aot: ?*Aot) ?*Compiled {
     const view = llvm.get() orelse return null;
     if (!defineHelpers(view)) return null;
 
@@ -831,7 +849,7 @@ fn prepare(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonS
         return oom();
     };
     out.prefix = prefix;
-    if (!build(out, data, lang, prefix, compile_error)) {
+    if (!build(out, data, lang, prefix, compile_error, aot)) {
         out.arena.deinit();
         allocator.destroy(out);
         return null;
@@ -848,7 +866,7 @@ fn mainName(c: *Compiled) ?[:0]const u8 {
 /// null with an exception (zrun.CompileError when the semantics can't be
 /// compiled).
 pub fn compileProgram(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject, seed: *const [32]u8, opt: u32) ?*Compiled {
-    const out = prepare(data, lang, python, compile_error, seed, opt) orelse return null;
+    const out = prepare(data, lang, python, compile_error, seed, opt, null) orelse return null;
     const main_name = mainName(out) orelse {
         out.destroy();
         return oom();
@@ -1082,7 +1100,7 @@ fn freeAbandoned() void {
 /// when its code isn't at hand: null with an exception.
 pub fn compileInBackground(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject, seed: *const [32]u8) ?*Pending {
     freeAbandoned();
-    const c = prepare(data, lang, python, compile_error, seed, 2) orelse return null;
+    const c = prepare(data, lang, python, compile_error, seed, 2, null) orelse return null;
     const p = allocator.create(Pending) catch {
         c.destroy();
         _ = py.c.PyErr_NoMemory();
@@ -1123,7 +1141,7 @@ pub fn irText(data: *program_mod.Data, lang: compile_mod.LangView, python: *Pyth
     const view = llvm.get() orelse return null;
     const out = allocator.create(Compiled) catch return null;
     out.* = .{ .arena = std.heap.ArenaAllocator.init(allocator), .compiler = undefined, .python = python, .view = view, .main = undefined, .globals = 0 };
-    if (!build(out, data, lang, "zr_ir", compile_error)) {
+    if (!build(out, data, lang, "zr_ir", compile_error, null)) {
         out.arena.deinit();
         allocator.destroy(out);
         return null;
@@ -1149,4 +1167,150 @@ fn oomA() ?usize {
 fn oomT() ?Thunk {
     _ = py.c.PyErr_NoMemory();
     return null;
+}
+
+// -- standalone builds --
+
+/// A standalone build (lang.build_native()): the program compiled ahead of
+/// time, all of it (standalone_build.zig), its objects (owned: deinit and
+/// destroy); null with an exception (zrun.CompileError when the program
+/// can't be).
+pub fn buildStandalone(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject, seed: *const [32]u8, opt: u32, max_depth: u64, path: []const u8) ?*standalone_build.Build {
+    var aot: Aot = .{};
+    const c = prepare(data, lang, python, compile_error, seed, opt, &aot) orelse return null;
+    defer c.destroy();
+    const b = allocator.create(standalone_build.Build) catch {
+        _ = py.c.PyErr_NoMemory();
+        return null;
+    };
+    b.* = standalone_build.Build.init(c.view, opt);
+    if (!aheadOfTime(c, b, &aot, data, max_depth, path, compile_error)) {
+        b.deinit();
+        allocator.destroy(b);
+        return null;
+    }
+    return b;
+}
+
+fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *program_mod.Data, max_depth: u64, path: []const u8, compile_error: *PyObject) bool {
+    const comp = &c.compiler;
+    const failed = struct {
+        fn f(made: *standalone_build.Build, e: standalone_build.Error, err_class: *PyObject) bool {
+            switch (e) {
+                error.OutOfMemory => _ = py.c.PyErr_NoMemory(),
+                else => ph.raise(err_class, "{s}", .{made.why.items}),
+            }
+            return false;
+        }
+    }.f;
+    b.emit(&comp.m) catch |e| return failed(b, e, compile_error);
+    // What's compiled as a program runs in the JIT, compiled now: the
+    // thunks of nodes code evaluates knowing them only at run time (each
+    // node of the scope the code runs in, with a semantic for it), the
+    // Python functions it holds as values for every way it calls those it
+    // only knows at run time; till compiling them finds no more
+    const pt = compile_mod.pyFunctionType();
+    var sites_done: usize = 0;
+    const ThunkKey = struct { node: u32, which: u32, owner: u32 };
+    var thunks_tried: std.AutoHashMapUnmanaged(ThunkKey, void) = .empty;
+    defer thunks_tried.deinit(allocator);
+    const Tried = struct { func: usize, nargs: usize, rt_mask: u64 };
+    var tried: std.AutoHashMapUnmanaged(Tried, void) = .empty;
+    defer tried.deinit(allocator);
+    while (true) {
+        var more = false;
+        while (sites_done < aot.run_sites.count()) : (sites_done += 1) {
+            more = true;
+            const site = aot.run_sites.keys()[sites_done];
+            const table = if (site.which == 0) comp.lang.eval_of else comp.lang.exec_of;
+            for (0..data.nodes.len) |i| {
+                const n: u32 = @intCast(i);
+                // (code given its scope when it runs (a helper's out of
+                // line): any node, in its own)
+                const owner = if (site.owner == compile_mod.OWNER_PARAM) comp.ownerOf(n) else site.owner;
+                if (comp.ownerOf(n) != owner) continue;
+                const rid = data.rule(n);
+                if (rid >= table.len or table[rid] == null) continue;
+                if ((thunks_tried.getOrPut(allocator, .{ .node = n, .which = site.which, .owner = owner }) catch return oomB()).found_existing) continue;
+                const made: ?[:0]const u8 = while (true) {
+                    comp.failed_semantic = null;
+                    comp.need_retry = false;
+                    break comp.compileThunk(n, @enumFromInt(site.which), owner) catch |e| {
+                        comp.forgetModule();
+                        if (e == error.Unsupported and comp.need_retry) continue;
+                        // (a node it can't be: an error if it's ever run)
+                        py.c.PyErr_Clear();
+                        break null;
+                    };
+                };
+                const name = made orelse continue;
+                b.emit(&comp.m) catch |e| return failed(b, e, compile_error);
+                b.thunks.append(b.arena.allocator(), .{ .node = n, .which = site.which, .owner = owner, .name = name }) catch return oomB();
+            }
+        }
+        // (the objects the code holds, and those in the values it refers to)
+        var held: std.ArrayListUnmanaged(*PyObject) = .empty;
+        defer held.deinit(allocator);
+        held.appendSlice(allocator, comp.objects.items) catch return oomB();
+        standalone_build.heldObjects(allocator, &aot.notes, &held) catch return oomB();
+        for (held.items) |o| {
+            // (a closure too: its code for it, the variables it captured
+            // read as they are now, as the front reads them)
+            if (pt == null or ph.typeOf(o) != @as(*py.c.PyTypeObject, @ptrCast(@alignCast(pt.?)))) continue;
+            for (aot.shapes.keys()) |s| {
+                const key = Tried{ .func = @intFromPtr(o), .nargs = s.nargs, .rt_mask = s.rt_mask };
+                if ((tried.getOrPut(allocator, key) catch return oomB()).found_existing) continue;
+                more = true;
+                const made: ?[:0]const u8 = while (true) {
+                    comp.failed_semantic = null;
+                    comp.need_retry = false;
+                    break comp.compileCalled(o, s.nargs, s.rt_mask, false) catch |e| {
+                        comp.forgetModule();
+                        if (e == error.Unsupported and comp.need_retry) continue;
+                        py.c.PyErr_Clear();
+                        break null;
+                    };
+                };
+                const name = made orelse continue;
+                b.emit(&comp.m) catch |e| return failed(b, e, compile_error);
+                b.called.append(b.arena.allocator(), .{ .func = key.func, .nargs = key.nargs, .rt_mask = key.rt_mask, .name = name }) catch return oomB();
+            }
+        }
+        if (!more) break;
+    }
+    // The image
+    const main_name = mainName(c) orelse return oomB();
+    const grammar_desc = b.describeGrammar(data.grammar) catch return oomB();
+    // (what rt.load / rt.store of an rt value find variables by)
+    const ba = b.arena.allocator();
+    const owners = ba.alloc(u32, data.nodes.len) catch return oomB();
+    for (owners, 0..) |*o, i| o.* = comp.ownerOf(@intCast(i));
+    const syms = ba.alloc(@import("standalone.zig").SymInfo, data.syms.len) catch return oomB();
+    for (syms, data.syms, 0..) |*s, sym, i| s.* = .{
+        .scope = sym.scope,
+        .home = data.homeOf(@intCast(i)),
+        .slot = comp.slot_of.get(@intCast(i)) orelse program_mod.NONE,
+        .builtin = @intFromBool(sym.builtin),
+    };
+    b.emitImage(&aot.notes, .{
+        .main_name = main_name,
+        .globals = c.globals,
+        .max_depth = max_depth,
+        .objects = comp.objects.items,
+        .path = path,
+        .source = data.input,
+        .nodes = std.mem.sliceAsBytes(data.nodes),
+        .nodes_len = data.nodes.len,
+        .parents = data.parents,
+        .grammar = grammar_desc,
+        .sym_of = data.sym_of,
+        .owners = owners,
+        .syms = syms,
+    }) catch |e| return failed(b, e, compile_error);
+    return true;
+}
+
+fn oomB() bool {
+    _ = py.c.PyErr_NoMemory();
+    return false;
 }

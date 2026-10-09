@@ -34,6 +34,7 @@ const value = @import("value.zig");
 const objects_mod = @import("objects.zig");
 const types_mod = @import("types.zig");
 const adopt_mod = @import("adopt.zig");
+const Aot = @import("standalone_build.zig").Aot;
 const Value = value.Value;
 
 const Allocator = std.mem.Allocator;
@@ -882,7 +883,7 @@ var rebound_cache: std.AutoHashMapUnmanaged(*PyObject, ScanEntry) = .empty;
 const AT_PARAM: u32 = NONE - 2;
 /// In a helper's code out of line, the scope of the frames it runs in: its
 /// caller's, given at run time
-const OWNER_PARAM: u32 = NONE - 3;
+pub const OWNER_PARAM: u32 = NONE - 3;
 
 /// A helper compiled out of line, once for the calls like it: the
 /// arguments it's made for (rt, Python objects, bools: its code depends on
@@ -1076,6 +1077,10 @@ pub const Compiler = struct {
     kind_table: ?[]u64 = null,
     owner_table: ?[]u64 = null,
     field_tables: std.AutoHashMapUnmanaged(u8, []u64) = .empty,
+    /// A standalone build's (standalone_build.zig): all of it compiled
+    /// ahead of time, no tiers, what the code refers to noted; null in the
+    /// JIT
+    aot: ?*Aot = null,
 
     /// In a field table: a node whose label isn't one child or none (a
     /// list of them, a value an action makes): zr_getattr's
@@ -1232,6 +1237,15 @@ pub const Compiler = struct {
         for (self.new_fns.items) |f| _ = self.compiled_fns.remove(f);
         self.new_fns.clearRetainingCapacity();
         self.queue.clearRetainingCapacity();
+        // (a standalone build's code of called functions, made in it: to
+        // make again)
+        if (self.aot) |x| for (self.helper_fns.items[self.helpers_kept..]) |h| {
+            var it = x.called.iterator();
+            while (it.next()) |e| if (e.value_ptr.*.ptr == h.name.ptr) {
+                x.called.removeByPtr(e.key_ptr);
+                break;
+            };
+        };
         self.helper_fns.shrinkRetainingCapacity(self.helpers_kept);
         self.helper_queue.clearRetainingCapacity();
     }
@@ -1355,6 +1369,27 @@ pub const Compiler = struct {
         try self.helper_fns.append(self.a, h);
         try self.helper_queue.append(self.a, h);
         try self.drainQueues();
+        return h.name;
+    }
+
+    /// A standalone build's code for a Python function called with `nargs`
+    /// of its values where it's known (compileCalled's, without rt values),
+    /// compiled with the module being made (once for the program): its
+    /// name.
+    pub fn calledHere(self: *Compiler, o: *PyObject, nargs: usize) Error![:0]const u8 {
+        const aot = self.aot.?;
+        const key = Aot.CalledKey{ .func = @intFromPtr(o), .nargs = nargs };
+        if (aot.called.get(key)) |name| return name;
+        const func = try self.readFunction(o);
+        if (!func.takes(nargs)) return self.unsupported("{s}() takes {d} to {d} arguments, called with {d}", .{ func.name, func.required, func.param_count, nargs });
+        const args = try self.a.alloc(SVal, nargs);
+        for (args) |*slot| slot.* = .{ .dyn = undefined };
+        _ = try self.objectIndex(o);
+        const h = try self.a.create(HelperSpec);
+        h.* = .{ .func = func, .args = args, .name = try std.fmt.allocPrintSentinel(self.a, "{s}_c{d}", .{ self.m.prefix, self.helper_fns.items.len }, 0), .semantic = null, .raw = true };
+        try self.helper_fns.append(self.a, h);
+        try self.helper_queue.append(self.a, h);
+        try aot.called.put(self.a, key, h.name);
         return h.name;
     }
 
@@ -1566,6 +1601,7 @@ pub const Compiler = struct {
     fn declareRuntime(self: *Compiler) !void {
         // (the program's names for addresses, across its modules)
         self.m.counter = &self.ksyms;
+        self.m.notes = if (self.aot) |x| &x.notes else null;
         for (runtime_decls) |d| {
             var params: [12]ir.Type = undefined;
             for (d[1][1..], 0..) |l, i| params[i] = self.letterType(l);
@@ -2372,7 +2408,7 @@ const Gen = struct {
                 try f.condBr(f.icmp(jit_c.LLVMIntUGT, self.nargs, self.k(@intCast(nparams))), extra, none);
                 try f.block(none);
                 f.store(self.k(@intFromEnum(value.Tag.tuple)), self.varargs_slot);
-                f.store(f.ptrToInt(self.c.m.ptrConst(@intFromPtr(helpers.empty_tuple.?))), f.field(t.val, self.varargs_slot, 1));
+                f.store(f.ptrToInt(self.c.m.ptrOf(@intFromPtr(helpers.empty_tuple.?), .{ .value = @intFromEnum(value.Tag.tuple) })), f.field(t.val, self.varargs_slot, 1));
                 try f.br(done);
                 try f.block(extra);
                 try self.callCheck("zr_varargs", &.{ self.ctx, self.k32(self.fnode), self.args, self.nargs, self.k(@intCast(nparams)), self.out });
@@ -2736,7 +2772,7 @@ const Gen = struct {
             try frozen_natives.put(std.heap.c_allocator, o, v);
             break :blk v;
         };
-        return .{ .tag = self.k(@intCast(v.tag)), .bits = self.c.m.addrInt(v.bits), .shape = shape };
+        return .{ .tag = self.k(@intCast(v.tag)), .bits = self.c.m.addrOf(v.bits, .{ .value = v.tag }), .shape = shape };
     }
 
     /// A zrun.comptime function's result (a list or dict, comptimeValue) at
@@ -2750,7 +2786,7 @@ const Gen = struct {
             try comptime_natives.put(std.heap.c_allocator, o, v);
             break :blk v;
         };
-        return .{ .tag = self.k(@intCast(v.tag)), .bits = self.c.m.addrInt(v.bits), .shape = shape };
+        return .{ .tag = self.k(@intCast(v.tag)), .bits = self.c.m.addrOf(v.bits, .{ .value = v.tag }), .shape = shape };
     }
 
     /// A Python list or dict as a native one (its items as values are:
@@ -2809,14 +2845,14 @@ const Gen = struct {
             // (a big int within 128 bits: a Big, made once for the program)
             .py => |o| if (ph.typeOf(o) == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyLong_Type")))) and value.bigOf(o) != null) blk: {
                 const b = try self.c.bigConst(value.bigOf(o).?);
-                break :blk .{ .tag = self.k(@intFromEnum(value.Tag.big)), .bits = self.c.m.addrInt(@intFromPtr(b)), .shape = .any };
+                break :blk .{ .tag = self.k(@intFromEnum(value.Tag.big)), .bits = self.c.m.addrOf(@intFromPtr(b), .big), .shape = .any };
             } else if (ph.typeOf(o) == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyBytes_Type"))))) blk: {
                 // (a bytes constant: native, its memory, made once for the
                 // program (immortal: the program keeps the object))
                 _ = try self.c.objectIndex(o);
                 const bv = value.fromPython(o) orelse return error.Python;
                 bv.ptr().rc = value.IMMORTAL;
-                break :blk .{ .tag = self.k(@intFromEnum(value.Tag.bytes)), .bits = self.c.m.addrInt(bv.bits), .shape = .any };
+                break :blk .{ .tag = self.k(@intFromEnum(value.Tag.bytes)), .bits = self.c.m.addrOf(bv.bits, .{ .value = bv.tag }), .shape = .any };
             } else blk: {
                 // (a constant of the source's, bytes, complex or `...`: only
                 // held, what's done with it checked where it's done)
@@ -3198,7 +3234,7 @@ const Gen = struct {
         // scope it's given: the frames up to `owner`'s walked when it runs)
         if (self.detached) {
             const owners = try c.ownerTable();
-            return self.call("zr_frame_of", &.{ self.frame.?, self.owner_param, c.m.k32(owner), c.m.ptrConst(@intFromPtr(owners.ptr)) });
+            return self.call("zr_frame_of", &.{ self.frame.?, self.owner_param, c.m.k32(owner), c.m.ptrOf(@intFromPtr(owners.ptr), .{ .words = .{ .len = owners.len } }) });
         }
         if (owner == self.fnode) return self.frame orelse c.unsupported(unreachable_msg ++ " (node {d})", .{owner});
         if (self.fnode == NONE) return c.unsupported(unreachable_msg ++ " (node {d})", .{owner});
@@ -3634,6 +3670,9 @@ const Gen = struct {
         const spec = c.specOf(fnode).?;
         const n = self.paramNodes(fnode, spec).len;
         if (n == 0 or n > 4) return;
+        // (a standalone build: a typed entry only if it's declared, none
+        // made as it runs)
+        if (c.aot != null and try self.typedParams(fnode) == null) return;
         const generic = try f.label("entry_generic");
         const guard = try f.label("entry_check");
         const forward = try f.label("entry_typed");
@@ -4068,6 +4107,8 @@ const Gen = struct {
         c.uses_python = true;
         const d = try self.materialize(v, at);
         const owner = self.currentOwner();
+        // (a standalone build: the thunks it can run compiled ahead)
+        if (c.aot) |x| try x.noteRunSite(c.a, if (which == 0) 0 else 1, owner);
         // (the code it runs sees this code's variables through the frames)
         var made: ?ir.Value = null;
         const slot = if (self.scopes.items.len > 0) self.scopes.items[self.scopes.items.len - 1].slot else blk: {
@@ -4904,6 +4945,8 @@ const Gen = struct {
     /// code (`key`) does: its Site (a number in the compiler's), or null.
     fn siteOf(self: *Gen, func: *const front.Function, args: []const SVal, key: []const SVal, semantic: ?*PyObject) Error!?usize {
         const c = self.c;
+        // (a standalone build: no tiers)
+        if (c.aot != null) return null;
         const full = try c.a.alloc(SVal, args.len);
         const layout = try c.a.alloc(bool, args.len);
         var more = false;
@@ -5771,7 +5814,7 @@ const Gen = struct {
             for (cands) |cand| {
                 const yes = try f.label("setfield_of");
                 const no = try f.label("setfield_next");
-                try f.condBr(f.icmp(jit_c.LLVMIntEQ, rt, self.c.m.addrInt(@intFromPtr(cand.rtype))), yes, no);
+                try f.condBr(f.icmp(jit_c.LLVMIntEQ, rt, self.c.m.addrOf(@intFromPtr(cand.rtype), .rtype)), yes, no);
                 try f.block(yes);
                 const p = self.fieldPtr(d, cand.index);
                 const old = Dyn{ .tag = f.load(t.i64, p), .bits = f.load(t.i64, f.offset(p, 8)), .shape = .any };
@@ -6339,7 +6382,7 @@ const Gen = struct {
             .make_closure => |func| {
                 const env = try self.closureEnv(inst, func);
                 const code = try self.closureCode(func);
-                const ok = self.call("zr_closure", &.{ self.ctx, self.k32(inst.node), self.c.m.addrInt(@intFromPtr(func)), env orelse self.c.m.nullPtr(), code, self.out });
+                const ok = self.call("zr_closure", &.{ self.ctx, self.k32(inst.node), self.c.m.addrOf(@intFromPtr(func), .function), env orelse self.c.m.nullPtr(), code, self.out });
                 try self.check(ok);
                 return .{ .dyn = try self.loadOut(.any) };
             },
@@ -6821,7 +6864,7 @@ const Gen = struct {
                     try self.c.adopted.append(self.c.a, nv);
                     return .{ .dyn = .{
                         .tag = self.k(@intCast(nv.tag)),
-                        .bits = self.c.m.addrInt(nv.bits),
+                        .bits = self.c.m.addrOf(nv.bits, .{ .value = nv.tag }),
                         .shape = switch (nv.kind()) {
                             .list => .list,
                             .dict => .dict,
@@ -7019,7 +7062,7 @@ const Gen = struct {
         try f.condBr(f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.node))), is_node, slow);
         try f.block(is_node);
         // (an immortal str: no reference to take)
-        const s = f.load(t.i64, f.at(t.i64, self.c.m.ptrConst(@intFromPtr(table.ptr)), d.bits));
+        const s = f.load(t.i64, f.at(t.i64, self.c.m.ptrOf(@intFromPtr(table.ptr), .{ .words = .{ .len = table.len, .strs = true } }), d.bits));
         try f.br(join);
         try f.block(slow);
         const g = try self.getattrCall(inst, d, name);
@@ -7047,7 +7090,7 @@ const Gen = struct {
         const join = try f.label("field_got");
         try f.condBr(f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.node))), is_node, slow);
         try f.block(is_node);
-        const ch = f.load(t.i64, f.at(t.i64, self.c.m.ptrConst(@intFromPtr(table.ptr)), d.bits));
+        const ch = f.load(t.i64, f.at(t.i64, self.c.m.ptrOf(@intFromPtr(table.ptr), .{ .words = .{ .len = table.len } }), d.bits));
         try f.condBr(f.icmp(jit_c.LLVMIntEQ, ch, self.k(Compiler.field_other)), slow, known);
         try f.block(known);
         const none = f.icmp(jit_c.LLVMIntEQ, ch, self.k(NONE));
@@ -7121,7 +7164,7 @@ const Gen = struct {
         for (cands) |cand| {
             const yes = try f.label("field_of");
             const no = try f.label("field_next");
-            try f.condBr(f.icmp(jit_c.LLVMIntEQ, rt, self.c.m.addrInt(@intFromPtr(cand.rtype))), yes, no);
+            try f.condBr(f.icmp(jit_c.LLVMIntEQ, rt, self.c.m.addrOf(@intFromPtr(cand.rtype), .rtype)), yes, no);
             try f.block(yes);
             const p = self.fieldPtr(d, cand.index);
             const ftag = f.load(t.i64, p);
@@ -7228,6 +7271,9 @@ const Gen = struct {
     }
 
     fn genericMethodCall(self: *Gen, inst: *Inst, d: Dyn, name: []const u8, args: []const SVal) Error!SVal {
+        // (a standalone build: a function in a field called so, compiled
+        // ahead for calls like this one)
+        try self.noteShape(args);
         const arr = try self.valueArray(args, inst.node);
         const s = try self.c.m.string(name);
         const ok = self.call("zr_call_method", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, s, arr, self.k(@intCast(args.len)), self.out });
@@ -7294,7 +7340,7 @@ const Gen = struct {
             try f.block(of_type);
             // (a record's type: the word after its header)
             const rt = f.load(t.i64, f.offset(f.intToPtr(d.bits), 16));
-            try f.condBr(f.icmp(jit_c.LLVMIntEQ, rt, self.c.m.addrInt(@intFromPtr(cand.rtype))), yes, no);
+            try f.condBr(f.icmp(jit_c.LLVMIntEQ, rt, self.c.m.addrOf(@intFromPtr(cand.rtype), .rtype)), yes, no);
             try f.block(yes);
             const r = try self.materialize(try self.outOfLine(cand.func, inst.node, try self.withDefaults(cand.func, all)), inst.node);
             try self.storeSlot(result, r);
@@ -7883,6 +7929,17 @@ const Gen = struct {
     /// value: a Python object's called as Python calls it (its arguments
     /// and result as they are, its error its own), not as rt.call hands
     /// values over (ints I64s, a host function's error worded so).
+    /// A standalone build's note of a call of a function only known at run
+    /// time: its arguments' count, which are rt values (Aot.shapes)
+    fn noteShape(self: *Gen, args: []const SVal) Error!void {
+        const x = self.c.aot orelse return;
+        var mask: u64 = 0;
+        for (args, 0..) |item, i| if (item == .rt and i < 64) {
+            mask |= @as(u64, 1) << @intCast(i);
+        };
+        try x.noteShape(self.c.a, args.len, mask);
+    }
+
     fn dynCall(self: *Gen, inst: *Inst, fv: SVal, args_v: SVal, receiver: ?SVal, plain: bool) Error!SVal {
         const items: []const SVal = switch (args_v) {
             .list => |l| blk: {
@@ -7900,6 +7957,9 @@ const Gen = struct {
             if (try self.hostInline(inst, fv.py, items)) |v| return v;
             return self.hostCall(inst, fv.py, items);
         }
+        // (a standalone build: Python functions held as values compiled
+        // ahead for calls like this one)
+        try self.noteShape(items);
         // (a function of the top level read without a reference: called so,
         // kept for the call (buried if its variable's stored to: storeVar))
         const fd = if (self.topBorrowed(fv)) fv.dyn else try self.materialize(fv, inst.node);
@@ -8044,6 +8104,9 @@ const Gen = struct {
         const idx = try self.c.objectIndex(o);
         const slot = try self.c.a.create(u64);
         slot.* = 0;
+        // (a standalone build: the function's code compiled here, the
+        // slot holding its address from the start)
+        if (self.c.aot != null) m.note(@intFromPtr(slot), .{ .code = try self.c.calledHere(o, n) });
         const slot_p = m.ptrConst(@intFromPtr(slot));
         // (ints as rt hands them over: I64s, a plain int's tag made an I64's)
         for (0..n) |i| {
@@ -8348,12 +8411,12 @@ const Gen = struct {
                 @memcpy(full[0..args.len], args);
                 for (full[args.len..], args.len..) |*slot, i| slot.* = try self.fieldDefault(inst, o, rtype, i, pos);
                 const arr = try self.valueArray(full, inst.node);
-                try self.callCheck("zr_record", &.{ self.ctx, self.k32(inst.node), self.ptrConst(rtype), arr, self.out });
+                try self.callCheck("zr_record", &.{ self.ctx, self.k32(inst.node), self.c.m.ptrOf(@intFromPtr(rtype), .rtype), arr, self.out });
                 return .{ .dyn = try self.loadOut(.record) };
             }
             // (a class with __slots__: its fields unset, then its __init__
             // on it, compiled)
-            try self.callCheck("zr_record_new", &.{ self.ctx, self.k32(inst.node), self.ptrConst(rtype), self.out });
+            try self.callCheck("zr_record_new", &.{ self.ctx, self.k32(inst.node), self.c.m.ptrOf(@intFromPtr(rtype), .rtype), self.out });
             const rec = try self.loadOut(.record);
             const init = ph.attr(o, "__init__") orelse return error.Python;
             defer py.Py_DecRef(init);
@@ -9088,9 +9151,9 @@ const Gen = struct {
         try f.block(maybe);
         try f.condBr(is_rec, rec, slow);
         try f.block(rec);
-        try f.condBr(f.icmp(jit_c.LLVMIntEQ, self.recordTypeOf(d), self.c.m.addrInt(@intFromPtr(rtype))), join, slow);
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, self.recordTypeOf(d), self.c.m.addrOf(@intFromPtr(rtype), .rtype)), join, slow);
         try f.block(slow);
-        const r = f.zext64(self.call("zr_is_record", &.{ d.tag, d.bits, self.ptrConst(rtype) }));
+        const r = f.zext64(self.call("zr_is_record", &.{ d.tag, d.bits, self.c.m.ptrOf(@intFromPtr(rtype), .rtype) }));
         const slow_end = f.current;
         try f.br(join);
         try f.block(join);
@@ -9195,7 +9258,7 @@ const Gen = struct {
         // an I64's or a plain int's)
         switch (d.shape) {
             .any, .int => {},
-            .record => if (d.rtype) |rt| return .{ .key = self.c.m.addrInt(@intFromPtr(rt)), .host = self.c.m.k1(false) },
+            .record => if (d.rtype) |rt| return .{ .key = self.c.m.addrOf(@intFromPtr(rt), .rtype), .host = self.c.m.k1(false) },
             else => return .{ .key = self.k(@intCast(@intFromEnum(shapeTag(d.shape)))), .host = self.c.m.k1(false) },
         }
         const low = f.and_(d.tag, self.k(0xffff_ffff));
@@ -9238,7 +9301,7 @@ const Gen = struct {
         const tag: ?i64 = if (is.t(o, "PyLong_Type")) @intCast(value.PINT_TAG) else if (o == types_mod.I64) @intFromEnum(T.int) else if (is.t(o, "PyFloat_Type")) @intFromEnum(T.float) else if (is.t(o, "PyUnicode_Type")) @intFromEnum(T.str) else if (is.t(o, "PyBool_Type")) @intFromEnum(T.bool) else if (is.t(o, "PyList_Type")) @intFromEnum(T.list) else if (is.t(o, "PyTuple_Type")) @intFromEnum(T.tuple) else if (is.t(o, "PyDict_Type")) @intFromEnum(T.dict) else if (o == @as(*PyObject, @ptrCast(@alignCast(ph.typeOf(py.Py_None()))))) @intFromEnum(T.none) else if (o == objects_mod.FunctionType) @intFromEnum(T.function) else if (o == objects_mod.NodeType) @intFromEnum(T.node) else if (is.t(o, "PySet_Type")) @intFromEnum(T.set) else if (is.t(o, "PyBytes_Type")) py_bytes_key else if (o == @import("bytes.zig").BytesType) @intFromEnum(T.bytes) else if (o == pyFunctionType()) @intFromEnum(T.closure) else null;
         if (tag) |n| return self.k(n);
         if (try isInstanceOf(o, @ptrCast(@alignCast(py.types.typeObject("PyType_Type"))))) {
-            if (try self.c.recordType(o)) |rt| return self.c.m.addrInt(@intFromPtr(rt));
+            if (try self.c.recordType(o)) |rt| return self.c.m.addrOf(@intFromPtr(rt), .rtype);
         }
         return null;
     }

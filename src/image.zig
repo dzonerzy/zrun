@@ -237,6 +237,28 @@ fn sizeAhead(r: *Reader) usize {
 // The compiler's side
 // ----------------------------------------------------------------------
 
+/// What an address the code refers to (ir.Module.ptrConst) is, said where
+/// the code takes it: how a standalone build puts it in the image
+pub const Note = union(enum) {
+    /// A value.Str (a literal: immortal)
+    str,
+    /// A value.Big
+    big,
+    /// The object of a value (its tag): a constant table, a bytes, a tuple
+    value: u64,
+    /// A value.RecordType
+    rtype,
+    /// A closure's front.Function
+    function,
+    /// A table of words (strs: each one a str's address)
+    words: struct { len: usize, strs: bool = false },
+    /// A word: the address of the compiled code of that name
+    code: [:0]const u8,
+    /// A Python object the code holds (a host function as a value): a
+    /// stand-in, the same object to the code
+    pyobj,
+};
+
 /// An item: a static object's bytes, a table of words, or a description
 /// built at the start
 pub const Entry = union(enum) {
@@ -244,6 +266,8 @@ pub const Entry = union(enum) {
     static: []const u8,
     /// Words, those that are another item's address (by index) relocated
     words: struct { words: []const u64, refs: []const ?u32 },
+    /// A word: the address of the compiled code of that name
+    code: [:0]const u8,
     /// Built at the start: its kind, its room, its description
     built: struct { kind: Kind, size: usize, desc: []const u8 },
 };

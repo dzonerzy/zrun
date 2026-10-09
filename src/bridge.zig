@@ -28,6 +28,7 @@ const program_mod = @import("program.zig");
 const grammar_mod = @import("grammar.zig");
 const compile_mod = @import("compile.zig");
 const driver = @import("driver.zig");
+const standalone = @import("standalone.zig");
 
 const Value = value.Value;
 const Ctx = helpers.Ctx;
@@ -50,26 +51,34 @@ pub const Link = struct {
     error_object: *const fn (program: *anyopaque, idx: u32, message: []const u8, stack: []const helpers.CallEntry) ?*PyObject,
 };
 
+/// The program's tree and what reading it works out: the JIT's program's,
+/// or a standalone one's
+fn nodeSource(ctx: *Ctx) struct { data: *const program_mod.Data, cache: *driver.NodeCache } {
+    if (comptime helpers.standalone) return .{ .data = standalone.programData(), .cache = &standalone.nodes };
+    const link = linkOf(ctx);
+    return .{ .data = link.data, .cache = &link.compiled.nodes };
+}
+
 /// node.name of a node only known at run time, read from the program's
 /// tree as the compiler reads a known node's: true / false (an error), or
 /// null for one not read here (Python's Node then: a field whose value an
 /// action makes...).
 pub fn nodeAttr(ctx: *Ctx, idx: u32, name: *const value.Str, out: *Value) ?bool {
-    const link = linkOf(ctx);
-    const d = link.data;
+    const src = nodeSource(ctx);
+    const d = src.data;
     const n = d.nodes[idx];
     const rid = n.ruleId();
     // (what the name is, worked out once: a literal's str is one per name)
-    const attr = link.compiled.attrOf(name, d.grammar) orelse return helpers.fail(ctx, idx, "out of memory", .{});
+    const attr = src.cache.attrOf(name, d.grammar) orelse return helpers.fail(ctx, idx, "out of memory", .{});
     switch (attr) {
         .field => |field| return fieldValue(ctx, d, idx, rid, field, out),
         .kind, .rule => {
             const is_kind = attr == .kind;
-            const s = link.compiled.nameStr(if (is_kind) d.grammar.kind_names[rid] else d.grammar.rule_names[rid], rid, is_kind) orelse return helpers.fail(ctx, idx, "out of memory", .{});
+            const s = src.cache.nameStr(if (is_kind) d.grammar.kind_names[rid] else d.grammar.rule_names[rid], rid, is_kind) orelse return helpers.fail(ctx, idx, "out of memory", .{});
             out.* = Value.obj(.str, &s.head);
         },
         .text => {
-            const s = link.compiled.textStr(idx, d) orelse return helpers.fail(ctx, idx, "out of memory", .{});
+            const s = src.cache.textStr(idx, d) orelse return helpers.fail(ctx, idx, "out of memory", .{});
             value.increfObj(&s.head);
             out.* = Value.obj(.str, &s.head);
         },
@@ -262,6 +271,15 @@ pub export fn zr_run_value(ctx: *Ctx, which: u32, at: u32, tag: u64, bits: u64, 
 /// A node's eval or exec from compiled code that only knows it at run
 /// time: its Python semantic, or its thunk (compiled the first time).
 fn runNode(ctx: *Ctx, which: compile_mod.Which, idx: u32, frame_slot: **value.Frame, owner: u32, out: *Value) i32 {
+    // (a standalone program: its thunk compiled ahead)
+    if (comptime helpers.standalone) {
+        const code = standalone.thunkOf(idx, @intFromEnum(which), owner) orelse {
+            _ = helpers.fail(ctx, idx, "this node's {s} wasn't compiled ahead of time (a standalone program runs only what its build compiled)", .{@tagName(which)});
+            return 0;
+        };
+        const t: *const fn (*Ctx, *value.Frame, *Value) callconv(.c) i32 = @ptrCast(@alignCast(code));
+        return t(ctx, frame_slot.*, out);
+    }
     const link = linkOf(ctx);
     // (what it did last time, for the same frames: again)
     const run_ = link.compiled.runOf(idx, which, link.data.nodes.len) orelse {
@@ -601,12 +619,47 @@ pub export fn zr_control_value(ctx: *Ctx, at: u32, t: u64, bits: u64, out: *Valu
     return true;
 }
 
+/// compiledCall in a standalone program: the function's code compiled
+/// ahead for calls like this one (its stand-in's, by its arguments' count
+/// and rt values), or an error.
+fn standaloneCall(ctx: *Ctx, node: u32, callee: *PyObject, args: []const Value, checked: bool, out: *Value) ?bool {
+    if (args.len > 63) return helpers.fail(ctx, node, "a call of {d} arguments wasn't compiled ahead of time", .{args.len});
+    var mask: u64 = 0;
+    var frame: ?*value.Frame = null;
+    var owner: u32 = 0;
+    var given: [64]Value = undefined;
+    var n: usize = 0;
+    for (args, 0..) |a, i| {
+        if (a.kind() == .rt) {
+            mask |= @as(u64, 1) << @intCast(i);
+            frame = @ptrFromInt(a.bits);
+            owner = a.rtOwner();
+            continue;
+        }
+        given[n] = if (checked) a.checked() else a;
+        n += 1;
+    }
+    const code_p = standalone.calledOf(@intFromPtr(callee), args.len, mask) orelse
+        return helpers.fail(ctx, node, "{s}() wasn't compiled ahead of time for a call of {d} arguments (a standalone program runs only what its build compiled)", .{ standalone.nameOf(callee), args.len });
+    const code: driver.Helper = @ptrCast(@alignCast(code_p));
+    const status = code(ctx, frame, &given, node, owner, null, null, out);
+    switch (status) {
+        1 => {
+            if (checked) out.* = out.*.checked();
+            return true;
+        },
+        0 => return if (checked) helpers.hostCodeFailed(ctx, callee) else false,
+        else => return helpers.fail(ctx, node, "rt.Return, rt.Break or rt.Continue raised out of a function called with rt.call", .{}),
+    }
+}
+
 /// A Python function compiled code calls (`f(args)`, a library function
 /// of the language...): by its compiled code (made the first time), the
 /// rt values among the arguments giving it the frames to run in.
 /// `checked`: through rt.call (ints handed over as I64s, as it does). True
 /// / false (an error); null if it can't be compiled (Python runs it).
 pub fn compiledCall(ctx: *Ctx, node: u32, callee: *PyObject, args: []const Value, checked: bool, out: *Value) ?bool {
+    if (comptime helpers.standalone) return standaloneCall(ctx, node, callee, args, checked, out);
     const link = ctx.link orelse return null;
     const lk: *const Link = @ptrCast(@alignCast(link));
     if (args.len > 63) return null;
@@ -762,6 +815,8 @@ pub fn classFunction(cls: *PyObject, name: []const u8) ?*PyObject {
 }
 
 pub fn compiledMethod(ctx: *Ctx, node: u32, m: *PyObject, args: []const Value, checked: bool, out: *Value) ?bool {
+    // (a standalone program: the stand-ins are its functions')
+    if (comptime helpers.standalone) return standaloneCall(ctx, node, m, args, checked, out);
     if (args.len >= 63) return null;
     const pt = compile_mod.pyMethodType() orelse return null;
     if (ph.typeOf(m) != @as(*py.c.PyTypeObject, @ptrCast(@alignCast(pt)))) return compiledCall(ctx, node, m, args, checked, out);
@@ -1047,6 +1102,7 @@ fn rtStore(self: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
 /// natively (zr_call_method), as CompiledRuntime's do it; true / false (an
 /// error at `at`); null for another method (Python's).
 pub fn rtValueMethod(ctx: *Ctx, at: u32, rv: Value, name: []const u8, args: []const Value, out: *Value) ?bool {
+    if (comptime helpers.standalone) return standaloneRtMethod(ctx, at, rv, name, args, out);
     // (rt.scope(node): the scope the name it uses is of, the program's
     // symbols say; None: a global, or no name)
     if (std.mem.eql(u8, name, "scope") and args.len == 1 and args[0].kind() == .node) {
@@ -1090,6 +1146,45 @@ pub fn rtValueMethod(ctx: *Ctx, at: u32, rv: Value, name: []const u8, args: []co
     // (a top-level variable's function, read without a reference: kept
     // till the code's done)
     if (home == NONE) ctx.bury(old) else if (old.tag != helpers.UNSET) value.decref(old);
+    out.* = Value.none_v;
+    return true;
+}
+
+/// rtValueMethod in a standalone program: the same, by the image's tables
+/// of symbols and owners
+fn standaloneRtMethod(ctx: *Ctx, at: u32, rv: Value, name: []const u8, args: []const Value, out: *Value) ?bool {
+    const d = standalone.programData();
+    if (std.mem.eql(u8, name, "scope") and args.len == 1 and args[0].kind() == .node) {
+        out.* = Value.none_v;
+        const s = standalone.symbolOf(@intCast(args[0].bits)) orelse return true;
+        if (s.scope != NONE and s.scope < d.nodes.len) out.* = .{ .tag = @intFromEnum(value.Tag.node), .bits = s.scope };
+        return true;
+    }
+    const store = std.mem.eql(u8, name, "store") and args.len == 2;
+    if (!store and !(std.mem.eql(u8, name, "load") and args.len == 1)) return helpers.fail(ctx, at, "rt.{s}() of an rt value isn't in a standalone program", .{name});
+    if (args[0].kind() != .node) return helpers.fail(ctx, at, "rt.{s}() of something not a node", .{name});
+    const idx: u32 = @intCast(args[0].bits);
+    const s = standalone.symbolOf(idx) orelse return helpers.fail(ctx, idx, "'{s}' is not a variable", .{d.text(idx)});
+    if (s.builtin != 0 or s.slot == NONE) return helpers.fail(ctx, idx, "'{s}' has no variable in a standalone program", .{d.text(idx)});
+    var frame: ?*value.Frame = @ptrFromInt(rv.bits);
+    var owner = rv.rtOwner();
+    while (owner != s.home) {
+        if (owner == NONE) return helpers.fail(ctx, at, "a variable isn't reachable from here", .{});
+        frame = frame.?.parent;
+        owner = standalone.ownerOf(owner);
+    }
+    const slot = &frame.?.slots()[s.slot];
+    if (!store) {
+        if (slot.tag == helpers.UNSET) return helpers.fail(ctx, idx, "'{s}' has no value yet", .{d.text(idx)});
+        value.incref(slot.*);
+        out.* = slot.*.checked();
+        return true;
+    }
+    const nv = args[1].checked();
+    value.incref(nv);
+    const old = slot.*;
+    slot.* = nv;
+    if (s.home == NONE) ctx.bury(old) else if (old.tag != helpers.UNSET) value.decref(old);
     out.* = Value.none_v;
     return true;
 }
