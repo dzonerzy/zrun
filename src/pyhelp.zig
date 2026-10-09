@@ -29,10 +29,15 @@ pub inline fn refcnt(o: *PyObject) isize {
 
 /// Raise `exc` with a formatted message.
 pub fn raise(exc: *PyObject, comptime fmt: []const u8, args: anytype) void {
-    var buf: [512]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     const msg = std.fmt.bufPrintZ(&buf, fmt, args) catch blk: {
-        buf[buf.len - 1] = 0;
-        break :blk buf[0 .. buf.len - 1 :0];
+        // (too long: cut at a character's start, the rest UTF-8 still, or
+        // Python couldn't make the message, and no exception would be set)
+        var end = buf.len - 4;
+        while (end > 0 and buf[end] & 0xC0 == 0x80) end -= 1;
+        @memcpy(buf[end .. end + 3], "...");
+        buf[end + 3] = 0;
+        break :blk buf[0 .. end + 3 :0];
     };
     py.PyErr_SetString(exc, msg.ptr);
 }
@@ -96,6 +101,27 @@ pub fn toSpan(v: *PyObject) error{Python}!?[2]u32 {
     }
     return out;
 }
+
+/// The exception being raised, kept aside while code that may raise and
+/// clear its own runs (a dealloc: freeing an object mustn't lose the error
+/// it's freed on the way out of), then raised again: `restore()`.
+pub const SavedError = struct {
+    t: ?*PyObject = null,
+    v: ?*PyObject = null,
+    tb: ?*PyObject = null,
+
+    pub fn save() SavedError {
+        var s = SavedError{};
+        py.c.PyErr_Fetch(@ptrCast(&s.t), @ptrCast(&s.v), @ptrCast(&s.tb));
+        return s;
+    }
+
+    pub fn restore(self: SavedError) void {
+        if (self.t == null) return;
+        py.c.PyErr_Clear();
+        py.c.PyErr_Restore(self.t, self.v, self.tb);
+    }
+};
 
 /// The message of the Python exception being raised, cleared, copied into
 /// `buf` ("ValueError: ..."), for logging instead of raising.

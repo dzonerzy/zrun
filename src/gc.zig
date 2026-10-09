@@ -3,7 +3,7 @@
 //! in, holding it; a table holding itself).
 //!
 //! As CPython's: every container (list, tuple, dict, record, function,
-//! frame) is on a list of its thread's, in a generation (young, old), linked
+//! closure, frame) is on a list of its thread's, in a generation (young, old), linked
 //! through a header before it (Head: the object's own layout unchanged).
 //! Collecting a generation counts, for each of its objects, the references
 //! to it from the generation's others; one with more references than those
@@ -226,7 +226,7 @@ inline fn eachChild(o: *Obj, ctx: anytype, comptime f: anytype) void {
     switch (o.kind) {
         @intFromEnum(Tag.list) => for (@as(*value.List, @ptrCast(@alignCast(o))).slice()) |v| child(v, ctx, f),
         @intFromEnum(Tag.tuple) => for (@as(*value.Tuple, @ptrCast(@alignCast(o))).slice()) |v| child(v, ctx, f),
-        @intFromEnum(Tag.dict) => {
+        @intFromEnum(Tag.dict), @intFromEnum(Tag.set) => {
             const d: *value.Dict = @ptrCast(@alignCast(o));
             if (d.entries) |es| for (es[0..d.used]) |e| {
                 if (e.key.tag == value.DELETED) continue;
@@ -236,6 +236,7 @@ inline fn eachChild(o: *Obj, ctx: anytype, comptime f: anytype) void {
         },
         @intFromEnum(Tag.record) => for (@as(*value.Record, @ptrCast(@alignCast(o))).fields()) |v| child(v, ctx, f),
         @intFromEnum(Tag.function) => if (@as(*value.Function, @ptrCast(@alignCast(o))).env) |e| frameChild(e, ctx, f),
+        @intFromEnum(Tag.closure) => if (@as(*value.Closure, @ptrCast(@alignCast(o))).env) |e| frameChild(e, ctx, f),
         value.KIND_FRAME => {
             const fr: *value.Frame = @ptrCast(@alignCast(o));
             if (fr.parent) |p| frameChild(p, ctx, f);
@@ -245,9 +246,9 @@ inline fn eachChild(o: *Obj, ctx: anytype, comptime f: anytype) void {
     }
 }
 
-/// A container's tag: list..function (5-9)
+/// A container's tag: list..function (5-9), closure, set
 inline fn isContainer(tag: u64) bool {
-    return tag -% @intFromEnum(Tag.list) < 5;
+    return tag -% @intFromEnum(Tag.list) < 5 or tag -% @intFromEnum(Tag.closure) < 2;
 }
 
 inline fn child(v: Value, ctx: anytype, comptime f: anytype) void {
@@ -434,7 +435,7 @@ fn references(o: *Obj, out: *std.ArrayListUnmanaged(Value)) !void {
     switch (o.kind) {
         @intFromEnum(Tag.list) => for (@as(*value.List, @ptrCast(@alignCast(o))).slice()) |v| try Add.value_(out, v),
         @intFromEnum(Tag.tuple) => for (@as(*value.Tuple, @ptrCast(@alignCast(o))).slice()) |v| try Add.value_(out, v),
-        @intFromEnum(Tag.dict) => {
+        @intFromEnum(Tag.dict), @intFromEnum(Tag.set) => {
             const d: *value.Dict = @ptrCast(@alignCast(o));
             if (d.entries) |es| for (es[0..d.used]) |e| {
                 if (e.key.tag == value.DELETED) continue;
@@ -448,6 +449,7 @@ fn references(o: *Obj, out: *std.ArrayListUnmanaged(Value)) !void {
             if (f.env) |e| try Add.frame(out, e);
             try out.append(ca, Value.obj(.str, &f.name.head));
         },
+        @intFromEnum(Tag.closure) => if (@as(*value.Closure, @ptrCast(@alignCast(o))).env) |e| try Add.frame(out, e),
         value.KIND_FRAME => {
             const f: *value.Frame = @ptrCast(@alignCast(o));
             if (f.parent) |p| try Add.frame(out, p);

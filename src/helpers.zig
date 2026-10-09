@@ -1203,6 +1203,50 @@ pub export fn zr_function(ctx: *Ctx, code: Code, env: ?*value.Frame, node: u32, 
     return true;
 }
 
+/// A closure a semantic made (a lambda, a nested def as a value: zr_closure)
+/// in `out`: its code (the function's generic code), its env.
+export fn zr_closure(ctx: *Ctx, node: u32, func: u64, env: ?*value.Frame, code: *const anyopaque, out: *Value) callconv(.c) bool {
+    const c = value.newClosure(@ptrFromInt(func), env, ctx.program) orelse return oomFail(ctx, node);
+    c.code = code;
+    out.* = Value.obj(.closure, &c.head);
+    return true;
+}
+
+/// A closure called (its arguments borrowed): its code, given them and its
+/// env; Python's TypeError for a count of arguments it doesn't take.
+fn callClosure(ctx: *Ctx, node: u32, c: *value.Closure, args: []const Value, out: *Value) bool {
+    const func: *const @import("front.zig").Function = @ptrCast(@alignCast(c.func));
+    if (c.program != ctx.program) return fail(ctx, node, "a function of another program can't be called here", .{});
+    const own = func.own;
+    if (args.len > own) {
+        return failAs(ctx, node, py.PyExc_TypeError(), null, "{s}() takes {d} positional argument{s} but {d} {s} given", .{ func.qualname, own, if (own == 1) "" else "s", args.len, if (args.len == 1) "was" else "were" });
+    }
+    if (args.len < own) {
+        const missing = own - args.len;
+        var buf: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        // (Python's words: 'a', 'a' and 'b', 'a', 'b', and 'c')
+        for (func.locals[args.len..own], 0..) |name, i| {
+            if (i > 0) w.writeAll(if (missing == 2) " and " else if (i + 1 == missing) ", and " else ", ") catch {};
+            w.print("'{s}'", .{name}) catch {};
+        }
+        return failAs(ctx, node, py.PyExc_TypeError(), null, "{s}() missing {d} required positional argument{s}: {s}", .{ func.qualname, missing, if (missing == 1) "" else "s", w.buffered() });
+    }
+    if (own >= 63) return fail(ctx, node, "a closure of more than 62 parameters can't be called", .{});
+    // (a semantic's call, not the program's: no entry on its stack, the
+    // native stack's room checked)
+    if (@frameAddress() < ctx.stack_low) return fail(ctx, node, "the semantics' calls nest too deep", .{});
+    var call_args: [64]Value = undefined;
+    @memcpy(call_args[0..own], args);
+    call_args[own] = .{ .tag = value.ENV_TAG, .bits = @intFromPtr(c.env) };
+    const code: @import("driver.zig").Helper = @ptrCast(@alignCast(c.code));
+    return switch (code(ctx, null, &call_args, node, 0, null, null, out)) {
+        1 => true,
+        0 => false,
+        else => fail(ctx, node, "rt.Return, rt.Break or rt.Continue raised out of a function a semantic made", .{}),
+    };
+}
+
 /// A function's result standing for a call it left to its caller
 /// (rt.tail_call: Ctx.tail_f...)
 pub const TAIL_TAG: u64 = 0xFFFF0002;
@@ -1333,6 +1377,7 @@ fn callOnce(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Value, nargs:
             @memset(padded[nargs..], Value.none_v);
             return code(ctx, fo.env, padded.ptr, nparams, receiver, out);
         },
+        .closure => return callClosure(ctx, node, @ptrCast(@alignCast(f.ptr())), args[0..nargs], out),
         .host => {
             const callee: *PyObject = @ptrFromInt(f.bits);
             // (a Python function: by its compiled code, if it can have one;
@@ -3605,13 +3650,26 @@ export fn zr_global(ctx: *Ctx, node: u32, globals_index: u64, name: *const value
     return true;
 }
 
-/// isinstance(v, <a builtin type>): by tag (int, float, str, bool, list,
-/// tuple, dict); `code` says which.
+/// A module variable a semantic assigns (`global name`): set in the
+/// module's dict, as Python sets it.
+export fn zr_set_global(ctx: *Ctx, node: u32, globals_index: u64, name: *const value.Str, t: u64, bits: u64) callconv(.c) bool {
+    gil.ensureAt(@src(), node, null);
+    const g = ctx.object(globals_index);
+    const v = value.toPython(.{ .tag = t, .bits = bits }, ctx.node_maker) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(v);
+    const key = ph.newString(name.bytes()) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(key);
+    if (py.c.PyDict_SetItem(g, key, v) != 0) return failPython(ctx, node);
+    return true;
+}
+
 /// Whether a Python object is of a builtin type (or a subclass of it).
 fn ofType(o: *PyObject, comptime name: [:0]const u8) bool {
     return py.c.PyType_IsSubtype(ph.typeOf(o), @ptrCast(@alignCast(py.types.typeObject(name)))) != 0;
 }
 
+/// isinstance(v, <a builtin type>): by tag (int, float, str, bool, list,
+/// tuple, dict); `code` says which.
 export fn zr_is_type(t: u64, bits: u64, code: u32) callconv(.c) bool {
     const v = Value{ .tag = t, .bits = bits };
     // (a Python object: of the type or a subclass of it)
@@ -3730,6 +3788,8 @@ const helper_names = [_][]const u8{
     "zr_int_base", "zr_utf8_len", "zr_min_max", "zr_math", "zr_huge_int", "zr_dict_view",
     "zr_new_exception", "zr_call_plain", "zr_int_base_of", "zr_float_hex",
     "zr_delitem",
+    "zr_closure",
+    "zr_set_global",
 };
 
 /// The names compiled code calls them by, and their addresses

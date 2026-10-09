@@ -52,8 +52,33 @@ pub const Tag = enum(u64) {
     big = 13,
     /// Data read without copies (Bytes): a zrun.Bytes in Python
     bytes = 14,
+    /// A function a semantic made (a lambda, a nested def as a value:
+    /// Closure)
+    closure = 15,
+    /// A set: a Dict whose values aren't used (None)
+    set = 16,
     _,
 };
+
+/// A function a semantic or helper made (front.Function.closure): its code
+/// (compiled the first time it's called), the heap frame of the run it was
+/// made in (its variables around), the compiled program it's of
+pub const Closure = extern struct {
+    head: Obj,
+    env: ?*Frame,
+    /// Its front.Function
+    func: *const anyopaque,
+    /// The compiled program it's of (driver.Compiled.id): its code runs
+    /// only in that program's runs
+    program: u64,
+    /// Its code (driver.Helper): its own arguments, then its env (ENV_TAG)
+    code: ?*const anyopaque = null,
+};
+
+/// A closure's env given to its code: the frame's address under a tag no
+/// count is kept for (borrowed: the closure, or the run calling it, keeps
+/// the frame)
+pub const ENV_TAG: u64 = 0xFFFF_FFFD;
 
 /// Data compiled code reads (bytes.zig's zrun.Bytes, natively): part of the
 /// memory a zrun.Bytes object views, which it keeps
@@ -457,11 +482,12 @@ pub const KIND_FRAME: u32 = 100;
 
 /// A tag of a counted object: str..function (4-9), a Big (13). (By tags,
 /// not kind(): reference counts are most of what code does with values)
-/// The counted tags: str..function (4-9), Big, Bytes; a bit each
-const counted_mask: u64 = 0x3F0 | (1 << @intFromEnum(Tag.big)) | (1 << @intFromEnum(Tag.bytes));
+/// The counted tags: str..function (4-9), Big, Bytes, Closure, Set; a bit
+/// each
+pub const counted_mask: u64 = 0x3F0 | (1 << @intFromEnum(Tag.big)) | (1 << @intFromEnum(Tag.bytes)) | (1 << @intFromEnum(Tag.closure)) | (1 << @intFromEnum(Tag.set));
 
 pub inline fn counted(tag: u64) bool {
-    return tag < 16 and (counted_mask >> @intCast(tag)) & 1 != 0;
+    return tag < 32 and (counted_mask >> @intCast(tag)) & 1 != 0;
 }
 
 pub fn incref(v: Value) void {
@@ -520,7 +546,7 @@ pub const Freezer = struct {
         switch (tag) {
             .list => for (@as(*List, @ptrCast(@alignCast(o))).slice()) |x| try self.value(x),
             .tuple => for (@as(*Tuple, @ptrCast(@alignCast(o))).slice()) |x| try self.value(x),
-            .dict => {
+            .dict, .set => {
                 const d: *Dict = @ptrCast(@alignCast(o));
                 if (d.entries) |es| for (es[0..d.used]) |e| {
                     try self.value(e.key);
@@ -529,6 +555,7 @@ pub const Freezer = struct {
             },
             .record => for (@as(*Record, @ptrCast(@alignCast(o))).fields()) |x| if (x.tag != UNSET_TAG) try self.value(x),
             .function => if (@as(*Function, @ptrCast(@alignCast(o))).env) |e| try self.frame(e),
+            .closure => if (@as(*Closure, @ptrCast(@alignCast(o))).env) |e| try self.frame(e),
             else => {},
         }
     }
@@ -552,7 +579,7 @@ fn dropReferences(o: *Obj) void {
     switch (o.kind) {
         @intFromEnum(Tag.list) => for (@as(*List, @ptrCast(@alignCast(o))).slice()) |item| decref(item),
         @intFromEnum(Tag.tuple) => for (@as(*Tuple, @ptrCast(@alignCast(o))).slice()) |item| decref(item),
-        @intFromEnum(Tag.dict) => {
+        @intFromEnum(Tag.dict), @intFromEnum(Tag.set) => {
             const d: *Dict = @ptrCast(@alignCast(o));
             if (d.entries) |es| for (es[0..d.used]) |e| {
                 if (e.key.tag == DELETED) continue;
@@ -566,6 +593,7 @@ fn dropReferences(o: *Obj) void {
             if (f.env) |e| decrefFrame(e);
             decref(Value.obj(.str, &f.name.head));
         },
+        @intFromEnum(Tag.closure) => if (@as(*Closure, @ptrCast(@alignCast(o))).env) |e| decrefFrame(e),
         KIND_FRAME => {
             const f: *Frame = @ptrCast(@alignCast(o));
             for (f.slots()) |s| decref(s);
@@ -584,7 +612,7 @@ pub fn freeBlock(o: *Obj) void {
             gc.free(o, list_block);
         },
         @intFromEnum(Tag.tuple) => gc.free(o, @sizeOf(Tuple) + @as(*Tuple, @ptrCast(@alignCast(o))).len * @sizeOf(Value)),
-        @intFromEnum(Tag.dict) => {
+        @intFromEnum(Tag.dict), @intFromEnum(Tag.set) => {
             const d: *Dict = @ptrCast(@alignCast(o));
             if (d.entries) |es| allocator.free(es[0..d.cap]);
             if (d.index) |ix| allocator.free(ix[0 .. d.cap * 2]);
@@ -592,6 +620,7 @@ pub fn freeBlock(o: *Obj) void {
         },
         @intFromEnum(Tag.record) => gc.free(o, @sizeOf(Record) + @as(*Record, @ptrCast(@alignCast(o))).rtype.fields.len * @sizeOf(Value)),
         @intFromEnum(Tag.function) => gc.free(o, @sizeOf(Function)),
+        @intFromEnum(Tag.closure) => gc.free(o, @sizeOf(Closure)),
         KIND_FRAME => gc.free(o, @sizeOf(Frame) + @as(*Frame, @ptrCast(@alignCast(o))).len * @sizeOf(Value)),
         else => {},
     }
@@ -613,7 +642,7 @@ pub fn free(tag: Tag, o: *Obj) void {
             freeListItems(l);
             gc.free(o, list_block);
         },
-        .tuple, .dict, .record, .function => {
+        .tuple, .dict, .record, .function, .closure, .set => {
             dropReferences(o);
             freeBlock(o);
         },
@@ -763,10 +792,36 @@ pub fn newFrame(parent: ?*Frame, n: usize, fill: Value) ?*Frame {
     return f;
 }
 
+/// A closure of `func` (a front.Function), its variables around in `env`
+/// (a reference of its own taken).
+pub fn newClosure(func: *const anyopaque, env: ?*Frame, program: u64) ?*Closure {
+    const c: *Closure = @ptrCast(@alignCast(gc.alloc(@sizeOf(Closure)) orelse return null));
+    if (env) |e| increfObj(&e.head);
+    c.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.closure) }, .env = env, .func = func, .program = program };
+    return c;
+}
+
 pub fn newDict() ?*Dict {
     const d: *Dict = @ptrCast(@alignCast(gc.alloc(@sizeOf(Dict)) orelse return null));
     d.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.dict) }, .len = 0, .used = 0, .cap = 0, .entries = null, .index = null };
     return d;
+}
+
+/// An empty set (a Dict of kind set: its keys the items)
+pub fn newSet() ?*Dict {
+    const d = newDict() orelse return null;
+    d.head.kind = @intFromEnum(Tag.set);
+    return d;
+}
+
+/// s.add(x) (borrowed)
+pub fn setAdd(s: *Dict, x: Value) bool {
+    if (dictFind(s, x, hash(x)) != null) return true;
+    return dictSet(s, x, Value.none_v);
+}
+
+pub fn setHas(s: *Dict, x: Value) bool {
+    return dictFind(s, x, hash(x)) != null;
 }
 
 // ----------------------------------------------------------------------
@@ -787,7 +842,8 @@ pub fn typeName(v: Value) []const u8 {
             const r: *Record = @ptrCast(@alignCast(v.ptr()));
             break :blk r.rtype.name;
         },
-        .function => "function",
+        .function, .closure => "function",
+        .set => "set",
         .node => "Node",
         .host => "object",
         .rt => "CompiledRuntime",
@@ -806,7 +862,7 @@ pub fn truthy(v: Value) bool {
         .str => @as(*Str, @ptrCast(v.ptr())).len != 0,
         .list => @as(*List, @ptrCast(@alignCast(v.ptr()))).len != 0,
         .tuple => @as(*Tuple, @ptrCast(@alignCast(v.ptr()))).len != 0,
-        .dict => @as(*Dict, @ptrCast(@alignCast(v.ptr()))).len != 0,
+        .dict, .set => @as(*Dict, @ptrCast(@alignCast(v.ptr()))).len != 0,
         .host => blk: {
             gil.ensure(@src());
             break :blk py.c.PyObject_IsTrue(@ptrFromInt(v.bits)) == 1;
@@ -1045,6 +1101,14 @@ pub fn equal(a: Value, b: Value) bool {
             break :blk true;
         },
         .node => a.bits == b.bits,
+        // (the same items)
+        .set => blk: {
+            const x: *Dict = @ptrCast(@alignCast(a.ptr()));
+            const y: *Dict = @ptrCast(@alignCast(b.ptr()));
+            if (x.len != y.len) break :blk false;
+            for (dictEntries(x)) |e| if (!isDeleted(e) and !setHas(y, e.key)) break :blk false;
+            break :blk true;
+        },
         else => a.bits == b.bits,
     };
 }
@@ -1130,7 +1194,7 @@ pub fn hashable(v: Value) bool {
     return switch (v.kind()) {
         // (a Python object: unless its type says it isn't, as a list's does)
         .host => py.c.PyType_GetSlot(ph.typeOf(@ptrFromInt(v.bits)), py.c.Py_tp_hash) != @as(?*anyopaque, @ptrCast(@constCast(&py.c.PyObject_HashNotImplemented))),
-        .list, .dict => false,
+        .list, .dict, .set => false,
         // (a dataclass compared by value isn't, unless it's frozen (by its
         // fields' values then); a plain object is, by identity)
         .record => blk: {
@@ -1295,6 +1359,29 @@ pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
         .node => return nodeObject.make(@intCast(v.bits)),
         // (a zrun.Function, as the reference mode gives them)
         .function => return objects.newNativeFunction(@ptrCast(@alignCast(v.ptr())), nodeObject.owner),
+        // (a set: a Python set of its items, a copy)
+        .set => {
+            const s: *Dict = @ptrCast(@alignCast(v.ptr()));
+            const out = py.c.PySet_New(null) orelse return null;
+            for (dictEntries(s)) |e| {
+                if (isDeleted(e)) continue;
+                const o = toPython(e.key, nodeObject) orelse {
+                    py.Py_DecRef(out);
+                    return null;
+                };
+                defer py.Py_DecRef(o);
+                if (py.c.PySet_Add(out, o) != 0) {
+                    py.Py_DecRef(out);
+                    return null;
+                }
+            }
+            return out;
+        },
+        // (a semantic's lambda or nested def: compiled code's only)
+        .closure => {
+            ph.raise(py.PyExc_TypeError(), "a function compiled code made (a lambda, a nested def) can't be given to Python", .{});
+            return null;
+        },
         // (rt reaching Python code: an rt object over its frames)
         .rt => return @import("bridge.zig").runtimeObject(v),
         // (the zrun.Bytes it's of, or a slice of it: the same memory)

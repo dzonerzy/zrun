@@ -103,6 +103,46 @@ def test_other_constants():
     assert _program(other_constants, strict=True).call("f", "x", 1) == other_constants("x", 1)
 
 
+def unrolled_jumps(a, b):
+    # (loops whose iterations are unrolled: a break or continue known when
+    # compiling, and one only at run time)
+    out = []
+    for x in (1, 2, 3, 4):
+        if x == 3:
+            break
+        out.append(x)
+    for x in (1, 2, 3, 4):
+        if x == 2:
+            continue
+        out.append(x * 10)
+    else:
+        out.append("else")
+    i = 0
+    while True:
+        i += 1
+        if i > 3:
+            break
+        out.append(i * 100)
+    for x in (1, 2, 3):
+        if x == a:
+            break
+        out.append(-x)
+    else:
+        out.append("no break")
+    j = 0
+    while j < 4:
+        j += 1
+        if j == b:
+            continue
+        out.append(j * 1000)
+    return out
+
+
+def test_break_and_continue_in_unrolled_loops():
+    same_in_both(_program(unrolled_jumps), [(0, 0), (2, 3), (1, 1), (3, 4)])
+    assert _program(unrolled_jumps, strict=True).call("f", 2, 3) == unrolled_jumps(2, 3)
+
+
 def add3(x, y, z):
     return x * 100 + y * 10 + z
 

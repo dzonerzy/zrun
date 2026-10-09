@@ -253,6 +253,8 @@ const Language = struct {
     }
 
     pub fn __del__(self: *Language) void {
+        const saved = ph.SavedError.save();
+        defer saved.restore();
         self.release();
     }
 
@@ -971,6 +973,9 @@ const Program = struct {
     }
 
     pub fn __del__(self: *Program) void {
+        // (the error it's freed on the way out of, if any, kept)
+        const saved = ph.SavedError.save();
+        defer saved.restore();
         self.release();
     }
 

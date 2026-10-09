@@ -61,6 +61,10 @@ pub const Expr = struct {
         /// its arguments and then the variables around it that it reads
         /// (as they are when it's called: what a closure reads then)
         call_nested: struct { func: *const Function, args: []const *Expr },
+        /// A function defined inside this one as a value (a lambda, a def's
+        /// name read): a closure of `func` (Function.closure), the
+        /// variables around it in the heap frames of the runs it's in
+        make_closure: *const Function,
         /// `(name := value)`: value, stored to the local `slot` too
         named: struct { slot: u32, value: *Expr },
         /// `*value` among a call's arguments: its items there
@@ -108,6 +112,8 @@ pub const FPart = union(enum) {
 
 pub const Target = union(enum) {
     local: u32,
+    /// A module variable (`global name` in the function)
+    global: []const u8,
     tuple: []const Target,
     attr: struct { obj: *Expr, name: []const u8 },
     index: struct { obj: *Expr, index: *Expr },
@@ -172,6 +178,49 @@ pub const Function = struct {
     /// How big it is: its expressions (whether to run it inline)
     size: u32 = 0,
 
+    // A function defined in another (Reader.nestedFunction): its locals
+    // its own parameters (`own`), its env (a closure's: the heap frame of
+    // the run it was made in), the variables around it it reads
+    // (`captures`), then what it assigns. A closure is given its own
+    // parameters and its env; another (only called where it's defined) its
+    // own, None and the captures' values as they are then.
+
+    /// The function it's defined in (null: a semantic or helper)
+    parent: ?*Function = null,
+    /// Python's name of it (`f.<locals>.<lambda>`: what errors say)
+    qualname: []const u8 = "",
+    own: u32 = 0,
+    captures: []const []const u8 = &.{},
+    /// Made a value (a lambda, a def's name read)
+    escapes: bool = false,
+    /// Its `nonlocal` names (among the captures)
+    nonlocals: bool = false,
+    /// Run as a closure: its captures in its env's frames (`env`: where)
+    closure: bool = false,
+    env: []const EnvRef = &.{},
+    /// Its locals a closure defined in it reads: in a heap frame each run
+    /// makes (their index there, by slot; null: a stack local)
+    heap: []?u32 = &.{},
+    heap_len: u32 = 0,
+    /// Whether a run makes that frame (heap locals, or closures made in it)
+    makes_frame: bool = false,
+    children: []const *Function = &.{},
+
+    /// Where a closure's capture is: `depth` frames up from its env (0: the
+    /// env itself), slot `index` there
+    pub const EnvRef = struct { depth: u32, index: u32 };
+
+    /// Whether local `slot` is the function's own (not its env or a capture)
+    pub fn ownsLocal(self: *const Function, slot: usize) bool {
+        if (self.parent == null) return true;
+        return slot < self.own or slot >= self.own + 1 + self.captures.len;
+    }
+
+    fn slotOf(self: *const Function, name: []const u8) ?usize {
+        for (self.locals, 0..) |l, i| if (std.mem.eql(u8, l, name)) return i;
+        return null;
+    }
+
     pub fn destroy(self: *Function, gpa: Allocator) void {
         py.Py_DecRef(self.py_function);
         self.arena.deinit();
@@ -226,6 +275,7 @@ pub fn read(gpa: Allocator, func: *PyObject, failure: *Failure) ReadError!*Funct
     r.file = file;
     const first = try intAttr(code, "co_firstlineno");
     const name = try r.strAttr(func, "__name__");
+    r.qualname = try r.strAttr(func, "__qualname__");
 
     const body = try listAttr(module, "body");
     defer py.Py_DecRef(body);
@@ -270,11 +320,13 @@ pub fn read(gpa: Allocator, func: *PyObject, failure: *Failure) ReadError!*Funct
     // everywhere in the function)
     const stmts = try listAttr(def, "body");
     defer py.Py_DecRef(stmts);
+    try r.scopeDecls(stmts);
+    if (r.nonlocal_names.items.len > 0) return r.unsupported(try r.posOf(def), "`nonlocal` outside a nested function", .{});
     try r.collectAssigned(stmts);
 
     const out = try r.stmtList(stmts);
     const f = try gpa.create(Function);
-    py.Py_IncRef(func);
+    errdefer gpa.destroy(f);
     f.* = .{
         .arena = r.arena,
         .name = name,
@@ -286,9 +338,99 @@ pub fn read(gpa: Allocator, func: *PyObject, failure: *Failure) ReadError!*Funct
         .body = out,
         .py_function = func,
         .size = r.exprs,
+        .children = r.children.items,
+        .qualname = r.qualname,
     };
+    for (r.children.items) |ch| ch.parent = f;
+    // (the function's arena from here: r's is its)
+    resolveClosures(f, f.arena.allocator()) catch |e| {
+        r.arena = f.arena;
+        return e;
+    };
+    py.Py_IncRef(func);
     _ = a;
     return f;
+}
+
+/// Which functions defined in `top` (all through) run as closures, and
+/// which locals are in heap frames: one made a value, with `nonlocal`
+/// names, or reading a variable in a heap frame is a closure; what a
+/// closure reads is in a heap frame of the function it's a local of (as
+/// many times as that changes something). Then where each closure's
+/// captures are, up its env's frames.
+fn resolveClosures(top: *Function, a: Allocator) ReadError!void {
+    var all: std.ArrayList(*Function) = .empty;
+    try collectFunctions(top, &all, a);
+    for (all.items) |f| {
+        f.heap = try a.alloc(?u32, f.locals.len);
+        @memset(f.heap, null);
+    }
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (all.items) |f| {
+            const parent = f.parent orelse continue;
+            if (!f.closure) {
+                var reads_heap = false;
+                for (f.captures) |c| if (ownerOf(parent, c)) |o| {
+                    if (o.f.heap[o.slot] != null) reads_heap = true;
+                };
+                if (f.escapes or f.nonlocals or reads_heap) {
+                    f.closure = true;
+                    changed = true;
+                }
+            }
+            if (f.closure) for (f.captures) |c| if (ownerOf(parent, c)) |o| {
+                if (o.f.heap[o.slot] == null) {
+                    o.f.heap[o.slot] = o.f.heap_len;
+                    o.f.heap_len += 1;
+                    changed = true;
+                }
+            };
+        }
+    }
+    for (all.items) |f| {
+        f.makes_frame = f.heap_len > 0;
+        for (f.children) |ch| {
+            if (ch.closure) f.makes_frame = true;
+        }
+        if (!f.closure) continue;
+        // (given its own parameters and its env)
+        f.param_count = f.own + 1;
+        f.required = f.own + 1;
+        const env = try a.alloc(Function.EnvRef, f.captures.len);
+        for (f.captures, env) |c, *e| {
+            // (up the functions it's in: the frame of the one it's a local
+            // of; those between are closures reading it too)
+            var p = f.parent.?;
+            var depth: u32 = 0;
+            while (true) {
+                const slot = p.slotOf(c).?;
+                if (p.ownsLocal(slot)) {
+                    e.* = .{ .depth = depth, .index = p.heap[slot].? };
+                    break;
+                }
+                p = p.parent.?;
+                depth += 1;
+            }
+        }
+        f.env = env;
+    }
+}
+
+fn collectFunctions(f: *Function, out: *std.ArrayList(*Function), a: Allocator) ReadError!void {
+    try out.append(a, f);
+    for (f.children) |ch| try collectFunctions(ch, out, a);
+}
+
+/// The function `name` is a local of, from `f` up, and its slot there
+fn ownerOf(f: *Function, name: []const u8) ?struct { f: *Function, slot: usize } {
+    var p: ?*Function = f;
+    while (p) |x| : (p = x.parent) {
+        const slot = x.slotOf(name) orelse return null;
+        if (x.ownsLocal(slot)) return .{ .f = x, .slot = slot };
+    }
+    return null;
 }
 
 const Reader = struct {
@@ -315,6 +457,13 @@ const Reader = struct {
     /// The names of the functions defined in this one (collectAssigned),
     /// read or not yet
     defs: std.ArrayList([]const u8) = .empty,
+    /// The functions defined in this one (defs and lambdas), read
+    children: std.ArrayList(*Function) = .empty,
+    /// Python's name of the function read (Function.qualname)
+    qualname: []const u8 = "",
+    /// Its `global` and `nonlocal` names: not its locals
+    global_names: std.ArrayList([]const u8) = .empty,
+    nonlocal_names: std.ArrayList([]const u8) = .empty,
 
     /// A function defined in one (nestedDef): its own parameters' count,
     /// the variables around it it reads (its parameters after those)
@@ -371,6 +520,49 @@ const Reader = struct {
         }
         try self.locals.append(self.alloc(), try self.alloc().dupe(u8, name));
         return @intCast(self.locals.items.len - 1);
+    }
+
+    /// Whether assigning `name` makes it a local (not `global` or
+    /// `nonlocal` in the function)
+    fn bindsLocal(self: *Reader, name: []const u8) bool {
+        return !contains(self.global_names.items, name) and !contains(self.nonlocal_names.items, name);
+    }
+
+    /// The `global` and `nonlocal` statements of a function's body (its
+    /// own: not those of a def or class in it)
+    fn scopeDecls(self: *Reader, stmts: *PyObject) ReadError!void {
+        const n: usize = @intCast(py.c.PyList_Size(stmts));
+        for (0..n) |i| {
+            const s = py.c.PyList_GetItem(stmts, @intCast(i)).?;
+            const k = try kindOf(s);
+            if (eq(k, "FunctionDef") or eq(k, "AsyncFunctionDef") or eq(k, "ClassDef")) continue;
+            if (eq(k, "Global") or eq(k, "Nonlocal")) {
+                const names = try listAttr(s, "names");
+                defer py.Py_DecRef(names);
+                const out = if (eq(k, "Global")) &self.global_names else &self.nonlocal_names;
+                for (0..@intCast(py.c.PyList_Size(names))) |j| {
+                    const o = py.c.PyList_GetItem(names, @intCast(j)).?;
+                    try out.append(self.alloc(), try self.alloc().dupe(u8, ph.utf8(o, "a name") orelse return error.Python));
+                }
+                continue;
+            }
+            inline for (.{ "body", "orelse", "finalbody" }) |f| {
+                if (py.c.PyObject_HasAttrString(s, f) == 1) {
+                    const l = try listAttr(s, f);
+                    defer py.Py_DecRef(l);
+                    try self.scopeDecls(l);
+                }
+            }
+            if (eq(k, "Try")) {
+                const hs = try listAttr(s, "handlers");
+                defer py.Py_DecRef(hs);
+                for (0..@intCast(py.c.PyList_Size(hs))) |j| {
+                    const body = try listAttr(py.c.PyList_GetItem(hs, @intCast(j)).?, "body");
+                    defer py.Py_DecRef(body);
+                    try self.scopeDecls(body);
+                }
+            }
+        }
     }
 
     fn lookupLocal(self: *Reader, name: []const u8) ?u32 {
@@ -478,7 +670,8 @@ const Reader = struct {
             if (eq(k, "NamedExpr")) {
                 const t = ph.attr(kid, "target") orelse return error.Python;
                 defer py.Py_DecRef(t);
-                _ = try self.declare(try self.strAttr(t, "id"));
+                const name = try self.strAttr(t, "id");
+                if (self.bindsLocal(name)) _ = try self.declare(name);
             }
             try self.collectNamed(kid);
         }
@@ -498,7 +691,8 @@ const Reader = struct {
     fn collectTarget(self: *Reader, t: *PyObject) ReadError!void {
         const k = try kindOf(t);
         if (eq(k, "Name")) {
-            _ = try self.declare(try self.strAttr(t, "id"));
+            const name = try self.strAttr(t, "id");
+            if (self.bindsLocal(name)) _ = try self.declare(name);
         } else if (eq(k, "Tuple") or eq(k, "List")) {
             const elts = try listAttr(t, "elts");
             defer py.Py_DecRef(elts);
@@ -647,6 +841,8 @@ const Reader = struct {
             if (eq(k, "Break")) break :blk .break_;
             if (eq(k, "Continue")) break :blk .continue_;
             if (eq(k, "Pass")) break :blk .pass;
+            // (read before the body: scopeDecls)
+            if (eq(k, "Global") or eq(k, "Nonlocal")) break :blk .pass;
             // (a def inside: read as a function of its own; nothing to run
             // where it's defined)
             if (eq(k, "FunctionDef")) {
@@ -658,29 +854,37 @@ const Reader = struct {
         return .{ .pos = pos, .kind = kind };
     }
 
-    /// A def inside the function: read as a function of its own (lambda
-    /// lifting), its parameters its own, then the variables of the
-    /// functions around it that it reads (or that the ones defined there it
-    /// calls read): its calls give them, as they are then, what a closure
-    /// would read then. Its name is only called (call_nested): kept or
-    /// passed as a value, it isn't compiled. Its own variables aren't the
-    /// ones around (a `nonlocal` isn't compiled).
+    /// A def inside the function: read as a function of its own
+    /// (nestedFunction), its name the functions around it call (from here
+    /// on) or read as a value.
     fn nestedDef(self: *Reader, def: *PyObject, pos: Pos) ReadError!void {
-        const name = try self.strAttr(def, "name");
         const decos = try listAttr(def, "decorator_list");
         defer py.Py_DecRef(decos);
         if (py.c.PyList_Size(decos) != 0) return self.unsupported(try self.posOf(py.c.PyList_GetItem(decos, 0).?), "a nested def with decorators can't be compiled", .{});
-        const args = ph.attr(def, "args") orelse return error.Python;
+        _ = try self.nestedFunction(def, try self.strAttr(def, "name"), pos, false);
+    }
+
+    /// A def or lambda inside the function, read as a function of its own
+    /// (lambda lifting): its parameters, then its env (a closure's: the
+    /// heap frame of the run of this one it's made in), then the variables
+    /// of the functions around it that it reads (or that the ones defined
+    /// there it calls read), then what it assigns. Called where it's defined
+    /// (call_nested), it's given those variables as they are then, what a
+    /// closure would read then; a closure (resolveClosures) reads them in
+    /// their heap frames.
+    fn nestedFunction(self: *Reader, node: *PyObject, name: []const u8, pos: Pos, lambda: bool) ReadError!*Function {
+        const what = if (lambda) "a lambda" else "a nested def";
+        const args = ph.attr(node, "args") orelse return error.Python;
         defer py.Py_DecRef(args);
         inline for (.{ "posonlyargs", "kwonlyargs", "kw_defaults", "defaults" }) |field| {
             const l = try listAttr(args, field);
             defer py.Py_DecRef(l);
-            if (py.c.PyList_Size(l) != 0) return self.unsupported(pos, "a nested def's parameters must be plain ones (no defaults, keyword-only or positional-only ones)", .{});
+            if (py.c.PyList_Size(l) != 0) return self.unsupported(pos, "{s}'s parameters must be plain ones (no defaults, keyword-only or positional-only ones)", .{what});
         }
         inline for (.{ "vararg", "kwarg" }) |field| {
             const o = ph.attr(args, field) orelse return error.Python;
             defer py.Py_DecRef(o);
-            if (o != py.Py_None()) return self.unsupported(pos, "a nested def's *args and **kwargs can't be compiled", .{});
+            if (o != py.Py_None()) return self.unsupported(pos, "{s}'s *args and **kwargs can't be compiled", .{what});
         }
         var sub = Reader{
             .gpa = self.gpa,
@@ -691,40 +895,53 @@ const Reader = struct {
             .parent = self,
             .py_function = self.py_function,
             .file = self.file,
+            .qualname = try std.fmt.allocPrint(self.alloc(), "{s}.<locals>.{s}", .{ self.qualname, name }),
         };
-        // Its own: its parameters, what it assigns
+        // Its own: its parameters, what it assigns (not its `global` and
+        // `nonlocal` names)
         const params = try listAttr(args, "args");
         defer py.Py_DecRef(params);
         const n_own: usize = @intCast(py.c.PyList_Size(params));
         for (0..n_own) |i| _ = try sub.declare(try sub.strAttr(py.c.PyList_GetItem(params, @intCast(i)).?, "arg"));
-        const body = try listAttr(def, "body");
-        defer py.Py_DecRef(body);
-        try sub.collectAssigned(body);
+        // (a lambda's body: an expression, its walruses its own)
+        const body: ?*PyObject = if (lambda) null else try listAttr(node, "body");
+        defer if (body) |b| py.Py_DecRef(b);
+        if (body) |b| {
+            try sub.scopeDecls(b);
+            try sub.collectAssigned(b);
+        } else try sub.collectNamed(node);
         // What it reads of the functions around it: those variables, and
         // what the functions defined there that it calls read
         var captures: std.ArrayList([]const u8) = .empty;
-        for (try self.loadedNames(def)) |n| {
-            if (eq(n, name) or sub.lookupLocal(n) != null) continue;
-            if (self.nestedNamed(n)) |other| {
-                for (other.captures) |c| if (!contains(captures.items, c)) try captures.append(self.alloc(), c);
-            } else if (self.lookupLocal(n) != null) {
+        for (try self.loadedNames(node)) |n| {
+            if ((!lambda and eq(n, name)) or sub.lookupLocal(n) != null or contains(sub.global_names.items, n)) continue;
+            if (self.lookupLocal(n) != null) {
                 if (!contains(captures.items, n)) try captures.append(self.alloc(), n);
+            } else if (self.nestedNamed(n)) |other| {
+                for (other.captures) |c| if (!contains(captures.items, c)) try captures.append(self.alloc(), c);
             }
         }
-        // (its locals again, in a function's order: its parameters, then
-        // those, then what it assigns)
+        for (sub.nonlocal_names.items) |n| {
+            if (!contains(captures.items, n)) return self.unsupported(pos, "no variable {s} around {s} for its `nonlocal`", .{ n, name });
+        }
+        // (its locals again, in a function's order: its parameters, its
+        // env, those, then what it assigns)
         sub.locals.shrinkRetainingCapacity(n_own);
         sub.defs.clearRetainingCapacity();
+        _ = try sub.declare("");
         for (captures.items) |c| _ = try sub.declare(c);
-        try sub.collectAssigned(body);
+        if (body) |b| try sub.collectAssigned(b) else try sub.collectNamed(node);
         const f = try self.alloc().create(Function);
-        const entry = Nested{ .name = name, .func = f, .own = n_own, .captures = captures.items };
         // (visible to the functions around it from here, to itself, and to
         // those defined in it)
-        try self.nested.append(self.alloc(), entry);
+        if (!lambda) try self.nested.append(self.alloc(), .{ .name = name, .func = f, .own = n_own, .captures = captures.items });
         try sub.nested.appendSlice(self.alloc(), self.nested.items);
-        const out = try sub.stmtList(body);
-        const n_params: u32 = @intCast(n_own + captures.items.len);
+        const out = if (body) |b| try sub.stmtList(b) else blk: {
+            const ret = try self.alloc().alloc(Stmt, 1);
+            ret[0] = .{ .pos = pos, .kind = .{ .return_ = try sub.exprAttr(node, "body") } };
+            break :blk ret;
+        };
+        const n_params: u32 = @intCast(n_own + 1 + captures.items.len);
         f.* = .{
             // (its memory the outermost function's: its own arena empty)
             .arena = sub.arena,
@@ -737,10 +954,19 @@ const Reader = struct {
             .body = out,
             .py_function = self.py_function.?,
             .size = sub.exprs,
+            .own = @intCast(n_own),
+            .qualname = sub.qualname,
+            .captures = captures.items,
+            .nonlocals = sub.nonlocal_names.items.len > 0,
+            .children = sub.children.items,
         };
+        for (sub.children.items) |ch| ch.parent = f;
+        try self.children.append(self.alloc(), f);
+        return f;
     }
 
     /// The names an AST node (a nested def) reads, all through, in order
+    /// (a `nonlocal` name's too: it reads and writes the variable around)
     fn loadedNames(self: *Reader, node: *PyObject) ReadError![]const []const u8 {
         const ast_mod = py.c.PyImport_ImportModule("ast") orelse return error.Python;
         defer py.Py_DecRef(ast_mod);
@@ -752,6 +978,15 @@ const Reader = struct {
         const n: usize = @intCast(py.c.PyList_Size(all));
         for (0..n) |i| {
             const x = py.c.PyList_GetItem(all, @intCast(i)).?;
+            if (eq(try kindOf(x), "Nonlocal")) {
+                const names = try listAttr(x, "names");
+                defer py.Py_DecRef(names);
+                for (0..@intCast(py.c.PyList_Size(names))) |j| {
+                    const id = try self.alloc().dupe(u8, ph.utf8(py.c.PyList_GetItem(names, @intCast(j)).?, "a name") orelse return error.Python);
+                    if (!contains(out.items, id)) try out.append(self.alloc(), id);
+                }
+                continue;
+            }
             if (!eq(try kindOf(x), "Name")) continue;
             const ctx = ph.attr(x, "ctx") orelse return error.Python;
             defer py.Py_DecRef(ctx);
@@ -766,6 +1001,7 @@ const Reader = struct {
         const k = try kindOf(t);
         if (eq(k, "Name")) {
             const name = try self.strAttr(t, "id");
+            if (contains(self.global_names.items, name)) return .{ .global = name };
             return .{ .local = self.lookupLocal(name) orelse try self.declare(name) };
         }
         if (eq(k, "Tuple") or eq(k, "List")) {
@@ -852,9 +1088,19 @@ const Reader = struct {
         if (eq(k, "Name")) {
             const name = try self.strAttr(e, "id");
             if (self.lookupLocal(name)) |slot| return self.new(pos, .{ .local = slot });
-            if (self.nestedNamed(name) != null or self.definesLater(name))
-                return self.unsupported(pos, "the nested function {s} used as a value can't be compiled (only called)", .{name});
+            // (a def's name as a value: a closure of it)
+            if (self.nestedNamed(name)) |n| {
+                n.func.escapes = true;
+                return self.new(pos, .{ .make_closure = n.func });
+            }
+            if (self.definesLater(name))
+                return self.unsupported(pos, "the nested function {s} used before its def can't be compiled", .{name});
             return self.new(pos, .{ .global = name });
+        }
+        if (eq(k, "Lambda")) {
+            const f = try self.nestedFunction(e, "<lambda>", pos, true);
+            f.escapes = true;
+            return self.new(pos, .{ .make_closure = f });
         }
         if (eq(k, "Attribute")) return self.new(pos, .{ .attr = .{ .obj = try self.exprAttr(e, "value"), .name = try self.strAttr(e, "attr") } });
         if (eq(k, "Subscript")) {
@@ -879,9 +1125,12 @@ const Reader = struct {
                     if (py.c.PyList_Size(kw) != 0) return self.unsupported(pos, "keyword arguments to the nested function {s} can't be compiled", .{fname});
                     const own = try self.exprList(e, "args");
                     if (own.len != n.own) return self.unsupported(pos, "{s}() takes {d} arguments", .{ fname, n.own });
-                    const all = try self.alloc().alloc(*Expr, own.len + n.captures.len);
+                    // (its own arguments, None for its env (a closure's: the
+                    // compiler gives it), the captures' values)
+                    const all = try self.alloc().alloc(*Expr, own.len + 1 + n.captures.len);
                     @memcpy(all[0..own.len], own);
-                    for (n.captures, all[own.len..]) |c, *slot| {
+                    all[own.len] = try self.new(pos, .none);
+                    for (n.captures, all[own.len + 1 ..]) |c, *slot| {
                         const s = self.lookupLocal(c) orelse return self.unsupported(pos, "{s} isn't reachable where the nested function {s} is called", .{ c, fname });
                         slot.* = try self.new(pos, .{ .local = s });
                     }
@@ -908,6 +1157,7 @@ const Reader = struct {
             const t = ph.attr(e, "target") orelse return error.Python;
             defer py.Py_DecRef(t);
             const name = try self.strAttr(t, "id");
+            if (contains(self.global_names.items, name)) return self.unsupported(pos, "`:=` to a `global` name can't be compiled", .{});
             const slot = for (self.locals.items, 0..) |l, i| {
                 if (eq(l, name)) break @as(u32, @intCast(i));
             } else try self.declare(name);
@@ -1261,6 +1511,7 @@ const Dumper = struct {
     fn target(self: *Dumper, t: Target) Allocator.Error!void {
         switch (t) {
             .local => |slot| try self.print("{s}#{d}", .{ self.f.locals[slot], slot }),
+            .global => |name| try self.print("global {s}", .{name}),
             .tuple => |ts| {
                 try self.print("(", .{});
                 for (ts, 0..) |x, i| {
@@ -1349,6 +1600,7 @@ const Dumper = struct {
                 try self.list(c.args);
                 try self.print(")", .{});
             },
+            .make_closure => |f| try self.print("{s}<closure>", .{f.name}),
             .named => |n| {
                 try self.print("({s}#{d} := ", .{ self.f.locals[n.slot], n.slot });
                 try self.expr(n.value);

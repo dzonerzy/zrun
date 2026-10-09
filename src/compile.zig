@@ -1488,6 +1488,8 @@ pub const Compiler = struct {
         .{ "zr_int_base_of", "bpilllllp" },
         .{ "zr_float_hex", "bpilllp" },
         .{ "zr_delitem", "bpillll" },
+        .{ "zr_closure", "bpilppp" },
+        .{ "zr_set_global", "bpilpll" },
         .{ "zr_raise_from", "bpillll" },
         .{ "zr_range", "bpiplp" },
         .{ "zr_is_type", "blli" },
@@ -1544,9 +1546,10 @@ pub const Compiler = struct {
         const other = try f.label("other");
         const python = try f.label("python");
         const done = try f.label("done");
-        // (counted: str..function (4-9), a Big (13), Bytes (14))
+        // (counted: str..function (4-9), a Big (13), Bytes (14), a Closure
+        // (15), a set (16))
         const k = f.sub(tag, m.k64(4));
-        const big_or_bytes = f.icmp(jit_c.LLVMIntULT, f.sub(tag, m.k64(@intFromEnum(value.Tag.big))), m.k64(2));
+        const big_or_bytes = f.icmp(jit_c.LLVMIntULT, f.sub(tag, m.k64(@intFromEnum(value.Tag.big))), m.k64(4));
         try f.condBr(f.or_(f.icmp(jit_c.LLVMIntULT, k, m.k64(6)), big_or_bytes), counted, other);
         try f.block(counted);
         const p = f.intToPtr(bits);
@@ -1854,16 +1857,30 @@ const Inst = struct {
     loops: std.ArrayListUnmanaged(PyLoop) = .empty,
     /// It returned (outside run-time control flow): the rest is dead
     done: bool = false,
+    /// A break or continue of an unrolled iteration, at its own level: the
+    /// rest of the iteration is dead (the unrolling sees which)
+    jumped: ?enum { brk, cont } = null,
     /// Slots of values it holds for a while (a run-time loop's items):
     /// None but while held, released with its locals
     temps: std.ArrayListUnmanaged(ir.Value) = .empty,
+    /// The heap frame this run made (front.Function.makes_frame: the
+    /// variables closures read), released with its locals
+    heap_frame: ?ir.Value = null,
+    /// A closure's env: the heap frame of the run it was made in (null:
+    /// none, or not a closure)
+    env: ?ir.Value = null,
 };
+
+/// A closure's env as an argument (its front.Function's parameter `own`)
+const ENV_TAG: u64 = value.ENV_TAG;
 
 const Local = union(enum) {
     unset,
     static: SVal,
-    /// In a stack slot (an alloca of {i64, i64}), with the shape last stored
-    slot: struct { ptr: ir.Value, shape: Shape },
+    /// In a stack slot (an alloca of {i64, i64}), with the shape last stored;
+    /// `heap`: a slot of a heap frame (a variable closures read: the frame
+    /// holds its value, not the run)
+    slot: struct { ptr: ir.Value, shape: Shape, heap: bool = false },
 };
 
 /// An rt.loop's targets, and how many semantics ran when it started (those
@@ -1871,8 +1888,22 @@ const Local = union(enum) {
 const LoopTarget = struct { brk: ir.Block, cont: ir.Block, depth: usize, scope_depth: usize = 0, tries: usize };
 
 /// A semantic's own loop (break / continue): its targets, and the try
-/// statements around it (jumping out leaves those inside)
-const PyLoop = struct { brk: ir.Block, cont: ir.Block, tries: usize };
+/// statements around it (jumping out leaves those inside). An iteration
+/// unrolled (`unrolled`: the loop's key, rolled_loops): where it started
+/// (a jump at its own level ends it there; one in run-time control flow
+/// can't be unrolled)
+const PyLoop = struct {
+    brk: ir.Block,
+    cont: ir.Block,
+    tries: usize,
+    unrolled: ?*const anyopaque = null,
+    dyn_depth: u32 = 0,
+    in_try: u32 = 0,
+};
+
+/// Loops whose iterations can't be unrolled (a break or continue in
+/// run-time control flow in them): compiled again as loops at run time
+var rolled_loops: std.AutoHashMapUnmanaged(*const anyopaque, void) = .empty;
 
 /// A try statement being compiled
 const TryFrame = struct {
@@ -2073,10 +2104,11 @@ const Gen = struct {
         }
         const f = &self.f;
         const m = &self.c.m;
-        // (counted: 4 to 10, 13, 14; as bits of a mask: tags under 16)
-        const mask: u64 = 0x7F0 | (1 << @intFromEnum(value.Tag.big)) | (1 << @intFromEnum(value.Tag.bytes));
-        const bit = f.and_(f.lshr(m.k64(mask), f.and_(tag, m.k64(15))), m.k64(1));
-        const counted = f.and_(f.icmp(jit_c.LLVMIntULT, tag, m.k64(16)), f.icmp(jit_c.LLVMIntNE, bit, m.k64(0)));
+        // (counted: value.counted_mask's, and Python objects (10); as bits
+        // of a mask: tags under 32)
+        const mask: u64 = value.counted_mask | (1 << @intFromEnum(value.Tag.host));
+        const bit = f.and_(f.lshr(m.k64(mask), f.and_(tag, m.k64(31))), m.k64(1));
+        const counted = f.and_(f.icmp(jit_c.LLVMIntULT, tag, m.k64(32)), f.icmp(jit_c.LLVMIntNE, bit, m.k64(0)));
         const yes = try f.label("rc");
         const done = try f.label("rc_done");
         try f.condBr(counted, yes, done);
@@ -2574,7 +2606,8 @@ const Gen = struct {
     /// nothing else refers to it), unset from here.
     fn releaseLocal(self: *Gen, inst: *Inst, slot: u32) Error!void {
         switch (inst.locals[slot]) {
-            .slot => |s| try self.dropTemp(s.ptr),
+            // (a heap frame's: the frame holds it, closures read it)
+            .slot => |s| if (s.heap) return else try self.dropTemp(s.ptr),
             .static => |sv| {
                 inst.locals[slot] = .unset;
                 try self.drop(sv);
@@ -4872,6 +4905,7 @@ const Gen = struct {
         inst.* = .{ .func = func, .args = args, .node = at, .locals = locals, .exit_label = try self.f.label("ret"), .loop_level0 = self.loop_level };
         try self.insts.append(self.a(), inst);
         defer _ = self.insts.pop();
+        try self.closureLocals(inst);
 
         try self.stmts(inst, body);
         // Falling off the end: None
@@ -4884,6 +4918,85 @@ const Gen = struct {
         }
         try self.releaseLocals(inst);
         return inst.result orelse .none;
+    }
+
+    /// A run's locals closures read (front.Function.heap), in a heap frame
+    /// it makes (a parameter's value moved there); a closure's captures, in
+    /// its env's frames.
+    fn closureLocals(self: *Gen, inst: *Inst) Error!void {
+        const func = inst.func;
+        const f = &self.f;
+        const t = self.c.m.t;
+        if (func.closure) {
+            // (its env: the frame's address, or None if it needs none)
+            inst.env = switch (inst.locals[func.own].static) {
+                .dyn => |d| f.intToPtr(d.bits),
+                else => null,
+            };
+            for (func.env, 0..) |ref, i| {
+                var fr = inst.env orelse return self.c.unsupportedAt(func, .{ .line = func.first_line }, "a closure made without its env", .{});
+                for (0..ref.depth) |_| fr = f.load(t.ptr, f.offset(fr, 16));
+                inst.locals[func.own + 1 + i] = .{ .slot = .{ .ptr = f.offset(fr, 32 + 16 * @as(i64, ref.index)), .shape = .any, .heap = true } };
+            }
+        }
+        if (!func.makes_frame) return;
+        const parent = inst.env orelse self.c.m.nullPtr();
+        const fr = self.call("zr_frame_new", &.{ parent, self.k(func.heap_len) });
+        inst.heap_frame = fr;
+        for (func.heap, 0..) |h, slot| if (h) |idx| {
+            const p = f.offset(fr, 32 + 16 * @as(i64, idx));
+            if (inst.locals[slot] == .static) {
+                const d = try self.materialize(inst.locals[slot].static, inst.node);
+                try self.storeSlot(p, d);
+            }
+            inst.locals[slot] = .{ .slot = .{ .ptr = p, .shape = .any, .heap = true } };
+        };
+    }
+
+    /// closureEnv() as a closure's argument (ENV_TAG; None: no env)
+    fn closureEnvValue(self: *Gen, inst: *Inst, func: *const front.Function) Error!SVal {
+        const env = try self.closureEnv(inst, func) orelse return .none;
+        return .{ .dyn = .{ .tag = self.k(ENV_TAG), .bits = self.f.ptrToInt(env), .shape = .any } };
+    }
+
+    /// The generic code of a closure's function (its own arguments and its
+    /// env given at run time): a helper out of line, in this module.
+    fn closureCode(self: *Gen, func: *const front.Function) Error!ir.Value {
+        const c = self.c;
+        const key = try c.a.alloc(SVal, func.param_count);
+        for (key) |*k_| k_.* = .{ .dyn = undefined };
+        const spec = for (c.helper_fns.items) |h| {
+            if (h.matches(func, key)) break h;
+        } else blk: {
+            const h = try c.a.create(HelperSpec);
+            const semantic = self.helper_semantic orelse if (self.insts.items.len > 0) self.insts.items[0].func.py_function else null;
+            // (`_l`: `_k` names constants)
+            h.* = .{ .func = func, .args = key, .name = try std.fmt.allocPrintSentinel(c.a, "{s}_l{d}", .{ c.m.prefix, c.helper_fns.items.len }, 0), .semantic = semantic };
+            try c.helper_fns.append(c.a, h);
+            try c.helper_queue.append(c.a, h);
+            break :blk h;
+        };
+        return (try c.helperFn(spec.name)).v;
+    }
+
+    /// The env a closure of `func` is made with (its variables around),
+    /// seen from the run `inst`: the heap frame of the run of the function
+    /// it's defined in (this one, or one around it, up the envs); null if it
+    /// reads nothing around it.
+    fn closureEnv(self: *Gen, inst: *Inst, func: *const front.Function) Error!?ir.Value {
+        if (func.captures.len == 0) return null;
+        const home = func.parent.?;
+        if (inst.func == home) return inst.heap_frame.?;
+        var x = inst.func;
+        var fr = inst.env;
+        while (true) {
+            const p = x.parent orelse break;
+            const env = fr orelse break;
+            if (p == home) return env;
+            fr = self.f.load(self.c.m.t.ptr, self.f.offset(env, 16));
+            x = p;
+        }
+        return self.c.unsupportedAt(inst.func, .{ .line = inst.func.first_line }, "the variables of {s} aren't reachable from here", .{func.name});
     }
 
     /// The semantic's result: kept, or in its slot (and to its exit).
@@ -4918,8 +5031,9 @@ const Gen = struct {
         // another return releases them again, on its own)
         var released: std.ArrayListUnmanaged(*SList) = .empty;
         for (inst.locals) |l| switch (l) {
-            // (None again: the semantic may run again, along another path)
-            .slot => |s| try self.dropTemp(s.ptr),
+            // (None again: the semantic may run again, along another path;
+            // a heap frame's: its frame's, released below)
+            .slot => |s| if (!s.heap) try self.dropTemp(s.ptr),
             .static => |sv| {
                 try self.drop(sv);
                 if (sv == .list and std.mem.indexOfScalar(*SList, released.items, sv.list) == null) {
@@ -4930,6 +5044,7 @@ const Gen = struct {
             .unset => {},
         };
         for (inst.temps.items) |slot| try self.dropTemp(slot);
+        if (inst.heap_frame) |fr| _ = self.call("zr_frame_release", &.{fr});
     }
 
     /// A known list a semantic's variable refers to, the semantic done: its
@@ -4990,7 +5105,7 @@ const Gen = struct {
 
     fn stmts(self: *Gen, inst: *Inst, body: []const front.Stmt) Error!void {
         for (body) |s| {
-            if (inst.done) return;
+            if (inst.done or inst.jumped != null) return;
             try self.stmt(inst, s);
         }
     }
@@ -5043,7 +5158,7 @@ const Gen = struct {
                 // (a small body without loops, in few others unrolled (an
                 // `if` of the language in another's block...): code
                 // growing a little)
-                const unroll = self.unrolling < max_unrolled_nesting and smallBody(w.body) and !long_loops.contains(w.test_);
+                const unroll = self.unrolling < max_unrolled_nesting and smallBody(w.body) and !long_loops.contains(w.test_) and !rolled_loops.contains(w.test_);
                 if (unroll) self.unrolling += 1;
                 defer if (unroll) {
                     self.unrolling -= 1;
@@ -5058,11 +5173,14 @@ const Gen = struct {
                                 return;
                             }
                             const next = try self.f.label("next");
-                            try inst.loops.append(self.a(), .{ .brk = exit, .cont = next, .tries = self.tries.items.len });
+                            try inst.loops.append(self.a(), .{ .brk = exit, .cont = next, .tries = self.tries.items.len, .unrolled = w.test_, .dyn_depth = inst.dyn_depth, .in_try = inst.in_try });
                             try self.stmts(inst, w.body);
                             _ = inst.loops.pop();
+                            const jumped = inst.jumped;
+                            inst.jumped = null;
                             try self.f.block(next);
-                            if (inst.done) {
+                            // (a break: the loop done, its else not run)
+                            if (inst.done or jumped == .brk) {
                                 try self.f.block(exit);
                                 return;
                             }
@@ -5167,6 +5285,18 @@ const Gen = struct {
             .break_, .continue_ => {
                 if (inst.loops.items.len == 0) return self.c.unsupportedAt(inst.func, s.pos, "this break or continue can't be compiled", .{});
                 const target = inst.loops.items[inst.loops.items.len - 1];
+                // (an unrolled iteration's: at its own level, the rest of
+                // it dead, the unrolling ending or going on; in run-time
+                // control flow, the paths after it wouldn't be the same:
+                // compiled again, a loop at run time)
+                if (target.unrolled) |key| {
+                    if (inst.dyn_depth != target.dyn_depth or inst.in_try != target.in_try) {
+                        try rolled_loops.put(std.heap.c_allocator, key, {});
+                        self.c.need_retry = true;
+                        return self.c.unsupportedAt(inst.func, s.pos, "a break or continue in run-time control flow of a loop unrolled: compiled again, a loop at run time", .{});
+                    }
+                    inst.jumped = if (s.kind == .break_) .brk else .cont;
+                }
                 _ = try self.leaveTries(target.tries, null, null);
                 try self.f.br(if (s.kind == .break_) target.brk else target.cont);
                 try self.f.block(try self.f.label("after_jump"));
@@ -5460,6 +5590,17 @@ const Gen = struct {
                     inst.locals[slot] = .{ .static = v };
                 },
             },
+            // (`global name`: the module's dict, as Python sets it)
+            .global => |name| {
+                try self.strictRefuses("assigns the module variable {s} (`global {s}`)", .{ name, name });
+                const globals = ph.attr(inst.func.py_function, "__globals__") orelse return error.Python;
+                defer py.Py_DecRef(globals);
+                const idx = try self.c.objectIndex(globals);
+                const d = try self.materialize(v, inst.node);
+                const ok = self.call("zr_set_global", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), try self.c.m.string(name), d.tag, d.bits });
+                try self.drop(.{ .dyn = d });
+                try self.check(ok);
+            },
             .tuple => |ts| {
                 const known: ?[]const SVal = switch (v) {
                     .tuple => |x| x,
@@ -5596,6 +5737,11 @@ const Gen = struct {
                 const rhs = try self.expr(inst, value_e);
                 try self.assign(inst, t, try self.binary(inst, op, cur, rhs), pos);
             },
+            .global => |name| {
+                const cur = try self.global(inst, name, pos);
+                const rhs = try self.expr(inst, value_e);
+                try self.assign(inst, t, try self.binary(inst, op, cur, rhs), pos);
+            },
             .attr => |x| {
                 const obj = try self.expr(inst, x.obj);
                 const cur = try self.attr(inst, try self.copyOf(obj), x.name, pos);
@@ -5667,6 +5813,22 @@ const Gen = struct {
             .runtime => |it| return self.runtimeFor(inst, target, it, body, else_, pos),
         };
         const items = known.items;
+        // (one with a break or continue in run-time control flow: a loop at
+        // run time over them)
+        if (rolled_loops.contains(iter_e)) {
+            const of: SVal = switch (known.of) {
+                .list, .tuple => known.of,
+                else => blk: {
+                    const copies = try self.a().alloc(SVal, items.len);
+                    for (copies, items) |*slot, x| slot.* = try self.copyOf(x);
+                    break :blk .{ .tuple = copies };
+                },
+            };
+            const slots = try self.a().alloc(ir.Value, 1);
+            slots[0] = try self.tempSlot(inst);
+            try self.storeSlot(slots[0], try self.itemsOf(inst, of));
+            return self.runtimeFor(inst, target, .{ .kind = .plain, .slots = slots }, body, else_, pos);
+        }
         // Known items: unrolled (break / continue jump within it)
         const exit = try self.f.label("endfor");
         var broke = false;
@@ -5674,11 +5836,15 @@ const Gen = struct {
             const next = try self.f.label("next");
             if (item == .dyn) try self.increfDyn(item.dyn);
             try self.assign(inst, target, item, pos);
-            try inst.loops.append(self.a(), .{ .brk = exit, .cont = next, .tries = self.tries.items.len });
+            try inst.loops.append(self.a(), .{ .brk = exit, .cont = next, .tries = self.tries.items.len, .unrolled = iter_e, .dyn_depth = inst.dyn_depth, .in_try = inst.in_try });
             try self.stmts(inst, body);
             _ = inst.loops.pop();
+            const jumped = inst.jumped;
+            inst.jumped = null;
             try self.f.block(next);
-            if (inst.done) {
+            // (a break: the rest of the items not gone over, the else not
+            // run)
+            if (inst.done or jumped == .brk) {
                 broke = true;
                 break;
             }
@@ -6004,10 +6170,23 @@ const Gen = struct {
             .call_nested => |x| {
                 const mark = self.inflight.items.len;
                 errdefer self.taken(mark);
-                const args = try self.a().alloc(SVal, x.args.len);
-                for (args, x.args) |*slot, ae| slot.* = try self.operand(inst, ae);
+                // (a closure: given its own arguments and its env, the
+                // variables around it in their frames)
+                const n = if (x.func.closure) x.func.own else x.args.len;
+                const args = try self.a().alloc(SVal, if (x.func.closure) n + 1 else n);
+                for (args[0..n], x.args[0..n]) |*slot, ae| slot.* = try self.operand(inst, ae);
+                if (x.func.closure) args[n] = try self.closureEnvValue(inst, x.func);
                 self.taken(mark);
                 return self.callHelper(x.func, inst.node, args);
+            },
+            // A lambda, a nested def as a value: a closure (its code the
+            // generic code of the function, compiled with this)
+            .make_closure => |func| {
+                const env = try self.closureEnv(inst, func);
+                const code = try self.closureCode(func);
+                const ok = self.call("zr_closure", &.{ self.ctx, self.k32(inst.node), self.c.m.addrInt(@intFromPtr(func)), env orelse self.c.m.nullPtr(), code, self.out });
+                try self.check(ok);
+                return .{ .dyn = try self.loadOut(.any) };
             },
             .binary => |x| {
                 const mark = self.inflight.items.len;
@@ -9474,6 +9653,7 @@ fn collectAssigned(body: []const front.Stmt, set: *std.AutoHashMapUnmanaged(u32,
 fn collectTarget(t: front.Target, set: *std.AutoHashMapUnmanaged(u32, void), a: Allocator) !void {
     switch (t) {
         .local => |slot| try set.put(a, slot, {}),
+        .global => {},
         .tuple => |ts| for (ts) |x| try collectTarget(x, set, a),
         .attr => |x| if (x.obj.kind == .local) try set.put(a, x.obj.kind.local, {}),
         .index => |x| if (x.obj.kind == .local) try set.put(a, x.obj.kind.local, {}),
@@ -9622,7 +9802,7 @@ const FoldedSize = struct {
         switch (t) {
             .local => |slot| self.known[slot] = .unknown,
             .tuple => |ts| for (ts) |x| try self.forget(x),
-            .attr, .index => {},
+            .attr, .index, .global => {},
         }
     }
 
@@ -9764,7 +9944,7 @@ const FoldedSize = struct {
     fn countExpr(e: *const front.Expr) usize {
         var n: usize = 1;
         switch (e.kind) {
-            .int, .big, .object, .float, .str, .bool, .none, .global, .local, .outline => {},
+            .int, .big, .object, .float, .str, .bool, .none, .global, .local, .outline, .make_closure => {},
             .attr => |x| n += countExpr(x.obj),
             .index => |x| n += countExpr(x.obj) + countExpr(x.index),
             .slice => |x| {
@@ -9913,7 +10093,7 @@ fn stmtLocalReads(s: front.Stmt, plain: bool, out: *std.ArrayListUnmanaged(Local
 
 fn targetLocalReads(t: front.Target, out: *std.ArrayListUnmanaged(LocalRead), a: Allocator) Allocator.Error!void {
     switch (t) {
-        .local => {},
+        .local, .global => {},
         .tuple => |ts| for (ts) |x| try targetLocalReads(x, out, a),
         .attr => |x| try localReads(x.obj, false, out, a),
         .index => |x| {
@@ -9926,8 +10106,9 @@ fn targetLocalReads(t: front.Target, out: *std.ArrayListUnmanaged(LocalRead), a:
 fn localReads(e: *const front.Expr, plain: bool, out: *std.ArrayListUnmanaged(LocalRead), a: Allocator) Allocator.Error!void {
     switch (e.kind) {
         .local => |slot| try out.append(a, .{ .slot = slot, .e = e, .plain = plain }),
-        // (.outline: only in the compiler's own statements, never read here)
-        .int, .big, .object, .float, .str, .bool, .none, .global, .outline => {},
+        // (.outline: only in the compiler's own statements, never read here;
+        // a closure reads its variables in heap frames, never moved)
+        .int, .big, .object, .float, .str, .bool, .none, .global, .outline, .make_closure => {},
         .attr => |x| try localReads(x.obj, plain, out, a),
         .index => |x| {
             try localReads(x.obj, plain, out, a);
@@ -10002,7 +10183,7 @@ fn fpartLocalReads(p: front.FPart, out: *std.ArrayListUnmanaged(LocalRead), a: A
 /// (a target's reads: an attribute's or item's object and index)
 fn targetReads(t: front.Target, set: *std.AutoHashMapUnmanaged(u32, void), a: Allocator) !void {
     switch (t) {
-        .local => {},
+        .local, .global => {},
         .tuple => |ts| for (ts) |x| try targetReads(x, set, a),
         .attr => |x| try exprReads(x.obj, set, a),
         .index => |x| {
@@ -10029,8 +10210,9 @@ fn readsBesidesArgs(body: []const front.Stmt, slot: u32, a: Allocator) Allocator
 fn exprReads(e: *const front.Expr, set: *std.AutoHashMapUnmanaged(u32, void), a: Allocator) Allocator.Error!void {
     switch (e.kind) {
         .local => |slot| try set.put(a, slot, {}),
-        // (.outline reads the parameters, which its `if` doesn't assign)
-        .int, .big, .object, .float, .str, .bool, .none, .global, .outline => {},
+        // (.outline reads the parameters, which its `if` doesn't assign; a
+        // closure, heap frames' slots)
+        .int, .big, .object, .float, .str, .bool, .none, .global, .outline, .make_closure => {},
         .attr => |x| {
             if (reads_ignoring_args) |s| if (x.obj.kind == .local and x.obj.kind.local == s and std.mem.eql(u8, x.name, "args")) return;
             try exprReads(x.obj, set, a);

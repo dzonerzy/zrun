@@ -34,12 +34,10 @@ class TestSubset:
     @pytest.mark.parametrize(
         "source, reason",
         [
-            ("    f = lambda x: x\n", "`lambda` can't be compiled"),
+            ("    f = lambda x=1: x\n", "a lambda's parameters must be plain ones (no defaults, keyword-only or positional-only ones)"),
             ("    with open('x') as f:\n        pass\n", "`with` can't be compiled"),
-            # (a nested def is compiled where it's called; as a value, not)
-            ("    f = inner\n    def inner():\n        pass\n", "the nested function inner used as a value can't be compiled (only called)"),
+            ("    f = inner\n    def inner():\n        pass\n", "the nested function inner used before its def can't be compiled"),
             ("    @staticmethod\n    def inner():\n        pass\n", "a nested def with decorators can't be compiled"),
-            ("    global g\n", "`global` can't be compiled"),
             ("    class Inner:\n        pass\n", "a nested `class` can't be compiled"),
             ("    return {1, 2}\n", "a set can't be compiled"),
             ("    return [*node.children]\n", "*unpacking can't be compiled"),

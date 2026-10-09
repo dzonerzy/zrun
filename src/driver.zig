@@ -565,8 +565,14 @@ pub const Compiled = struct {
     fn add(self: *Compiled, name: [:0]const u8) ?usize {
         var err: [2048]u8 = undefined;
         @memset(&err, 0);
-        if (!self.defineNames()) return null;
+        // (a module that isn't in the JIT: its functions and helpers still to
+        // compile, none of the code after calling them)
+        if (!self.defineNames()) {
+            self.compiler.forgetModule();
+            return null;
+        }
         const module = self.compileModule(&err) orelse {
+            self.compiler.forgetModule();
             ph.raise(py.PyExc_RuntimeError(), "zrun: LLVM rejected the compiled program (a zrun bug): {s}", .{std.mem.sliceTo(&err, 0)});
             return null;
         };
