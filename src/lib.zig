@@ -1507,9 +1507,9 @@ const Program = struct {
         const what: []const u8 = if (e.calledName()) |name| name else "";
         ph.raise(ztypes.StrictError, "strict: {s}the compiled code went into Python while it ran{s}{s}{s} ({s}, {s}:{d} in zrun)", .{
             where.items,
-            if (what.len > 0) ", calling " else "",
+            if (what.len == 0) "" else if (e.phrase) ": " else ", calling ",
             what,
-            if (what.len > 0) "()" else "",
+            if (what.len > 0 and !e.phrase) "()" else "",
             e.at.fn_name,
             e.at.file,
             e.at.line,

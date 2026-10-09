@@ -353,8 +353,16 @@ export fn zr_overflow(ctx: *Ctx, node: u32) callconv(.c) bool {
 // Through Python: the slow and the error paths
 // ======================================================================
 
-fn objects(ctx: *Ctx, vals: []const Value, out: []*PyObject) bool {
-    gil.ensure(@src());
+/// Values as Python objects (new references), for Python to do what the
+/// code at `node` asks of them (strict mode's message: their kinds)
+fn objects(ctx: *Ctx, node: u32, vals: []const Value, out: []*PyObject) bool {
+    if (gil.strictOn()) {
+        var buf: [96]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        for (vals, 0..) |v, i| w.print("{s}{s}", .{ if (i > 0) ", " else "", value.typeName(v) }) catch {};
+        w.writeAll(" handed to Python") catch {};
+        gil.ensurePhrase(@src(), node, w.buffered());
+    } else gil.ensure(@src());
     for (vals, 0..) |v, i| {
         out[i] = value.toPython(v, ctx.node_maker) orelse {
             for (out[0..i]) |o| py.Py_DecRef(o);
@@ -442,7 +450,7 @@ fn pythonBinary(ctx: *Ctx, node: u32, op: Op, a: Value, b: Value, out: *Value) b
         stat("binary {s} {s} {s}", .{ statType(a, &b1), @tagName(op), statType(b, &b2) });
     }
     var objs: [2]*PyObject = undefined;
-    if (!objects(ctx, &.{ a, b }, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node,&.{ a, b }, &objs)) return failPython(ctx, node);
     defer for (objs) |o| py.Py_DecRef(o);
     const x = objs[0];
     const y = objs[1];
@@ -597,11 +605,129 @@ export fn zr_binary(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u6
         out.* = Value.obj(.str, &r.head);
         return true;
     }
+    // A list + a list, a tuple + a tuple: a new one of both's items
+    if (op == .add and a.kind() == b.kind() and (a.kind() == .list or a.kind() == .tuple)) {
+        const xs = itemsOfSeq(a);
+        const ys = itemsOfSeq(b);
+        return sequenceOf(ctx, node, a.kind(), &.{ xs, ys }, 1, out);
+    }
+    // A list, tuple or str times an int (either side): repeated (none for
+    // n <= 0); a huge one Python's (its MemoryError)
+    if (op == .mul) {
+        const seq, const times = if (isInt(b)) .{ a, b } else .{ b, a };
+        if (isInt(times) and (seq.kind() == .list or seq.kind() == .tuple or seq.kind() == .str)) {
+            const n: usize = @intCast(@max(times.asInt(), 0));
+            const size: usize = if (seq.kind() == .str) @as(*value.Str, @ptrCast(seq.ptr())).len else itemsOfSeq(seq).len;
+            if (size == 0 or n <= (1 << 31) / size) {
+                if (seq.kind() != .str) return sequenceOf(ctx, node, seq.kind(), &.{itemsOfSeq(seq)}, n, out);
+                const s: *value.Str = @ptrCast(seq.ptr());
+                const buf = allocator.alloc(u8, s.len * n) catch return fail(ctx, node, "out of memory", .{});
+                defer allocator.free(buf);
+                for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s.bytes());
+                const r = value.newStr(buf) orelse return fail(ctx, node, "out of memory", .{});
+                out.* = Value.obj(.str, &r.head);
+                return true;
+            }
+        }
+    }
     // Anything else: Python's result (or error) for the same objects
     return pythonBinary(ctx, node, op, a, b, out);
 }
 
+/// A list's or tuple's items
+fn itemsOfSeq(v: Value) []const Value {
+    return if (v.kind() == .list) @as(*value.List, @ptrCast(@alignCast(v.ptr()))).slice() else @as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).slice();
+}
+
+/// A new list or tuple (`kind`) of the parts' items, `times` over: in
+/// `out`
+fn sequenceOf(ctx: *Ctx, node: u32, kind: value.Tag, parts: []const []const Value, times: usize, out: *Value) bool {
+    var n: usize = 0;
+    for (parts) |p| n += p.len;
+    n *= times;
+    if (kind == .list) {
+        const l = value.newList(n) orelse return oomFail(ctx, node);
+        for (0..times) |_| for (parts) |p| for (p) |x| {
+            value.incref(x);
+            _ = value.listPush(l, x);
+        };
+        out.* = Value.obj(.list, &l.head);
+        return true;
+    }
+    const t = value.newTuple(n) orelse return oomFail(ctx, node);
+    var i: usize = 0;
+    for (0..times) |_| for (parts) |p| for (p) |x| {
+        value.incref(x);
+        t.slice()[i] = x;
+        i += 1;
+    };
+    out.* = Value.obj(.tuple, &t.head);
+    return true;
+}
+
 const Cmp = enum(u32) { eq, ne, lt, le, gt, ge, is, is_not, in, not_in };
+
+/// How two values order, as Python's <, <=, >, >= see them: numbers (ints
+/// of any width and floats, exactly), strs; `unordered` with a NaN (every
+/// comparison false); null for anything else (Python's to say).
+const Order = enum { lt, eq, gt, unordered };
+
+fn orderOf(a: Value, b: Value) ?Order {
+    const from = struct {
+        fn std_(o: std.math.Order) Order {
+            return switch (o) {
+                .lt => .lt,
+                .eq => .eq,
+                .gt => .gt,
+            };
+        }
+    };
+    if (isInt(a) and isInt(b)) return from.std_(std.math.order(a.asInt(), b.asInt()));
+    // (ints of any width, and ints with floats: exactly, as Python
+    // compares them)
+    if (value.wide(a)) |x| {
+        if (value.wide(b)) |y| return from.std_(std.math.order(x, y));
+        if (b.kind() == .float) {
+            if (std.math.isNan(b.asFloat())) return .unordered;
+            return from.std_(orderIntFloat(x, b.asFloat()));
+        }
+    } else if (value.wide(b)) |y| if (a.kind() == .float) {
+        if (std.math.isNan(a.asFloat())) return .unordered;
+        return from.std_(orderIntFloat(y, a.asFloat()).invert());
+    };
+    const fa: ?f64 = switch (a.kind()) {
+        .int, .bool => @floatFromInt(a.asInt()),
+        .float => a.asFloat(),
+        else => null,
+    };
+    const fb: ?f64 = switch (b.kind()) {
+        .int, .bool => @floatFromInt(b.asInt()),
+        .float => b.asFloat(),
+        else => null,
+    };
+    if (fa != null and fb != null) {
+        if (std.math.isNan(fa.?) or std.math.isNan(fb.?)) return .unordered;
+        return from.std_(std.math.order(fa.?, fb.?));
+    }
+    if (a.kind() == .str and b.kind() == .str)
+        return from.std_(std.mem.order(u8, @as(*value.Str, @ptrCast(a.ptr())).bytes(), @as(*value.Str, @ptrCast(b.ptr())).bytes()));
+    return null;
+}
+
+/// min(*args) / max(*args) of two or more values (objects[callee_index]:
+/// the builtin): natively for numbers and strs, the first of the smallest
+/// (largest) as Python picks it; anything else by the builtin.
+export fn zr_min_max(ctx: *Ctx, node: u32, is_max: u32, callee_index: u64, args: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
+    var best = args[0];
+    for (args[1..n]) |x| {
+        const o = orderOf(x, best) orelse return zr_call_python(ctx, node, callee_index, args, n, out);
+        // (Python's: x replaces the best one if x < best (max: x > best))
+        if (if (is_max != 0) o == .gt else o == .lt) best = x;
+    }
+    value.incref(best);
+    out.* = best;
+    return true;
+}
 
 /// a <cmp> b, Python's way: a bool in `out` (`in` too).
 export fn zr_compare(ctx: *Ctx, node: u32, cmp_code: u32, ta: u64, ba: u64, tb: u64, bb: u64, out: *Value) callconv(.c) bool {
@@ -621,59 +747,19 @@ export fn zr_compare(ctx: *Ctx, node: u32, cmp_code: u32, ta: u64, ba: u64, tb: 
             out.* = Value.boolean(if (cmp == .is) same else !same);
             return true;
         },
-        .lt, .le, .gt, .ge => {
-            const order: ?std.math.Order = blk: {
-                if (isInt(a) and isInt(b)) break :blk std.math.order(a.asInt(), b.asInt());
-                // (ints of any width, and ints with floats: exactly, as
-                // Python compares them)
-                if (value.wide(a)) |x| {
-                    if (value.wide(b)) |y| break :blk std.math.order(x, y);
-                    if (b.kind() == .float) {
-                        if (std.math.isNan(b.asFloat())) {
-                            out.* = Value.boolean(false);
-                            return true;
-                        }
-                        break :blk orderIntFloat(x, b.asFloat());
-                    }
-                } else if (value.wide(b)) |y| if (a.kind() == .float) {
-                    if (std.math.isNan(a.asFloat())) {
-                        out.* = Value.boolean(false);
-                        return true;
-                    }
-                    break :blk orderIntFloat(y, a.asFloat()).invert();
-                };
-                const fa: ?f64 = switch (a.kind()) {
-                    .int, .bool => @floatFromInt(a.asInt()),
-                    .float => a.asFloat(),
-                    else => null,
-                };
-                const fb: ?f64 = switch (b.kind()) {
-                    .int, .bool => @floatFromInt(b.asInt()),
-                    .float => b.asFloat(),
-                    else => null,
-                };
-                if (fa != null and fb != null) {
-                    if (std.math.isNan(fa.?) or std.math.isNan(fb.?)) {
-                        out.* = Value.boolean(false);
-                        return true;
-                    }
-                    break :blk std.math.order(fa.?, fb.?);
-                }
-                if (a.kind() == .str and b.kind() == .str) {
-                    break :blk std.mem.order(u8, @as(*value.Str, @ptrCast(a.ptr())).bytes(), @as(*value.Str, @ptrCast(b.ptr())).bytes());
-                }
-                break :blk null;
-            };
-            if (order) |o| {
-                const r = switch (cmp) {
+        .lt, .le, .gt, .ge => if (orderOf(a, b)) |order| {
+            const r = switch (order) {
+                // (NaN: every comparison false)
+                .unordered => false,
+                inline else => |o| switch (cmp) {
                     .lt => o == .lt,
                     .le => o != .gt,
                     .gt => o == .gt,
                     else => o != .lt,
-                };
-                out.* = Value.boolean(r);
-                return true;
-            }
+                },
+            };
+            out.* = Value.boolean(r);
+            return true;
         },
         .in, .not_in => {
             if (contains(a, b)) |r| {
@@ -692,7 +778,7 @@ export fn zr_compare(ctx: *Ctx, node: u32, cmp_code: u32, ta: u64, ba: u64, tb: 
         stat("compare {s} {s} {s}", .{ statType(a, &b1), @tagName(cmp), statType(b, &b2) });
     }
     var objs: [2]*PyObject = undefined;
-    if (!objects(ctx, &.{ a, b }, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node,&.{ a, b }, &objs)) return failPython(ctx, node);
     defer for (objs) |o| py.Py_DecRef(o);
     const r: c_int = switch (cmp) {
         .in, .not_in => py.c.PySequence_Contains(objs[1], objs[0]),
@@ -793,7 +879,7 @@ export fn zr_unary(ctx: *Ctx, node: u32, op_code: u32, t: u64, bits: u64, out: *
         },
     }
     var objs: [1]*PyObject = undefined;
-    if (!objects(ctx, &.{a}, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node,&.{a}, &objs)) return failPython(ctx, node);
     defer py.Py_DecRef(objs[0]);
     const r = switch (op) {
         .neg => py.c.PyNumber_Negative(objs[0]),
@@ -1253,7 +1339,7 @@ export fn zr_isinstance(ctx: *Ctx, node: u32, t: u64, bits: u64, cls_index: u64,
     gil.ensureAt(@src(), node, ctx.object(cls_index));
     const v = Value{ .tag = t, .bits = bits };
     var objs: [1]*PyObject = undefined;
-    if (!objects(ctx, &.{v}, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node,&.{v}, &objs)) return failPython(ctx, node);
     defer py.Py_DecRef(objs[0]);
     const r = py.c.PyObject_IsInstance(objs[0], ctx.object(cls_index));
     if (r < 0) return failPython(ctx, node);
@@ -1285,7 +1371,7 @@ export fn zr_getattr(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value
         stat("getattr {s}.{s}", .{ statType(v, &b), name.bytes() });
     }
     var objs: [1]*PyObject = undefined;
-    if (!objects(ctx, &.{v}, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node,&.{v}, &objs)) return failPython(ctx, node);
     defer py.Py_DecRef(objs[0]);
     const key = ph.newString(name.bytes()) orelse return failPython(ctx, node);
     defer py.Py_DecRef(key);
@@ -1396,7 +1482,7 @@ export fn zr_getitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
         stat("getitem {s}[{s}]", .{ statType(v, &b1), statType(k, &b2) });
     }
     var objs: [2]*PyObject = undefined;
-    if (!objects(ctx, &.{ v, k }, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node,&.{ v, k }, &objs)) return failPython(ctx, node);
     defer for (objs) |o| py.Py_DecRef(o);
     return fromResult(ctx, node, py.c.PyObject_GetItem(objs[0], objs[1]), out);
 }
@@ -1406,7 +1492,7 @@ export fn zr_getitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
 /// it, its error the same.
 export fn zr_wrapping(ctx: *Ctx, node: u32, op: u32, at: u64, ab: u64, bt: u64, bb: u64, out: *Value) callconv(.c) bool {
     var objs: [2]*PyObject = undefined;
-    if (!objects(ctx, &.{ .{ .tag = at, .bits = ab }, .{ .tag = bt, .bits = bb } }, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node,&.{ .{ .tag = at, .bits = ab }, .{ .tag = bt, .bits = bb } }, &objs)) return failPython(ctx, node);
     defer for (objs) |o| py.Py_DecRef(o);
     return fromResult(ctx, node, @import("wrapping.zig").ofPython(@enumFromInt(op), objs[0], objs[1]), out);
 }
@@ -1416,7 +1502,7 @@ export fn zr_wrapping(ctx: *Ctx, node: u32, op: u32, at: u64, ab: u64, bt: u64, 
 export fn zr_read(ctx: *Ctx, node: u32, r: u32, dt: u64, db: u64, at: u64, ab: u64, out: *Value) callconv(.c) bool {
     const read: @import("bytes.zig").Read = @enumFromInt(r);
     var objs: [2]*PyObject = undefined;
-    if (!objects(ctx, &.{ .{ .tag = dt, .bits = db }, .{ .tag = at, .bits = ab } }, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node,&.{ .{ .tag = dt, .bits = db }, .{ .tag = at, .bits = ab } }, &objs)) return failPython(ctx, node);
     defer for (objs) |o| py.Py_DecRef(o);
     return fromResult(ctx, node, @import("bytes.zig").read(read, objs[0], objs[1]), out);
 }
@@ -1456,7 +1542,7 @@ export fn zr_setitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
         // (a Python object: itself changed, as Python does it)
         .host => {
             var objs: [3]*PyObject = undefined;
-            if (!objects(ctx, &.{ v, k, x }, &objs)) return failPython(ctx, node);
+            if (!objects(ctx, node,&.{ v, k, x }, &objs)) return failPython(ctx, node);
             defer for (objs) |o| py.Py_DecRef(o);
             if (py.c.PyObject_SetItem(objs[0], objs[1], objs[2]) != 0) return failPython(ctx, node);
             return true;
@@ -1522,10 +1608,61 @@ export fn zr_items(ctx: *Ctx, node: u32, t: u64, bits: u64, out: *Value) callcon
         stat("items {s}", .{statType(v, &b)});
     }
     var objs: [1]*PyObject = undefined;
-    if (!objects(ctx, &.{v}, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node,&.{v}, &objs)) return failPython(ctx, node);
     defer py.Py_DecRef(objs[0]);
     const seq = py.c.PySequence_List(objs[0]);
     return fromResult(ctx, node, seq, out);
+}
+
+/// What `for ... in v.items()` (which 0), `v.keys()` (1), `v.values()` (2)
+/// goes over: a native dict's, natively (a list of them, made as the loop
+/// starts, in the dict's order); anything else's view (Python's), as a
+/// list.
+export fn zr_dict_view(ctx: *Ctx, node: u32, which: u32, t: u64, bits: u64, out: *Value) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    const names = [3][:0]const u8{ "items", "keys", "values" };
+    if (v.kind() == .dict) {
+        const d: *value.Dict = @ptrCast(@alignCast(v.ptr()));
+        const l = value.newList(d.len) orelse return oomFail(ctx, node);
+        for (value.dictEntries(d)) |e| {
+            if (value.isDeleted(e)) continue;
+            const item = switch (which) {
+                0 => blk: {
+                    const pair = value.newTuple(2) orelse {
+                        value.decref(Value.obj(.list, &l.head));
+                        return oomFail(ctx, node);
+                    };
+                    value.incref(e.key);
+                    value.incref(e.value);
+                    pair.slice()[0] = e.key;
+                    pair.slice()[1] = e.value;
+                    break :blk Value.obj(.tuple, &pair.head);
+                },
+                1 => blk: {
+                    value.incref(e.key);
+                    break :blk e.key;
+                },
+                else => blk: {
+                    value.incref(e.value);
+                    break :blk e.value;
+                },
+            };
+            if (!value.listPush(l, item)) return oomFail(ctx, node);
+        }
+        out.* = Value.obj(.list, &l.head);
+        return true;
+    }
+    // (anything else: its method's result, Python's, as a list)
+    if (gil.strictOn()) {
+        var nb: [96]u8 = undefined;
+        gil.ensureNamed(@src(), node, std.fmt.bufPrint(&nb, "{s}.{s}", .{ value.typeName(v), names[which] }) catch names[which]);
+    } else gil.ensure(@src());
+    var objs: [1]*PyObject = undefined;
+    if (!objects(ctx, node,&.{v}, &objs)) return failPython(ctx, node);
+    defer py.Py_DecRef(objs[0]);
+    const view = py.c.PyObject_CallMethod(objs[0], names[which].ptr, null) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(view);
+    return fromResult(ctx, node, py.c.PySequence_List(view), out);
 }
 
 /// The one-character strs of ASCII, made once (immortal)
@@ -1612,7 +1749,7 @@ export fn zr_unpack(ctx: *Ctx, node: u32, t: u64, bits: u64, n: u64, out: [*]Val
     gil.ensureAt(@src(), node, null);
     const f = unpacker(n) orelse return failPython(ctx, node);
     var objs: [1]*PyObject = undefined;
-    if (!objects(ctx, &.{v}, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node,&.{v}, &objs)) return failPython(ctx, node);
     defer py.Py_DecRef(objs[0]);
     const r = py.c.PyObject_CallFunctionObjArgs(f, objs[0], @as(?*PyObject, null)) orelse return failPython(ctx, node);
     defer py.Py_DecRef(r);
@@ -1647,7 +1784,7 @@ export fn zr_append(ctx: *Ctx, node: u32, t: u64, bits: u64, xt: u64, xb: u64) c
     if (v.kind() != .list) {
         // (a Python object's append(), or Python's error)
         var objs: [2]*PyObject = undefined;
-        if (!objects(ctx, &.{ v, x }, &objs)) return failPython(ctx, node);
+        if (!objects(ctx, node,&.{ v, x }, &objs)) return failPython(ctx, node);
         defer for (objs) |o| py.Py_DecRef(o);
         const r = py.c.PyObject_CallMethod(objs[0], "append", "(O)", objs[1]) orelse return failPython(ctx, node);
         py.Py_DecRef(r);
@@ -1712,6 +1849,36 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
         // (a method of its class: its compiled code, the record self)
         if (@import("bridge.zig").recordMethod(ctx, node, v, name, args[0..n], out)) |ok| return ok;
     }
+    // A list's or tuple's index(x), count(x): natively, by ==; x missing
+    // from index(): Python's ValueError, its words (an error: what strict
+    // mode allows)
+    if ((v.kind() == .list or v.kind() == .tuple) and n == 1 and args[0].kind() != .host) {
+        const is_index = std.mem.eql(u8, name.bytes(), "index");
+        if (is_index or std.mem.eql(u8, name.bytes(), "count")) {
+            var count: i64 = 0;
+            for (itemsOfSeq(v), 0..) |x, i| {
+                if (x.kind() == .host) break;
+                if (!value.equal(x, args[0])) continue;
+                if (is_index) {
+                    out.* = Value.pint(@intCast(i));
+                    return true;
+                }
+                count += 1;
+            } else {
+                if (!is_index) {
+                    out.* = Value.pint(count);
+                    return true;
+                }
+                gil.allowBegin();
+                defer gil.allowEnd();
+                return callMethodPython(ctx, node, v, name, args[0..n], out);
+            }
+        }
+    }
+    // rt.load(), rt.store() of an rt handed over: natively
+    if (v.kind() == .rt) {
+        if (@import("bridge.zig").rtValueMethod(ctx, node, v, name.bytes(), args[0..n], out)) |ok| return ok;
+    }
     // A str's common methods, natively (an ASCII one: Unicode's case
     // rules are Python's)
     if (v.kind() == .str) {
@@ -1758,14 +1925,26 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
             return true;
         }
     }
-    // Anything else: the method as Python finds it
-    gil.ensureAt(@src(), node, null);
+    // Anything else: the method as Python finds it (strict mode's message:
+    // the value's kind and the method, `str.encode`)
+    if (gil.strictOn()) {
+        var nb: [96]u8 = undefined;
+        const what = std.fmt.bufPrint(&nb, "{s}.{s}", .{ value.typeName(v), name.bytes() }) catch name.bytes();
+        gil.ensureNamed(@src(), node, what);
+    } else gil.ensure(@src());
+    return callMethodPython(ctx, node, v, name, args[0..n], out);
+}
+
+/// v.name(args) as Python does it (its compiled code if it's a Python
+/// function's), the GIL taken.
+fn callMethodPython(ctx: *Ctx, node: u32, v: Value, name: *const value.Str, args: []const Value, out: *Value) bool {
+    const n = args.len;
     if (collecting) {
         var b: [64]u8 = undefined;
         stat("method {s}.{s}", .{ statType(v, &b), name.bytes() });
     }
     var objs: [1]*PyObject = undefined;
-    if (!objects(ctx, &.{v}, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node, &.{v}, &objs)) return failPython(ctx, node);
     defer py.Py_DecRef(objs[0]);
     const key = ph.newString(name.bytes()) orelse return failPython(ctx, node);
     defer py.Py_DecRef(key);
@@ -1979,6 +2158,14 @@ export fn zr_call_python(ctx: *Ctx, node: u32, callee_index: u64, args: [*]const
     return fromResult(ctx, node, py.c.PyObject_CallObject(callee, tuple), out);
 }
 
+/// An exception made (zr_call_python of an exception class: rt.Throw(v),
+/// ValueError(msg)...): an error on its way, what strict mode allows.
+export fn zr_new_exception(ctx: *Ctx, node: u32, callee_index: u64, args: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
+    gil.allowBegin();
+    defer gil.allowEnd();
+    return zr_call_python(ctx, node, callee_index, args, n, out);
+}
+
 /// v[lo:hi:step] with bounds only known at run time: lists, tuples and
 /// ASCII strings natively, the rest (and the errors) as Python does it.
 export fn zr_slice(ctx: *Ctx, node: u32, t: u64, bits: u64, lt: u64, lb: u64, ht: u64, hb: u64, st: u64, sb: u64, out: *Value) callconv(.c) bool {
@@ -2063,7 +2250,7 @@ export fn zr_slice(ctx: *Ctx, node: u32, t: u64, bits: u64, lt: u64, lb: u64, ht
         return true;
     }
     var objs: [4]*PyObject = undefined;
-    if (!objects(ctx, &.{ v, bounds[0], bounds[1], bounds[2] }, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node,&.{ v, bounds[0], bounds[1], bounds[2] }, &objs)) return failPython(ctx, node);
     defer for (objs) |o| py.Py_DecRef(o);
     const sl = py.c.PySlice_New(objs[1], objs[2], objs[3]) orelse return failPython(ctx, node);
     defer py.Py_DecRef(sl);
@@ -2127,23 +2314,26 @@ export fn zr_range(ctx: *Ctx, node: u32, args: [*]const Value, n: u64, out: *[3]
 }
 
 /// The builtins zr_builtin does natively, by code
-pub const Builtin = enum(u32) { int, float, len, abs, str, bool };
+/// The builtins zr_builtin does natively for native values (floor and ceil:
+/// math's)
+pub const Builtin = enum(u32) { int, float, len, abs, str, bool, list, floor, ceil, chr, ord, id };
 
 /// A builtin of one argument (`code`), natively for native values, as
 /// Python does it; anything else (and the errors) by the builtin itself
 /// (objects[callee_index]).
 export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64, bits: u64, out: *Value) callconv(.c) bool {
     const v = Value{ .tag = t, .bits = bits };
-    // (a Big: int() and abs() in 128 bits, float() rounded, str() its
-    // digits, bool() true)
+    // (a Big: int(), floor(), ceil() itself, abs() in 128 bits, float()
+    // rounded, str() its digits, bool() true)
     if (v.kind() == .big) {
         const x = value.wide(v).?;
         switch (@as(Builtin, @enumFromInt(code))) {
-            .int => {
+            .int, .floor, .ceil => {
                 value.incref(v);
                 out.* = v;
                 return true;
             },
+            .list, .ord, .chr, .id => {},
             .abs => if (x != std.math.minInt(i128)) {
                 out.* = value.intValue(if (x < 0) -x else x) orelse return oomFail(ctx, node);
                 return true;
@@ -2285,8 +2475,336 @@ export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64,
             },
             else => {},
         },
+        // (math.floor(), math.ceil(): an int itself, a float rounded to an
+        // int (infinity, NaN and ones beyond 64 bits: Python's))
+        .floor, .ceil => switch (v.kind()) {
+            .int, .bool => {
+                out.* = Value.pint(v.asInt());
+                return true;
+            },
+            .float => {
+                const f = v.asFloat();
+                const r = if (code == @intFromEnum(Builtin.floor)) @floor(f) else @ceil(f);
+                if (r == r and @abs(r) < 9.2e18) {
+                    out.* = Value.pint(@intFromFloat(r));
+                    return true;
+                }
+            },
+            else => {},
+        },
+        // (chr() of an int: its character, UTF-8; one out of range: Python's
+        // error, its words; a lone surrogate (not UTF-8): Python's str)
+        .chr => if (isInt(v)) {
+            const cp = v.asInt();
+            if (cp < 0 or cp > 0x10FFFF) return pythonsError(ctx, node, callee_index, v, out);
+            if (cp < 0xD800 or cp > 0xDFFF) {
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(@intCast(cp), &buf) catch unreachable;
+                const s = value.newStr(buf[0..n]) orelse return oomFail(ctx, node);
+                out.* = Value.obj(.str, &s.head);
+                return true;
+            }
+        },
+        // (ord() of a str of one character: its code point)
+        .ord => if (v.kind() == .str) {
+            const s: *value.Str = @ptrCast(v.ptr());
+            if (s.chars == 1) {
+                const cp = std.unicode.utf8Decode(s.bytes()) catch unreachable;
+                out.* = Value.pint(cp);
+                return true;
+            }
+            return pythonsError(ctx, node, callee_index, v, out);
+        },
+        // (id(): see idOf)
+        .id => if (idOf(v)) |x| {
+            out.* = Value.pint(x);
+            return true;
+        },
+        // (list() of a list or tuple: a new list of its items)
+        .list => switch (v.kind()) {
+            .list, .tuple => {
+                const items = if (v.kind() == .list) @as(*value.List, @ptrCast(@alignCast(v.ptr()))).slice() else @as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).slice();
+                const l = value.newList(items.len) orelse return oomFail(ctx, node);
+                for (items) |x| {
+                    value.incref(x);
+                    if (!value.listPush(l, x)) return oomFail(ctx, node);
+                }
+                out.* = Value.obj(.list, &l.head);
+                return true;
+            },
+            // (a dict's keys, a str's characters: a new list, as a loop
+            // over them sees them)
+            .dict, .str => return zr_items(ctx, node, v.tag, v.bits, out),
+            else => {},
+        },
     }
     return zr_call_python(ctx, node, callee_index, @ptrCast(&v), 1, out);
+}
+
+/// id(v), with what Python promises: two values alive at once have the same
+/// id exactly when they're the same (`is`). An object of the code's (a str,
+/// list, dict, record, function...): its address; a Python object: its
+/// address, as CPython's id(); None, True, False: CPython's own objects'.
+/// A number (or a node) is no object here: Python's id() of one is a
+/// temporary's; its id here, from its kind and bits (the same for the same
+/// one), is odd (no object's address, all aligned) and below 2**63 (an
+/// int of the program). Null for anything else (Python's to say).
+fn idOf(v: Value) ?i64 {
+    switch (v.kind()) {
+        .none => return @intCast(@intFromPtr(py.Py_None())),
+        .bool => return @intCast(@intFromPtr(if (v.asInt() != 0) py.Py_True() else py.Py_False())),
+        .host => return @intCast(v.bits),
+        .int, .float, .node => {
+            // (a bijective mix of the bits, the kind apart; 62 of its bits)
+            const kind_salt: u64 = @as(u64, @intFromEnum(v.kind())) *% 0xD6E8FEB86659FD93;
+            const h = (v.bits ^ kind_salt) *% 0x9E3779B97F4A7C15;
+            return @intCast(((h >> 2) << 1) | 1);
+        },
+        else => {},
+    }
+    if (value.counted(v.tag)) return @intCast(@intFromPtr(v.ptr()));
+    return null;
+}
+
+/// An int beyond 64 bits: a Big, or Python's int beyond 128 bits (a host
+/// value): not one of the program's (Gen.checkedAt: the overflow, as the
+/// reference mode's I64 raises it). Its type read, no Python run.
+export fn zr_huge_int(t: u64, bits: u64) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    if (v.kind() == .big) return true;
+    if (v.kind() != .host) return false;
+    return ph.typeOf(@ptrFromInt(bits)) == py.types.typeObject("PyLong_Type");
+}
+
+/// A builtin (objects[callee_index]) given a value it refuses: called by
+/// Python for its error, in its words (what strict mode allows: an error).
+fn pythonsError(ctx: *Ctx, node: u32, callee_index: u64, v: Value, out: *Value) bool {
+    return pythonsErrorOf(ctx, node, callee_index, @ptrCast(&v), 1, out);
+}
+
+fn pythonsErrorOf(ctx: *Ctx, node: u32, callee_index: u64, args: [*]const Value, n: u64, out: *Value) bool {
+    gil.allowBegin();
+    defer gil.allowEnd();
+    return zr_call_python(ctx, node, callee_index, args, n, out);
+}
+
+/// The math module's functions zr_math does natively (copysign, fmod,
+/// atan2, pow: two arguments; isnan, isinf, isfinite: a bool). Those from
+/// `exp` on are the C library's, natively only where it's the one Python
+/// runs with (Linux: the same libm, so the same results to the last bit).
+pub const MathFn = enum(u32) { sqrt, fabs, degrees, radians, isnan, isinf, isfinite, copysign, fmod, exp, log, log2, log10, sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, asinh, acosh, atanh, expm1, log1p, atan2, pow };
+
+pub fn mathArity(f: MathFn) u32 {
+    return switch (f) {
+        .copysign, .fmod, .atan2, .pow => 2,
+        else => 1,
+    };
+}
+
+/// Whether math's `f` is the C library's (zr_math: from the process's libm)
+fn needsLibm(f: MathFn) bool {
+    return switch (f) {
+        .sqrt, .fabs, .degrees, .radians, .isnan, .isinf, .isfinite, .copysign => false,
+        else => true,
+    };
+}
+
+const F1 = *const fn (f64) callconv(.c) f64;
+const F2 = *const fn (f64, f64) callconv(.c) f64;
+
+/// The C library's math functions as Python's math module calls them: the
+/// process's libm's own, found by name (Zig's compiler-rt has functions of
+/// the same names, not the same to the last bit); null where they can't be
+/// had (math's functions run in Python then).
+const Libm = struct { fmod: F2, exp: F1, log: F1, log2: F1, log10: F1, sin: F1, cos: F1, tan: F1, asin: F1, acos: F1, atan: F1, sinh: F1, cosh: F1, tanh: F1, asinh: F1, acosh: F1, atanh: F1, expm1: F1, log1p: F1, atan2: F2, pow: F2 };
+var libm: ?Libm = null;
+var libm_looked = false;
+
+/// libm's functions looked up (once: while compiling, with the GIL)
+pub fn findLibm() void {
+    if (libm_looked) return;
+    libm_looked = true;
+    if (@import("builtin").os.tag != .linux) return;
+    const h = std.c.dlopen("libm.so.6", .{ .LAZY = true, .NOLOAD = true }) orelse return;
+    var t: Libm = undefined;
+    inline for (@typeInfo(Libm).@"struct".fields) |fd| {
+        const p = std.c.dlsym(h, fd.name) orelse return;
+        @field(t, fd.name) = @ptrCast(@alignCast(p));
+    }
+    libm = t;
+}
+
+/// A number as math's functions take it (an int, a bool, a float), or null
+fn floatOf(v: Value) ?f64 {
+    if (value.wide(v)) |x| return @floatFromInt(x);
+    return switch (v.kind()) {
+        .bool => @floatFromInt(v.asInt()),
+        .float => v.asFloat(),
+        else => null,
+    };
+}
+
+/// math.<f>(args) (objects[callee_index]: the function) of numbers,
+/// natively, as CPython computes it; a NaN from numbers that aren't, an
+/// infinity from finite ones (CPython's errors, or its special cases): the
+/// function itself, its result or its error in its words; anything not a
+/// number, the function.
+export fn zr_math(ctx: *Ctx, node: u32, code: u32, callee_index: u64, n: u64, args: [*]const Value, out: *Value) callconv(.c) bool {
+    const f: MathFn = @enumFromInt(code);
+    var xs: [2]f64 = undefined;
+    for (args[0..n], 0..) |a, i| xs[i] = floatOf(a) orelse return zr_call_python(ctx, node, callee_index, args, n, out);
+    if (needsLibm(f) and libm == null) return zr_call_python(ctx, node, callee_index, args, n, out);
+    const lm = libm orelse undefined;
+    const x = xs[0];
+    const y = xs[1];
+    switch (f) {
+        .isnan, .isinf, .isfinite => {
+            out.* = Value.boolean(switch (f) {
+                .isnan => std.math.isNan(x),
+                .isinf => std.math.isInf(x),
+                else => std.math.isFinite(x),
+            });
+            return true;
+        },
+        else => {},
+    }
+    const r: f64 = switch (f) {
+        .sqrt => @sqrt(x),
+        .fabs => @abs(x),
+        // (CPython's constants: 180 / pi, pi / 180, divided as doubles)
+        .degrees => x * (@as(f64, 180.0) / @as(f64, std.math.pi)),
+        .radians => x * (@as(f64, std.math.pi) / @as(f64, 180.0)),
+        .copysign => std.math.copysign(x, y),
+        .isnan, .isinf, .isfinite => unreachable,
+        // (the C library's, by the name: Libm's field)
+        inline else => |g| blk: {
+            const func = @field(lm, @tagName(g));
+            break :blk if (@TypeOf(func) == F2) func(x, y) else func(x);
+        },
+    };
+    var any_nan = false;
+    var all_finite = true;
+    for (xs[0..n]) |a| {
+        any_nan = any_nan or std.math.isNan(a);
+        all_finite = all_finite and std.math.isFinite(a);
+    }
+    if ((std.math.isNan(r) and !any_nan) or (std.math.isInf(r) and all_finite)) return pythonsErrorOf(ctx, node, callee_index, args, n, out);
+    out.* = Value.float(r);
+    return true;
+}
+
+const IntParse = union(enum) { int: i64, too_big, invalid };
+
+/// int(s, base) of an ASCII str as Python reads it (base 2 to 36, or 0:
+/// from its prefix): whitespace around, a sign, a prefix (0x, 0o, 0b) the
+/// base allows, digits below the base with single underscores between them
+/// (one may follow the prefix); base 0 refuses leading zeros of a number
+/// not zero.
+fn parseIntBase(s: []const u8, base_given: u32) IntParse {
+    const t = std.mem.trim(u8, s, int_space);
+    var i: usize = 0;
+    var neg = false;
+    if (i < t.len and (t[i] == '+' or t[i] == '-')) {
+        neg = t[i] == '-';
+        i += 1;
+    }
+    var base = base_given;
+    var prefixed = false;
+    if (i + 1 < t.len and t[i] == '0') {
+        const pb: u32 = switch (std.ascii.toLower(t[i + 1])) {
+            'x' => 16,
+            'o' => 8,
+            'b' => 2,
+            else => 0,
+        };
+        if (pb != 0 and (base == 0 or base == pb)) {
+            base = pb;
+            i += 2;
+            prefixed = true;
+        }
+    }
+    const auto = base == 0;
+    if (auto) base = 10;
+    var acc: i128 = 0;
+    var too_big = false;
+    var digits: usize = 0;
+    var leading_zero = false;
+    var nonzero = false;
+    // (an underscore: after a digit, or the prefix)
+    var after_digit = prefixed;
+    while (i < t.len) : (i += 1) {
+        const ch = t[i];
+        if (ch == '_') {
+            if (!after_digit or i + 1 >= t.len) return .invalid;
+            after_digit = false;
+            continue;
+        }
+        const d: u32 = if (std.ascii.isDigit(ch)) ch - '0' else if (std.ascii.isAlphabetic(ch)) std.ascii.toLower(ch) - 'a' + 10 else return .invalid;
+        if (d >= base) return .invalid;
+        if (digits == 0 and d == 0) leading_zero = true;
+        if (d != 0) nonzero = true;
+        digits += 1;
+        after_digit = true;
+        if (!too_big) {
+            acc = acc * base + d;
+            if (acc > std.math.maxInt(i64) + 1) too_big = true;
+        }
+    }
+    if (digits == 0) return .invalid;
+    if (auto and !prefixed and leading_zero and nonzero) return .invalid;
+    if (too_big) return .too_big;
+    if (neg) acc = -acc;
+    if (acc > std.math.maxInt(i64)) return .too_big;
+    return .{ .int = @intCast(acc) };
+}
+
+/// int(v, base) (objects[callee_index]: int), base known when compiling:
+/// an ASCII str natively, with Python's error for one that isn't a number
+/// in the base; a non-str, Python's TypeError; a str beyond 64 bits (a big
+/// int), or not ASCII, by int itself.
+export fn zr_int_base(ctx: *Ctx, node: u32, callee_index: u64, t: u64, bits: u64, base: u32, out: *Value) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    switch (v.kind()) {
+        .str => {
+            const s: *value.Str = @ptrCast(v.ptr());
+            if (s.chars == s.len) switch (parseIntBase(s.bytes(), base)) {
+                .int => |x| {
+                    out.* = Value.pint(x);
+                    return true;
+                },
+                .invalid => {
+                    var buf: [256]u8 = undefined;
+                    const r = pyRepr(s.bytes(), &buf) orelse "...";
+                    return failAs(ctx, node, py.PyExc_ValueError(), null, "invalid literal for int() with base {d}: {s}", .{ base, r });
+                },
+                .too_big => {},
+            };
+        },
+        .int, .bool, .float, .none, .list, .tuple, .dict => return failAs(ctx, node, py.PyExc_TypeError(), null, "int() can't convert non-string with explicit base", .{}),
+        else => {},
+    }
+    const args = [2]Value{ v, Value.pint(base) };
+    return zr_call_python(ctx, node, callee_index, &args, 2, out);
+}
+
+/// len(v.encode("utf-8")): a str's length in bytes (a str is its UTF-8
+/// bytes); anything else as Python does it.
+export fn zr_utf8_len(ctx: *Ctx, node: u32, t: u64, bits: u64, out: *Value) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    if (v.kind() == .str) {
+        out.* = Value.pint(@intCast(@as(*value.Str, @ptrCast(v.ptr())).len));
+        return true;
+    }
+    gil.ensureAt(@src(), node, null);
+    var objs: [1]*PyObject = undefined;
+    if (!objects(ctx, node,&.{v}, &objs)) return failPython(ctx, node);
+    defer py.Py_DecRef(objs[0]);
+    const encoded = py.c.PyObject_CallMethod(objs[0], "encode", "s", "utf-8") orelse return failPython(ctx, node);
+    defer py.Py_DecRef(encoded);
+    const n = py.c.PyObject_Size(encoded);
+    if (n < 0) return failPython(ctx, node);
+    out.* = Value.pint(@intCast(n));
+    return true;
 }
 
 /// A closure's captured variable: its cell `idx` (of the function called,
@@ -2410,7 +2928,7 @@ export fn zr_format(ctx: *Ctx, node: u32, t: u64, bits: u64, conversion: u32, sp
     }
     gil.ensureAt(@src(), node, null);
     var objs: [1]*PyObject = undefined;
-    if (!objects(ctx, &.{v}, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node,&.{v}, &objs)) return failPython(ctx, node);
     var o = objs[0];
     defer py.Py_DecRef(o);
     if (conversion != 0) {
@@ -2457,6 +2975,8 @@ const helper_names = [_][]const u8{
     "zr_varargs",  "zr_record_new", "zr_isinstance", "zr_call_seq",      "zr_slice",
     "zr_type",     "zr_builtin",    "zr_range",      "zr_cell",          "zr_frame_of",
     "zr_extend_items", "zr_tail_set", "zr_tail_resolve", "zr_tail_take", "zr_tail_put", "zr_tail_clear",
+    "zr_int_base", "zr_utf8_len", "zr_min_max", "zr_math", "zr_huge_int", "zr_dict_view",
+    "zr_new_exception",
 };
 
 /// The names compiled code calls them by, and their addresses

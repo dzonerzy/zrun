@@ -1467,6 +1467,13 @@ pub const Compiler = struct {
         .{ "zr_type", "vllp" },
         .{ "zr_cell", "bpilllp" },
         .{ "zr_builtin", "bpiilllp" },
+        .{ "zr_int_base", "bpilllip" },
+        .{ "zr_utf8_len", "bpillp" },
+        .{ "zr_min_max", "bpiilplp" },
+        .{ "zr_math", "bpiillpp" },
+        .{ "zr_huge_int", "bll" },
+        .{ "zr_dict_view", "bpiillp" },
+        .{ "zr_new_exception", "bpilplp" },
         .{ "zr_range", "bpiplp" },
         .{ "zr_is_type", "blli" },
         .{ "zr_format", "bpillipp" },
@@ -3652,12 +3659,17 @@ const Gen = struct {
                 // overflow, as the reference mode's I64 raises it)
                 if (d.shape == .any) {
                     const f = &self.f;
+                    const maybe = try f.label("maybe_big");
                     const big = try f.label("big_int");
                     const fine = try f.label("not_big");
-                    // (rare: out of the way)
+                    // (rare: out of the way; a Big, or Python's int beyond
+                    // 128 bits (a host value): zr_huge_int)
                     const is_big = f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.big)));
+                    const is_host = f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(value.Tag.host)));
                     const expect = self.c.m.intrinsic("llvm.expect", &.{self.c.m.t.i1});
-                    try f.condBr(f.call(expect, &.{ is_big, self.c.m.k1(false) }), big, fine);
+                    try f.condBr(f.call(expect, &.{ f.or_(is_big, is_host), self.c.m.k1(false) }), maybe, fine);
+                    try f.block(maybe);
+                    try f.condBr(self.call("zr_huge_int", &.{ d.tag, d.bits }), big, fine);
                     try f.block(big);
                     try self.failAt(at, "integer overflow");
                     try f.br(fine);
@@ -5680,6 +5692,24 @@ const Gen = struct {
                 return self.rangeIteration(inst, args);
             }
         }
+        // d.items(), d.keys(), d.values() of a run-time value: a native
+        // dict's own, no view made (zr_dict_view: a list of them as the loop
+        // starts)
+        if (e.kind == .call and e.kind.call.args.len == 0 and e.kind.call.keywords.len == 0 and e.kind.call.func.kind == .attr) {
+            const name = e.kind.call.func.kind.attr.name;
+            const which: ?u32 = if (std.mem.eql(u8, name, "items")) 0 else if (std.mem.eql(u8, name, "keys")) 1 else if (std.mem.eql(u8, name, "values")) 2 else null;
+            if (which) |w| {
+                const obj = try self.expr(inst, e.kind.call.func.kind.attr.obj);
+                if (obj == .dyn) {
+                    const ok = self.call("zr_dict_view", &.{ self.ctx, self.k32(inst.node), self.k32(w), obj.dyn.tag, obj.dyn.bits, self.out });
+                    try self.drop(obj);
+                    try self.check(ok);
+                    return self.iterationOf(inst, .{ .dyn = try self.loadOut(.list) });
+                }
+                // (a known one: its method, as any call of it)
+                return self.iterationOf(inst, try self.methodCall(inst, obj, name, &.{}, e.pos));
+            }
+        }
         return self.iterationOf(inst, try self.expr(inst, e));
     }
 
@@ -6913,6 +6943,18 @@ const Gen = struct {
             }
         } else callee = try self.expr(inst, func_e);
         try self.inflight.append(self.a(), callee);
+        // len(s.encode("utf-8")): a str's length in bytes, no bytes made
+        // (zr_utf8_len)
+        if (callee == .py and args_e.len == 1 and kws.len == 0 and isBuiltin(callee.py, "len")) if (encodedUtf8(args_e[0])) |obj_e| {
+            // (the operand held while it's made, taken by the call)
+            const v = try self.operand(inst, obj_e);
+            self.taken(mark);
+            const d = try self.materialize(v, inst.node);
+            const ok = self.call("zr_utf8_len", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, self.out });
+            try self.drop(.{ .dyn = d });
+            try self.check(ok);
+            return .{ .dyn = try self.loadOut(.int) };
+        };
         // all() / any() of a generator expression: up to the item deciding
         if (callee == .py and args_e.len == 1 and kws.len == 0 and args_e[0].kind == .gen_exp) {
             self.taken(mark);
@@ -7813,7 +7855,8 @@ const Gen = struct {
         if (self.c.lang.strict and !isExceptionClass(o)) try self.strictRefuses("calls the Python function {s}()", .{try self.pyName(o)});
         const idx = try self.c.objectIndex(o);
         const arr = try self.valueArray(args, inst.node);
-        const ok = self.call("zr_call_python", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), arr, self.k(@intCast(args.len)), self.out });
+        // (an exception class: an error being made, zr_new_exception)
+        const ok = self.call(if (isExceptionClass(o)) "zr_new_exception" else "zr_call_python", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), arr, self.k(@intCast(args.len)), self.out });
         try self.dropArray(arr, args.len);
         try self.check(ok);
         return .{ .dyn = try self.loadOut(.any) };
@@ -7833,13 +7876,68 @@ const Gen = struct {
         return b == o;
     }
 
+    /// `x` of `x.encode()`, `x.encode("utf-8")` (UTF-8 by any of its
+    /// names), or null.
+    fn encodedUtf8(e: *const front.Expr) ?*const front.Expr {
+        if (e.kind != .call) return null;
+        const ce = e.kind.call;
+        if (ce.func.kind != .attr or !std.mem.eql(u8, ce.func.kind.attr.name, "encode") or ce.keywords.len != 0) return null;
+        if (ce.args.len > 1) return null;
+        if (ce.args.len == 1) {
+            if (ce.args[0].kind != .str) return null;
+            const names = [_][]const u8{ "utf-8", "utf8", "UTF-8", "UTF8", "utf_8" };
+            for (names) |n| {
+                if (std.mem.eql(u8, ce.args[0].kind.str, n)) break;
+            } else return null;
+        }
+        return ce.func.kind.attr.obj;
+    }
+
+    /// Whether `o` is module `module`'s `name` (math.floor...)
+    fn isModuleAttr(o: *PyObject, module: [*:0]const u8, name: [*:0]const u8) bool {
+        const m = py.c.PyImport_ImportModule(module) orelse {
+            py.c.PyErr_Clear();
+            return false;
+        };
+        defer py.Py_DecRef(m);
+        const x = py.c.PyObject_GetAttrString(m, name) orelse {
+            py.c.PyErr_Clear();
+            return false;
+        };
+        defer py.Py_DecRef(x);
+        return x == o;
+    }
+
+    /// Whether `o` is a function of the math module (pure: its result for
+    /// known numbers decided when compiling)
+    fn isMathFunction(o: *PyObject) bool {
+        const n = py.c.PyObject_GetAttrString(o, "__name__") orelse {
+            py.c.PyErr_Clear();
+            return false;
+        };
+        defer py.Py_DecRef(n);
+        var buf: [64]u8 = undefined;
+        const s = ph.utf8(n, "name") orelse {
+            py.c.PyErr_Clear();
+            return false;
+        };
+        if (s.len >= buf.len) return false;
+        @memcpy(buf[0..s.len], s);
+        buf[s.len] = 0;
+        return isModuleAttr(o, "math", @ptrCast(&buf));
+    }
+
     /// The builtins compiled code knows; null for another callable.
     fn builtinCall(self: *Gen, inst: *Inst, o: *PyObject, args: []const SVal, pos: front.Pos) Error!?SVal {
         const c = self.c;
-        // Known arguments: Python's result now (int("12"), len("ab"), ...)
+        // Known arguments: Python's result now (int("12"), len("ab"),
+        // math.floor(2.5), ...)
         if (allScalar(args) and !isBuiltin(o, "print") and !isBuiltin(o, "input")) {
             const pure = [_][*:0]const u8{ "int", "float", "str", "bool", "len", "abs", "min", "max", "round", "repr", "ord", "chr", "hex", "oct", "bin", "divmod", "pow", "hash" };
-            for (pure) |name| if (isBuiltin(o, name)) {
+            const is_pure = for (pure) |name| {
+                if (isBuiltin(o, name)) break true;
+            } else isMathFunction(o);
+            if (is_pure) {
                 const tuple = py.c.PyTuple_New(@intCast(args.len)) orelse return error.Python;
                 defer py.Py_DecRef(tuple);
                 for (args, 0..) |x, i| _ = py.c.PyTuple_SetItem(tuple, @intCast(i), try self.pyOf(x));
@@ -7847,25 +7945,64 @@ const Gen = struct {
                     defer py.Py_DecRef(r);
                     return try self.constant(r, inst.node);
                 }
+                // (it fails when run: at run time, as Python, below)
                 py.c.PyErr_Clear();
-                // (it fails when run: at run time, as Python)
-                break;
-            };
+            }
         }
-        // int(), float(), len(), abs(), str(), bool() of a run-time value:
-        // natively where it can be (zr_builtin)
+        // int(x, base), the base known: natively (zr_int_base)
+        if (args.len == 2 and isBuiltin(o, "int") and (args[0] == .dyn or isScalar(args[0]))) if (intOf(args[1])) |base| if (base == 0 or (base >= 2 and base <= 36)) {
+            const d = try self.materialize(args[0], inst.node);
+            const idx = try c.objectIndex(o);
+            const ok = self.call("zr_int_base", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), d.tag, d.bits, self.k32(@intCast(base)), self.out });
+            try self.drop(.{ .dyn = d });
+            try self.check(ok);
+            return SVal{ .dyn = try self.loadOut(.any) };
+        };
+        // min(a, b, ...), max(a, b, ...): natively for numbers and strs
+        // (zr_min_max)
+        if (args.len >= 2) inline for (.{ .{ "min", 0 }, .{ "max", 1 } }) |m| if (isBuiltin(o, m[0])) {
+            const idx = try c.objectIndex(o);
+            const arr = try self.valueArray(args, inst.node);
+            const ok = self.call("zr_min_max", &.{ self.ctx, self.k32(inst.node), self.k32(m[1]), self.k(@intCast(idx)), arr, self.k(@intCast(args.len)), self.out });
+            try self.dropArray(arr, args.len);
+            try self.check(ok);
+            return SVal{ .dyn = try self.loadOut(.any) };
+        };
+        // math.sqrt(), math.copysign(), math.sin()...: natively, as CPython
+        // computes them (zr_math)
+        inline for (@typeInfo(helpers.MathFn).@"enum".fields) |fd| {
+            if (args.len == helpers.mathArity(@enumFromInt(fd.value)) and isModuleAttr(o, "math", fd.name)) {
+                // (the process's libm, found now: compiling has the GIL)
+                helpers.findLibm();
+                const idx = try c.objectIndex(o);
+                const arr = try self.valueArray(args, inst.node);
+                const ok = self.call("zr_math", &.{ self.ctx, self.k32(inst.node), self.k32(fd.value), self.k(@intCast(idx)), self.k(@intCast(args.len)), arr, self.out });
+                try self.dropArray(arr, args.len);
+                try self.check(ok);
+                const f: helpers.MathFn = @enumFromInt(fd.value);
+                return SVal{ .dyn = try self.loadOut(if (f == .isnan or f == .isinf or f == .isfinite) .bool else .any) };
+            }
+        }
+        // int(), float(), len(), abs(), str(), bool(), list(), math.floor(),
+        // math.ceil() of a run-time value (or of a known one Python refused
+        // above: its error when the code runs): natively where it can be
+        // (zr_builtin)
         if (args.len == 1 and args[0] == .dyn and isBuiltin(o, "len")) return .{ .dyn = try self.lenInline(inst, o, args[0].dyn) };
-        if (args.len == 1 and args[0] == .dyn) {
+        if (args.len == 1 and (args[0] == .dyn or isScalar(args[0]) or args[0] == .list or args[0] == .dict)) {
             inline for (@typeInfo(helpers.Builtin).@"enum".fields) |fd| {
-                if (isBuiltin(o, fd.name)) {
-                    const d = args[0].dyn;
+                const of_math = comptime std.mem.eql(u8, fd.name, "floor") or std.mem.eql(u8, fd.name, "ceil");
+                // (a known list or dict: id()'s only, made the run-time
+                // object every reference to it is from then)
+                const takes_containers = comptime std.mem.eql(u8, fd.name, "id");
+                if ((args[0] != .list and args[0] != .dict or takes_containers) and (if (of_math) isModuleAttr(o, "math", fd.name) else isBuiltin(o, fd.name))) {
+                    const d = try self.materialize(args[0], inst.node);
                     const idx = try c.objectIndex(o);
                     const ok = self.call("zr_builtin", &.{ self.ctx, self.k32(inst.node), self.k32(fd.value), self.k(@intCast(idx)), d.tag, d.bits, self.out });
-                    try self.drop(args[0]);
+                    try self.drop(.{ .dyn = d });
                     try self.check(ok);
-                    // (len() is always an int, bool() a bool; the others
-                    // may be anything a class's method made)
-                    const shape: Shape = comptime if (std.mem.eql(u8, fd.name, "len")) .int else if (std.mem.eql(u8, fd.name, "bool")) .bool else .any;
+                    // (len() is always an int, bool() a bool, list() a list;
+                    // the others may be anything a class's method made)
+                    const shape: Shape = comptime if (std.mem.eql(u8, fd.name, "len") or std.mem.eql(u8, fd.name, "id")) .int else if (std.mem.eql(u8, fd.name, "bool")) .bool else if (std.mem.eql(u8, fd.name, "list")) .list else .any;
                     return SVal{ .dyn = try self.loadOut(shape) };
                 }
             }

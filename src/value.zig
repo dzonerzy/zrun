@@ -371,7 +371,10 @@ pub fn incref(v: Value) void {
         const o = v.ptr();
         if (o.rc < IMMORTAL) o.rc += 1;
     } else if (v.tag == @intFromEnum(Tag.host)) {
-        gil.ensure(@src());
+        // (a count, not Python running: what strict mode allows; how the
+        // object came is what it looks at)
+        gil.allowBegin();
+        defer gil.allowEnd();
         py.Py_IncRef(@ptrFromInt(v.bits));
     }
 }
@@ -383,7 +386,8 @@ pub fn decref(v: Value) void {
         o.rc -= 1;
         if (o.rc == 0) free(@enumFromInt(v.tag), o);
     } else if (v.tag == @intFromEnum(Tag.host)) {
-        gil.ensure(@src());
+        gil.allowBegin();
+        defer gil.allowEnd();
         py.Py_DecRef(@ptrFromInt(v.bits));
     }
 }

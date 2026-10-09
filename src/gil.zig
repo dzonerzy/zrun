@@ -47,6 +47,9 @@ pub const Entry = struct {
     node: ?u32 = null,
     name: [96]u8 = undefined,
     name_len: usize = 0,
+    /// `name` is what went to Python ("a list handed to Python"), not
+    /// something called
+    phrase: bool = false,
 
     pub fn calledName(self: *const Entry) ?[]const u8 {
         return if (self.name_len > 0) self.name[0..self.name_len] else null;
@@ -99,6 +102,34 @@ pub inline fn ensureAt(comptime at: std.builtin.SourceLocation, node: u32, calle
     if (!s.held or s.strict) slow(s, &struct {
         const loc = at;
     }.loc, node, callee);
+}
+
+/// Whether this thread runs a strict language's code (its messages worth
+/// making)
+pub inline fn strictOn() bool {
+    return here().strict;
+}
+
+/// ensure() for the program's node `node`, calling what's named `name` (a
+/// method, by its name)
+pub inline fn ensureNamed(comptime at: std.builtin.SourceLocation, node: u32, name: []const u8) void {
+    ensureSaying(at, node, name, false);
+}
+
+/// ensure() for the program's node `node`, `what` going to Python
+pub inline fn ensurePhrase(comptime at: std.builtin.SourceLocation, node: u32, what: []const u8) void {
+    ensureSaying(at, node, what, true);
+}
+
+inline fn ensureSaying(comptime at: std.builtin.SourceLocation, node: u32, text: []const u8, phrase: bool) void {
+    const s = here();
+    if (!s.held) take(s);
+    if (s.strict and s.allowed == 0 and !s.entered) {
+        note(s, at, node, null);
+        entry.name_len = @min(text.len, entry.name.len);
+        @memcpy(entry.name[0..entry.name_len], text[0..entry.name_len]);
+        entry.phrase = phrase;
+    }
 }
 
 noinline fn slow(s: *State, at: *const std.builtin.SourceLocation, node: ?u32, callee: ?*py.c.PyObject) void {

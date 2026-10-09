@@ -198,7 +198,8 @@ pub export fn zr_py_semantic(ctx: *Ctx, which: u32, idx: u32, frame_slot: **valu
 /// anything else is itself (eval). A status as zr_py_semantic's (rt.loop:
 /// 1 with True or False in `out`, its Break and Continue taken).
 pub export fn zr_run_value(ctx: *Ctx, which: u32, at: u32, tag: u64, bits: u64, frame_slot: **value.Frame, owner: u32, out: *Value) callconv(.c) i32 {
-    gil.ensureAt(@src(), at, null);
+    // (no GIL to start with: a node's thunk run again needs none; runNode
+    // takes it where it does)
     out.* = Value.none_v;
     const v = Value{ .tag = tag, .bits = bits };
     const loop = which == 2;
@@ -265,7 +266,12 @@ fn runNode(ctx: *Ctx, which: compile_mod.Which, idx: u32, frame_slot: **value.Fr
         run_.python = true;
         return zr_py_semantic(ctx, @intFromEnum(which), idx, frame_slot, owner, out);
     }
-    const thunk = link.compiled.thunk(idx, which, owner) orelse return fromPythonError(ctx, idx, out);
+    // (its thunk compiled now: what strict mode allows; run outside that)
+    const thunk = blk: {
+        gil.allowBegin();
+        defer gil.allowEnd();
+        break :blk link.compiled.thunk(idx, which, owner) orelse return fromPythonError(ctx, idx, out);
+    };
     run_.* = .{ .thunk = thunk, .owner = owner };
     return thunk(ctx, frame_slot.*, out);
 }
@@ -966,6 +972,48 @@ fn rtStore(self: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     const top = if (d.symbolIndex(idx)) |si| d.homeOf(si) == program_mod.NONE else false;
     if (top) r.ctx.?.bury(old) else if (old.tag != helpers.UNSET) value.decref(old);
     return none();
+}
+
+/// rt.load(node), rt.store(node, v) on an rt value compiled code handed
+/// over (a function's parameter, a variable: its frames and their owner),
+/// natively (zr_call_method), as CompiledRuntime's do it; true / false (an
+/// error at `at`); null for another method (Python's).
+pub fn rtValueMethod(ctx: *Ctx, at: u32, rv: Value, name: []const u8, args: []const Value, out: *Value) ?bool {
+    const store = std.mem.eql(u8, name, "store") and args.len == 2;
+    if (!store and !(std.mem.eql(u8, name, "load") and args.len == 1)) return null;
+    if (args[0].kind() != .node) return null;
+    const link = linkOf(ctx);
+    const c = &link.compiled.compiler;
+    const d = link.data;
+    const idx: u32 = @intCast(args[0].bits);
+    const si = d.symbolIndex(idx) orelse return helpers.fail(ctx, idx, "'{s}' is not a variable", .{d.text(idx)});
+    // (a builtin's name: its host function, Python's)
+    if (d.syms[si].builtin) return null;
+    var frame: ?*value.Frame = @ptrFromInt(rv.bits);
+    var owner = rv.rtOwner();
+    const home = d.homeOf(si);
+    while (owner != home) {
+        if (owner == NONE) return helpers.fail(ctx, at, "a variable isn't reachable from here", .{});
+        frame = frame.?.parent;
+        owner = c.ownerOf(owner);
+    }
+    const slot = &frame.?.slots()[c.slot_of.get(si).?];
+    if (!store) {
+        if (slot.tag == helpers.UNSET) return helpers.fail(ctx, idx, "'{s}' has no value yet", .{d.text(idx)});
+        value.incref(slot.*);
+        out.* = slot.*.checked();
+        return true;
+    }
+    // (stored as rt.store does: an int an I64)
+    const nv = args[1].checked();
+    value.incref(nv);
+    const old = slot.*;
+    slot.* = nv;
+    // (a top-level variable's function, read without a reference: kept
+    // till the code's done)
+    if (home == NONE) ctx.bury(old) else if (old.tag != helpers.UNSET) value.decref(old);
+    out.* = Value.none_v;
+    return true;
 }
 
 // -- functions --

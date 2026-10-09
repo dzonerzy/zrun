@@ -13,12 +13,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`@zrun.comptime`**: a function whose result depends only on its arguments, its author says. Compiled code calling it with values known when compiling (constants, the tree's fields, other such results) calls it then, once for those values in the process: its result is a constant of the code, whatever Python is in the function (the compilable subset or not). Lists, dicts and tuples in a result are native all through at run time and read-only (a semantic changing one runs as Python). With values known only at run time it's called as any function is; the reference mode calls it as ever. A table built from the spec while compiling, looked up by the code at run time: no Python.
 
 ### Performance
+- **More of Python compiled natively**, the same results and errors as the reference mode (an error's words Python's own: its function called for them):
+  - `int(s, base)` of an ASCII str, `chr()`, `ord()`, `id()` (of any value: an object's address, None's, True's and False's CPython's; a number's, odd and from its bits), `list()` of a list, tuple, dict or str, `min()` and `max()` of numbers and strs, `len(s.encode("utf-8"))` (no bytes made);
+  - `math.floor`, `ceil`, `sqrt`, `fabs`, `degrees`, `radians`, `isnan`, `isinf`, `isfinite`, `copysign`, and on Linux `fmod`, `exp`, `log`, `log2`, `log10`, the trigonometric and hyperbolic functions, `expm1`, `log1p`, `atan2`, `pow` (from the process's libm: CPython's, the same to the last bit); math's functions of known numbers decided when compiling;
+  - `list + list`, `tuple + tuple`, a list, tuple or str times an int;
+  - a list's and tuple's `index()` and `count()`;
+  - `for ... in d.items()` (`keys()`, `values()`) of a dict known only at run time (a dict changed while the loop runs isn't the RuntimeError Python's view raises);
+  - `rt.load()` and `rt.store()` of an rt handed to other code as a value (out-of-line code, a function called with it);
+  - a builtin given known values it refuses (a branch the code never takes): its error when the code runs, not a call to Python.
+
+  The Lua example's numeric loop (`math.floor`, `min`): 0.099 s, was 0.119. Of the Lua test programs in strict mode, seven go into Python only to print.
 - **`except rt.Return as r` using `r.args` only is native**: the jump's value kept in the handler, no Python exception made (the same for rt.Break and rt.Continue). The Lua example's chunk (a `return` at the top level) needs no Python for it. A handler using the name otherwise gets the exception, as before.
 - **`x is y` of two Python objects known when compiling is decided then**: `type(1.5) is float` makes no Python object at run time.
 - **Helpers with native paths no longer take the GIL first**: unpacking a list or tuple, methods of strs, lists and dicts done natively, `int()`, `str()`, `abs()`, `bool()`, `len()` of native values. Code running them on several threads (`map()`) doesn't take turns for them.
 
 ### Fixed
 - **A program loaded again in the same process was compiled again**, and its compiled code not found in the cache: each load's code had names of its own (two programs alive at once can't share the JIT's), so its IR, so its key. A load now runs the code an earlier load of the program (the same language, source and path) compiled, while that one lives and after it goes (the last eight kept); with tiers, the code compiled fast too, and the optimized code an earlier load was having made when it went. Lua's `fib(30)` loaded ten times in a process, an empty cache: 1.55 s for the first load, then 0.040 s each (was 1.5 s each).
+- **An int beyond 128 bits a Python function gave compiled code went into the program**: the reference mode's I64 refuses one beyond 64 bits (integer overflow), compiled code refused them only up to 128 (`math.floor(1e300)`). Both refuse them now.
 - **An attribute of a module or class that may be rebound was decided when compiling**: `sys.stdout` read in a semantic was the one bound when the program compiled, so a second run with `sys.stdout` redirected wrote to the first run's. An attribute that isn't a function, class, module or value (an instance, a list...) is now read when the code runs.
 
 ## [0.4.1] - 2026-10-08
