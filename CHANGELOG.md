@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Strict mode: `zrun.Language(..., strict=True)`.** Compiled code calling nothing in Python, or the reason it can't: a semantic outside the compilable subset (or `native=False`) is a `CompileError` when it's registered; code that would call into Python (a Python function or builtin, a Python object as a value, `isinstance()` of a class not the language's, a module variable a function rebinds, a semantic run as Python) a `CompileError` when the program compiles, at the semantic's line; what only shows as the code runs (a host function in Python) a `zrun.StrictError` (a `CompileError`) at the program's line, saying what it called. Errors (still Python's exceptions) and code compiled while the program runs are allowed. In `run()`, `call()` and `map()`.
 
+- **A `def` inside a semantic or helper is compiled** where it's called (in the function, in itself, in the others defined there): a function of its own, given what it reads of the functions around it as they are when it's called (what a closure reads then). Used as a value (returned, kept, passed), it isn't compiled yet. The Lua example's `table.sort` (a recursive merge sort defined inside it) is native.
+- **`program.report()["python_functions"]`**: the Python functions compiled code called that couldn't be compiled, and why. Strict mode's message for a call to one says why too.
 - **`@zrun.comptime`**: a function whose result depends only on its arguments, its author says. Compiled code calling it with values known when compiling (constants, the tree's fields, other such results) calls it then, once for those values in the process: its result is a constant of the code, whatever Python is in the function (the compilable subset or not). Lists, dicts and tuples in a result are native all through at run time and read-only (a semantic changing one runs as Python). With values known only at run time it's called as any function is; the reference mode calls it as ever. A table built from the spec while compiling, looked up by the code at run time: no Python.
 
 ### Performance
@@ -20,7 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - a list's and tuple's `index()` and `count()`;
   - `for ... in d.items()` (`keys()`, `values()`) of a dict known only at run time (a dict changed while the loop runs isn't the RuntimeError Python's view raises);
   - `rt.load()` and `rt.store()` of an rt handed to other code as a value (out-of-line code, a function called with it);
-  - a builtin given known values it refuses (a branch the code never takes): its error when the code runs, not a call to Python.
+  - a builtin given known values it refuses (a branch the code never takes): its error when the code runs, not a call to Python;
+  - `s[i]` of a str that isn't ASCII (an index of its code points made the first time it's indexed: O(1), as Python's);
+  - `for ... in enumerate(items, start)`, the start known when compiling.
 
   The Lua example's numeric loop (`math.floor`, `min`): 0.099 s, was 0.119. Of the Lua test programs in strict mode, seven go into Python only to print.
 - **`except rt.Return as r` using `r.args` only is native**: the jump's value kept in the handler, no Python exception made (the same for rt.Break and rt.Continue). The Lua example's chunk (a `return` at the top level) needs no Python for it. A handler using the name otherwise gets the exception, as before.
@@ -29,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **A program loaded again in the same process was compiled again**, and its compiled code not found in the cache: each load's code had names of its own (two programs alive at once can't share the JIT's), so its IR, so its key. A load now runs the code an earlier load of the program (the same language, source and path) compiled, while that one lives and after it goes (the last eight kept); with tiers, the code compiled fast too, and the optimized code an earlier load was having made when it went. Lua's `fib(30)` loaded ten times in a process, an empty cache: 1.55 s for the first load, then 0.040 s each (was 1.5 s each).
+- **A semantic calling a Python object it has as a value** (`fs[i](x)`) called it as `rt.call` does: its ints as I64s, its error worded as a host function's (`sqrt: ValueError: ...`). It's called as Python calls it now, as the reference mode does.
 - **An int beyond 128 bits a Python function gave compiled code went into the program**: the reference mode's I64 refuses one beyond 64 bits (integer overflow), compiled code refused them only up to 128 (`math.floor(1e300)`). Both refuse them now.
 - **An attribute of a module or class that may be rebound was decided when compiling**: `sys.stdout` read in a semantic was the one bound when the program compiled, so a second run with `sys.stdout` redirected wrote to the first run's. An attribute that isn't a function, class, module or value (an instance, a list...) is now read when the code runs.
 

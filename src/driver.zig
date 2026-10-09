@@ -370,10 +370,19 @@ pub const Compiled = struct {
                 c.forgetModule();
                 // (a literal made at run time: again; anything else: Python)
                 if (e == error.Unsupported and c.need_retry) continue;
+                // (why, for strict mode's message: uncompiledReason)
+                var buf: [256]u8 = undefined;
+                noteUncompiled(o, switch (e) {
+                    error.Unsupported => self.failure.message.items,
+                    error.Python => ph.takeError(&buf),
+                    else => "out of memory",
+                });
                 py.c.PyErr_Clear();
                 break;
             };
             const addr = self.add(name) orelse {
+                var buf: [256]u8 = undefined;
+                noteUncompiled(o, ph.takeError(&buf));
                 py.c.PyErr_Clear();
                 break;
             };
@@ -612,6 +621,34 @@ fn types() type {
 
 var helpers_defined = false;
 var next_id: u64 = 0;
+
+/// The last Python function compiled code called that couldn't be
+/// compiled (it runs as Python), and why: what strict mode's message says
+/// of a call to it (uncompiledReason)
+var uncompiled_fn: ?*PyObject = null;
+var uncompiled_why: [256]u8 = undefined;
+var uncompiled_len: usize = 0;
+
+fn noteUncompiled(o: *PyObject, why: []const u8) void {
+    uncompiled_fn = o;
+    uncompiled_len = @min(why.len, uncompiled_why.len);
+    @memcpy(uncompiled_why[0..uncompiled_len], why[0..uncompiled_len]);
+    // (and for report(): every one, by the function)
+    const slot = uncompiled.getOrPut(allocator, o) catch return;
+    if (!slot.found_existing) py.Py_IncRef(o) else allocator.free(slot.value_ptr.*);
+    slot.value_ptr.* = allocator.dupe(u8, why) catch "";
+}
+
+/// The Python functions compiled code called that couldn't be compiled
+/// (they run as Python), and why: program.report()'s "python_functions"
+pub var uncompiled: std.AutoArrayHashMapUnmanaged(*PyObject, []const u8) = .empty;
+
+/// Why the Python function `o` couldn't be compiled, if it's the last one
+/// that couldn't (a call to it went into Python)
+pub fn uncompiledReason(o: ?*PyObject) ?[]const u8 {
+    if (o == null or o != uncompiled_fn) return null;
+    return uncompiled_why[0..uncompiled_len];
+}
 
 /// Code shared by the loads of one program in the process (its language,
 /// its source, its path: Program.shareKey), at each level: a program loaded

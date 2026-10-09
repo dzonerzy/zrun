@@ -1474,6 +1474,7 @@ pub const Compiler = struct {
         .{ "zr_huge_int", "bll" },
         .{ "zr_dict_view", "bpiillp" },
         .{ "zr_new_exception", "bpilplp" },
+        .{ "zr_call_plain", "bpillplpp" },
         .{ "zr_range", "bpiplp" },
         .{ "zr_is_type", "blli" },
         .{ "zr_format", "bpillipp" },
@@ -4213,7 +4214,7 @@ const Gen = struct {
     /// its result.
     fn tailCall(self: *Gen, inst: *Inst, fv: SVal, args_v: SVal, receiver: ?SVal) Error!void {
         if (self.fnode == NONE and !self.thunk) {
-            const r = try self.dynCall(inst, fv, args_v, receiver);
+            const r = try self.dynCall(inst, fv, args_v, receiver, false);
             try self.returnWith(try self.materialize(r, inst.node), inst.node);
         } else {
             const fd = try self.materialize(fv, inst.node);
@@ -5653,6 +5654,8 @@ const Gen = struct {
     const RtIter = struct {
         kind: enum { plain, zip, enumerate, range },
         slots: []const ir.Value,
+        /// enumerate()'s start (known when compiling)
+        start: i64 = 0,
         /// The index slot (an i64); a range's: its next value
         index: ir.Value = null,
         /// A range's stop and step (i64 slots)
@@ -5666,19 +5669,27 @@ const Gen = struct {
         if (e.kind == .call and e.kind.call.keywords.len == 0 and e.kind.call.func.kind == .global) {
             const x = e.kind.call;
             const callee = try self.global(inst, x.func.kind.global, x.func.pos);
-            if (callee == .py and (isBuiltin(callee.py, "zip") or (isBuiltin(callee.py, "enumerate") and x.args.len == 1))) {
-                const args = try self.a().alloc(SVal, x.args.len);
+            const is_enumerate = callee == .py and isBuiltin(callee.py, "enumerate");
+            if (callee == .py and (isBuiltin(callee.py, "zip") or (is_enumerate and (x.args.len == 1 or x.args.len == 2)))) {
+                var args = try self.a().alloc(SVal, x.args.len);
                 for (args, x.args) |*slot, ae| slot.* = try self.expr(inst, ae);
+                // (enumerate(items, start): the start known, added to each
+                // index)
+                var start: i64 = 0;
+                if (is_enumerate and args.len == 2) {
+                    start = intOf(args[1]) orelse return self.c.unsupportedAt(inst.func, e.pos, "enumerate()'s start must be known when compiling", .{});
+                    args = args[0..1];
+                }
                 const all_known = for (args) |v| {
                     if (v != .list and v != .tuple) break false;
                 } else true;
-                if (all_known or args.len == 0) return self.iterationOf(inst, (try self.builtinCall(inst, callee.py, args, e.pos)).?);
+                if (start == 0 and (all_known or args.len == 0)) return self.iterationOf(inst, (try self.builtinCall(inst, callee.py, args, e.pos)).?);
                 const slots = try self.a().alloc(ir.Value, args.len);
                 for (args, slots) |v, *slot| {
                     slot.* = try self.tempSlot(inst);
                     try self.storeSlot(slot.*, try self.itemsOf(inst, v));
                 }
-                return .{ .runtime = .{ .kind = if (isBuiltin(callee.py, "zip")) .zip else .enumerate, .slots = slots } };
+                return .{ .runtime = .{ .kind = if (isBuiltin(callee.py, "zip")) .zip else .enumerate, .slots = slots, .start = start } };
             }
             // range() of run-time (or many) values: counted, no list made
             if (callee == .py and isBuiltin(callee.py, "range") and x.args.len >= 1 and x.args.len <= 3) {
@@ -5782,7 +5793,7 @@ const Gen = struct {
         const parts = try self.a().alloc(Dyn, if (it.kind == .enumerate) 2 else it.slots.len);
         var n: usize = 0;
         if (it.kind == .enumerate) {
-            parts[0] = .{ .tag = self.k(@intCast(value.PINT_TAG)), .bits = i, .shape = .int };
+            parts[0] = .{ .tag = self.k(@intCast(value.PINT_TAG)), .bits = if (it.start == 0) i else f.add(i, self.k(it.start)), .shape = .int };
             n = 1;
         }
         for (it.slots) |slot| {
@@ -5915,6 +5926,17 @@ const Gen = struct {
                 return self.attr(inst, obj, x.name, e.pos);
             },
             .call => |x| return self.callExpr(inst, x.func, x.args, x.keywords, e.pos),
+            // A function defined in a semantic or helper (lambda lifted:
+            // front.Reader.nestedDef): a helper, given its arguments and the
+            // variables around it that it reads
+            .call_nested => |x| {
+                const mark = self.inflight.items.len;
+                errdefer self.taken(mark);
+                const args = try self.a().alloc(SVal, x.args.len);
+                for (args, x.args) |*slot, ae| slot.* = try self.operand(inst, ae);
+                self.taken(mark);
+                return self.callHelper(x.func, inst.node, args);
+            },
             .binary => |x| {
                 const mark = self.inflight.items.len;
                 errdefer self.taken(mark);
@@ -7001,7 +7023,7 @@ const Gen = struct {
                 const l = try self.a().create(SList);
                 l.* = .{};
                 try l.items.appendSlice(self.a(), args);
-                return self.dynCall(inst, callee, .{ .list = l }, null);
+                return self.dynCall(inst, callee, .{ .list = l }, null, true);
             },
             else => return c.unsupportedAt(inst.func, pos, "calling a {s} isn't compiled yet", .{@tagName(callee)}),
         }
@@ -7048,7 +7070,7 @@ const Gen = struct {
                 try self.freshScope(try self.nodeArg(inst, args[0], pos));
                 return .none;
             },
-            .call => return self.dynCall(inst, args[0], args[1], receiver),
+            .call => return self.dynCall(inst, args[0], args[1], receiver, false),
             .tail_call => {
                 try self.tailCall(inst, args[0], args[1], receiver);
                 return .none;
@@ -7245,7 +7267,11 @@ const Gen = struct {
     }
 
     /// Call a run-time function value (or a host function) with arguments.
-    fn dynCall(self: *Gen, inst: *Inst, fv: SVal, args_v: SVal, receiver: ?SVal) Error!SVal {
+    /// rt.call(fv, args), or (`plain`) a semantic's own `fv(*args)` of a
+    /// value: a Python object's called as Python calls it (its arguments
+    /// and result as they are, its error its own), not as rt.call hands
+    /// values over (ints I64s, a host function's error worded so).
+    fn dynCall(self: *Gen, inst: *Inst, fv: SVal, args_v: SVal, receiver: ?SVal, plain: bool) Error!SVal {
         const items: []const SVal = switch (args_v) {
             .list => |l| blk: {
                 // (the call takes them)
@@ -7286,7 +7312,7 @@ const Gen = struct {
             recv_ptr = p;
         }
         const got: ?CallResult = if (direct) try self.directCall(inst, fd, arr, ds, recv_ptr) else null;
-        const ok = if (got) |g| g.ok else self.call("zr_call", &.{ self.ctx, self.k32(inst.node), fd.tag, fd.bits, arr, self.k(@intCast(n)), recv_ptr, self.out });
+        const ok = if (got) |g| g.ok else self.call(if (plain) "zr_call_plain" else "zr_call", &.{ self.ctx, self.k32(inst.node), fd.tag, fd.bits, arr, self.k(@intCast(n)), recv_ptr, self.out });
         // (the call borrowed them)
         for (ds) |d| try self.drop(.{ .dyn = d });
         if (recv_d) |r| try self.drop(.{ .dyn = r });
@@ -9510,6 +9536,9 @@ const FoldedSize = struct {
                 for (x.args) |y| n += countExpr(y);
                 for (x.keywords) |k| n += countExpr(k.value);
             },
+            .call_nested => |x| for (x.args) |y| {
+                n += countExpr(y);
+            },
             .binary => |x| n += countExpr(x.left) + countExpr(x.right),
             .unary => |x| n += countExpr(x.operand),
             .and_, .or_, .list, .tuple => |xs| for (xs) |y| {
@@ -9657,6 +9686,7 @@ fn localReads(e: *const front.Expr, plain: bool, out: *std.ArrayListUnmanaged(Lo
             for (x.args) |y| try localReads(y, plain, out, a);
             for (x.keywords) |k| try localReads(k.value, plain, out, a);
         },
+        .call_nested => |x| for (x.args) |y| try localReads(y, plain, out, a),
         .binary => |x| {
             try localReads(x.left, plain, out, a);
             try localReads(x.right, plain, out, a);
@@ -9755,6 +9785,7 @@ fn exprReads(e: *const front.Expr, set: *std.AutoHashMapUnmanaged(u32, void), a:
             for (x.args) |y| try exprReads(y, set, a);
             for (x.keywords) |k| try exprReads(k.value, set, a);
         },
+        .call_nested => |x| for (x.args) |y| try exprReads(y, set, a),
         .binary => |x| {
             try exprReads(x.left, set, a);
             try exprReads(x.right, set, a);

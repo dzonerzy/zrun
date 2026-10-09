@@ -104,6 +104,22 @@ def test_id():
             assert outcome(p, mode, a, 0) == ("ok", repr((True,) * 7)), (a, mode)
 
 
+def kind_of(x):
+    return type(x).__name__
+
+
+def calling_a_value(a, b):
+    # (a callable known only at run time, called by the semantic itself:
+    # as Python calls it, its arguments as they are, its error its own)
+    fs = (math.sqrt, kind_of, int)
+    return fs[b](a)
+
+
+def test_calling_a_value():
+    p = _program(calling_a_value)
+    same_in_both(p, [(4.0, 0), (-1.0, 0), (3, 1), (2.5, 1), ("x", 2), ("12", 2)])
+
+
 def math_one(a, b):
     # (each called by name: compiled to zr_math)
     if b == 0:

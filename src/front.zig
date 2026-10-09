@@ -52,6 +52,11 @@ pub const Expr = struct {
         index: struct { obj: *Expr, index: *Expr },
         slice: struct { obj: *Expr, lo: ?*Expr, hi: ?*Expr, step: ?*Expr },
         call: struct { func: *Expr, args: []const *Expr, keywords: []const Keyword },
+        /// A call of a function defined inside this one (or one around
+        /// it): `func`, read as one of its own (Reader.nestedDef), given
+        /// its arguments and then the variables around it that it reads
+        /// (as they are when it's called: what a closure reads then)
+        call_nested: struct { func: *const Function, args: []const *Expr },
         binary: struct { op: BinOp, left: *Expr, right: *Expr },
         unary: struct { op: UnaryOp, operand: *Expr },
         and_: []const *Expr,
@@ -174,6 +179,7 @@ pub fn read(gpa: Allocator, func: *PyObject, failure: *Failure) ReadError!*Funct
         .gpa = gpa,
         .arena = std.heap.ArenaAllocator.init(gpa),
         .failure = failure,
+        .py_function = func,
     };
     errdefer r.arena.deinit();
     const a = r.arena.allocator();
@@ -195,6 +201,7 @@ pub fn read(gpa: Allocator, func: *PyObject, failure: *Failure) ReadError!*Funct
     const code = ph.attr(func, "__code__") orelse return error.Python;
     defer py.Py_DecRef(code);
     const file = try r.strAttr(code, "co_filename");
+    r.file = file;
     const first = try intAttr(code, "co_firstlineno");
     const name = try r.strAttr(func, "__name__");
 
@@ -273,9 +280,46 @@ const Reader = struct {
     comp_scope: std.ArrayList(struct { name: []const u8, slot: u32 }) = .empty,
     /// Expressions read
     exprs: u32 = 0,
+    /// The function this one is defined in (a nested def's reader), whose
+    /// memory it uses
+    parent: ?*Reader = null,
+    /// The functions defined in this one and around it, by name, those
+    /// read so far (and the one being read: its own calls)
+    nested: std.ArrayList(Nested) = .empty,
+    /// The function object read: its globals and closure the nested
+    /// functions' too
+    py_function: ?*PyObject = null,
+    file: []const u8 = "",
+    /// The names of the functions defined in this one (collectAssigned),
+    /// read or not yet
+    defs: std.ArrayList([]const u8) = .empty,
+
+    /// A function defined in one (nestedDef): its own parameters' count,
+    /// the variables around it it reads (its parameters after those)
+    const Nested = struct { name: []const u8, func: *Function, own: usize, captures: []const []const u8 };
 
     fn alloc(self: *Reader) Allocator {
+        if (self.parent) |p| return p.alloc();
         return self.arena.allocator();
+    }
+
+    /// Whether `name` is a function defined in this one or one around it
+    /// not read yet (called before it's defined: not compiled)
+    fn definesLater(self: *Reader, name: []const u8) bool {
+        var r: ?*Reader = self;
+        while (r) |x| : (r = x.parent) {
+            if (contains(x.defs.items, name)) return true;
+        }
+        return false;
+    }
+
+    fn nestedNamed(self: *Reader, name: []const u8) ?Nested {
+        var i = self.nested.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.nested.items[i].name, name)) return self.nested.items[i];
+        }
+        return null;
     }
 
     fn unsupported(self: *Reader, pos: Pos, comptime fmt: []const u8, args: anytype) ReadError {
@@ -330,6 +374,11 @@ const Reader = struct {
 
     fn collectStmt(self: *Reader, s: *PyObject) ReadError!void {
         const k = try kindOf(s);
+        // (a def inside: its name a function of its own, its body its own)
+        if (eq(k, "FunctionDef")) {
+            try self.defs.append(self.alloc(), try self.strAttr(s, "name"));
+            return;
+        }
         if (eq(k, "Assign")) {
             const targets = try listAttr(s, "targets");
             defer py.Py_DecRef(targets);
@@ -466,9 +515,119 @@ const Reader = struct {
             if (eq(k, "Break")) break :blk .break_;
             if (eq(k, "Continue")) break :blk .continue_;
             if (eq(k, "Pass")) break :blk .pass;
+            // (a def inside: read as a function of its own; nothing to run
+            // where it's defined)
+            if (eq(k, "FunctionDef")) {
+                try self.nestedDef(s, pos);
+                break :blk .pass;
+            }
             return self.unsupported(pos, "{s} can't be compiled", .{stmtName(k)});
         };
         return .{ .pos = pos, .kind = kind };
+    }
+
+    /// A def inside the function: read as a function of its own (lambda
+    /// lifting), its parameters its own, then the variables of the
+    /// functions around it that it reads (or that the ones defined there it
+    /// calls read): its calls give them, as they are then, what a closure
+    /// would read then. Its name is only called (call_nested): kept or
+    /// passed as a value, it isn't compiled. Its own variables aren't the
+    /// ones around (a `nonlocal` isn't compiled).
+    fn nestedDef(self: *Reader, def: *PyObject, pos: Pos) ReadError!void {
+        const name = try self.strAttr(def, "name");
+        const decos = try listAttr(def, "decorator_list");
+        defer py.Py_DecRef(decos);
+        if (py.c.PyList_Size(decos) != 0) return self.unsupported(try self.posOf(py.c.PyList_GetItem(decos, 0).?), "a nested def with decorators can't be compiled", .{});
+        const args = ph.attr(def, "args") orelse return error.Python;
+        defer py.Py_DecRef(args);
+        inline for (.{ "posonlyargs", "kwonlyargs", "kw_defaults", "defaults" }) |field| {
+            const l = try listAttr(args, field);
+            defer py.Py_DecRef(l);
+            if (py.c.PyList_Size(l) != 0) return self.unsupported(pos, "a nested def's parameters must be plain ones (no defaults, keyword-only or positional-only ones)", .{});
+        }
+        inline for (.{ "vararg", "kwarg" }) |field| {
+            const o = ph.attr(args, field) orelse return error.Python;
+            defer py.Py_DecRef(o);
+            if (o != py.Py_None()) return self.unsupported(pos, "a nested def's *args and **kwargs can't be compiled", .{});
+        }
+        var sub = Reader{
+            .gpa = self.gpa,
+            .arena = std.heap.ArenaAllocator.init(self.gpa),
+            .failure = self.failure,
+            .line_offset = self.line_offset,
+            .col_offset = self.col_offset,
+            .parent = self,
+            .py_function = self.py_function,
+            .file = self.file,
+        };
+        // Its own: its parameters, what it assigns
+        const params = try listAttr(args, "args");
+        defer py.Py_DecRef(params);
+        const n_own: usize = @intCast(py.c.PyList_Size(params));
+        for (0..n_own) |i| _ = try sub.declare(try sub.strAttr(py.c.PyList_GetItem(params, @intCast(i)).?, "arg"));
+        const body = try listAttr(def, "body");
+        defer py.Py_DecRef(body);
+        try sub.collectAssigned(body);
+        // What it reads of the functions around it: those variables, and
+        // what the functions defined there that it calls read
+        var captures: std.ArrayList([]const u8) = .empty;
+        for (try self.loadedNames(def)) |n| {
+            if (eq(n, name) or sub.lookupLocal(n) != null) continue;
+            if (self.nestedNamed(n)) |other| {
+                for (other.captures) |c| if (!contains(captures.items, c)) try captures.append(self.alloc(), c);
+            } else if (self.lookupLocal(n) != null) {
+                if (!contains(captures.items, n)) try captures.append(self.alloc(), n);
+            }
+        }
+        // (its locals again, in a function's order: its parameters, then
+        // those, then what it assigns)
+        sub.locals.shrinkRetainingCapacity(n_own);
+        sub.defs.clearRetainingCapacity();
+        for (captures.items) |c| _ = try sub.declare(c);
+        try sub.collectAssigned(body);
+        const f = try self.alloc().create(Function);
+        const entry = Nested{ .name = name, .func = f, .own = n_own, .captures = captures.items };
+        // (visible to the functions around it from here, to itself, and to
+        // those defined in it)
+        try self.nested.append(self.alloc(), entry);
+        try sub.nested.appendSlice(self.alloc(), self.nested.items);
+        const out = try sub.stmtList(body);
+        const n_params: u32 = @intCast(n_own + captures.items.len);
+        f.* = .{
+            // (its memory the outermost function's: its own arena empty)
+            .arena = sub.arena,
+            .name = name,
+            .file = self.file,
+            .first_line = pos.line,
+            .param_count = n_params,
+            .required = n_params,
+            .locals = sub.locals.items,
+            .body = out,
+            .py_function = self.py_function.?,
+            .size = sub.exprs,
+        };
+    }
+
+    /// The names an AST node (a nested def) reads, all through, in order
+    fn loadedNames(self: *Reader, node: *PyObject) ReadError![]const []const u8 {
+        const ast_mod = py.c.PyImport_ImportModule("ast") orelse return error.Python;
+        defer py.Py_DecRef(ast_mod);
+        const walk = py.c.PyObject_CallMethod(ast_mod, "walk", "(O)", node) orelse return error.Python;
+        defer py.Py_DecRef(walk);
+        const all = py.c.PySequence_List(walk) orelse return error.Python;
+        defer py.Py_DecRef(all);
+        var out: std.ArrayList([]const u8) = .empty;
+        const n: usize = @intCast(py.c.PyList_Size(all));
+        for (0..n) |i| {
+            const x = py.c.PyList_GetItem(all, @intCast(i)).?;
+            if (!eq(try kindOf(x), "Name")) continue;
+            const ctx = ph.attr(x, "ctx") orelse return error.Python;
+            defer py.Py_DecRef(ctx);
+            if (!eq(try kindOf(ctx), "Load")) continue;
+            const id = try self.strAttr(x, "id");
+            if (!contains(out.items, id)) try out.append(self.alloc(), id);
+        }
+        return out.items;
     }
 
     fn target(self: *Reader, t: *PyObject) ReadError!Target {
@@ -545,6 +704,8 @@ const Reader = struct {
         if (eq(k, "Name")) {
             const name = try self.strAttr(e, "id");
             if (self.lookupLocal(name)) |slot| return self.new(pos, .{ .local = slot });
+            if (self.nestedNamed(name) != null or self.definesLater(name))
+                return self.unsupported(pos, "the nested function {s} used as a value can't be compiled (only called)", .{name});
             return self.new(pos, .{ .global = name });
         }
         if (eq(k, "Attribute")) return self.new(pos, .{ .attr = .{ .obj = try self.exprAttr(e, "value"), .name = try self.strAttr(e, "attr") } });
@@ -558,6 +719,27 @@ const Reader = struct {
             return self.new(pos, .{ .index = .{ .obj = obj, .index = try self.indexExpr(sl) } });
         }
         if (eq(k, "Call")) {
+            // (a function defined in this one, or one around it: its code,
+            // given what it reads around it after its arguments)
+            const func_o = ph.attr(e, "func") orelse return error.Python;
+            defer py.Py_DecRef(func_o);
+            if (eq(try kindOf(func_o), "Name")) {
+                const fname = try self.strAttr(func_o, "id");
+                if (self.lookupLocal(fname) == null) if (self.nestedNamed(fname)) |n| {
+                    const kw = try listAttr(e, "keywords");
+                    defer py.Py_DecRef(kw);
+                    if (py.c.PyList_Size(kw) != 0) return self.unsupported(pos, "keyword arguments to the nested function {s} can't be compiled", .{fname});
+                    const own = try self.exprList(e, "args");
+                    if (own.len != n.own) return self.unsupported(pos, "{s}() takes {d} arguments", .{ fname, n.own });
+                    const all = try self.alloc().alloc(*Expr, own.len + n.captures.len);
+                    @memcpy(all[0..own.len], own);
+                    for (n.captures, all[own.len..]) |c, *slot| {
+                        const s = self.lookupLocal(c) orelse return self.unsupported(pos, "{s} isn't reachable where the nested function {s} is called", .{ c, fname });
+                        slot.* = try self.new(pos, .{ .local = s });
+                    }
+                    return self.new(pos, .{ .call_nested = .{ .func = n.func, .args = all } });
+                };
+            }
             const func = try self.exprAttr(e, "func");
             const args = try self.exprList(e, "args");
             const kws = try listAttr(e, "keywords");
@@ -974,6 +1156,11 @@ const Dumper = struct {
                 }
                 try self.print("]", .{});
             },
+            .call_nested => |c| {
+                try self.print("{s}<nested>(", .{c.func.name});
+                try self.list(c.args);
+                try self.print(")", .{});
+            },
             .call => |c| {
                 try self.expr(c.func);
                 try self.print("(", .{});
@@ -1123,6 +1310,11 @@ fn isKind(obj: *PyObject, name: []const u8) ReadError!bool {
 
 fn listAttr(obj: *PyObject, name: [*:0]const u8) ReadError!*PyObject {
     return ph.attr(obj, name) orelse error.Python;
+}
+
+fn contains(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| if (eq(n, name)) return true;
+    return false;
 }
 
 fn intAttr(obj: *PyObject, name: [*:0]const u8) ReadError!i64 {

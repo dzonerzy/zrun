@@ -36,6 +36,9 @@ pub const Ctx = struct {
     /// The compiled program running (driver.Compiled.id): its functions'
     /// code is the only code that runs here
     program: u64 = 0,
+    /// The next call is a semantic's own (zr_call_plain): a Python object
+    /// called as Python calls it; taken by that call
+    plain_call: bool = false,
     /// The language's calls being run, outermost first: calls[0..depth]
     /// (room for max_depth of them, made at the first call; compiled code
     /// pushes and pops them inline too)
@@ -968,6 +971,13 @@ pub const TAIL_TAG: u64 = 0xFFFF0002;
 /// (borrowed); the result in `out`. `node`: the node calling (errors, the
 /// stack). A function ending with rt.tail_call: the call it left made
 /// here, after its frame's gone, and so on (zr_tail_resolve).
+/// A semantic's own call `f(args)` of a value: zr_call, a Python object
+/// called as Python calls it (Gen.dynCall's `plain`)
+export fn zr_call_plain(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Value, nargs: u64, receiver: ?*const Value, out: *Value) callconv(.c) bool {
+    ctx.plain_call = true;
+    return zr_call(ctx, node, ft, fb, args, nargs, receiver, out);
+}
+
 pub export fn zr_call(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Value, nargs: u64, receiver: ?*const Value, out: *Value) callconv(.c) bool {
     if (!callOnce(ctx, node, ft, fb, args, nargs, receiver, out)) return false;
     if (out.tag != TAIL_TAG) return true;
@@ -1046,6 +1056,9 @@ pub export fn zr_tail_resolve(ctx: *Ctx, node: u32, out: *Value) callconv(.c) bo
 
 fn callOnce(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Value, nargs: u64, receiver: ?*const Value, out: *Value) bool {
     const f = Value{ .tag = ft, .bits = fb };
+    // (this call's only: what it calls makes its own)
+    const plain = ctx.plain_call;
+    ctx.plain_call = false;
     switch (f.kind()) {
         .function => {
             const fo: *value.Function = @ptrCast(@alignCast(f.ptr()));
@@ -1084,7 +1097,7 @@ fn callOnce(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Value, nargs:
             const callee: *PyObject = @ptrFromInt(f.bits);
             // (a Python function: by its compiled code, if it can have one;
             // finding it the first time touches Python, as compiling does)
-            if (receiver == null) if (@import("bridge.zig").compiledMethod(ctx, node, callee, args[0..nargs], true, out)) |ok| return ok;
+            if (receiver == null) if (@import("bridge.zig").compiledMethod(ctx, node, callee, args[0..nargs], !plain, out)) |ok| return ok;
             // (else called through Python)
             gil.ensureAt(@src(), node, callee);
             if (collecting) {
@@ -1095,20 +1108,21 @@ fn callOnce(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Value, nargs:
             const tuple = py.c.PyTuple_New(@intCast(n)) orelse return failPython(ctx, node);
             defer py.Py_DecRef(tuple);
             // (its arguments and result as rt.call hands them over: ints
-            // I64s)
+            // I64s; a semantic's own call: as they are, its error its own)
             var k: usize = 0;
             if (receiver) |r| {
-                const o = value.toPython(r.*.checked(), ctx.node_maker) orelse return failPython(ctx, node);
+                const o = value.toPython(if (plain) r.* else r.*.checked(), ctx.node_maker) orelse return failPython(ctx, node);
                 _ = py.c.PyTuple_SetItem(tuple, 0, o);
                 k = 1;
             }
             for (args[0..nargs], 0..) |a, i| {
-                const o = value.toPython(a.checked(), ctx.node_maker) orelse return failPython(ctx, node);
+                const o = value.toPython(if (plain) a else a.checked(), ctx.node_maker) orelse return failPython(ctx, node);
                 _ = py.c.PyTuple_SetItem(tuple, @intCast(k + i), o);
             }
-            const r = py.c.PyObject_CallObject(callee, tuple) orelse return hostFailed(ctx, node, callee);
+            const r = py.c.PyObject_CallObject(callee, tuple) orelse return if (plain) failPython(ctx, node) else hostFailed(ctx, node, callee);
             defer py.Py_DecRef(r);
-            out.* = (value.fromPython(r) orelse return failPython(ctx, node)).checked();
+            const got = value.fromPython(r) orelse return failPython(ctx, node);
+            out.* = if (plain) got else got.checked();
             return true;
         },
         else => return fail(ctx, node, "'{s}' value is not callable", .{value.typeName(f)}),
@@ -1445,6 +1459,18 @@ export fn zr_getitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
                     return true;
                 }
             }
+        },
+        // A str at an int: its character (one not ASCII found by its index:
+        // value.charOffset)
+        .str => if (isInt(k)) {
+            const s: *value.Str = @ptrCast(v.ptr());
+            const i = index(k.asInt(), s.chars) orelse return failAs(ctx, node, py.PyExc_IndexError(), null, "string index out of range", .{});
+            const b = s.bytes();
+            const at = value.charOffset(s, i);
+            const n = std.unicode.utf8ByteSequenceLength(b[at]) catch 1;
+            const ch = charStr(b[at .. at + n]) orelse return oomFail(ctx, node);
+            out.* = Value.obj(.str, &ch.head);
+            return true;
         },
         // A Python list or tuple (data given by Python) at an int in it:
         // its item read and converted (no int made for the index, no call
@@ -2976,7 +3002,7 @@ const helper_names = [_][]const u8{
     "zr_type",     "zr_builtin",    "zr_range",      "zr_cell",          "zr_frame_of",
     "zr_extend_items", "zr_tail_set", "zr_tail_resolve", "zr_tail_take", "zr_tail_put", "zr_tail_clear",
     "zr_int_base", "zr_utf8_len", "zr_min_max", "zr_math", "zr_huge_int", "zr_dict_view",
-    "zr_new_exception",
+    "zr_new_exception", "zr_call_plain",
 };
 
 /// The names compiled code calls them by, and their addresses

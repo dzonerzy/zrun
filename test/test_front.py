@@ -36,7 +36,9 @@ class TestSubset:
         [
             ("    f = lambda x: x\n", "`lambda` can't be compiled"),
             ("    with open('x') as f:\n        pass\n", "`with` can't be compiled"),
-            ("    def inner():\n        pass\n", "a nested `def` can't be compiled"),
+            # (a nested def is compiled where it's called; as a value, not)
+            ("    f = inner\n    def inner():\n        pass\n", "the nested function inner used as a value can't be compiled (only called)"),
+            ("    @staticmethod\n    def inner():\n        pass\n", "a nested def with decorators can't be compiled"),
             ("    global g\n", "`global` can't be compiled"),
             ("    del node\n", "`del` can't be compiled"),
             ("    x = (y := 1)\n", "`:=` can't be compiled"),

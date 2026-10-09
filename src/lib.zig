@@ -1267,6 +1267,20 @@ const Program = struct {
             }
         }
         if (py.c.PyDict_SetItemString(out, "speculated", speculated) != 0) return null;
+        // "python_functions": {qualified name: why} of the Python functions
+        // compiled code called that couldn't be compiled (they run as
+        // Python; the process's, every program's)
+        const funcs = py.c.PyDict_New() orelse return null;
+        defer py.Py_DecRef(funcs);
+        var it = driver.uncompiled.iterator();
+        while (it.next()) |e| {
+            const name = ph.attr(e.key_ptr.*, "__qualname__") orelse return null;
+            defer py.Py_DecRef(name);
+            const why = ph.newString(e.value_ptr.*) orelse return null;
+            defer py.Py_DecRef(why);
+            if (py.c.PyDict_SetItem(funcs, name, why) != 0) return null;
+        }
+        if (py.c.PyDict_SetItemString(out, "python_functions", funcs) != 0) return null;
         return out;
     }
 
@@ -1505,11 +1519,15 @@ const Program = struct {
         };
         py.c.PyErr_Clear();
         const what: []const u8 = if (e.calledName()) |name| name else "";
-        ph.raise(ztypes.StrictError, "strict: {s}the compiled code went into Python while it ran{s}{s}{s} ({s}, {s}:{d} in zrun)", .{
+        // (a Python function that couldn't be compiled: why)
+        const why = driver.uncompiledReason(e.callee);
+        ph.raise(ztypes.StrictError, "strict: {s}the compiled code went into Python while it ran{s}{s}{s}{s}{s} ({s}, {s}:{d} in zrun)", .{
             where.items,
             if (what.len == 0) "" else if (e.phrase) ": " else ", calling ",
             what,
             if (what.len > 0 and !e.phrase) "()" else "",
+            if (why != null) ", which isn't compiled: " else "",
+            why orelse "",
             e.at.fn_name,
             e.at.file,
             e.at.line,

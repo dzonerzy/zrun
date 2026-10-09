@@ -50,6 +50,8 @@ pub const Entry = struct {
     /// `name` is what went to Python ("a list handed to Python"), not
     /// something called
     phrase: bool = false,
+    /// The Python object called, if it was one (borrowed: for the message)
+    callee: ?*py.c.PyObject = null,
 
     pub fn calledName(self: *const Entry) ?[]const u8 {
         return if (self.name_len > 0) self.name[0..self.name_len] else null;
@@ -138,7 +140,7 @@ noinline fn slow(s: *State, at: *const std.builtin.SourceLocation, node: ?u32, c
 }
 
 fn note(s: *State, at: std.builtin.SourceLocation, node: ?u32, callee: ?*py.c.PyObject) void {
-    entry = .{ .at = at, .node = node };
+    entry = .{ .at = at, .node = node, .callee = callee };
     if (callee) |o| if (ph.attr(o, "__qualname__") orelse ph.attr(o, "__name__")) |n| {
         defer py.Py_DecRef(n);
         if (ph.utf8(n, "name")) |text| {

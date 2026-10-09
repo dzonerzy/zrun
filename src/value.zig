@@ -224,6 +224,9 @@ pub const Str = extern struct {
     chars: u64,
     /// Its hash once worked out (0: not yet; literals have theirs)
     hash: u64 = 0,
+    /// Not ASCII, indexed (charOffset): the byte offset of every
+    /// `index_step`th code point, made the first time
+    index: ?[*]u32 = null,
     // the bytes follow
 
     pub fn bytes(self: *const Str) []const u8 {
@@ -231,6 +234,47 @@ pub const Str = extern struct {
         return (base + @sizeOf(Str))[0..self.len];
     }
 };
+
+const index_step = 64;
+
+/// The byte offset of code point `i` (below its count) of a str: an ASCII
+/// one's `i`; another's from its index (made the first time it's indexed:
+/// a str is the same all its life), then fewer than `index_step` code
+/// points on. Python's str[i] is O(1); so is this, but for those steps.
+pub fn charOffset(s: *Str, i: usize) usize {
+    if (s.chars == s.len) return i;
+    const b = s.bytes();
+    const table = @atomicLoad(?[*]u32, &s.index, .acquire) orelse makeIndex(s) orelse return stepOn(b, 0, i);
+    return stepOn(b, table[i / index_step], i % index_step);
+}
+
+fn stepOn(b: []const u8, start: usize, n: usize) usize {
+    var at = start;
+    for (0..n) |_| at += std.unicode.utf8ByteSequenceLength(b[at]) catch 1;
+    return at;
+}
+
+/// A str's index made (null: out of memory), the one another thread made
+/// meanwhile if it did
+fn makeIndex(s: *Str) ?[*]u32 {
+    if (s.len > std.math.maxInt(u32)) return null;
+    const n = s.chars / index_step + 1;
+    const t = allocator.alloc(u32, n) catch return null;
+    const b = s.bytes();
+    var at: usize = 0;
+    var chars: usize = 0;
+    for (t) |*slot| {
+        slot.* = @intCast(at);
+        const step = @min(index_step, s.chars - chars);
+        at = stepOn(b, at, step);
+        chars += step;
+    }
+    if (@cmpxchgStrong(?[*]u32, &s.index, null, t.ptr, .acq_rel, .acquire)) |other| {
+        allocator.free(t);
+        return other;
+    }
+    return t.ptr;
+}
 
 /// A list's elements kind (its head's flags), as V8 keeps one: every item a
 /// program's int (an I64: what rt gives, the ints a program makes), every
@@ -505,6 +549,7 @@ pub fn free(tag: Tag, o: *Obj) void {
     switch (tag) {
         .str => {
             const s: *Str = @ptrCast(o);
+            if (s.index) |t| allocator.free(t[0 .. s.chars / index_step + 1]);
             allocator.free(@as([*]u8, @ptrCast(s))[0 .. @sizeOf(Str) + s.len]);
         },
         // (a list, most freed: inline)
