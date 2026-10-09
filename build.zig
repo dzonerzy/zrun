@@ -63,6 +63,24 @@ pub fn build(b: *std.Build) void {
         user_lib_mod.linkSystemLibrary(lib_name, .{ .use_pkg_config = .no });
     }
 
+    // The runtime of programs compiled to run without Python (`zig build
+    // rt`): the helpers, as a static library
+    const rt_mod = b.createModule(.{
+        .root_source_file = b.path("src/rt.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "PyOZ", .module = pyoz_dep.module("PyOZ") },
+        },
+    });
+    rt_mod.addIncludePath(b.path("vendor/llvm/include"));
+    rt_mod.addOptions("build_options", build_options);
+    const rt_lib = b.addLibrary(.{ .name = "zrun_rt", .linkage = .static, .root_module = rt_mod });
+    const rt_step = b.step("rt", "The runtime of programs compiled to run without Python");
+    rt_step.dependOn(&b.addInstallArtifact(rt_lib, .{}).step);
+
     // .pyd for Windows, .so otherwise (by the target, for cross builds)
     const ext = if (target.result.os.tag == .windows) ".pyd" else ".so";
     const install = b.addInstallArtifact(lib, .{
