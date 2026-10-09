@@ -24,7 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `rt.load()` and `rt.store()` of an rt handed to other code as a value (out-of-line code, a function called with it);
   - a builtin given known values it refuses (a branch the code never takes): its error when the code runs, not a call to Python;
   - `s[i]` of a str that isn't ASCII (an index of its code points made the first time it's indexed: O(1), as Python's);
-  - `for ... in enumerate(items, start)`, the start known when compiling.
+  - `for ... in enumerate(items, start)`, the start known when compiling;
+  - str methods of any str, not only ASCII ones: `find`, `rfind`, `index`, `rindex`, `count` (with a start and an end), `startswith` and `endswith` (a tuple too), `replace`, `split` (a separator, or whitespace; a maxsplit), `strip`, `lstrip`, `rstrip` (whitespace Python's, or the characters given), `join`; `float(s)` of a str (its syntax Python's, the number correctly rounded); a float's `is_integer()`.
 
   The Lua example's numeric loop (`math.floor`, `min`): 0.099 s, was 0.119. Of the Lua test programs in strict mode, seven go into Python only to print.
 - **`except rt.Return as r` using `r.args` only is native**: the jump's value kept in the handler, no Python exception made (the same for rt.Break and rt.Continue). The Lua example's chunk (a `return` at the top level) needs no Python for it. A handler using the name otherwise gets the exception, as before.

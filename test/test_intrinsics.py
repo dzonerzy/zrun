@@ -120,6 +120,46 @@ def test_calling_a_value():
     same_in_both(p, [(4.0, 0), (-1.0, 0), (3, 1), (2.5, 1), ("x", 2), ("12", 2)])
 
 
+def str_method(a, b):
+    if b == 0:
+        return (a.find("é"), a.find("b"), a.find(""), a.find("", 3), a.find("", 99), a.find("a", -3), a.find("a", 1, -1))
+    if b == 1:
+        return (a.rfind("a"), a.rfind("é", 0, 4), a.count("a"), a.count(""), a.count("a", 2), a.count("", 1, 3))
+    if b == 2:
+        return a.index("é")
+    if b == 3:
+        return a.rindex("a", 1)
+    if b == 4:
+        return (a.startswith("ab"), a.endswith(("x", "é")), a.startswith(("é", "a")))
+    if b == 5:
+        return (a.replace("a", "XY"), a.replace("", "-"), a.replace("é", ""))
+    if b == 6:
+        return (a.strip(), a.lstrip(), a.rstrip(), a.strip("aé "), a.rstrip(None))
+    if b == 7:
+        return (a.split(), a.split("a"), a.split("a", 1), a.split(None, 1), a.split(maxsplit=0) if False else a.split(None, 0))
+    if b == 8:
+        return a.split("")
+    return "|".join([a, a.upper() if a.isascii() else a, "é"])
+
+
+def test_str_methods():
+    p = _program(str_method)
+    texts = ("abcab", "aébécé", "  a b\tc\n", "　é a\xa0b ", "", "aaaa", "é", "  ")
+    same_in_both(p, [(t, i) for i in range(10) for t in texts])
+
+
+def float_of(a, b):
+    if b == 0:
+        return float(a)
+    return float(a).is_integer()
+
+
+def test_float_of_a_str():
+    p = _program(float_of)
+    texts = ("1.5", " -2.25e3 ", "1_000.5", "1__0", "1_", "_1", ".5", "1.", ".", "inf", "-Infinity", "NaN", "nan ", "1e", "1e+5", "0x10", "　1.0\xa0", "", "3.141592653589793238462643383279", "1e400", "2.5e-324", "12abc")
+    same_in_both(p, [(t, b) for t in texts for b in (0, 1)])
+
+
 def math_one(a, b):
     # (each called by name: compiled to zr_math)
     if b == 0:

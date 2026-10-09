@@ -1901,6 +1901,12 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
             }
         }
     }
+    // A float's is_integer()
+    if (v.kind() == .float and n == 0 and std.mem.eql(u8, name.bytes(), "is_integer")) {
+        const x = v.asFloat();
+        out.* = Value.boolean(std.math.isFinite(x) and @floor(x) == x);
+        return true;
+    }
     // rt.load(), rt.store() of an rt handed over: natively
     if (v.kind() == .rt) {
         if (@import("bridge.zig").rtValueMethod(ctx, node, v, name.bytes(), args[0..n], out)) |ok| return ok;
@@ -1990,9 +1996,248 @@ fn callMethodPython(ctx: *Ctx, node: u32, v: Value, name: *const value.Str, args
 /// A str method natively (true / false: an error), or null for one (or
 /// arguments, or a str) not done here.
 fn strMethod(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []const Value, out: *Value) ?bool {
+    if (strMethodAny(ctx, node, s, name, args, out)) |ok| return ok;
+    return strMethodAscii(ctx, node, s, name, args, out);
+}
+
+/// Python's whitespace (str.isspace(), str.split(), str.strip()): these
+/// code points exactly
+fn isSpaceCp(cp: u21) bool {
+    return switch (cp) {
+        '\t', '\n', 0x0b, 0x0c, '\r', 0x1c, 0x1d, 0x1e, 0x1f, ' ', 0x85, 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000 => true,
+        0x2000...0x200a => true,
+        else => false,
+    };
+}
+
+/// The code point at byte `at` of UTF-8 `b`, and its length
+fn cpAt(b: []const u8, at: usize) struct { cp: u21, n: usize } {
+    const n = std.unicode.utf8ByteSequenceLength(b[at]) catch 1;
+    const cp = std.unicode.utf8Decode(b[at..@min(b.len, at + n)]) catch b[at];
+    return .{ .cp = cp, .n = n };
+}
+
+/// The code point before byte `end` of UTF-8 `b`, and its length
+fn cpBefore(b: []const u8, end: usize) struct { cp: u21, n: usize } {
+    var start = end - 1;
+    while (start > 0 and b[start] & 0xC0 == 0x80) start -= 1;
+    return .{ .cp = std.unicode.utf8Decode(b[start..end]) catch b[end - 1], .n = end - start };
+}
+
+/// A str method of any str (UTF-8: substrings found by their bytes,
+/// indexes in code points; whitespace Python's), as Python does it; null
+/// for one (or arguments) not done here.
+fn strMethodAny(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []const Value, out: *Value) ?bool {
     const eq = std.mem.eql;
     const b = s.bytes();
-    // (ASCII only: one byte one character, Python's case rules plain)
+    const strOf = struct {
+        fn f(x: Value) ?[]const u8 {
+            if (x.kind() != .str) return null;
+            return @as(*value.Str, @ptrCast(x.ptr())).bytes();
+        }
+    }.f;
+    const newStrValue = struct {
+        fn f(c: *Ctx, at: u32, o: *Value, bytes: []const u8) bool {
+            const r = value.newStr(bytes) orelse return oomFail(c, at);
+            o.* = Value.obj(.str, &r.head);
+            return true;
+        }
+    }.f;
+    // (a char index of `s` given as start or end, as a slice's bound: its
+    // byte offset; null for one not an int or None)
+    const Bound = struct {
+        fn of(str: *value.Str, x: ?Value, default: usize) ??usize {
+            const v = x orelse return default;
+            if (v.kind() == .none) return default;
+            if (!isInt(v)) return @as(?usize, null);
+            const n: i64 = @intCast(str.chars);
+            var i = v.asInt();
+            if (i < 0) i = @max(i + n, 0);
+            if (i > n) return @as(?usize, str.len + 1);
+            return value.charOffset(str, @intCast(i));
+        }
+    };
+    const chars = struct {
+        fn of(bytes: []const u8) i64 {
+            return @intCast(std.unicode.utf8CountCodepoints(bytes) catch bytes.len);
+        }
+    }.of;
+
+    // find, rfind, index, rindex, count (sub[, start[, end]])
+    const finds = [_][]const u8{ "find", "rfind", "index", "rindex", "count" };
+    for (finds) |m| if (eq(u8, name, m) and args.len >= 1 and args.len <= 3) {
+        const sub = strOf(args[0]) orelse return null;
+        const lo = (Bound.of(s, if (args.len > 1) args[1] else null, 0) orelse return null) orelse return null;
+        const hi_raw = (Bound.of(s, if (args.len > 2) args[2] else null, s.len) orelse return null) orelse return null;
+        const hi = @min(hi_raw, s.len);
+        const is_count = eq(u8, m, "count");
+        const is_index = eq(u8, m, "index") or eq(u8, m, "rindex");
+        // (a start past the end: nothing there, not even "")
+        if (lo > s.len or lo > hi) {
+            if (is_count) {
+                out.* = Value.pint(0);
+                return true;
+            }
+            if (is_index) return failAs(ctx, node, py.PyExc_ValueError(), null, "substring not found", .{});
+            out.* = Value.pint(-1);
+            return true;
+        }
+        const hay = b[lo..hi];
+        if (is_count) {
+            out.* = Value.pint(if (sub.len == 0) chars(hay) + 1 else @intCast(std.mem.count(u8, hay, sub)));
+            return true;
+        }
+        const from_end = m[0] == 'r';
+        const at = if (from_end) std.mem.lastIndexOf(u8, hay, sub) else std.mem.indexOf(u8, hay, sub);
+        if (at) |i| {
+            out.* = Value.pint(chars(b[0 .. lo + i]));
+            return true;
+        }
+        if (is_index) return failAs(ctx, node, py.PyExc_ValueError(), null, "substring not found", .{});
+        out.* = Value.pint(-1);
+        return true;
+    };
+    // startswith, endswith (a str or a tuple of them)
+    if ((eq(u8, name, "startswith") or eq(u8, name, "endswith")) and args.len == 1) {
+        const starts = eq(u8, name, "startswith");
+        const one = [1]Value{args[0]};
+        const subs: []const Value = if (args[0].kind() == .tuple) @as(*value.Tuple, @ptrCast(@alignCast(args[0].ptr()))).slice() else &one;
+        for (subs) |x| {
+            const sub = strOf(x) orelse return null;
+            if (if (starts) std.mem.startsWith(u8, b, sub) else std.mem.endsWith(u8, b, sub)) {
+                out.* = Value.boolean(true);
+                return true;
+            }
+        }
+        out.* = Value.boolean(false);
+        return true;
+    }
+    // replace(old, new): every one; old "": new around every code point
+    if (eq(u8, name, "replace") and args.len == 2) {
+        const old = strOf(args[0]) orelse return null;
+        const new = strOf(args[1]) orelse return null;
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(allocator);
+        if (old.len == 0) {
+            var at: usize = 0;
+            buf.appendSlice(allocator, new) catch return oomFail(ctx, node);
+            while (at < b.len) {
+                const c = cpAt(b, at);
+                buf.appendSlice(allocator, b[at .. at + c.n]) catch return oomFail(ctx, node);
+                buf.appendSlice(allocator, new) catch return oomFail(ctx, node);
+                at += c.n;
+            }
+        } else {
+            var at: usize = 0;
+            while (std.mem.indexOfPos(u8, b, at, old)) |i| {
+                buf.appendSlice(allocator, b[at..i]) catch return oomFail(ctx, node);
+                buf.appendSlice(allocator, new) catch return oomFail(ctx, node);
+                at = i + old.len;
+            }
+            buf.appendSlice(allocator, b[at..]) catch return oomFail(ctx, node);
+        }
+        return newStrValue(ctx, node, out, buf.items);
+    }
+    // strip, lstrip, rstrip ([chars]): Python's whitespace, or the code
+    // points of chars
+    if ((eq(u8, name, "strip") or eq(u8, name, "lstrip") or eq(u8, name, "rstrip")) and args.len <= 1) {
+        const set: ?[]const u8 = if (args.len == 1 and args[0].kind() != .none) (strOf(args[0]) orelse return null) else null;
+        const inSet = struct {
+            fn f(cp: u21, chars_: ?[]const u8) bool {
+                const cs = chars_ orelse return isSpaceCp(cp);
+                var it = std.unicode.Utf8View.initUnchecked(cs).iterator();
+                while (it.nextCodepoint()) |c| if (c == cp) return true;
+                return false;
+            }
+        }.f;
+        var lo: usize = 0;
+        var hi: usize = b.len;
+        if (name[0] != 'r') while (lo < hi) {
+            const c = cpAt(b, lo);
+            if (!inSet(c.cp, set)) break;
+            lo += c.n;
+        };
+        if (name[0] != 'l') while (hi > lo) {
+            const c = cpBefore(b, hi);
+            if (!inSet(c.cp, set)) break;
+            hi -= c.n;
+        };
+        return newStrValue(ctx, node, out, b[lo..hi]);
+    }
+    // split(sep[, maxsplit]), split() / split(None[, maxsplit]): a list
+    if (eq(u8, name, "split") and args.len <= 2) {
+        const sep: ?[]const u8 = if (args.len >= 1 and args[0].kind() != .none) (strOf(args[0]) orelse return null) else null;
+        var maxsplit: i64 = -1;
+        if (args.len == 2) {
+            if (!isInt(args[1])) return null;
+            maxsplit = args[1].asInt();
+        }
+        if (sep) |sp| if (sp.len == 0) return failAs(ctx, node, py.PyExc_ValueError(), null, "empty separator", .{});
+        const l = value.newList(4) orelse return oomFail(ctx, node);
+        const push = struct {
+            fn f(c: *Ctx, at: u32, list: *value.List, bytes: []const u8) bool {
+                const r = value.newStr(bytes) orelse return oomFail(c, at);
+                if (!value.listPush(list, Value.obj(.str, &r.head))) return oomFail(c, at);
+                return true;
+            }
+        }.f;
+        var splits: i64 = 0;
+        if (sep) |sp| {
+            var at: usize = 0;
+            while (maxsplit < 0 or splits < maxsplit) : (splits += 1) {
+                const i = std.mem.indexOfPos(u8, b, at, sp) orelse break;
+                if (!push(ctx, node, l, b[at..i])) return false;
+                at = i + sp.len;
+            }
+            if (!push(ctx, node, l, b[at..])) return false;
+        } else {
+            // (runs of whitespace; none at the ends)
+            var at: usize = 0;
+            while (true) {
+                while (at < b.len) {
+                    const c = cpAt(b, at);
+                    if (!isSpaceCp(c.cp)) break;
+                    at += c.n;
+                }
+                if (at >= b.len) break;
+                if (maxsplit >= 0 and splits >= maxsplit) {
+                    // (the rest as it is, its trailing whitespace too)
+                    if (!push(ctx, node, l, b[at..])) return false;
+                    break;
+                }
+                const start = at;
+                while (at < b.len) {
+                    const c = cpAt(b, at);
+                    if (isSpaceCp(c.cp)) break;
+                    at += c.n;
+                }
+                if (!push(ctx, node, l, b[start..at])) return false;
+                splits += 1;
+            }
+        }
+        out.* = Value.obj(.list, &l.head);
+        return true;
+    }
+    // join (any str between them)
+    if (eq(u8, name, "join") and args.len == 1 and (args[0].kind() == .list or args[0].kind() == .tuple)) {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(allocator);
+        for (itemsOfSeq(args[0]), 0..) |x, i| {
+            // (anything not a str: Python's TypeError)
+            const t = strOf(x) orelse return null;
+            if (i > 0) buf.appendSlice(allocator, b) catch return oomFail(ctx, node);
+            buf.appendSlice(allocator, t) catch return oomFail(ctx, node);
+        }
+        return newStrValue(ctx, node, out, buf.items);
+    }
+    return null;
+}
+
+/// A str method of an ASCII str (one byte one character, Python's case
+/// rules plain); null for one not done here.
+fn strMethodAscii(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []const Value, out: *Value) ?bool {
+    const eq = std.mem.eql;
+    const b = s.bytes();
     if (s.chars != s.len) return null;
     const strArg = struct {
         fn f(x: Value) ?[]const u8 {
@@ -2422,6 +2667,17 @@ export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64,
                 out.* = v;
                 return true;
             },
+            // (a str as Python reads one: its syntax checked, the number
+            // correctly rounded, as CPython's; one that isn't: Python's
+            // error, its words)
+            .str => {
+                const s: *value.Str = @ptrCast(v.ptr());
+                if (pyFloat(s.bytes())) |x| {
+                    out.* = Value.float(x);
+                    return true;
+                }
+                return pythonsError(ctx, node, callee_index, v, out);
+            },
             else => {},
         },
         .len => switch (v.kind()) {
@@ -2717,6 +2973,88 @@ export fn zr_math(ctx: *Ctx, node: u32, code: u32, callee_index: u64, n: u64, ar
     if ((std.math.isNan(r) and !any_nan) or (std.math.isInf(r) and all_finite)) return pythonsErrorOf(ctx, node, callee_index, args, n, out);
     out.* = Value.float(r);
     return true;
+}
+
+/// float(s) of a str as Python reads it: whitespace around (Python's), a
+/// sign, then inf, infinity or nan (any case), or digits (single
+/// underscores between them) with a point and an exponent; null if it
+/// isn't one (or out of what's done here).
+fn pyFloat(s: []const u8) ?f64 {
+    // (the whitespace around: Python's)
+    var lo: usize = 0;
+    var hi: usize = s.len;
+    while (lo < hi) {
+        const c = cpAt(s, lo);
+        if (!isSpaceCp(c.cp)) break;
+        lo += c.n;
+    }
+    while (hi > lo) {
+        const c = cpBefore(s, hi);
+        if (!isSpaceCp(c.cp)) break;
+        hi -= c.n;
+    }
+    const t = s[lo..hi];
+    var i: usize = 0;
+    var neg = false;
+    if (i < t.len and (t[i] == '+' or t[i] == '-')) {
+        neg = t[i] == '-';
+        i += 1;
+    }
+    const word = t[i..];
+    const words = [_]struct { []const u8, f64 }{ .{ "inf", std.math.inf(f64) }, .{ "infinity", std.math.inf(f64) }, .{ "nan", std.math.nan(f64) } };
+    for (words) |w| if (std.ascii.eqlIgnoreCase(word, w[0])) return if (neg) -w[1] else w[1];
+    // digits (with single underscores between them), point, exponent
+    var buf: [128]u8 = undefined;
+    var n: usize = 0;
+    const digits = struct {
+        /// Digits from `at` (an underscore only between two): copied, their
+        /// count; null for an underscore out of place
+        fn run(text: []const u8, at: *usize, out: []u8, len: *usize) ?usize {
+            var count: usize = 0;
+            while (at.* < text.len) {
+                const c = text[at.*];
+                if (std.ascii.isDigit(c)) {
+                    if (len.* >= out.len) return null;
+                    out[len.*] = c;
+                    len.* += 1;
+                    count += 1;
+                    at.* += 1;
+                } else if (c == '_' and count > 0 and at.* + 1 < text.len and std.ascii.isDigit(text[at.* + 1])) {
+                    at.* += 1;
+                } else break;
+            }
+            return count;
+        }
+    }.run;
+    if (neg) {
+        buf[0] = '-';
+        n = 1;
+    }
+    const whole = digits(t, &i, &buf, &n) orelse return null;
+    var frac: usize = 0;
+    if (i < t.len and t[i] == '.') {
+        if (n >= buf.len) return null;
+        buf[n] = '.';
+        n += 1;
+        i += 1;
+        frac = digits(t, &i, &buf, &n) orelse return null;
+    }
+    if (whole == 0 and frac == 0) return null;
+    if (i < t.len and (t[i] == 'e' or t[i] == 'E')) {
+        if (n + 2 >= buf.len) return null;
+        buf[n] = 'e';
+        n += 1;
+        i += 1;
+        if (i < t.len and (t[i] == '+' or t[i] == '-')) {
+            buf[n] = t[i];
+            n += 1;
+            i += 1;
+        }
+        const exp = digits(t, &i, &buf, &n) orelse return null;
+        if (exp == 0) return null;
+    }
+    if (i != t.len) return null;
+    return std.fmt.parseFloat(f64, buf[0..n]) catch null;
 }
 
 const IntParse = union(enum) { int: i64, too_big, invalid };
