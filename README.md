@@ -176,6 +176,16 @@ Semantics are compiled from their Python source. What compiles, and how to write
 
 `program.report()` says where compiled code still went through Python and why, which state of the semantics' modules stayed Python, what the cache did, and which functions got typed entries.
 
+### Strict mode
+
+`zrun.Language(parser, rules, strict=True)` guarantees compiled code that calls nothing in Python, or says why it can't be:
+
+- a semantic outside the compilable subset, or marked `native=False`, is a `zrun.CompileError` when it's registered;
+- code that would call into Python is a `zrun.CompileError` when the program compiles, at the semantic's line: a Python function or builtin called, a Python object used as a value, `isinstance()` of a class that isn't the language's, a module variable a function rebinds, a semantic run as Python;
+- what only shows as the code runs (a host function written in Python, a value from Python) is a `zrun.StrictError` (a `CompileError`), at the program's line: `fib.tiny:9:5: the compiled code went into Python while it ran, calling print()`.
+
+Errors are still Python's exceptions (raised, caught), and code compiled while the program runs (call sites, typed entries) is allowed: neither is the program's work. The reference mode is Python's, strict or not. Host functions for a strict language are native ones (`lang.native_host`).
+
 ## Engines
 
 A program can be a set of entry points, loaded once and called many times:
@@ -260,7 +270,7 @@ Every class and method has its documentation in `help()` (and in the `.pyi` stub
 
 | | |
 |---|---|
-| `Language(parser, rules=None, max_depth=1000)` | a language: a zgram parser, zrules rules |
+| `Language(parser, rules=None, max_depth=1000, hot_calls=1000, strict=False)` | a language: a zgram parser, zrules rules (`strict=True`: compiled code calling nothing in Python) |
 | `@lang.eval(kind)`, `@lang.exec(kind)` | the semantics of a node kind (`native=False`: run as Python) |
 | `lang.function(kind, ...)`, `@lang.host`, `lang.native_host(name, capsule)` | functions of the language, of Python, of a native library |
 | `lang.types(mapping)` | what values the language's types have |
@@ -274,7 +284,7 @@ Every class and method has its documentation in `help()` (and in the `.pyi` stub
 | `zrun.Bytes(data)` | data read in place |
 | `zrun.configure(cache=, cache_size=, tiers=, perf_map=)`, `zrun.clear_cache()` | process-wide settings; the compiled-code cache |
 | `zrun.collect()` | the cycle collector, now |
-| `zrun.Error`, `zrun.LoadError`, `zrun.CompileError`, `zrun.IntegerOverflow` | errors |
+| `zrun.Error`, `zrun.LoadError`, `zrun.CompileError`, `zrun.StrictError`, `zrun.IntegerOverflow` | errors |
 
 ## Architecture
 

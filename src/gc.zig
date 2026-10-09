@@ -464,7 +464,9 @@ fn references(o: *Obj, out: *std.ArrayListUnmanaged(Value)) !void {
 fn heldByPython(o: *Obj, look: bool) bool {
     if (o.flags & value.HAS_PROXY == 0) return false;
     if (!look) return true;
-    gil.ensure();
+    // (asking Python, not running it: what strict mode allows)
+    gil.allowBegin();
+    defer gil.allowEnd();
     return proxies.heldByPython(o);
 }
 

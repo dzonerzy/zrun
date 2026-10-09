@@ -121,10 +121,14 @@ pub const Ctx = struct {
         self.err_msg.clearRetainingCapacity();
         for (self.err_stack.items) |e| value.decref(Value.obj(.str, &e.name.head));
         self.err_stack.clearRetainingCapacity();
-        if (self.pending != null or self.exc != null) gil.ensure();
-        if (self.pending) |p| py.Py_DecRef(p);
+        // (an error's Python objects: what strict mode allows)
+        if (self.pending != null or self.exc != null) {
+            gil.allowBegin();
+            defer gil.allowEnd();
+            if (self.pending) |p| py.Py_DecRef(p);
+            if (self.exc) |e| py.Py_DecRef(e);
+        }
         self.pending = null;
-        if (self.exc) |e| py.Py_DecRef(e);
         self.exc = null;
         self.exc_class = null;
         self.exc_msg.clearRetainingCapacity();
@@ -267,7 +271,8 @@ fn frozenError() ?*PyObject {
 /// The Python exception being raised as the run's error (as the reference
 /// mode words it); false.
 fn failPython(ctx: *Ctx, node: u32) bool {
-    gil.ensure();
+    gil.allowBegin();
+    defer gil.allowEnd();
     // (a rt.Throw, a zrun.Error: carried up as itself, for Python code
     // above to catch, as the bridge does it)
     if (py.c.PyErr_Occurred() != null and (py.c.PyErr_ExceptionMatches(types.Throw) != 0 or py.c.PyErr_ExceptionMatches(types.Error) != 0))
@@ -349,7 +354,7 @@ export fn zr_overflow(ctx: *Ctx, node: u32) callconv(.c) bool {
 // ======================================================================
 
 fn objects(ctx: *Ctx, vals: []const Value, out: []*PyObject) bool {
-    gil.ensure();
+    gil.ensure(@src());
     for (vals, 0..) |v, i| {
         out[i] = value.toPython(v, ctx.node_maker) orelse {
             for (out[0..i]) |o| py.Py_DecRef(o);
@@ -992,15 +997,15 @@ fn callOnce(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Value, nargs:
         .host => {
             const callee: *PyObject = @ptrFromInt(f.bits);
             // (a Python function: by its compiled code, if it can have one;
-            // finding it touches Python)
-            gil.ensure();
+            // finding it the first time touches Python, as compiling does)
             if (receiver == null) if (@import("bridge.zig").compiledMethod(ctx, node, callee, args[0..nargs], true, out)) |ok| return ok;
+            // (else called through Python)
+            gil.ensureAt(@src(), node, callee);
             if (collecting) {
                 var b: [64]u8 = undefined;
                 stat("call host {s}", .{statType(f, &b)});
             }
             const n = nargs + @intFromBool(receiver != null);
-            gil.ensure();
             const tuple = py.c.PyTuple_New(@intCast(n)) orelse return failPython(ctx, node);
             defer py.Py_DecRef(tuple);
             // (its arguments and result as rt.call hands them over: ints
@@ -1030,9 +1035,13 @@ fn callOnce(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Value, nargs:
 /// from then on (zr_host_jump for what that code says); without one, as
 /// zr_call.
 pub export fn zr_call_site(ctx: *Ctx, node: u32, slot: *u64, idx: u64, args: [*]const Value, nargs: u64, out: *Value) callconv(.c) bool {
-    gil.ensure();
     const callee = ctx.object(idx);
-    if (@import("bridge.zig").hostCode(ctx, callee, nargs)) |code| {
+    // (its code compiled now: what strict mode allows; without code, a
+    // call through Python, as zr_call makes it)
+    gil.allowBegin();
+    const host_code = @import("bridge.zig").hostCode(ctx, callee, nargs);
+    gil.allowEnd();
+    if (host_code) |code| {
         @atomicStore(u64, slot, @intFromPtr(code), .release);
         // (its arguments made I64s, as rt.call hands them over)
         var checked: [64]Value = undefined;
@@ -1057,7 +1066,8 @@ pub export fn zr_host_failed(ctx: *Ctx, node: u32, idx: u64) callconv(.c) bool {
 
 pub fn hostCodeFailed(ctx: *Ctx, f: *PyObject) bool {
     if (!ctx.failed) return false;
-    gil.ensure();
+    gil.allowBegin();
+    defer gil.allowEnd();
     var name_buf: [128]u8 = undefined;
     const name = pyName(f, &name_buf, "host function");
     // (the exception's type: one Python code raised, or the native error's
@@ -1108,7 +1118,8 @@ pub export fn zr_host_jump(ctx: *Ctx, node: u32) callconv(.c) bool {
 /// "name: Error: message", as the reference mode words a host function's
 /// failure.
 fn hostFailed(ctx: *Ctx, node: u32, f: *PyObject) bool {
-    gil.ensure();
+    gil.allowBegin();
+    defer gil.allowEnd();
     var buf: [512]u8 = undefined;
     const text = ph.takeError(&buf);
     var name_buf: [128]u8 = undefined;
@@ -1126,7 +1137,7 @@ fn hostFailed(ctx: *Ctx, node: u32, f: *PyObject) bool {
 
 /// A host object of the program (a host function...) as a value.
 export fn zr_object(ctx: *Ctx, idx: u64, out: *Value) callconv(.c) void {
-    gil.ensure();
+    gil.ensure(@src());
     const o = ctx.object(idx);
     py.Py_IncRef(o);
     out.* = .{ .tag = @intFromEnum(Tag.host), .bits = @intFromPtr(o) };
@@ -1226,7 +1237,7 @@ export fn zr_is_record(t: u64, bits: u64, rtype: *const value.RecordType) callco
     const v = Value{ .tag = t, .bits = bits };
     if (v.kind() == .host) {
         const cls = rtype.py_class orelse return false;
-        gil.ensure();
+        gil.ensure(@src());
         const r = py.c.PyObject_IsInstance(@ptrFromInt(v.bits), cls);
         if (r < 0) py.c.PyErr_Clear();
         return r == 1;
@@ -1239,7 +1250,7 @@ export fn zr_is_record(t: u64, bits: u64, rtype: *const value.RecordType) callco
 /// isinstance(v, cls) for any class (objects[cls_index]), as Python does
 /// it (a compiled value given as Python sees it).
 export fn zr_isinstance(ctx: *Ctx, node: u32, t: u64, bits: u64, cls_index: u64, out: *Value) callconv(.c) bool {
-    gil.ensure();
+    gil.ensureAt(@src(), node, ctx.object(cls_index));
     const v = Value{ .tag = t, .bits = bits };
     var objs: [1]*PyObject = undefined;
     if (!objects(ctx, &.{v}, &objs)) return failPython(ctx, node);
@@ -1291,7 +1302,9 @@ export fn zr_setattr(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value
         for (r.rtype.fields, 0..) |f, i| {
             if (std.mem.eql(u8, f, name.bytes())) {
                 if (r.rtype.frozen) {
-                    gil.ensure();
+                    // (an error: what strict mode allows)
+                    gil.allowBegin();
+                    defer gil.allowEnd();
                     const cls = frozenError() orelse return failPython(ctx, node);
                     return failAs(ctx, node, cls, null, "cannot assign to field '{s}'", .{f});
                 }
@@ -1352,7 +1365,7 @@ export fn zr_getitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
         // of Python's); out of range, Python's error
         .host => if (isInt(k)) {
             const o: *PyObject = @ptrFromInt(v.bits);
-            gil.ensure();
+            gil.ensureAt(@src(), node, null);
             const t_ = ph.typeOf(o);
             const is_list = t_ == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyList_Type"))));
             const is_tuple = !is_list and t_ == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyTuple_Type"))));
@@ -1411,7 +1424,8 @@ export fn zr_read(ctx: *Ctx, node: u32, r: u32, dt: u64, db: u64, at: u64, ab: u
 /// A native host function's failure (native.zig, code its call returned):
 /// the error a call through Python gives, RuntimeError(its message).
 export fn zr_native_fail(ctx: *Ctx, node: u32, idx: u64, code: i32) callconv(.c) bool {
-    gil.ensure();
+    gil.allowBegin();
+    defer gil.allowEnd();
     const o = ctx.objects.items[idx];
     const n = @import("native.zig").as(o);
     ph.raise(py.PyExc_RuntimeError(), "{s}", .{@import("native.zig").errorText(n, code)});
@@ -1574,7 +1588,6 @@ fn unpacker(n: u64) ?*PyObject {
 
 /// `a0, ..., an-1 = v`: the n items in out (new references).
 export fn zr_unpack(ctx: *Ctx, node: u32, t: u64, bits: u64, n: u64, out: [*]Value) callconv(.c) bool {
-    gil.ensure();
     const v = Value{ .tag = t, .bits = bits };
     switch (v.kind()) {
         .list, .tuple => {
@@ -1595,6 +1608,8 @@ export fn zr_unpack(ctx: *Ctx, node: u32, t: u64, bits: u64, n: u64, out: [*]Val
         },
         else => {},
     }
+    // (anything else: as Python unpacks it)
+    gil.ensureAt(@src(), node, null);
     const f = unpacker(n) orelse return failPython(ctx, node);
     var objs: [1]*PyObject = undefined;
     if (!objects(ctx, &.{v}, &objs)) return failPython(ctx, node);
@@ -1674,7 +1689,6 @@ export fn zr_extend_items(ctx: *Ctx, node: u32, t: u64, bits: u64, items: [*]con
 /// A method of a value called with arguments, as Python does it (for
 /// methods that don't change the value: str's, a dict's get...).
 export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value.Str, args: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
-    gil.ensure();
     const v = Value{ .tag = t, .bits = bits };
     // A dict's get(): natively (Python would see a copy)
     if (v.kind() == .dict and std.mem.eql(u8, name.bytes(), "get") and (n == 1 or n == 2)) {
@@ -1744,6 +1758,8 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
             return true;
         }
     }
+    // Anything else: the method as Python finds it
+    gil.ensureAt(@src(), node, null);
     if (collecting) {
         var b: [64]u8 = undefined;
         stat("method {s}.{s}", .{ statType(v, &b), name.bytes() });
@@ -1939,8 +1955,8 @@ fn isPySpace(c: u8) bool {
 /// A builtin called with arguments, as Python does it (int(), float(),
 /// len(), zip()... of run-time values): a host object of the program.
 export fn zr_call_python(ctx: *Ctx, node: u32, callee_index: u64, args: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
-    gil.ensure();
     const callee = ctx.object(callee_index);
+    gil.ensureAt(@src(), node, callee);
     if (collecting) {
         var b: [64]u8 = undefined;
         var b2: [64]u8 = undefined;
@@ -2095,7 +2111,7 @@ export fn zr_range(ctx: *Ctx, node: u32, args: [*]const Value, n: u64, out: *[3]
     for (args[0..n], 0..) |a, i| {
         vals[i] = if (isInt(a)) a.asInt() else if (a.kind() == .host) blk: {
             // (a Python object: its own __index__, as range() asks it)
-            gil.ensure();
+            gil.ensureAt(@src(), node, null);
             const o = py.c.PyNumber_Index(@ptrFromInt(a.bits)) orelse return failPython(ctx, node);
             defer py.Py_DecRef(o);
             var overflow: c_int = 0;
@@ -2117,7 +2133,6 @@ pub const Builtin = enum(u32) { int, float, len, abs, str, bool };
 /// Python does it; anything else (and the errors) by the builtin itself
 /// (objects[callee_index]).
 export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64, bits: u64, out: *Value) callconv(.c) bool {
-    gil.ensure();
     const v = Value{ .tag = t, .bits = bits };
     // (a Big: int() and abs() in 128 bits, float() rounded, str() its
     // digits, bool() true)
@@ -2201,6 +2216,7 @@ export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64,
             // (a Python list, tuple or dict (data given by Python): its
             // size, without calling Python)
             .host => {
+                gil.ensureAt(@src(), node, null);
                 const o: *PyObject = @ptrFromInt(v.bits);
                 const t_ = ph.typeOf(o);
                 const n: isize = if (t_ == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyList_Type")))))
@@ -2276,7 +2292,7 @@ export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64,
 /// A closure's captured variable: its cell `idx` (of the function called,
 /// a host value), what it holds now; Python's NameError for an empty one.
 export fn zr_cell(ctx: *Ctx, node: u32, ft: u64, fb: u64, idx: u64, out: *Value) callconv(.c) bool {
-    gil.ensure();
+    gil.ensureAt(@src(), node, null);
     _ = ft;
     const f: *PyObject = @ptrFromInt(fb);
     const closure = py.c.PyObject_GetAttrString(f, "__closure__") orelse return failPython(ctx, node);
@@ -2294,7 +2310,7 @@ export fn zr_cell(ctx: *Ctx, node: u32, ft: u64, fb: u64, idx: u64, out: *Value)
 /// type(v): its class, as the reference mode has it (an I64's zrun.I64, a
 /// plain int's int, a record's its class...), without Python.
 export fn zr_type(t: u64, bits: u64, out: *Value) callconv(.c) void {
-    gil.ensure();
+    gil.ensure(@src());
     const v = Value{ .tag = t, .bits = bits };
     const cls: *PyObject = switch (v.kind()) {
         .none => @ptrCast(@alignCast(ph.typeOf(py.Py_None()))),
@@ -2320,7 +2336,7 @@ export fn zr_type(t: u64, bits: u64, out: *Value) callconv(.c) void {
 /// code runs from the module's dict (objects[globals_index]), then the
 /// builtins; Python's NameError if neither has it.
 export fn zr_global(ctx: *Ctx, node: u32, globals_index: u64, name: *const value.Str, out: *Value) callconv(.c) bool {
-    gil.ensure();
+    gil.ensureAt(@src(), node, null);
     const g = ctx.object(globals_index);
     const key = ph.newString(name.bytes()) orelse return failPython(ctx, node);
     defer py.Py_DecRef(key);
@@ -2392,7 +2408,7 @@ export fn zr_format(ctx: *Ctx, node: u32, t: u64, bits: u64, conversion: u32, sp
             return true;
         }
     }
-    gil.ensure();
+    gil.ensureAt(@src(), node, null);
     var objs: [1]*PyObject = undefined;
     if (!objects(ctx, &.{v}, &objs)) return failPython(ctx, node);
     var o = objs[0];

@@ -246,8 +246,9 @@ pub const Compiled = struct {
                     // (a literal now made at run time: compiled again)
                     if (c.need_retry) continue;
                     // (a semantic it reaches can't be compiled: as Python)
+                    // (strict: the reason is the error)
                     if (c.failed_semantic) |s| {
-                        if (!self.python.contains(s)) {
+                        if (!c.lang.strict and !self.python.contains(s)) {
                             if (!markPython(self.python, s, self.failure.message.items)) return oomT();
                             continue;
                         }
@@ -417,7 +418,7 @@ pub const Compiled = struct {
                         // semantic run as Python, and compiled again)
                         if (c.need_retry) continue :attempt;
                         if (c.failed_semantic) |s| {
-                            if (!self.python.contains(s)) {
+                            if (!c.lang.strict and !self.python.contains(s)) {
                                 if (!markPython(self.python, s, self.failure.message.items)) return oomA();
                                 continue :attempt;
                             }
@@ -757,8 +758,10 @@ fn build(out: *Compiled, data: *program_mod.Data, lang: compile_mod.LangView, pr
                     }
                     // (compiled again with a literal made at run time)
                     if (need_retry) continue;
+                    // (strict: the reason is the error, nothing runs as
+                    // Python)
                     if (failed) |s| {
-                        if (!out.python.contains(s)) {
+                        if (!lang.strict and !out.python.contains(s)) {
                             if (!markPython(out.python, s, out.failure.message.items)) {
                                 _ = py.c.PyErr_NoMemory();
                                 return false;

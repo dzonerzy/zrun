@@ -75,6 +75,10 @@ const Language = struct {
     /// Calls of a call site in compiled code before code of its own is
     /// compiled for it (what it knows of its arguments)
     _hot_calls: i64 = 1000,
+    /// Language(strict=True): every semantic compiled, the code calling
+    /// nothing in Python (what would is a CompileError; at run time, the
+    /// run's error: StrictError); errors still Python's exceptions
+    _strict: bool = false,
     /// What values the nodes of the language's types evaluate to
     /// (types()): a dict by type name, or a function of the type's text
     _types: ?*PyObject = null,
@@ -89,7 +93,7 @@ const Language = struct {
     /// run time (they escape where known ones can't follow)
     _escaping: std.AutoHashMapUnmanaged(compile_mod.EscapeKey, void) = .empty,
 
-    pub fn __new__(args: pyoz.Args(struct { parser: *PyObject, rules: ?*PyObject = null, max_depth: i64 = 1000, hot_calls: i64 = 1000 })) ?Language {
+    pub fn __new__(args: pyoz.Args(struct { parser: *PyObject, rules: ?*PyObject = null, max_depth: i64 = 1000, hot_calls: i64 = 1000, strict: bool = false })) ?Language {
         const v = args.value;
         var lang = Language{};
         const g = allocator.create(grammar_mod.Grammar) catch return oom(Language);
@@ -119,6 +123,7 @@ const Language = struct {
             return lang.fail();
         }
         lang._hot_calls = v.hot_calls;
+        lang._strict = v.strict;
         return lang;
     }
 
@@ -327,9 +332,15 @@ const Language = struct {
             return false;
         }
         if (!native) {
+            if (self._strict) {
+                ph.raise(ztypes.CompileError, "strict: a semantic marked native=False (it would run in Python)", .{});
+                return false;
+            }
             if (!self.markPython(func, "native=False")) return false;
         } else if (!self.readSemantic(func)) {
             if (py.c.PyErr_ExceptionMatches(ztypes.CompileError) == 0) return false;
+            // (strict: why it can't be compiled is the error)
+            if (self._strict) return false;
             // (outside the compilable subset: run as Python, saying why)
             var t: ?*PyObject = null;
             var v: ?*PyObject = null;
@@ -665,7 +676,7 @@ const Language = struct {
                 return null;
             };
         };
-        text.print(allocator, "max_depth={d};hot_calls={d}", .{ self._max_depth, self._hot_calls }) catch {
+        text.print(allocator, "max_depth={d};hot_calls={d};strict={}", .{ self._max_depth, self._hot_calls, self._strict }) catch {
             _ = py.c.PyErr_NoMemory();
             return null;
         };
@@ -696,7 +707,7 @@ const Language = struct {
         return out;
     }
 
-    pub const __doc__: [*:0]const u8 = "Language(parser, rules=None, *, max_depth=1000): a language to run programs of: its zgram parser, its zrules rules (for names and their variables), and its semantics (eval, exec, function, host). load(source) parses and checks a program.";
+    pub const __doc__: [*:0]const u8 = "Language(parser, rules=None, *, max_depth=1000, hot_calls=1000, strict=False): a language to run programs of: its zgram parser, its zrules rules (for names and their variables), and its semantics (eval, exec, function, host). load(source) parses and checks a program. strict=True: compiled code calling nothing in Python (what would is a CompileError, or a StrictError as it runs).";
     pub const eval__doc__: [*:0]const u8 = "@lang.eval(kind): the semantics of an expression kind (a -> class or rule name, or a list of them): fn(node, rt) -> value.";
     pub const eval__params__ = "kind";
     pub const exec__doc__: [*:0]const u8 = "@lang.exec(kind): the semantics of a statement kind: fn(node, rt).";
@@ -1279,6 +1290,7 @@ const Program = struct {
             .escaping = &lang._escaping,
             .hot_calls = lang._hot_calls,
             .types = lang._types,
+            .strict = lang._strict,
         };
     }
 
@@ -1470,10 +1482,39 @@ const Program = struct {
         // (the GIL released, as for program.call(): the code takes it back
         // if it touches Python)
         const takes = gil.takes();
+        const strict = self.language()._strict;
+        if (strict) gil.strictBegin();
         const ok = gil.without(runMainCode, .{ c, ectx, globals });
+        const entered = if (strict) gil.strictEnd() else null;
         self._gil_taken += gil.takes() - takes;
+        if (entered) |e| return self.strictError(e);
         if (ok) return none();
         return self.compiledError(ectx);
+    }
+
+    /// zrun.StrictError: a strict language's code went into Python as it
+    /// ran (where: the program's node, what it called, zrun's code); null.
+    fn strictError(self: *Program, e: gil.Entry) ?*PyObject {
+        var where: std.ArrayListUnmanaged(u8) = .empty;
+        defer where.deinit(allocator);
+        const d = self.ctx().data;
+        if (e.node) |n| if (n < d.nodes.len) {
+            const at = d.lineCol(d.nodes[n].text_start);
+            const path: []const u8 = if (self._path) |p| (if (p == py.Py_None()) "<program>" else ph.utf8(p, "path") orelse "<program>") else "<program>";
+            where.print(allocator, "{s}:{d}:{d}: ", .{ path, at.line, at.col }) catch {};
+        };
+        py.c.PyErr_Clear();
+        const what: []const u8 = if (e.calledName()) |name| name else "";
+        ph.raise(ztypes.StrictError, "strict: {s}the compiled code went into Python while it ran{s}{s}{s} ({s}, {s}:{d} in zrun)", .{
+            where.items,
+            if (what.len > 0) ", calling " else "",
+            what,
+            if (what.len > 0) "()" else "",
+            e.at.fn_name,
+            e.at.file,
+            e.at.line,
+        });
+        return null;
     }
 
     fn runMainCode(c: *driver.Compiled, ectx: *helpers.Ctx, globals: *value_mod.Frame) bool {
@@ -1596,8 +1637,15 @@ const Program = struct {
         // (the GIL released: Python threads run meanwhile, and calls on
         // them; the code takes it back if it touches Python)
         const takes = gil.takes();
+        const strict = self.language()._strict;
+        if (strict) gil.strictBegin();
         const ok = gil.without(callFunction, .{ ectx, fv, vals, &out });
+        const entered = if (strict) gil.strictEnd() else null;
         self._gil_taken += gil.takes() - takes;
+        if (entered) |e| {
+            if (ok) value_mod.decref(out);
+            return self.strictError(e);
+        }
         if (!ok) return self.compiledError(ectx);
         defer value_mod.decref(out);
         return value_mod.toPython(out, ectx.node_maker);
@@ -1676,7 +1724,7 @@ const Program = struct {
         defer ca.free(results);
         @memset(results, value_mod.Value.none_v);
         defer for (results) |v| value_mod.decref(v);
-        var job = MapJob{ .fv = fv, .args = args, .results = results, .template = ectx };
+        var job = MapJob{ .fv = fv, .args = args, .results = results, .template = ectx, .strict = self.language()._strict };
         defer if (job.failed) |f| {
             f.deinit();
             ca.destroy(f);
@@ -1695,6 +1743,7 @@ const Program = struct {
         gil.without(MapJob.join, .{handles[0..spawned]});
         self._gil_taken += job.gil_takes.load(.monotonic);
         if (spawned == 0) return py.c.PyErr_NoMemory();
+        if (job.entered) |e| return self.strictError(e);
         if (job.failed) |f| return self.compiledError(f);
         const list = py.c.PyList_New(@intCast(n)) orelse return null;
         for (results, 0..) |v, i| {
@@ -1721,6 +1770,10 @@ const Program = struct {
         failed: ?*helpers.Ctx = null,
         /// The times the threads took the GIL
         gil_takes: std.atomic.Value(u64) = .init(0),
+        /// A strict language's: where a thread's code first went into
+        /// Python (under `lock`)
+        strict: bool = false,
+        entered: ?gil.Entry = null,
 
         fn fresh(job: *const MapJob) helpers.Ctx {
             const t = job.template;
@@ -1729,6 +1782,12 @@ const Program = struct {
 
         fn work(job: *MapJob) void {
             gil.worker();
+            if (job.strict) gil.strictBegin();
+            defer if (job.strict) if (gil.strictEnd()) |at| {
+                while (!job.lock.tryLock()) std.atomic.spinLoopHint();
+                defer job.lock.unlock();
+                if (job.entered == null) job.entered = at;
+            };
             var own = job.fresh();
             bridge.current = &own;
             while (true) {

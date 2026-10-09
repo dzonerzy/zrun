@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.2] - 2026-10-09
 
+### Added
+- **Strict mode: `zrun.Language(..., strict=True)`.** Compiled code calling nothing in Python, or the reason it can't: a semantic outside the compilable subset (or `native=False`) is a `CompileError` when it's registered; code that would call into Python (a Python function or builtin, a Python object as a value, `isinstance()` of a class not the language's, a module variable a function rebinds, a semantic run as Python) a `CompileError` when the program compiles, at the semantic's line; what only shows as the code runs (a host function in Python) a `zrun.StrictError` (a `CompileError`) at the program's line, saying what it called. Errors (still Python's exceptions) and code compiled while the program runs are allowed. In `run()`, `call()` and `map()`.
+
+### Performance
+- **Helpers with native paths no longer take the GIL first**: unpacking a list or tuple, methods of strs, lists and dicts done natively, `int()`, `str()`, `abs()`, `bool()`, `len()` of native values. Code running them on several threads (`map()`) doesn't take turns for them.
+
 ### Fixed
 - **A program loaded again in the same process was compiled again**, and its compiled code not found in the cache: each load's code had names of its own (two programs alive at once can't share the JIT's), so its IR, so its key. A load now runs the code an earlier load of the program (the same language, source and path) compiled, while that one lives and after it goes (the last eight kept); with tiers, the code compiled fast too, and the optimized code an earlier load was having made when it went. Lua's `fib(30)` loaded ten times in a process, an empty cache: 1.55 s for the first load, then 0.040 s each (was 1.5 s each).
 - **An attribute of a module or class that may be rebound was decided when compiling**: `sys.stdout` read in a semantic was the one bound when the program compiled, so a second run with `sys.stdout` redirected wrote to the first run's. An attribute that isn't a function, class, module or value (an instance, a list...) is now read when the code runs.

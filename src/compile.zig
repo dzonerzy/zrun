@@ -67,6 +67,9 @@ pub const LangView = struct {
     hot_calls: i64,
     /// Language.types(): a dict by type name or a function of a type's text
     types: ?*PyObject = null,
+    /// Language(strict=True): code that would call into Python is a
+    /// compile error (Gen.strictRefuses), not a semantic run as Python
+    strict: bool = false,
 };
 
 /// A literal built at run time: where it is (its expression), the code it's
@@ -327,6 +330,19 @@ pub fn runPython(src: [:0]const u8) ?*PyObject {
 fn stablePy(o: *PyObject) error{Python}!bool {
     const r = py.c.PyObject_IsInstance(o, (try pyTypes()).stable);
     if (r < 0) return error.Python;
+    return r == 1;
+}
+
+/// An exception class (raised, caught: what strict mode still lets reach
+/// Python, an error being the way out of the code)
+fn isExceptionClass(o: *PyObject) bool {
+    const is_type = isInstanceOf(o, @ptrCast(@alignCast(py.types.typeObject("PyType_Type")))) catch {
+        py.c.PyErr_Clear();
+        return false;
+    };
+    if (!is_type) return false;
+    const r = py.c.PyObject_IsSubclass(o, py.PyExc_BaseException());
+    if (r < 0) py.c.PyErr_Clear();
     return r == 1;
 }
 
@@ -1795,6 +1811,9 @@ const Gen = struct {
     f: ir.Function,
     fnode: u32,
     layout: *Layout,
+    /// Where in its semantic the code being made is (the statement or
+    /// expression: strict mode's errors say it)
+    pos: front.Pos = .{},
     /// The function's parameters: the context; the globals (the top
     /// level), or the frame around, the arguments, the receiver and the
     /// result slot (a language function)
@@ -2546,6 +2565,7 @@ const Gen = struct {
                 const b = try self.c.bigConst(value.bigOf(o).?);
                 break :blk .{ .tag = self.k(@intFromEnum(value.Tag.big)), .bits = self.c.m.addrInt(@intFromPtr(b)), .shape = .any };
             } else blk: {
+                if (self.c.lang.strict and !isExceptionClass(o)) try self.strictRefuses("uses {s}, a Python object, as a value", .{try self.pyName(o)});
                 const idx = try self.c.objectIndex(o);
                 _ = self.call("zr_object", &.{ self.ctx, self.k(@intCast(idx)), self.out });
                 break :blk try self.loadOut(.any);
@@ -3925,6 +3945,7 @@ const Gen = struct {
     fn pySemantic(self: *Gen, idx: u32, which: Which) Error!SVal {
         const c = self.c;
         const f = &self.f;
+        try self.strictRefuses("runs a semantic as Python", .{});
         c.uses_python = true;
         // (the frame the code here runs in, in a slot rt.fresh can replace)
         const owner = self.currentOwner();
@@ -4005,6 +4026,7 @@ const Gen = struct {
                 // rt.Return(value), rt.Break(), rt.Continue(); borrowing
                 // the value)
                 const cls = controlClass(kind).?;
+                try self.strictRefuses("catches rt.{s} as an exception", .{@tagName(kind)});
                 const n: usize = if (kind == .Return) 1 else 0;
                 const arr = try self.valueSlots(1);
                 if (n == 1) try self.storeSlot(self.elem(arr, 0), ret orelse self.noneDyn());
@@ -4717,6 +4739,9 @@ const Gen = struct {
     }
 
     fn stmt(self: *Gen, inst: *Inst, s: front.Stmt) Error!void {
+        const outer = self.pos;
+        self.pos = s.pos;
+        defer self.pos = outer;
         switch (s.kind) {
             .pass => {},
             .expr => |e| try self.drop(try self.expr(inst, e)),
@@ -5556,6 +5581,9 @@ const Gen = struct {
 
     fn expr(self: *Gen, inst: *Inst, e: *const front.Expr) Error!SVal {
         const c = self.c;
+        const outer = self.pos;
+        self.pos = e.pos;
+        defer self.pos = outer;
         switch (e.kind) {
             // (a literal of the semantic's: a plain int; a big one, Python's)
             .int => |n| return .{ .pint = n },
@@ -6037,6 +6065,7 @@ const Gen = struct {
         // (one a function assigns: its value when the code runs)
         const rebound = try reboundGlobals(globals);
         if (py.c.PySequence_Contains(rebound, key) == 1) {
+            try self.strictRefuses("reads the module variable {s}, which a function rebinds (`global {s}`)", .{ name, name });
             const idx = try self.c.objectIndex(globals);
             const s = try self.c.m.string(name);
             try self.callCheck("zr_global", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), s, self.out });
@@ -7459,6 +7488,7 @@ const Gen = struct {
     /// failure worded as the reference mode words a host function's), its
     /// arguments made dynamic already (borrowed).
     fn callPythonDyns(self: *Gen, inst: *Inst, idx: usize, ds: []const Dyn) Error!Dyn {
+        if (self.c.lang.strict) try self.strictRefuses("calls the host function {s}()", .{try self.pyName(self.c.objects.items[idx])});
         const arr = try self.valueSlots(@max(ds.len, 1));
         for (ds, 0..) |d, i| try self.storeSlot(self.elem(arr, i), d);
         _ = self.call("zr_object", &.{ self.ctx, self.k(@intCast(idx)), self.out });
@@ -7475,7 +7505,30 @@ const Gen = struct {
     }
 
     /// Call a Python object at run time with the arguments.
+    /// Language(strict=True): code calling into Python (`what` it is) a
+    /// compile error at the semantic's line, saying why; nothing otherwise.
+    fn strictRefuses(self: *Gen, comptime what: []const u8, args: anytype) Error!void {
+        if (!self.c.lang.strict) return;
+        const fmt = "strict: " ++ what ++ " (it would run in Python)";
+        if (self.insts.items.len == 0) return self.c.unsupported(fmt, args);
+        return self.c.unsupportedAt(self.insts.items[self.insts.items.len - 1].func, self.pos, fmt, args);
+    }
+
+    /// A Python object's name for messages (its __qualname__ or
+    /// __name__, else its type's), in the compiler's memory.
+    fn pyName(self: *Gen, o: *PyObject) Error![]const u8 {
+        inline for (.{ "__qualname__", "__name__" }) |attr_name| {
+            if (ph.attr(o, attr_name)) |n| {
+                defer py.Py_DecRef(n);
+                if (py.PyUnicode_Check(n)) if (ph.utf8(n, "name")) |s| return self.a().dupe(u8, s);
+            }
+            py.c.PyErr_Clear();
+        }
+        return try std.fmt.allocPrint(self.a(), "a {s}", .{try adopt_mod.typeName(self.a(), o)});
+    }
+
     fn callPython(self: *Gen, inst: *Inst, o: *PyObject, args: []const SVal) Error!SVal {
+        if (self.c.lang.strict and !isExceptionClass(o)) try self.strictRefuses("calls the Python function {s}()", .{try self.pyName(o)});
         const idx = try self.c.objectIndex(o);
         const arr = try self.valueArray(args, inst.node);
         const ok = self.call("zr_call_python", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), arr, self.k(@intCast(args.len)), self.out });
@@ -7683,6 +7736,7 @@ const Gen = struct {
             return self.isType(v.dyn, entry[1]);
         };
         // Any other class: as Python answers it, the value as Python sees it
+        if (self.c.lang.strict) try self.strictRefuses("asks isinstance() of the class {s}", .{try self.pyName(o)});
         const d = try self.materialize(v, inst.node);
         const idx = try c.objectIndex(o);
         try self.callCheck("zr_isinstance", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, self.k(@intCast(idx)), self.out });

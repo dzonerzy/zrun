@@ -371,7 +371,7 @@ pub fn incref(v: Value) void {
         const o = v.ptr();
         if (o.rc < IMMORTAL) o.rc += 1;
     } else if (v.tag == @intFromEnum(Tag.host)) {
-        gil.ensure();
+        gil.ensure(@src());
         py.Py_IncRef(@ptrFromInt(v.bits));
     }
 }
@@ -383,7 +383,7 @@ pub fn decref(v: Value) void {
         o.rc -= 1;
         if (o.rc == 0) free(@enumFromInt(v.tag), o);
     } else if (v.tag == @intFromEnum(Tag.host)) {
-        gil.ensure();
+        gil.ensure(@src());
         py.Py_DecRef(@ptrFromInt(v.bits));
     }
 }
@@ -517,7 +517,7 @@ pub fn free(tag: Tag, o: *Obj) void {
         .big => allocator.destroy(@as(*Big, @ptrCast(@alignCast(o)))),
         .bytes => {
             const b: *Bytes = @ptrCast(@alignCast(o));
-            gil.ensure();
+            gil.ensure(@src());
             py.Py_DecRef(b.py);
             allocator.destroy(b);
         },
@@ -705,7 +705,7 @@ pub fn truthy(v: Value) bool {
         .tuple => @as(*Tuple, @ptrCast(@alignCast(v.ptr()))).len != 0,
         .dict => @as(*Dict, @ptrCast(@alignCast(v.ptr()))).len != 0,
         .host => blk: {
-            gil.ensure();
+            gil.ensure(@src());
             break :blk py.c.PyObject_IsTrue(@ptrFromInt(v.bits)) == 1;
         },
         else => true,
@@ -740,7 +740,7 @@ fn intEqualsFloat(i: i64, f: f64) bool {
 const HostKind = enum { identity, int, float, str, own };
 
 fn hostKind(o: *PyObject) HostKind {
-    gil.ensure();
+    gil.ensure(@src());
     const t = ph.typeOf(o);
     if (py.c.PyType_IsSubtype(t, exact.int()) != 0) return .int;
     if (py.c.PyType_IsSubtype(t, exact.float()) != 0) return .float;
@@ -790,7 +790,7 @@ fn scalarOf(v: Value) Scalar {
 /// A record compared by value as Python sees it (its proxy; a new
 /// reference), or null.
 fn valueRecordObject(v: Value) ?*PyObject {
-    gil.ensure();
+    gil.ensure(@src());
     if (v.kind() != .record) return null;
     if (!@as(*Record, @ptrCast(@alignCast(v.ptr()))).rtype.value_eq) return null;
     return proxies.make(v, @import("adopt.zig").shared_maker) orelse {
@@ -800,7 +800,7 @@ fn valueRecordObject(v: Value) ?*PyObject {
 }
 
 fn hostEqual(a: Value, b: Value) bool {
-    gil.ensure();
+    gil.ensure(@src());
     if (a.kind() == .host and b.kind() == .host and a.bits == b.bits) return true;
     const x = scalarOf(a);
     const y = scalarOf(b);
@@ -838,7 +838,7 @@ fn hostEqual(a: Value, b: Value) bool {
 /// A Python int of an i128 (a new reference; null with an exception):
 /// from its decimal digits.
 pub fn bigObject(x: i128) ?*PyObject {
-    gil.ensure();
+    gil.ensure(@src());
     var buf: [48]u8 = undefined;
     const s = std.fmt.bufPrintZ(&buf, "{d}", .{x}) catch unreachable;
     return py.c.PyLong_FromString(s.ptr, null, 10);
@@ -996,7 +996,7 @@ fn hashOf(tag: u64, bits: u64) u64 {
         .record => {
             const r: *Record = @ptrCast(@alignCast(v.ptr()));
             if (!r.rtype.value_eq) return std.hash.Wyhash.hash(4, std.mem.asBytes(&bits));
-            gil.ensure();
+            gil.ensure(@src());
             const h = proxies.valueHash(r) orelse blk: {
                 py.c.PyErr_Clear();
                 break :blk 0;
@@ -1009,7 +1009,7 @@ fn hashOf(tag: u64, bits: u64) u64 {
 
 /// A Python object's hash, alike for the values it equals (hostEqual).
 fn hostHash(o: *PyObject) u64 {
-    gil.ensure();
+    gil.ensure(@src());
     const bits = @intFromPtr(o);
     switch (scalarOf(.{ .tag = @intFromEnum(Tag.host), .bits = bits })) {
         .int => |i| return hashOf(@intFromEnum(Tag.int), @bitCast(i)),
@@ -1149,7 +1149,7 @@ pub fn isDeleted(e: Dict.Entry) bool {
 /// A value as a Python object (new reference), or null with an exception.
 /// Ints become zrun's checked ints, as the reference mode gives them.
 pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
-    gil.ensure();
+    gil.ensure(@src());
     switch (v.kind()) {
         .none => {
             py.Py_IncRef(py.Py_None());
@@ -1254,7 +1254,7 @@ const exact = struct {
 /// (`unique`: the reference given is the only one, the containers it's
 /// in included)
 fn convert(o: *PyObject, unique: bool) ?Value {
-    gil.ensure();
+    gil.ensure(@src());
     if (o == py.Py_None()) return Value.none_v;
     // (a proxy: the compiled object itself)
     if (proxies.unwrap(o)) |v| return v;

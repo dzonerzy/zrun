@@ -59,7 +59,7 @@ pub const Outcome = union(enum) { not_state, native: Value, refused: []const u8 
 /// another's state: a metatable the globals' table don't reach...).
 /// An object's type's name (copied into `a`), for messages (its
 /// __name__: the type object's fields aren't the stable ABI's)
-fn typeName(a: std.mem.Allocator, o: *PyObject) Error![]const u8 {
+pub fn typeName(a: std.mem.Allocator, o: *PyObject) Error![]const u8 {
     const t: *PyObject = @ptrCast(@alignCast(ph.typeOf(o)));
     return (ph.attrString(a, t, "__name__") catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,

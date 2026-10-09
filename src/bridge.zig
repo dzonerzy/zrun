@@ -166,7 +166,7 @@ fn linkOf(ctx: *Ctx) *const Link {
 /// `frame_slot` (the frame of `owner`): its status (0 error, 1 done: the
 /// value in `out`, 2 Return: its value in `out`, 3 Break, 4 Continue).
 pub export fn zr_py_semantic(ctx: *Ctx, which: u32, idx: u32, frame_slot: **value.Frame, owner: u32, out: *Value) callconv(.c) i32 {
-    gil.ensure();
+    gil.ensureAt(@src(), idx, null);
     out.* = Value.none_v;
     helpers.stat("py_semantic", .{});
     const link = linkOf(ctx);
@@ -198,7 +198,7 @@ pub export fn zr_py_semantic(ctx: *Ctx, which: u32, idx: u32, frame_slot: **valu
 /// anything else is itself (eval). A status as zr_py_semantic's (rt.loop:
 /// 1 with True or False in `out`, its Break and Continue taken).
 pub export fn zr_run_value(ctx: *Ctx, which: u32, at: u32, tag: u64, bits: u64, frame_slot: **value.Frame, owner: u32, out: *Value) callconv(.c) i32 {
-    gil.ensure();
+    gil.ensureAt(@src(), at, null);
     out.* = Value.none_v;
     const v = Value{ .tag = tag, .bits = bits };
     const loop = which == 2;
@@ -449,7 +449,9 @@ fn newRuntime(ctx: *Ctx, frame_slot: **value.Frame, owner: u32, at: u32) ?*PyObj
 /// goes up to whoever catches it, anything else is the run's error, worded
 /// as the reference mode does). Always false.
 pub export fn zr_raise(ctx: *Ctx, at: u32, t: u64, bits: u64) callconv(.c) bool {
-    gil.ensure();
+    // (an error: Python's exceptions still, what strict mode allows)
+    gil.allowBegin();
+    defer gil.allowEnd();
     const v = Value{ .tag = t, .bits = bits };
     const o = value.toPython(v, ctx.node_maker) orelse return pythonFailure(ctx, at) != 0;
     defer py.Py_DecRef(o);
@@ -469,7 +471,8 @@ pub export fn zr_raise(ctx: *Ctx, at: u32, t: u64, bits: u64) callconv(.c) bool 
 /// (objects[cls_index]: a class or a tuple of them). An error of the
 /// compiled code itself is a zrun.Error, as Python code above would see it.
 pub export fn zr_exc_matches(ctx: *Ctx, cls_index: u64) callconv(.c) bool {
-    gil.ensure();
+    gil.allowBegin();
+    defer gil.allowEnd();
     const cls = ctx.object(cls_index);
     const r = if (ctx.pending orelse ctx.exc) |e|
         py.c.PyObject_IsInstance(e, cls)
@@ -482,7 +485,8 @@ pub export fn zr_exc_matches(ctx: *Ctx, cls_index: u64) callconv(.c) bool {
 /// The error being raised, caught (`except ... as e`): the exception
 /// object in `out` (a host value), the error cleared.
 pub export fn zr_exc_catch(ctx: *Ctx, at: u32, out: *Value) callconv(.c) bool {
-    gil.ensure();
+    gil.allowBegin();
+    defer gil.allowEnd();
     var exc: *PyObject = undefined;
     if (ctx.pending != null or ctx.exc != null or ctx.exc_class != null) {
         exc = ctx.exceptionOf() orelse {
@@ -534,7 +538,11 @@ pub fn compiledCall(ctx: *Ctx, node: u32, callee: *PyObject, args: []const Value
     // address, for the code); a closure's is by its code object)
     const known = lk.compiled.called.get(.{ .func = callee, .nargs = args.len, .rt_mask = mask });
     var closure = false;
-    if (known == null) {
+    const code = (if (known) |k| k else blk: {
+        // (the first call: its code compiled now, what strict mode allows;
+        // the code itself runs outside that)
+        gil.allowBegin();
+        defer gil.allowEnd();
         // (a closure: one code for all of them, the function given last)
         const closure_obj = py.c.PyObject_GetAttrString(callee, "__closure__") orelse {
             py.c.PyErr_Clear();
@@ -542,9 +550,10 @@ pub fn compiledCall(ctx: *Ctx, node: u32, callee: *PyObject, args: []const Value
         };
         py.Py_DecRef(closure_obj);
         closure = closure_obj != py.Py_None();
-    }
-    const code = (if (known) |k| k else lk.compiled.calledCode(callee, args.len, mask, closure)) orelse {
+        break :blk lk.compiled.calledCode(callee, args.len, mask, closure);
+    }) orelse {
         if (helpers.collecting) {
+            gil.ensureAt(@src(), node, callee);
             if (ph.attr(callee, "__qualname__")) |nm| {
                 defer py.Py_DecRef(nm);
                 helpers.stat("python function {s}", .{ph.utf8(nm, "name") orelse "?"});
@@ -608,6 +617,9 @@ pub fn recordMethod(ctx: *Ctx, node: u32, rec: Value, name: *const value.Str, ar
     const r: *value.Record = @ptrCast(@alignCast(rec.ptr()));
     const key: driver.Compiled.MethodKey = .{ .rtype = r.rtype, .name = name };
     const found: ?*PyObject = if (lk.compiled.methods.get(key)) |f| f else blk: {
+        // (found once per class: what strict mode allows)
+        gil.allowBegin();
+        defer gil.allowEnd();
         const f = classFunction(r.rtype.py_class orelse return null, name.bytes());
         lk.compiled.methods.put(allocator, key, f) catch return null;
         break :blk f;
@@ -659,6 +671,8 @@ pub fn compiledMethod(ctx: *Ctx, node: u32, m: *PyObject, args: []const Value, c
     if (args.len >= 63) return null;
     const pt = compile_mod.pyMethodType() orelse return null;
     if (ph.typeOf(m) != @as(*py.c.PyTypeObject, @ptrCast(@alignCast(pt)))) return compiledCall(ctx, node, m, args, checked, out);
+    // (a bound method: its function and object as Python has them)
+    gil.ensureAt(@src(), node, m);
     const func = py.c.PyObject_GetAttrString(m, "__func__") orelse {
         py.c.PyErr_Clear();
         return null;
@@ -713,7 +727,7 @@ pub fn runtimeValue(o: *PyObject) ?Value {
 /// `rt` as a value compiled code passes (to a Python function: f(rt,
 /// node...)): an rt over the frames of the code there, holding its frame.
 pub export fn zr_runtime(ctx: *Ctx, at: u32, frame: *value.Frame, owner: u32, out: *Value) callconv(.c) bool {
-    gil.ensure();
+    gil.ensureAt(@src(), at, null);
     var slot: *value.Frame = frame;
     const obj = newRuntime(ctx, &slot, owner, at) orelse {
         py.c.PyErr_Clear();
@@ -1288,14 +1302,16 @@ pub fn init(module: *PyObject) !void {
 /// what the site calls from now on. Nothing (the site keeps calling the
 /// generic code) if that can't be done.
 pub export fn zr_specialize(ctx: *Ctx, site: u64) callconv(.c) void {
-    gil.ensure();
+    // (compiling while the program runs: what strict mode allows)
+    gil.allowBegin();
+    defer gil.allowEnd();
     linkOf(ctx).compiled.specialize(@intCast(site));
 }
 
 /// rt.context in compiled code: the object program.call() was given (None:
 /// none), as a value.
 pub export fn zr_context(ctx: *Ctx, out: *Value) callconv(.c) bool {
-    gil.ensure();
+    gil.ensure(@src());
     const o = linkOf(ctx).context orelse py.Py_None();
     out.* = value.fromPython(o) orelse return pythonFailure(ctx, 0) != 0;
     return true;
@@ -1304,7 +1320,8 @@ pub export fn zr_context(ctx: *Ctx, out: *Value) callconv(.c) bool {
 /// A hot language function's typed entry, for the kinds its arguments have
 /// always been (driver's speculate)
 pub export fn zr_speculate(ctx: *Ctx, fnode: u64) callconv(.c) void {
-    gil.ensure();
+    gil.allowBegin();
+    defer gil.allowEnd();
     linkOf(ctx).compiled.speculate(@intCast(fnode));
 }
 
