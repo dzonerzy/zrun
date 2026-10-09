@@ -53,12 +53,19 @@ def test_native_code_runs():
     p.run(mode="python")
 
 
+def kw_print(*args, **kw):
+    print(*args, **kw)
+
+
 def test_a_host_function_in_python_is_an_error_where_it_runs():
+    # (a print taking **kwargs: not compiled, run in Python)
+    own = _strict_tiny()
+    own.lang.host("print", kw_print)
     src = FIB + "print(x);\n"
-    p = tiny.lang.load(src, "fib.tiny")
+    p = own.lang.load(src, "fib.tiny")
     with pytest.raises(zrun.StrictError) as e:
         p.run(mode="compiled")
-    assert "fib.tiny:7:1:" in str(e.value) and "calling print()" in str(e.value)
+    assert "fib.tiny:7:1:" in str(e.value) and "calling kw_print()" in str(e.value)
     assert issubclass(zrun.StrictError, zrun.CompileError)
 
 

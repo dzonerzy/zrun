@@ -2568,6 +2568,16 @@ pub fn hostCodeFailed(ctx: *Ctx, f: *PyObject) bool {
     defer allocator.free(old);
     ctx.err_msg.clearRetainingCapacity();
     ctx.err_msg.print(allocator, "{s}: {s}: {s}", .{ name, type_name, old }) catch {};
+    // (a native error: a zrun.Error now, as rt.call raises a host
+    // function's exception, what `except` matches; an rt.Throw goes up as
+    // itself)
+    if (ctx.exc_kind != null and ctx.exc_kind != .Throw and ctx.pending == null and ctx.exc == null) {
+        ctx.exc_kind = .ZrunError;
+        ctx.exc_msg.clearRetainingCapacity();
+        ctx.exc_msg.appendSlice(allocator, ctx.err_msg.items) catch {};
+        if (ctx.exc_value) |v| value.decref(v);
+        ctx.exc_value = null;
+    }
     return false;
 }
 
@@ -3961,7 +3971,261 @@ fn strInto(ctx: *Ctx, v: Value, buf: *std.ArrayListUnmanaged(u8)) bool {
         buf.appendSlice(allocator, p.of(&small)) catch return false;
         return true;
     }
-    return pythonStr(ctx, v, buf, false);
+    return anyStr(ctx, v, buf, false);
+}
+
+/// Running without Python (a standalone build's runtime): what Python
+/// would do, natively
+pub const standalone = @import("build_options").standalone;
+
+// -- output: print(), sys.stdout.write(), sys.stderr.write() --
+
+/// What a standalone program wrote to its standard output and hasn't
+/// written out yet (as Python's sys.stdout buffers it: by line on a
+/// terminal, else by block)
+var out_buf: std.ArrayListUnmanaged(u8) = .empty;
+var out_tty: ?bool = null;
+
+/// The standard output written out (before the standard error is
+/// written, and as the program ends).
+pub fn flushOutput() void {
+    writeAll(1, out_buf.items);
+    out_buf.clearRetainingCapacity();
+}
+
+fn writeAll(fd: i32, bytes: []const u8) void {
+    var rest = bytes;
+    while (rest.len > 0) {
+        const n = std.c.write(fd, rest.ptr, rest.len);
+        if (n <= 0) return;
+        rest = rest[@intCast(n)..];
+    }
+}
+
+/// Text to the standard output (fd 1) or error (2): Python's sys.stdout
+/// or sys.stderr (whatever they are when it's written, as Python's
+/// print() finds them), or, without Python, the file.
+fn emit(ctx: *Ctx, node: u32, fd: u32, text: []const u8) bool {
+    if (standalone) {
+        if (fd == 1) {
+            out_buf.appendSlice(allocator, text) catch return oomFail(ctx, node);
+            const tty = out_tty orelse blk: {
+                const t = std.c.isatty(1) != 0;
+                out_tty = t;
+                break :blk t;
+            };
+            if (out_buf.items.len >= 8192 or (tty and std.mem.indexOfScalar(u8, text, '\n') != null)) flushOutput();
+        } else {
+            flushOutput();
+            writeAll(2, text);
+        }
+        return true;
+    }
+    // (I/O: what strict mode allows)
+    gil.allowBegin();
+    defer gil.allowEnd();
+    const file = py.c.PySys_GetObject(if (fd == 1) "stdout" else "stderr") orelse
+        return failAs(ctx, node, .RuntimeError, null, "lost sys.{s}", .{if (fd == 1) "stdout" else "stderr"});
+    const s = py.c.PyUnicode_DecodeUTF8(text.ptr, @intCast(text.len), null) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(s);
+    const w = py.c.PyObject_GetAttrString(file, "write") orelse return failPython(ctx, node);
+    defer py.Py_DecRef(w);
+    const r = py.c.PyObject_CallFunctionObjArgs(w, s, @as(?*PyObject, null)) orelse return failPython(ctx, node);
+    py.Py_DecRef(r);
+    return true;
+}
+
+/// sys.stdout.write(s) (fd 1), sys.stderr.write(s) (2): the str written,
+/// its length in characters the result.
+export fn zr_write(ctx: *Ctx, node: u32, fd: u32, t: u64, bits: u64, out: *Value) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    if (v.kind() != .str) return failAs(ctx, node, .TypeError, null, "write() argument must be str, not {s}", .{value.typeName(v)});
+    const s: *value.Str = @ptrCast(v.ptr());
+    if (!emit(ctx, node, fd, s.bytes())) return false;
+    out.* = Value.pint(@intCast(s.chars));
+    return true;
+}
+
+/// print(*args, *seq, sep=sep, end=end) to the standard output (fd 1) or
+/// error (2): each item's str(), sep between them (None: a space), end
+/// after (None: a newline). `seq`: the items of a list known only at run
+/// time, after args (none: none).
+export fn zr_print(ctx: *Ctx, node: u32, fd: u32, args: [*]const Value, n: u64, seq_t: u64, seq_bits: u64, sep_t: u64, sep_bits: u64, end_t: u64, end_bits: u64, out: *Value) callconv(.c) bool {
+    const sep = Value{ .tag = sep_t, .bits = sep_bits };
+    const end = Value{ .tag = end_t, .bits = end_bits };
+    inline for (.{ .{ sep, "sep" }, .{ end, "end" } }) |p| {
+        if (p[0].kind() != .none and p[0].kind() != .str) return failAs(ctx, node, .TypeError, null, p[1] ++ " must be None or a string, not {s}", .{value.typeName(p[0])});
+    }
+    const seq = Value{ .tag = seq_t, .bits = seq_bits };
+    const more: []const Value = if (seq.kind() == .list) @as(*value.List, @ptrCast(@alignCast(seq.ptr()))).slice() else &.{};
+    var text: std.ArrayListUnmanaged(u8) = .empty;
+    defer text.deinit(allocator);
+    var i: usize = 0;
+    while (i < n + more.len) : (i += 1) {
+        if (i > 0) {
+            if (sep.kind() == .str) text.appendSlice(allocator, @as(*value.Str, @ptrCast(sep.ptr())).bytes()) catch return oomFail(ctx, node) else text.append(allocator, ' ') catch return oomFail(ctx, node);
+        }
+        const x = if (i < n) args[i] else more[i - n];
+        if (!strInto(ctx, x, &text)) return if (ctx.failed) false else fail(ctx, node, "print(): str() of a {s} failed", .{value.typeName(x)});
+    }
+    if (end.kind() == .str) text.appendSlice(allocator, @as(*value.Str, @ptrCast(end.ptr())).bytes()) catch return oomFail(ctx, node) else text.append(allocator, '\n') catch return oomFail(ctx, node);
+    if (!emit(ctx, node, fd, text.items)) return false;
+    out.* = Value.none_v;
+    return true;
+}
+
+/// str() (repr: repr()) of any value: natively, else Python's
+fn anyStr(ctx: *Ctx, v: Value, buf: *std.ArrayListUnmanaged(u8), repr: bool) bool {
+    const start = buf.items.len;
+    var seen: std.ArrayListUnmanaged(usize) = .empty;
+    defer seen.deinit(allocator);
+    nativeStr(v, buf, repr, &seen) catch |e| switch (e) {
+        error.OutOfMemory => return false,
+        error.NotNative => {
+            buf.shrinkRetainingCapacity(start);
+            return pythonStr(ctx, v, buf, repr);
+        },
+    };
+    return true;
+}
+
+/// str() (repr: repr()) of a value as Python writes it, natively: NotNative
+/// when a part of it isn't written natively (a host object, a str repr()
+/// would escape beyond ASCII, a record of a Python class...: Python's
+/// then). Without Python, every value is (those Python alone knows by
+/// their kind). `seen`: the containers being written (one inside itself
+/// is `[...]`, as Python's).
+fn nativeStr(v: Value, buf: *std.ArrayListUnmanaged(u8), repr: bool, seen: *std.ArrayListUnmanaged(usize)) error{ OutOfMemory, NotNative }!void {
+    var small: [40]u8 = undefined;
+    if (plainStr(v)) |p| return buf.appendSlice(allocator, p.of(&small));
+    if (v.kind() != .bool) if (value.wide(v)) |x| return buf.print(allocator, "{d}", .{x});
+    switch (v.kind()) {
+        .str => {
+            const s = @as(*value.Str, @ptrCast(v.ptr())).bytes();
+            if (!repr) return buf.appendSlice(allocator, s);
+            if (!standalone) for (s) |ch| if (ch >= 0x80) return error.NotNative;
+            return quoted(s, buf, false);
+        },
+        .bytes => {
+            const b: *value.Bytes = @ptrCast(@alignCast(v.ptr()));
+            if (!standalone and !b.isPyBytes()) return error.NotNative;
+            try buf.append(allocator, 'b');
+            return quoted(b.slice(), buf, true);
+        },
+        .list, .dict, .set => {
+            const addr = v.bits;
+            const open: u8, const close: u8 = if (v.kind() == .list) .{ '[', ']' } else .{ '{', '}' };
+            if (std.mem.indexOfScalar(usize, seen.items, addr) != null) return buf.print(allocator, "{c}...{c}", .{ open, close });
+            try seen.append(allocator, addr);
+            defer _ = seen.pop();
+            switch (v.kind()) {
+                .list => {
+                    const l: *value.List = @ptrCast(@alignCast(v.ptr()));
+                    try buf.append(allocator, '[');
+                    // (by index: an item's repr can't change the list, but
+                    // its length is read each time, as Python's)
+                    var i: usize = 0;
+                    while (i < l.len) : (i += 1) {
+                        if (i > 0) try buf.appendSlice(allocator, ", ");
+                        try nativeStr(l.slice()[i], buf, true, seen);
+                    }
+                    try buf.append(allocator, ']');
+                },
+                .dict => {
+                    const d: *value.Dict = @ptrCast(@alignCast(v.ptr()));
+                    try buf.append(allocator, '{');
+                    var first = true;
+                    if (d.entries) |entries| for (entries[0..d.used]) |e| {
+                        if (e.key.tag == value.DELETED) continue;
+                        if (!first) try buf.appendSlice(allocator, ", ");
+                        first = false;
+                        try nativeStr(e.key, buf, true, seen);
+                        try buf.appendSlice(allocator, ": ");
+                        try nativeStr(e.value, buf, true, seen);
+                    };
+                    try buf.append(allocator, '}');
+                },
+                else => {
+                    const s: *@import("set.zig").Set = @ptrCast(@alignCast(v.ptr()));
+                    var it = @import("set.zig").iterate(s);
+                    var first = true;
+                    while (it.next()) |x| {
+                        try buf.appendSlice(allocator, if (first) "{" else ", ");
+                        first = false;
+                        try nativeStr(x, buf, true, seen);
+                    }
+                    try buf.appendSlice(allocator, if (first) "set()" else "}");
+                },
+            }
+        },
+        .tuple => {
+            const items = @as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).slice();
+            try buf.append(allocator, '(');
+            for (items, 0..) |x, i| {
+                if (i > 0) try buf.appendSlice(allocator, ", ");
+                try nativeStr(x, buf, true, seen);
+            }
+            if (items.len == 1) try buf.append(allocator, ',');
+            try buf.append(allocator, ')');
+        },
+        .record => {
+            // (a dataclass's repr: its class's, unless it's Python's to say)
+            const r: *value.Record = @ptrCast(@alignCast(v.ptr()));
+            if (!standalone and r.rtype.py_class != null) return error.NotNative;
+            if (std.mem.indexOfScalar(usize, seen.items, v.bits) != null) return buf.appendSlice(allocator, "...");
+            try seen.append(allocator, v.bits);
+            defer _ = seen.pop();
+            try buf.print(allocator, "{s}(", .{r.rtype.name});
+            for (r.fields(), r.rtype.fields, 0..) |x, name, i| {
+                if (i > 0) try buf.appendSlice(allocator, ", ");
+                try buf.print(allocator, "{s}=", .{name});
+                try nativeStr(x, buf, true, seen);
+            }
+            try buf.append(allocator, ')');
+        },
+        .exc => {
+            const e: *value.Exc = @ptrCast(@alignCast(v.ptr()));
+            const args = @as(*value.Tuple, @ptrCast(@alignCast(e.args.ptr()))).slice();
+            if (repr) {
+                try buf.print(allocator, "{s}(", .{@as(errors.Kind, @enumFromInt(e.kind)).name()});
+                for (args, 0..) |x, i| {
+                    if (i > 0) try buf.appendSlice(allocator, ", ");
+                    try nativeStr(x, buf, true, seen);
+                }
+                return buf.append(allocator, ')');
+            }
+            if (args.len == 0) return;
+            if (args.len == 1) return nativeStr(args[0], buf, e.kind == @intFromEnum(errors.Kind.KeyError), seen);
+            return nativeStr(e.args, buf, true, seen);
+        },
+        else => {
+            if (!standalone) return error.NotNative;
+            try buf.print(allocator, "<{s}>", .{@tagName(v.kind())});
+        },
+    }
+}
+
+/// A str's (bytes: a bytes') repr() between quotes, as Python writes it:
+/// ' unless the text has ' and not ", escapes for what isn't printable
+/// (beyond ASCII: a str's characters as they are; a bytes' \x escapes)
+fn quoted(s: []const u8, buf: *std.ArrayListUnmanaged(u8), is_bytes: bool) !void {
+    const has_single = std.mem.indexOfScalar(u8, s, '\'') != null;
+    const has_double = std.mem.indexOfScalar(u8, s, '"') != null;
+    const q: u8 = if (has_single and !has_double) '"' else '\'';
+    try buf.append(allocator, q);
+    for (s) |ch| switch (ch) {
+        '\\' => try buf.appendSlice(allocator, "\\\\"),
+        '\n' => try buf.appendSlice(allocator, "\\n"),
+        '\r' => try buf.appendSlice(allocator, "\\r"),
+        '\t' => try buf.appendSlice(allocator, "\\t"),
+        else => if (ch == q) {
+            try buf.append(allocator, '\\');
+            try buf.append(allocator, ch);
+        } else if (ch < 0x20 or ch == 0x7f or (is_bytes and ch >= 0x80)) {
+            try buf.print(allocator, "\\x{x:0>2}", .{ch});
+        } else try buf.append(allocator, ch),
+    };
+    try buf.append(allocator, q);
 }
 
 /// str() (repr: repr()) of a value, Python's (an error's way: what strict
@@ -3996,7 +4260,7 @@ fn reprInto(ctx: *Ctx, v: Value, buf: *std.ArrayListUnmanaged(u8)) bool {
         buf.print(allocator, "{d}", .{x}) catch return false;
         return true;
     };
-    return pythonStr(ctx, v, buf, true);
+    return anyStr(ctx, v, buf, true);
 }
 
 /// Python's str() of an exception value: its arguments' (none: "", one:
@@ -4008,7 +4272,7 @@ fn excStr(ctx: *Ctx, e: *value.Exc, buf: *std.ArrayListUnmanaged(u8)) bool {
         if (e.kind == @intFromEnum(errors.Kind.KeyError)) return reprInto(ctx, args[0], buf);
         return strInto(ctx, args[0], buf);
     }
-    return pythonStr(ctx, e.args, buf, false);
+    return anyStr(ctx, e.args, buf, false);
 }
 
 /// `raise e` of an exception value: the run's error, natively (what
@@ -5409,6 +5673,7 @@ export fn zr_concat(ctx: *Ctx, node: u32, items: [*]const Value, n: u64, out: *V
 /// The helpers compiled code calls, by name
 const helper_names = [_][]const u8{
     "zr_incref",   "zr_decref",     "zr_fail",       "zr_unset",         "zr_overflow",
+    "zr_write",    "zr_print",
     "zr_binary",   "zr_compare",    "zr_unary",      "zr_truthy",        "zr_function",
     "zr_call",     "zr_object",     "zr_frame_new",  "zr_frame_release", "zr_free",
     "zr_list",     "zr_tuple",      "zr_dict",       "zr_record",        "zr_is_record",

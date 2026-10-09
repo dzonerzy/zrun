@@ -84,12 +84,17 @@ class TestSubset:
         def star(node, *rest):
             return 1
 
-        # (defaults: the function's own, when called without)
+        def kwargs(node, **rest):
+            return 1
+
+        # (defaults: the function's own, when called without; *args a
+        # parameter after the others)
         assert lang().ir(defaults).splitlines()[0] == "def defaults(node, rt):"
+        assert lang().ir(star).splitlines()[0] == "def star(node, rest):"
         with pytest.raises(zrun.CompileError, match="only plain parameters"):
             lang().ir(keyword_only)
-        with pytest.raises(zrun.CompileError, match=r"\*args and \*\*kwargs"):
-            lang().ir(star)
+        with pytest.raises(zrun.CompileError, match=r"\*\*kwargs"):
+            lang().ir(kwargs)
 
     def test_native_false_isnt_read(self, capsys):
         l = lang()

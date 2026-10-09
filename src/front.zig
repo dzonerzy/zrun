@@ -171,9 +171,11 @@ pub const Function = struct {
     /// The line of its `def` (or first decorator) in the file
     first_line: u32,
     /// Its parameters are locals 0 .. param_count; those from `required`
-    /// on have defaults (the function's __defaults__)
+    /// on have defaults (the function's __defaults__). `*args`: the last,
+    /// a tuple of the arguments after the others
     param_count: u32,
     required: u32 = 0,
+    vararg: bool = false,
     /// Every local's name, by slot
     locals: []const []const u8,
     body: []const Stmt,
@@ -216,6 +218,16 @@ pub const Function = struct {
     pub const EnvRef = struct { depth: u32, index: u32 };
 
     /// Whether local `slot` is the function's own (not its env or a capture)
+    /// Its parameters given one argument each (all but `*args`)
+    pub fn positional(self: *const Function) u32 {
+        return self.param_count - @intFromBool(self.vararg);
+    }
+
+    /// Whether a call with `n` arguments gives what it takes
+    pub fn takes(self: *const Function, n: usize) bool {
+        return n >= self.required and (self.vararg or n <= self.param_count);
+    }
+
     pub fn ownsLocal(self: *const Function, slot: usize) bool {
         if (self.parent == null) return true;
         return slot < self.own or slot >= self.own + 1 + self.captures.len;
@@ -307,10 +319,10 @@ pub fn read(gpa: Allocator, func: *PyObject, failure: *Failure) ReadError!*Funct
     const defaults = try listAttr(args, "defaults");
     const n_defaults: usize = @intCast(py.c.PyList_Size(defaults));
     py.Py_DecRef(defaults);
-    inline for (.{ "vararg", "kwarg" }) |f| {
-        const o = ph.attr(args, f) orelse return error.Python;
+    {
+        const o = ph.attr(args, "kwarg") orelse return error.Python;
         defer py.Py_DecRef(o);
-        if (o != py.Py_None()) return r.unsupported(try r.posOf(def), "*args and **kwargs can't be compiled", .{});
+        if (o != py.Py_None()) return r.unsupported(try r.posOf(def), "**kwargs can't be compiled", .{});
     }
     const params = try listAttr(args, "args");
     defer py.Py_DecRef(params);
@@ -320,6 +332,14 @@ pub fn read(gpa: Allocator, func: *PyObject, failure: *Failure) ReadError!*Funct
         const pname = try r.strAttr(p, "arg");
         _ = try r.declare(pname);
     }
+    // (*args: a parameter after the others)
+    const vararg = blk: {
+        const o = ph.attr(args, "vararg") orelse return error.Python;
+        defer py.Py_DecRef(o);
+        if (o == py.Py_None()) break :blk false;
+        _ = try r.declare(try r.strAttr(o, "arg"));
+        break :blk true;
+    };
 
     // Locals: every name the body assigns (Python's rule: then local
     // everywhere in the function)
@@ -337,8 +357,9 @@ pub fn read(gpa: Allocator, func: *PyObject, failure: *Failure) ReadError!*Funct
         .name = name,
         .file = file,
         .first_line = @intCast(first),
-        .param_count = @intCast(n_params),
+        .param_count = @intCast(n_params + @intFromBool(vararg)),
         .required = @intCast(n_params - n_defaults),
+        .vararg = vararg,
         .locals = r.locals.items,
         .body = out,
         .py_function = func,

@@ -238,6 +238,29 @@ pub const SVal = union(enum) {
     }
 };
 
+/// Whether a known value is the known list `l` or holds it (a list put in
+/// itself would be a known value without end)
+fn holdsList(v: SVal, l: *const SList) bool {
+    return holdsListAt(v, l, 0);
+}
+
+fn holdsListAt(v: SVal, l: *const SList, depth: u32) bool {
+    // (deeper than known values are made: as if it did)
+    if (depth > 64) return true;
+    return switch (v) {
+        .list => |x| x == l or for (x.items.items) |item| {
+            if (holdsListAt(item, l, depth + 1)) break true;
+        } else false,
+        .tuple => |t| for (t) |item| {
+            if (holdsListAt(item, l, depth + 1)) break true;
+        } else false,
+        .dict => |d| for (d.values.items) |item| {
+            if (holdsListAt(item, l, depth + 1)) break true;
+        } else false,
+        else => false,
+    };
+}
+
 /// A known tuple holding references (dynamic items, its own: a value's,
 /// copied with it (Gen.copyOf), dropped with it, moved into the run-time
 /// tuple materializing makes)
@@ -878,9 +901,12 @@ const HelperSpec = struct {
     /// A specialization (Site): the arguments the calls give in the array,
     /// as the generic code's (it knows some of them: those it skips)
     layout: ?[]const bool = null,
+    /// Its arguments as a call gives them (compileCalled's), not one per
+    /// parameter: defaults and *args made of them
+    raw: bool = false,
 
     fn matches(self: *const HelperSpec, func: *const front.Function, args: []const SVal) bool {
-        if (self.func != func or self.args.len != args.len or self.layout != null) return false;
+        if (self.func != func or self.args.len != args.len or self.layout != null or self.raw) return false;
         for (self.args, args) |x, y| if (!sameSpec(x, y)) return false;
         return true;
     }
@@ -1277,7 +1303,9 @@ pub const Compiler = struct {
             try g.increfDyn(d);
             args[i] = .{ .dyn = d };
         }
-        const params = try g.withDefaults(h.func, if (h.closure) args[0 .. args.len - 1] else args);
+        const given = if (h.closure) args[0 .. args.len - 1] else args;
+        // (*args made already, but for a call's arguments)
+        const params = if (h.func.vararg and !h.raw) given else try g.withDefaults(h.func, given);
         const v = try g.materialize(try g.runFunction(h.func, AT_PARAM, params), AT_PARAM);
         try g.storeSlot(g.out_param, v);
         try g.f.ret(self.m.k32(1));
@@ -1316,14 +1344,14 @@ pub const Compiler = struct {
     pub fn compileCalled(self: *Compiler, o: *PyObject, nargs: usize, rt_mask: u64, closure: bool) Error![:0]const u8 {
         try self.newModule();
         const func = try self.readFunction(o);
-        if (nargs < func.required or nargs > func.param_count) return self.unsupported("{s}() takes {d} to {d} arguments, called with {d}", .{ func.name, func.required, func.param_count, nargs });
+        if (!func.takes(nargs)) return self.unsupported("{s}() takes {d} to {d} arguments, called with {d}", .{ func.name, func.required, func.param_count, nargs });
         // (a closure: the function called given last, its variables read
         // from it)
         const key = try self.a.alloc(SVal, nargs + @intFromBool(closure));
         for (key, 0..) |*slot, i| slot.* = if (i < nargs and rt_mask & (@as(u64, 1) << @intCast(i)) != 0) .rt else .{ .dyn = undefined };
         _ = try self.objectIndex(o);
         const h = try self.a.create(HelperSpec);
-        h.* = .{ .func = func, .args = key, .name = try std.fmt.allocPrintSentinel(self.a, "{s}_c{d}", .{ self.m.prefix, self.helper_fns.items.len }, 0), .semantic = null, .closure = closure };
+        h.* = .{ .func = func, .args = key, .name = try std.fmt.allocPrintSentinel(self.a, "{s}_c{d}", .{ self.m.prefix, self.helper_fns.items.len }, 0), .semantic = null, .closure = closure, .raw = true };
         try self.helper_fns.append(self.a, h);
         try self.helper_queue.append(self.a, h);
         try self.drainQueues();
@@ -1436,6 +1464,8 @@ pub const Compiler = struct {
         .{ "zr_fail", "bpip" },
         .{ "zr_unset", "bpip" },
         .{ "zr_overflow", "bpi" },
+        .{ "zr_write", "bpiillp" },
+        .{ "zr_print", "bpiiplllllllp" },
         .{ "zr_binary", "bpiillllp" },
         .{ "zr_compare", "bpiillllp" },
         .{ "zr_unary", "bpiillp" },
@@ -4747,12 +4777,16 @@ const Gen = struct {
     /// (the function's __defaults__: made when it was defined, the same
     /// objects each call, as Python's).
     fn withDefaults(self: *Gen, func: *const front.Function, args: []const SVal) Error![]const SVal {
-        if (args.len == func.param_count) return args;
-        if (args.len < func.required or args.len > func.param_count)
+        if (!func.vararg and args.len == func.param_count) return args;
+        if (!func.takes(args.len))
             return self.c.unsupportedAt(func, .{ .line = func.first_line }, "{s}() called with {d} arguments, takes {d} to {d}", .{ func.name, args.len, func.required, func.param_count });
         const all = try self.a().alloc(SVal, func.param_count);
-        @memcpy(all[0..args.len], args);
-        for (args.len..func.param_count) |i| all[i] = try self.defaultOf(func, i);
+        const n = func.positional();
+        const given = @min(args.len, n);
+        @memcpy(all[0..given], args[0..given]);
+        for (given..n) |i| all[i] = try self.defaultOf(func, i);
+        // (*args: a tuple of the rest, known here)
+        if (func.vararg) all[n] = .{ .tuple = try self.a().dupe(SVal, args[given..]) };
         return all;
     }
 
@@ -4762,7 +4796,7 @@ const Gen = struct {
         defer py.Py_DecRef(defaults);
         if (defaults == py.Py_None()) return self.c.unsupportedAt(func, .{ .line = func.first_line }, "{s}()'s defaults changed", .{func.name});
         const n: usize = @intCast(py.c.PyTuple_Size(defaults));
-        const first = func.param_count - n;
+        const first = func.positional() - n;
         if (i < first) return self.c.unsupportedAt(func, .{ .line = func.first_line }, "{s}() missing an argument", .{func.name});
         const o = py.c.PyTuple_GetItem(defaults, @intCast(i - first)).?;
         // (kept: the function's defaults may change)
@@ -7118,7 +7152,9 @@ const Gen = struct {
         // A known list or dict changed while nothing runs at run time: now
         if (inst.dyn_depth == 0) {
             switch (obj) {
-                .list => |l| if (eq(u8, name, "append") and args.len == 1) {
+                // (not a list put inside itself: at run time, its cycle
+                // the run's)
+                .list => |l| if (eq(u8, name, "append") and args.len == 1 and !holdsList(args[0], l)) {
                     try l.items.append(self.a(), args[0]);
                     return .none;
                 } else if (eq(u8, name, "extend") and args.len == 1 and args[0] == .list and args[0].list != l and args[0].list.frozen == null and !self.aliased(args[0].list)) {
@@ -7172,7 +7208,11 @@ const Gen = struct {
             return .none;
         }
         if (eq(u8, name, "append") and args.len == 1) {
-            const x = try self.materialize(args[0], inst.node);
+            // (the list put in itself (or in what's put): the run-time one,
+            // not a copy)
+            var arg = args[0];
+            if (containerPtr(obj)) |ptr| try self.replaceRefs(&arg, ptr, d, 4);
+            const x = try self.materialize(arg, inst.node);
             const ok = self.call("zr_append", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, x.tag, x.bits });
             try self.drop(.{ .dyn = x });
             try self.drop(.{ .dyn = d });
@@ -7225,7 +7265,7 @@ const Gen = struct {
                 error.Unsupported => continue,
                 else => return e,
             };
-            if (nargs < func.required or nargs > func.param_count) continue;
+            if (!func.takes(nargs)) continue;
             _ = try c.objectIndex(m);
             try out.append(self.a(), .{ .rtype = rtype, .func = func });
         }
@@ -7334,6 +7374,30 @@ const Gen = struct {
     // ------------------------------------------------------------------
 
     /// A call expression of a semantic.
+    /// Whether an expression is sys.stdout (1) or sys.stderr (2), read as
+    /// it's written (`sys.stdout`, `from sys import stdout`); null if not
+    fn stdFile(self: *Gen, inst: *Inst, e: *const front.Expr) Error!?u32 {
+        const fdOf = struct {
+            fn f(name: []const u8) ?u32 {
+                return if (std.mem.eql(u8, name, "stdout")) 1 else if (std.mem.eql(u8, name, "stderr")) 2 else null;
+            }
+        }.f;
+        switch (e.kind) {
+            .import_ => |im| return if (std.mem.eql(u8, im.module, "sys")) if (im.attr) |name| fdOf(name) else null else null,
+            .attr => |at| {
+                const fd = fdOf(at.name) orelse return null;
+                if (at.obj.kind != .global and at.obj.kind != .import_) return null;
+                const m = try self.expr(inst, at.obj);
+                defer self.drop(m) catch {};
+                if (m != .py) return null;
+                const sys = py.c.PyImport_ImportModule("sys") orelse return error.Python;
+                defer py.Py_DecRef(sys);
+                return if (m.py == sys) fd else null;
+            },
+            else => return null,
+        }
+    }
+
     fn callExpr(self: *Gen, inst: *Inst, func_e: *const front.Expr, args_e: []const *const front.Expr, kws: []const front.Keyword, pos: front.Pos) Error!SVal {
         const c = self.c;
         // obj.name(...): a method of a value, or an attribute of rt, a node,
@@ -7344,6 +7408,17 @@ const Gen = struct {
         const mark = self.inflight.items.len;
         errdefer self.taken(mark);
         if (func_e.kind == .attr) {
+            // sys.stdout.write(s), sys.stderr.write(s): natively (zr_write;
+            // sys.stdout as it is when it's written, as Python looks it up)
+            if (std.mem.eql(u8, func_e.kind.attr.name, "write") and args_e.len == 1 and kws.len == 0) if (try self.stdFile(inst, func_e.kind.attr.obj)) |fd| {
+                const v = try self.operand(inst, args_e[0]);
+                self.taken(mark);
+                const d = try self.materialize(v, inst.node);
+                const ok = self.call("zr_write", &.{ self.ctx, self.k32(inst.node), self.k32(fd), d.tag, d.bits, self.out });
+                try self.drop(.{ .dyn = d });
+                try self.check(ok);
+                return .{ .dyn = try self.loadOut(.int) };
+            };
             const obj = try self.expr(inst, func_e.kind.attr.obj);
             // (a bytes constant's method: the value's, native)
             const is_bytes = obj == .py and ph.typeOf(obj.py) == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyBytes_Type"))));
@@ -7440,6 +7515,32 @@ const Gen = struct {
             try self.drop(try self.methodCall(inst, .{ .dyn = spread_list.? }, "extend", &.{v}, pos));
         }
         const args = arg_list.items;
+        // print(...): natively (zr_print), to sys.stdout or sys.stderr
+        if (callee == .py and isBuiltin(callee.py, "print")) print: {
+            var fd: u32 = 1;
+            var sep: SVal = .none;
+            var end: SVal = .none;
+            for (kws) |kw| {
+                if (std.mem.eql(u8, kw.name, "file")) {
+                    fd = try self.stdFile(inst, kw.value) orelse break :print;
+                } else if (!std.mem.eql(u8, kw.name, "sep") and !std.mem.eql(u8, kw.name, "end") and !std.mem.eql(u8, kw.name, "flush")) break :print;
+            }
+            for (kws) |kw| {
+                if (std.mem.eql(u8, kw.name, "sep")) sep = try self.operand(inst, kw.value) else if (std.mem.eql(u8, kw.name, "end")) end = try self.operand(inst, kw.value) else if (std.mem.eql(u8, kw.name, "flush")) try self.drop(try self.operand(inst, kw.value));
+            }
+            self.taken(mark);
+            const arr = try self.valueArray(args, inst.node);
+            const sd = try self.materialize(sep, inst.node);
+            const ed = try self.materialize(end, inst.node);
+            const seq = spread_list orelse self.noneDyn();
+            const ok = self.call("zr_print", &.{ self.ctx, self.k32(inst.node), self.k32(fd), arr, self.k(@intCast(args.len)), seq.tag, seq.bits, sd.tag, sd.bits, ed.tag, ed.bits, self.out });
+            try self.dropArray(arr, args.len);
+            if (spread_list) |l| try self.drop(.{ .dyn = l });
+            try self.drop(.{ .dyn = sd });
+            try self.drop(.{ .dyn = ed });
+            try self.check(ok);
+            return .{ .dyn = try self.loadOut(.none) };
+        }
         if (spread_list) |l| {
             self.taken(mark);
             if (kws.len > 0) return c.unsupportedAt(inst.func, pos, "keyword arguments with *args known only at run time aren't compiled", .{});
@@ -7480,6 +7581,7 @@ const Gen = struct {
         // A helper's keyword arguments: in their parameters' places
         if (kws.len > 0 and callee == .py and try isInstanceOf(callee.py, (try pyTypes()).function)) {
             const func = try self.helperFunction(callee.py);
+            if (func.vararg) return c.unsupportedAt(inst.func, pos, "keyword arguments to {s}(), which takes *args, aren't compiled", .{func.name});
             const all = try self.a().alloc(?SVal, func.param_count);
             @memset(all, null);
             if (args.len > func.param_count) return c.unsupportedAt(inst.func, pos, "{s}() takes {d} arguments", .{ func.name, func.param_count });
@@ -7856,7 +7958,7 @@ const Gen = struct {
             },
             else => |x| return x,
         };
-        if (func.size > inline_size or items.len < func.required or items.len > func.param_count) return null;
+        if (func.size > inline_size or !func.takes(items.len)) return null;
         if (try namesJumps(o)) return null;
         // (containers known here made, once, as a call gives them: the
         // function sees one object, which it may keep, compare, change)

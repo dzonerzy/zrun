@@ -42,6 +42,7 @@ pub fn build(b: *std.Build) void {
     // Single source for the version string returned by zrun.version()
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    build_options.addOption(bool, "standalone", false);
     user_lib_mod.addOptions("build_options", build_options);
 
     const lib = b.addLibrary(.{
@@ -76,7 +77,11 @@ pub fn build(b: *std.Build) void {
         },
     });
     rt_mod.addIncludePath(b.path("vendor/llvm/include"));
-    rt_mod.addOptions("build_options", build_options);
+    // (the same, in a process without Python: no path falls back to it)
+    const rt_options = b.addOptions();
+    rt_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    rt_options.addOption(bool, "standalone", true);
+    rt_mod.addOptions("build_options", rt_options);
     const rt_lib = b.addLibrary(.{ .name = "zrun_rt", .linkage = .static, .root_module = rt_mod });
     const rt_step = b.step("rt", "The runtime of programs compiled to run without Python");
     rt_step.dependOn(&b.addInstallArtifact(rt_lib, .{}).step);
