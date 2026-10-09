@@ -67,6 +67,15 @@ pub fn new() ?*Set {
     return s;
 }
 
+/// An immortal empty set made at `mem` (a standalone build's image: the
+/// cycle collector's header before it zeroed)
+pub fn immortalAt(mem: [*]u8) ?*Set {
+    const s: *Set = @ptrCast(@alignCast(mem));
+    const t = newTable(min_size) orelse return null;
+    s.* = .{ .head = .{ .rc = value.IMMORTAL, .kind = @intFromEnum(value.Tag.set) }, .fill = 0, .used = 0, .mask = min_size - 1, .table = t, .finger = 0 };
+    return s;
+}
+
 /// The table's memory (its items dropped already)
 pub fn freeTable(s: *Set) void {
     allocator.free(s.entries());

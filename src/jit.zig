@@ -79,6 +79,8 @@ pub const Api = struct {
     ConstNull: *const fn (Type) callconv(.c) Value,
     ConstStringInContext2: *const fn (Context, Str, usize, Bool) callconv(.c) Value,
     ConstStructInContext: *const fn (Context, [*c]Value, c_uint, Bool) callconv(.c) Value,
+    ConstArray2: *const fn (Type, [*c]Value, u64) callconv(.c) Value,
+    ConstInBoundsGEP2: *const fn (Type, Value, [*c]Value, c_uint) callconv(.c) Value,
     ConstIntToPtr: *const fn (Value, Type) callconv(.c) Value,
     AddGlobal: *const fn (ModuleRef, Type, Str) callconv(.c) Value,
     ConstPtrToInt: *const fn (Value, Type) callconv(.c) Value,
@@ -142,6 +144,12 @@ var api: Api = undefined;
 /// "")`).
 pub inline fn f(comptime name: []const u8) @FieldType(Api, name["LLVM".len..]) {
     return @field(api, name["LLVM".len..]);
+}
+
+/// A C API function a zgram may not have (a newer one's): null without
+pub fn optional(name: [*:0]const u8) ?*const anyopaque {
+    const v = loaded orelse return null;
+    return v.function(name);
 }
 
 /// The view, once loaded (the capsule is kept for the process's life)

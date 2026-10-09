@@ -796,7 +796,15 @@ var big_literals: std.AutoHashMapUnmanaged(i128, *Big) = .empty;
 /// Items a list has room for in its own allocation (most lists are small:
 /// one allocation, none more until it grows past them)
 const list_inline = 4;
-const list_block = @sizeOf(List) + list_inline * @sizeOf(Value);
+pub const list_block = @sizeOf(List) + list_inline * @sizeOf(Value);
+
+/// An immortal empty list made at `mem` (list_block bytes, the cycle
+/// collector's header before them zeroed: a standalone build's image)
+pub fn immortalListAt(mem: [*]u8) *List {
+    const l: *List = @ptrCast(@alignCast(mem));
+    l.* = .{ .head = .{ .rc = IMMORTAL, .kind = @intFromEnum(Tag.list), .flags = LIST_KINDS }, .len = 0, .cap = list_inline, .items = listInline(l) };
+    return l;
+}
 
 /// A list's own room for items (after it, in its allocation).
 fn listInline(l: *List) [*]Value {
