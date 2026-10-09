@@ -1492,6 +1492,8 @@ pub const Compiler = struct {
         .{ "zr_set", "bpiplip" },
         .{ "zr_to_set", "bpillp" },
         .{ "zr_inplace", "bpiillllp" },
+        .{ "zr_lib", "bpiilplip" },
+        .{ "zr_sorted", "bpillllllip" },
         .{ "zr_set_global", "bpilpll" },
         .{ "zr_raise_from", "bpillll" },
         .{ "zr_range", "bpiplp" },
@@ -2732,6 +2734,13 @@ const Gen = struct {
             .py => |o| if (ph.typeOf(o) == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyLong_Type")))) and value.bigOf(o) != null) blk: {
                 const b = try self.c.bigConst(value.bigOf(o).?);
                 break :blk .{ .tag = self.k(@intFromEnum(value.Tag.big)), .bits = self.c.m.addrInt(@intFromPtr(b)), .shape = .any };
+            } else if (ph.typeOf(o) == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyBytes_Type"))))) blk: {
+                // (a bytes constant: native, its memory, made once for the
+                // program (immortal: the program keeps the object))
+                _ = try self.c.objectIndex(o);
+                const bv = value.fromPython(o) orelse return error.Python;
+                bv.ptr().rc = value.IMMORTAL;
+                break :blk .{ .tag = self.k(@intFromEnum(value.Tag.bytes)), .bits = self.c.m.addrInt(bv.bits), .shape = .any };
             } else blk: {
                 // (a constant of the source's, bytes, complex or `...`: only
                 // held, what's done with it checked where it's done)
@@ -7267,15 +7276,46 @@ const Gen = struct {
         errdefer self.taken(mark);
         if (func_e.kind == .attr) {
             const obj = try self.expr(inst, func_e.kind.attr.obj);
-            switch (obj) {
+            // (a bytes constant's method: the value's, native)
+            const is_bytes = obj == .py and ph.typeOf(obj.py) == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyBytes_Type"))));
+            switch (if (is_bytes) SVal.none else obj) {
                 .rt, .node, .py => callee = try self.attr(inst, obj, func_e.kind.attr.name, func_e.pos),
                 else => {
-                    if (kws.len != 0) return c.unsupportedAt(inst.func, pos, "keyword arguments to a method aren't compiled yet", .{});
+                    // (n.to_bytes(length, byteorder, signed=...): its keywords
+                    // in their places, signed third, as zr_call_method takes it)
+                    const name = func_e.kind.attr.name;
+                    const to_bytes = std.mem.eql(u8, name, "to_bytes");
+                    // (items.sort(key=..., reverse=...): natively, in place)
+                    if (std.mem.eql(u8, name, "sort") and args_e.len == 0) {
+                        try self.inflight.append(self.a(), obj);
+                        var key: SVal = .none;
+                        var rev: SVal = .{ .bool = false };
+                        for (kws) |kw| {
+                            if (std.mem.eql(u8, kw.name, "key")) key = try self.operand(inst, kw.value) else if (std.mem.eql(u8, kw.name, "reverse")) rev = try self.operand(inst, kw.value) else return c.unsupportedAt(inst.func, pos, "sort() has no argument {s}", .{kw.name});
+                        }
+                        self.taken(mark);
+                        return self.sortCall(inst, obj, key, rev, true);
+                    }
+                    if (kws.len != 0 and !to_bytes) return c.unsupportedAt(inst.func, pos, "keyword arguments to a method aren't compiled yet", .{});
                     try self.inflight.append(self.a(), obj);
-                    const margs = try self.a().alloc(SVal, args_e.len);
-                    for (margs, args_e) |*slot, ae| slot.* = try self.operand(inst, ae);
+                    var margs: std.ArrayListUnmanaged(SVal) = .empty;
+                    for (args_e) |ae| try margs.append(self.a(), try self.operand(inst, ae));
+                    if (kws.len != 0) {
+                        var slots = [3]?SVal{ null, null, null };
+                        for (margs.items, 0..) |x, i| {
+                            if (i >= 2) return c.unsupportedAt(inst.func, pos, "to_bytes() takes at most 2 positional arguments", .{});
+                            slots[i] = x;
+                        }
+                        for (kws) |kw| {
+                            const i: usize = if (std.mem.eql(u8, kw.name, "length")) 0 else if (std.mem.eql(u8, kw.name, "byteorder")) 1 else if (std.mem.eql(u8, kw.name, "signed")) 2 else return c.unsupportedAt(inst.func, pos, "to_bytes() has no argument {s}", .{kw.name});
+                            slots[i] = try self.operand(inst, kw.value);
+                        }
+                        if (slots[0] == null or slots[1] == null) return c.unsupportedAt(inst.func, pos, "to_bytes() without its length and byteorder isn't compiled", .{});
+                        margs.clearRetainingCapacity();
+                        for (slots) |sv| if (sv) |x| try margs.append(self.a(), x);
+                    }
                     self.taken(mark);
-                    return self.methodCall(inst, obj, func_e.kind.attr.name, margs, pos);
+                    return self.methodCall(inst, obj, name, margs.items, pos);
                 },
             }
         } else callee = try self.expr(inst, func_e);
@@ -7339,6 +7379,35 @@ const Gen = struct {
             return c.unsupportedAt(inst.func, pos, "*args known only at run time to this function isn't compiled (its arguments' count is needed when compiling)", .{});
         }
         var receiver: ?SVal = null;
+        // sorted(items, key=..., reverse=...): natively (zr_sorted)
+        if (callee == .py and isBuiltin(callee.py, "sorted") and args.len == 1) {
+            var key: SVal = .none;
+            var rev: SVal = .{ .bool = false };
+            for (kws) |kw| {
+                if (std.mem.eql(u8, kw.name, "key")) key = try self.operand(inst, kw.value) else if (std.mem.eql(u8, kw.name, "reverse")) rev = try self.operand(inst, kw.value) else return c.unsupportedAt(inst.func, pos, "sorted() has no argument {s}", .{kw.name});
+            }
+            self.taken(mark);
+            return self.sortCall(inst, args[0], key, rev, false);
+        }
+        // int.from_bytes(data, byteorder, signed=...): natively (zr_lib)
+        if (kws.len > 0 and callee == .py and isTypeAttr(callee.py, "PyLong_Type", "from_bytes")) {
+            var all: std.ArrayListUnmanaged(SVal) = .empty;
+            try all.appendSlice(self.a(), args);
+            var signed: u32 = 2;
+            for (kws) |kw| {
+                if (std.mem.eql(u8, kw.name, "byteorder") and all.items.len == 1) {
+                    try all.append(self.a(), try self.operand(inst, kw.value));
+                } else if (std.mem.eql(u8, kw.name, "signed")) {
+                    const v = try self.expr(inst, kw.value);
+                    signed = switch (v) {
+                        .bool => |b| @intFromBool(b),
+                        else => return c.unsupportedAt(inst.func, pos, "int.from_bytes()'s signed= must be known when compiling", .{}),
+                    };
+                } else return c.unsupportedAt(inst.func, pos, "the keyword argument {s}= isn't compiled", .{kw.name});
+            }
+            self.taken(mark);
+            return self.libCall(inst, .from_bytes, callee.py, all.items, signed);
+        }
         // A helper's keyword arguments: in their parameters' places
         if (kws.len > 0 and callee == .py and try isInstanceOf(callee.py, (try pyTypes()).function)) {
             const func = try self.helperFunction(callee.py);
@@ -8140,6 +8209,32 @@ const Gen = struct {
         return self.callPython(inst, o, args);
     }
 
+    /// sorted(items, key=key, reverse=rev), or items.sort(...) (in_place: the
+    /// list itself sorted, None): natively (helpers.zr_sorted)
+    fn sortCall(self: *Gen, inst: *Inst, items: SVal, key: SVal, rev: SVal, in_place: bool) Error!SVal {
+        // (a list sorted in place: a run-time one, every variable seeing it)
+        const d = if (in_place) try self.materializeToChange(items, inst.node) else try self.materialize(items, inst.node);
+        const kd = try self.materialize(key, inst.node);
+        const rd = try self.materialize(rev, inst.node);
+        const ok = self.call("zr_sorted", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, kd.tag, kd.bits, rd.tag, rd.bits, self.k32(@intFromBool(in_place)), self.out });
+        try self.drop(.{ .dyn = rd });
+        try self.drop(.{ .dyn = kd });
+        try self.drop(.{ .dyn = d });
+        try self.check(ok);
+        return .{ .dyn = try self.loadOut(if (in_place) .none else .list) };
+    }
+
+    /// A library function done natively (helpers.zr_lib): its arguments in
+    /// an array; `signed`: int.from_bytes' keyword (2: not given)
+    fn libCall(self: *Gen, inst: *Inst, which: helpers.Lib, o: *PyObject, args: []const SVal, signed: u32) Error!SVal {
+        const idx = try self.c.objectIndex(o);
+        const arr = try self.valueArray(args, inst.node);
+        const ok = self.call("zr_lib", &.{ self.ctx, self.k32(inst.node), self.k32(@intFromEnum(which)), self.k(@intCast(idx)), arr, self.k(@intCast(args.len)), self.k32(signed), self.out });
+        try self.dropArray(arr, args.len);
+        try self.check(ok);
+        return .{ .dyn = try self.loadOut(.any) };
+    }
+
     /// A dataclass field's default, for a call not giving it: its `default`
     /// (known when compiling), or what its `default_factory` makes, called
     /// then (as the dataclass's __init__ does); none: a CompileError, as
@@ -8386,7 +8481,25 @@ const Gen = struct {
             return false;
         };
         defer py.Py_DecRef(x);
-        return x == o;
+        if (x == o) return true;
+        // (a classmethod (int.from_bytes): bound anew each time it's read,
+        // the same type's, the same name)
+        const self_o = py.c.PyObject_GetAttrString(o, "__self__") orelse {
+            py.c.PyErr_Clear();
+            return false;
+        };
+        defer py.Py_DecRef(self_o);
+        if (self_o != t) return false;
+        const n = py.c.PyObject_GetAttrString(o, "__name__") orelse {
+            py.c.PyErr_Clear();
+            return false;
+        };
+        defer py.Py_DecRef(n);
+        const s = ph.utf8(n, "name") orelse {
+            py.c.PyErr_Clear();
+            return false;
+        };
+        return std.mem.eql(u8, s, std.mem.span(name));
     }
 
     /// Whether `o` is module `module`'s `name` (math.floor...)
@@ -8475,6 +8588,13 @@ const Gen = struct {
             try self.drop(.{ .dyn = d });
             try self.check(ok);
             return SVal{ .dyn = try self.loadOut(.any) };
+        }
+        // bytes(...), bytes.fromhex(), int.from_bytes(), struct's, zlib's
+        // checksums: natively (zr_lib)
+        {
+            const Lib = helpers.Lib;
+            const which: ?Lib = if (isBuiltin(o, "bytes")) .bytes_of else if (isTypeAttr(o, "PyBytes_Type", "fromhex")) .fromhex else if (isTypeAttr(o, "PyLong_Type", "from_bytes")) .from_bytes else if (isModuleAttr(o, "struct", "unpack")) .unpack else if (isModuleAttr(o, "struct", "unpack_from")) .unpack_from else if (isModuleAttr(o, "struct", "pack")) .pack else if (isModuleAttr(o, "zlib", "crc32")) .crc32 else if (isModuleAttr(o, "zlib", "adler32")) .adler32 else null;
+            if (which) |w| return try self.libCall(inst, w, o, args, 2);
         }
         // list(), dict(), tuple(): a new empty one, as `[]` makes one
         if (args.len == 0) {
@@ -8756,7 +8876,10 @@ const Gen = struct {
         const host = try f.label("is_host");
         const join = try f.label("is_joined");
         const start = f.current;
-        try f.condBr(f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(T.host))), host, join);
+        // (a bytes: native, a Python bytes or a zrun.Bytes, zr_is_type tells)
+        var ask = f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(T.host)));
+        if (code == 9) ask = f.or_(ask, f.icmp(jit_c.LLVMIntEQ, d.tag, self.k(@intFromEnum(T.bytes))));
+        try f.condBr(ask, host, join);
         try f.block(host);
         const r = f.zext64(self.call("zr_is_type", &.{ d.tag, d.bits, self.k32(code) }));
         const host_end = f.current;
@@ -8903,15 +9026,30 @@ const Gen = struct {
         const low = f.and_(d.tag, self.k(0xffff_ffff));
         const key0 = f.select(f.icmp(jit_c.LLVMIntEQ, low, self.k(@intFromEnum(T.big))), self.k(@intCast(value.PINT_TAG)), low);
         const rec = try f.label("key_record");
+        const not_rec = try f.label("key_not_record");
+        const byt = try f.label("key_bytes");
         const done = try f.label("key_done");
         const start = f.current;
-        try f.condBr(f.icmp(jit_c.LLVMIntEQ, low, self.k(@intFromEnum(T.record))), rec, done);
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, low, self.k(@intFromEnum(T.record))), rec, not_rec);
         try f.block(rec);
         const kr = self.recordTypeOf(d);
         try f.br(done);
+        // (bytes: a Python bytes' key, or a zrun.Bytes' (its tag), by its flag)
+        try f.block(not_rec);
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, low, self.k(@intFromEnum(T.bytes))), byt, done);
+        try f.block(byt);
+        const flags = f.load(t.i32, f.offset(f.intToPtr(d.bits), 12));
+        const is_py = f.icmp(jit_c.LLVMIntNE, f.and_(flags, self.c.m.k32(@bitCast(value.PY_BYTES))), self.c.m.k32(0));
+        const kb = f.select(is_py, self.k(py_bytes_key), low);
+        try f.br(done);
         try f.block(done);
-        return .{ .key = f.phi(t.i64, key0, start, kr, rec), .host = f.icmp(jit_c.LLVMIntEQ, low, self.k(@intFromEnum(T.host))) };
+        const key = f.phiN(t.i64, &.{ key0, kr, kb }, &.{ not_rec, rec, byt });
+        _ = start;
+        return .{ .key = key, .host = f.icmp(jit_c.LLVMIntEQ, low, self.k(@intFromEnum(T.host))) };
     }
+
+    /// The type key (typeKey) of a Python bytes (a zrun.Bytes': its tag)
+    const py_bytes_key: i64 = 0x1_0000_0000 | @intFromEnum(value.Tag.bytes);
 
     /// The key (typeKey's) of a class known when compiling, or null: one
     /// only Python objects are of.
@@ -8922,7 +9060,7 @@ const Gen = struct {
                 return x == @as(*PyObject, @ptrCast(@alignCast(py.types.typeObject(name))));
             }
         };
-        const tag: ?i64 = if (is.t(o, "PyLong_Type")) @intCast(value.PINT_TAG) else if (o == types_mod.I64) @intFromEnum(T.int) else if (is.t(o, "PyFloat_Type")) @intFromEnum(T.float) else if (is.t(o, "PyUnicode_Type")) @intFromEnum(T.str) else if (is.t(o, "PyBool_Type")) @intFromEnum(T.bool) else if (is.t(o, "PyList_Type")) @intFromEnum(T.list) else if (is.t(o, "PyTuple_Type")) @intFromEnum(T.tuple) else if (is.t(o, "PyDict_Type")) @intFromEnum(T.dict) else if (o == @as(*PyObject, @ptrCast(@alignCast(ph.typeOf(py.Py_None()))))) @intFromEnum(T.none) else if (o == objects_mod.FunctionType) @intFromEnum(T.function) else if (o == objects_mod.NodeType) @intFromEnum(T.node) else null;
+        const tag: ?i64 = if (is.t(o, "PyLong_Type")) @intCast(value.PINT_TAG) else if (o == types_mod.I64) @intFromEnum(T.int) else if (is.t(o, "PyFloat_Type")) @intFromEnum(T.float) else if (is.t(o, "PyUnicode_Type")) @intFromEnum(T.str) else if (is.t(o, "PyBool_Type")) @intFromEnum(T.bool) else if (is.t(o, "PyList_Type")) @intFromEnum(T.list) else if (is.t(o, "PyTuple_Type")) @intFromEnum(T.tuple) else if (is.t(o, "PyDict_Type")) @intFromEnum(T.dict) else if (o == @as(*PyObject, @ptrCast(@alignCast(ph.typeOf(py.Py_None()))))) @intFromEnum(T.none) else if (o == objects_mod.FunctionType) @intFromEnum(T.function) else if (o == objects_mod.NodeType) @intFromEnum(T.node) else if (is.t(o, "PySet_Type")) @intFromEnum(T.set) else if (is.t(o, "PyBytes_Type")) py_bytes_key else if (o == @import("bytes.zig").BytesType) @intFromEnum(T.bytes) else if (o == pyFunctionType()) @intFromEnum(T.closure) else null;
         if (tag) |n| return self.k(n);
         if (try isInstanceOf(o, @ptrCast(@alignCast(py.types.typeObject("PyType_Type"))))) {
             if (try self.c.recordType(o)) |rt| return self.c.m.addrInt(@intFromPtr(rt));

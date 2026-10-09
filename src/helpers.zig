@@ -504,6 +504,7 @@ export fn zr_binary(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u6
     const b = Value{ .tag = tb, .bits = bb };
     const op: Op = @enumFromInt(op_code);
     if (setBinary(ctx, node, op, a, b, out)) |ok| return ok;
+    if (bytesBinary(ctx, node, op, a, b, out)) |ok| return ok;
     // (a Big among ints: in 128 bits)
     if ((a.kind() == .big or b.kind() == .big) and value.wide(a) != null and value.wide(b) != null) return wideBinary(ctx, node, op, a, b, out);
     if (isInt(a) and isInt(b)) {
@@ -1066,6 +1067,7 @@ fn contains(a: Value, b: Value) ?bool {
             if (!value.hashable(a)) return null;
             return set_mod.contains(setOf(b), a);
         },
+        .bytes => return bytesContains(a, b),
         .str => {
             if (a.kind() != .str) return null;
             const x: *value.Str = @ptrCast(a.ptr());
@@ -1546,6 +1548,793 @@ export fn zr_inplace(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u
         return fromResult(ctx, node, r, out);
     }
     return zr_binary(ctx, node, op_code, ta, ba, tb, bb, out);
+}
+
+// ----------------------------------------------------------------------
+// Python bytes (value.Bytes, PY_BYTES), natively
+// ----------------------------------------------------------------------
+
+fn pyBytesOf(v: Value) ?[]const u8 {
+    if (v.kind() != .bytes) return null;
+    const b: *value.Bytes = @ptrCast(@alignCast(v.ptr()));
+    if (!b.isPyBytes()) return null;
+    return b.slice();
+}
+
+fn bytesResult(ctx: *Ctx, node: u32, b: ?*value.Bytes, out: *Value) bool {
+    const r = b orelse return oomFail(ctx, node);
+    out.* = Value.obj(.bytes, &r.head);
+    return true;
+}
+
+/// a + b, a * n of Python bytes (null: not those)
+fn bytesBinary(ctx: *Ctx, node: u32, op: Op, a: Value, b: Value, out: *Value) ?bool {
+    const x = pyBytesOf(a) orelse {
+        // (n * b)
+        if (op == .mul and isInt(a)) if (pyBytesOf(b)) |y| return repeatBytes(ctx, node, y, a.asInt(), out);
+        return null;
+    };
+    switch (op) {
+        .add => {
+            const y = pyBytesOf(b) orelse return null;
+            const r = value.newOwnedBytes(x.len + y.len) orelse return oomFail(ctx, node);
+            const m = value.bytesMemory(r);
+            @memcpy(m[0..x.len], x);
+            @memcpy(m[x.len..], y);
+            out.* = Value.obj(.bytes, &r.head);
+            return true;
+        },
+        .mul => if (isInt(b)) return repeatBytes(ctx, node, x, b.asInt(), out),
+        else => {},
+    }
+    return null;
+}
+
+fn repeatBytes(ctx: *Ctx, node: u32, x: []const u8, n: i64, out: *Value) bool {
+    const k: usize = if (n <= 0) 0 else @intCast(n);
+    const total = std.math.mul(usize, x.len, k) catch return oomFail(ctx, node);
+    const r = value.newOwnedBytes(total) orelse return oomFail(ctx, node);
+    const m = value.bytesMemory(r);
+    for (0..k) |i| @memcpy(m[i * x.len ..][0..x.len], x);
+    out.* = Value.obj(.bytes, &r.head);
+    return true;
+}
+
+/// `a in b`, b a Python bytes: a byte (an int) or a bytes in it (null: not
+/// those; Python's then, its errors)
+fn bytesContains(a: Value, b: Value) ?bool {
+    const hay = pyBytesOf(b) orelse return null;
+    if (isInt(a)) {
+        const n = a.asInt();
+        if (n < 0 or n > 255) return null;
+        return std.mem.indexOfScalar(u8, hay, @intCast(n)) != null;
+    }
+    const needle = pyBytesOf(a) orelse return null;
+    return std.mem.indexOf(u8, hay, needle) != null;
+}
+
+/// What a bytes method's argument searches for: a bytes' bytes, an int's
+/// byte (null: neither)
+fn byteNeedle(v: Value, buf: *[1]u8) ?[]const u8 {
+    if (pyBytesOf(v)) |s| return s;
+    if (isInt(v)) {
+        const n = v.asInt();
+        if (n < 0 or n > 255) return null;
+        buf[0] = @intCast(n);
+        return buf[0..1];
+    }
+    return null;
+}
+
+const bytes_space = " \t\n\r\x0b\x0c";
+
+/// A Python bytes' method, natively (null: not one of these, or arguments
+/// Python takes otherwise: Python's then, its errors on a copy)
+fn bytesMethod(ctx: *Ctx, node: u32, v: Value, name: []const u8, args: []const Value, out: *Value) ?bool {
+    const s = pyBytesOf(v) orelse return null;
+    const eq = std.mem.eql;
+    var nb: [1]u8 = undefined;
+    // find, rfind, count, index, rindex (no start, end: Python's for those)
+    inline for (.{ "find", "rfind", "count", "index", "rindex" }) |m| if (eq(u8, name, m) and args.len == 1) {
+        const needle = byteNeedle(args[0], &nb) orelse return null;
+        if (comptime eq(u8, m, "count")) {
+            out.* = Value.pint(if (needle.len == 0) @intCast(s.len + 1) else @intCast(std.mem.count(u8, s, needle)));
+            return true;
+        }
+        const at = if (comptime m[0] == 'r') std.mem.lastIndexOf(u8, s, needle) else std.mem.indexOf(u8, s, needle);
+        if (at) |i| {
+            out.* = Value.pint(@intCast(i));
+            return true;
+        }
+        if (comptime eq(u8, m, "find") or eq(u8, m, "rfind")) {
+            out.* = Value.pint(-1);
+            return true;
+        }
+        return null;
+    };
+    if ((eq(u8, name, "startswith") or eq(u8, name, "endswith")) and args.len == 1) {
+        const start = name[0] == 's';
+        const one = struct {
+            fn f(hay: []const u8, x: []const u8, st: bool) bool {
+                return if (st) std.mem.startsWith(u8, hay, x) else std.mem.endsWith(u8, hay, x);
+            }
+        }.f;
+        if (pyBytesOf(args[0])) |x| {
+            out.* = Value.boolean(one(s, x, start));
+            return true;
+        }
+        if (args[0].kind() == .tuple) {
+            const items = @as(*value.Tuple, @ptrCast(@alignCast(args[0].ptr()))).slice();
+            for (items) |it| if (pyBytesOf(it) == null) return null;
+            for (items) |it| if (one(s, pyBytesOf(it).?, start)) {
+                out.* = Value.boolean(true);
+                return true;
+            };
+            out.* = Value.boolean(false);
+            return true;
+        }
+        return null;
+    }
+    if (eq(u8, name, "decode") and args.len <= 1) {
+        const enc = if (args.len == 0) "utf-8" else blk: {
+            if (args[0].kind() != .str) return null;
+            break :blk @as(*value.Str, @ptrCast(args[0].ptr())).bytes();
+        };
+        const lower = std.ascii.eqlIgnoreCase;
+        if (lower(enc, "utf-8") or lower(enc, "utf8")) {
+            if (!std.unicode.utf8ValidateSlice(s)) return null;
+            const r = value.newStr(s) orelse return oomFail(ctx, node);
+            out.* = Value.obj(.str, &r.head);
+            return true;
+        }
+        if (lower(enc, "ascii")) {
+            for (s) |c| if (c >= 0x80) return null;
+            const r = value.newStr(s) orelse return oomFail(ctx, node);
+            out.* = Value.obj(.str, &r.head);
+            return true;
+        }
+        if (lower(enc, "latin-1") or lower(enc, "latin1") or lower(enc, "iso-8859-1")) {
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer buf.deinit(allocator);
+            for (s) |c| {
+                var u: [2]u8 = undefined;
+                const n = std.unicode.utf8Encode(c, &u) catch unreachable;
+                buf.appendSlice(allocator, u[0..n]) catch return oomFail(ctx, node);
+            }
+            const r = value.newStr(buf.items) orelse return oomFail(ctx, node);
+            out.* = Value.obj(.str, &r.head);
+            return true;
+        }
+        return null;
+    }
+    if (eq(u8, name, "hex") and args.len == 0) {
+        const m = allocator.alloc(u8, s.len * 2) catch return oomFail(ctx, node);
+        defer allocator.free(m);
+        const digits = "0123456789abcdef";
+        for (s, 0..) |c, i| {
+            m[2 * i] = digits[c >> 4];
+            m[2 * i + 1] = digits[c & 15];
+        }
+        const r = value.newStr(m) orelse return oomFail(ctx, node);
+        out.* = Value.obj(.str, &r.head);
+        return true;
+    }
+    if ((eq(u8, name, "upper") or eq(u8, name, "lower")) and args.len == 0) {
+        const r = value.newOwnedBytes(s.len) orelse return oomFail(ctx, node);
+        const m = value.bytesMemory(r);
+        for (s, m) |c, *d| d.* = if (name[0] == 'u') std.ascii.toUpper(c) else std.ascii.toLower(c);
+        out.* = Value.obj(.bytes, &r.head);
+        return true;
+    }
+    if ((eq(u8, name, "strip") or eq(u8, name, "lstrip") or eq(u8, name, "rstrip")) and args.len <= 1) {
+        const chars = if (args.len == 0 or args[0].kind() == .none) bytes_space else pyBytesOf(args[0]) orelse return null;
+        var lo: usize = 0;
+        var hi: usize = s.len;
+        if (name[0] != 'r') {
+            while (lo < hi and std.mem.indexOfScalar(u8, chars, s[lo]) != null) lo += 1;
+        }
+        if (name[0] != 'l') {
+            while (hi > lo and std.mem.indexOfScalar(u8, chars, s[hi - 1]) != null) hi -= 1;
+        }
+        return bytesResult(ctx, node, value.bytesSlice(@ptrCast(@alignCast(v.ptr())), lo, hi), out);
+    }
+    if (eq(u8, name, "split") and args.len == 1) {
+        const sep = pyBytesOf(args[0]) orelse return null;
+        if (sep.len == 0) return null;
+        const l = value.newList(0) orelse return oomFail(ctx, node);
+        out.* = Value.obj(.list, &l.head);
+        var it = std.mem.splitSequence(u8, s, sep);
+        while (it.next()) |part| {
+            const from = @intFromPtr(part.ptr) - @intFromPtr(s.ptr);
+            const p = value.bytesSlice(@ptrCast(@alignCast(v.ptr())), from, from + part.len) orelse return oomFail(ctx, node);
+            if (!value.listPush(l, Value.obj(.bytes, &p.head))) return oomFail(ctx, node);
+        }
+        return true;
+    }
+    if (eq(u8, name, "replace") and args.len == 2) {
+        const old = pyBytesOf(args[0]) orelse return null;
+        const new = pyBytesOf(args[1]) orelse return null;
+        if (old.len == 0) return null;
+        const n = std.mem.replacementSize(u8, s, old, new);
+        const r = value.newOwnedBytes(n) orelse return oomFail(ctx, node);
+        _ = std.mem.replace(u8, s, old, new, value.bytesMemory(r));
+        out.* = Value.obj(.bytes, &r.head);
+        return true;
+    }
+    if (eq(u8, name, "join") and args.len == 1) {
+        var l = Value.none_v;
+        if (!zr_items(ctx, node, args[0].tag, args[0].bits, &l)) return false;
+        defer value.decref(l);
+        const items = @as(*value.List, @ptrCast(@alignCast(l.ptr()))).slice();
+        var total: usize = 0;
+        for (items, 0..) |x, i| {
+            const part = pyBytesOf(x) orelse return null;
+            total += part.len + (if (i > 0) s.len else 0);
+        }
+        const r = value.newOwnedBytes(total) orelse return oomFail(ctx, node);
+        const m = value.bytesMemory(r);
+        var at: usize = 0;
+        for (items, 0..) |x, i| {
+            if (i > 0) {
+                @memcpy(m[at..][0..s.len], s);
+                at += s.len;
+            }
+            const part = pyBytesOf(x).?;
+            @memcpy(m[at..][0..part.len], part);
+            at += part.len;
+        }
+        out.* = Value.obj(.bytes, &r.head);
+        return true;
+    }
+    return null;
+}
+
+// ----------------------------------------------------------------------
+// sorted(), list.sort()
+// ----------------------------------------------------------------------
+
+/// a < b as Python's sort compares them, natively; null: not natively (other
+/// kinds, a NaN: Python decides then)
+fn sortLess(a: Value, b: Value) ?bool {
+    if (orderOf(a, b)) |o| return switch (o) {
+        .lt => true,
+        .eq, .gt => false,
+        .unordered => null,
+    };
+    // (tuples, lists: at the first items that aren't equal, else by length)
+    const seq = (a.kind() == .tuple and b.kind() == .tuple) or (a.kind() == .list and b.kind() == .list);
+    if (seq) {
+        const x = itemsOfSeq(a);
+        const y = itemsOfSeq(b);
+        for (x[0..@min(x.len, y.len)], y[0..@min(x.len, y.len)]) |p, q| {
+            if (p.kind() == .host or q.kind() == .host) return null;
+            if (!value.equal(p, q)) return sortLess(p, q);
+        }
+        return x.len < y.len;
+    }
+    if (pyBytesOf(a)) |x| if (pyBytesOf(b)) |y| return std.mem.order(u8, x, y) == .lt;
+    return null;
+}
+
+/// sorted(v, key=key, reverse=reverse) (in_place: v.sort(...), v a list):
+/// the items' keys (key called on each, in order, as Python calls it),
+/// a stable sort of them natively; keys it can't compare natively ordered
+/// by Python (sorted(range(n), key=keys.__getitem__): Python's comparisons
+/// of the keys, its errors). key None: the items themselves.
+export fn zr_sorted(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, rt: u64, rb: u64, in_place: u32, out: *Value) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    const key = Value{ .tag = kt, .bits = kb };
+    const reverse = value.truthy(.{ .tag = rt, .bits = rb });
+    // (a Python list: sorted as sorted() does it, the result put back in it,
+    // the key called natively)
+    if (in_place != 0 and v.kind() == .host and ph.typeOf(@ptrFromInt(v.bits)) == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyList_Type"))))) {
+        var r = Value.none_v;
+        if (!zr_sorted(ctx, node, t, bits, kt, kb, rt, rb, 0, &r)) return false;
+        defer value.decref(r);
+        var objs: [1]*PyObject = undefined;
+        if (!objects(ctx, node, &.{r}, &objs)) return failPython(ctx, node);
+        defer py.Py_DecRef(objs[0]);
+        const o: *PyObject = @ptrFromInt(v.bits);
+        if (py.c.PyList_SetSlice(o, 0, py.c.PyList_Size(o), objs[0]) != 0) return failPython(ctx, node);
+        out.* = Value.none_v;
+        return true;
+    }
+    // (x.sort() of anything else: its own method, Python's)
+    if (in_place != 0 and v.kind() != .list) {
+        var objs: [3]*PyObject = undefined;
+        if (!objects(ctx, node, &.{ v, key, .{ .tag = rt, .bits = rb } }, &objs)) return failPython(ctx, node);
+        defer for (objs) |o| py.Py_DecRef(o);
+        const meth = py.c.PyObject_GetAttrString(objs[0], "sort") orelse return failPython(ctx, node);
+        defer py.Py_DecRef(meth);
+        const none_args = py.c.PyTuple_New(0) orelse return failPython(ctx, node);
+        defer py.Py_DecRef(none_args);
+        const kw = py.c.PyDict_New() orelse return failPython(ctx, node);
+        defer py.Py_DecRef(kw);
+        if (py.c.PyDict_SetItemString(kw, "key", objs[1]) != 0 or py.c.PyDict_SetItemString(kw, "reverse", objs[2]) != 0) return failPython(ctx, node);
+        return fromResult(ctx, node, py.c.PyObject_Call(meth, none_args, kw), out);
+    }
+    // (the items: the list itself, or a list of v's)
+    var list_v = v;
+    if (in_place == 0) {
+        if (!zr_items(ctx, node, t, bits, &list_v)) return false;
+    } else value.incref(v);
+    defer value.decref(list_v);
+    const l: *value.List = @ptrCast(@alignCast(list_v.ptr()));
+    const n = l.len;
+    const items = allocator.dupe(Value, l.slice()) catch return oomFail(ctx, node);
+    defer allocator.free(items);
+    for (items) |x| value.incref(x);
+    defer for (items) |x| value.decref(x);
+    // The keys
+    const keys = allocator.alloc(Value, n) catch return oomFail(ctx, node);
+    defer allocator.free(keys);
+    var made: usize = 0;
+    defer if (key.kind() != .none) for (keys[0..made]) |k| value.decref(k);
+    for (items, keys) |x, *k| {
+        if (key.kind() == .none) {
+            k.* = x;
+        } else {
+            if (!zr_call(ctx, node, key.tag, key.bits, @ptrCast(&x), 1, null, k)) return false;
+            made += 1;
+        }
+    }
+    // The order: natively, or Python's
+    const perm = allocator.alloc(usize, n) catch return oomFail(ctx, node);
+    defer allocator.free(perm);
+    for (perm, 0..) |*p, i| p.* = i;
+    const Sorter = struct {
+        keys: []const Value,
+        reverse: bool,
+        failed: bool = false,
+        fn less(s: *@This(), i: usize, j: usize) bool {
+            const r = if (s.reverse) sortLess(s.keys[j], s.keys[i]) else sortLess(s.keys[i], s.keys[j]);
+            return r orelse blk: {
+                s.failed = true;
+                break :blk false;
+            };
+        }
+    };
+    var sorter = Sorter{ .keys = keys, .reverse = reverse };
+    std.sort.block(usize, perm, &sorter, Sorter.less);
+    if (sorter.failed and !pythonsOrder(ctx, node, keys, reverse, perm)) return false;
+    // The result: the items in that order
+    if (in_place != 0) {
+        for (perm, l.slice()) |p, *slot| {
+            value.incref(items[p]);
+            value.decref(slot.*);
+            slot.* = items[p];
+        }
+        out.* = Value.none_v;
+        return true;
+    }
+    const r = value.newList(n) orelse return oomFail(ctx, node);
+    for (perm) |p| {
+        value.incref(items[p]);
+        _ = value.listPush(r, items[p]);
+    }
+    out.* = Value.obj(.list, &r.head);
+    return true;
+}
+
+/// The order Python's sort puts keys in (stable, its comparisons, its
+/// errors): sorted(range(n), key=keys.__getitem__, reverse=reverse), in `perm`
+fn pythonsOrder(ctx: *Ctx, node: u32, keys: []const Value, reverse: bool, perm: []usize) bool {
+    gil.allowBegin();
+    defer gil.allowEnd();
+    const pk = py.c.PyList_New(@intCast(keys.len)) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(pk);
+    for (keys, 0..) |k, i| {
+        const o = value.toPython(k, ctx.node_maker) orelse return failPython(ctx, node);
+        _ = py.c.PyList_SetItem(pk, @intCast(i), o);
+    }
+    const builtins = py.c.PyEval_GetBuiltins() orelse return failPython(ctx, node);
+    const sorted_f = py.c.PyDict_GetItemString(builtins, "sorted") orelse return failPython(ctx, node);
+    const range_f = py.c.PyDict_GetItemString(builtins, "range") orelse return failPython(ctx, node);
+    const indices = py.c.PyObject_CallFunction(range_f, "n", @as(isize, @intCast(keys.len))) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(indices);
+    const getter = py.c.PyObject_GetAttrString(pk, "__getitem__") orelse return failPython(ctx, node);
+    defer py.Py_DecRef(getter);
+    const args = py.c.PyTuple_Pack(1, indices) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(args);
+    const kw = py.c.PyDict_New() orelse return failPython(ctx, node);
+    defer py.Py_DecRef(kw);
+    if (py.c.PyDict_SetItemString(kw, "key", getter) != 0) return failPython(ctx, node);
+    if (py.c.PyDict_SetItemString(kw, "reverse", if (reverse) py.Py_True() else py.Py_False()) != 0) return failPython(ctx, node);
+    const order = py.c.PyObject_Call(sorted_f, args, kw) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(order);
+    for (perm, 0..) |*p, i| p.* = @intCast(py.c.PyLong_AsSsize_t(py.c.PyList_GetItem(order, @intCast(i)).?));
+    return true;
+}
+
+/// The library functions done natively (zr_lib)
+pub const Lib = enum(u32) { bytes_of, fromhex, from_bytes, unpack, unpack_from, pack, crc32, adler32, calcsize };
+
+/// A library function of Python's (objects[callee_index]) natively, as
+/// Python computes it; what it doesn't take natively (other kinds of
+/// arguments, its errors) by the function itself. `signed`: int.from_bytes'
+/// keyword (2: not given).
+export fn zr_lib(ctx: *Ctx, node: u32, which: u32, callee_index: u64, args: [*]const Value, n: u64, signed: u32, out: *Value) callconv(.c) bool {
+    const a = args[0..n];
+    if (libNative(ctx, node, @enumFromInt(which), a, signed, out)) |ok| return ok;
+    // (Python's: the function called, its keyword given back)
+    gil.allowBegin();
+    defer gil.allowEnd();
+    if (signed == 2) return zr_call_python(ctx, node, callee_index, args, n, out);
+    var objs: [8]*PyObject = undefined;
+    if (n > objs.len) return fail(ctx, node, "too many arguments", .{});
+    if (!objects(ctx, node, a, objs[0..n])) return failPython(ctx, node);
+    defer for (objs[0..n]) |o| py.Py_DecRef(o);
+    const tuple = py.c.PyTuple_New(@intCast(n)) orelse return failPython(ctx, node);
+    defer py.Py_DecRef(tuple);
+    for (objs[0..n], 0..) |o, i| {
+        py.Py_IncRef(o);
+        _ = py.c.PyTuple_SetItem(tuple, @intCast(i), o);
+    }
+    const kw = py.c.PyDict_New() orelse return failPython(ctx, node);
+    defer py.Py_DecRef(kw);
+    if (py.c.PyDict_SetItemString(kw, "signed", if (signed == 1) py.Py_True() else py.Py_False()) != 0) return failPython(ctx, node);
+    return fromResult(ctx, node, py.c.PyObject_Call(ctx.object(callee_index), tuple, kw), out);
+}
+
+fn byteOrder(v: Value) ?std.builtin.Endian {
+    if (v.kind() != .str) return null;
+    const s = @as(*value.Str, @ptrCast(v.ptr())).bytes();
+    if (std.mem.eql(u8, s, "little")) return .little;
+    if (std.mem.eql(u8, s, "big")) return .big;
+    return null;
+}
+
+/// Bytes' memory, of a Python bytes or a zrun.Bytes (what iterating them
+/// gives: int.from_bytes takes both)
+fn anyBytes(v: Value) ?[]const u8 {
+    if (v.kind() != .bytes) return null;
+    return @as(*value.Bytes, @ptrCast(@alignCast(v.ptr()))).slice();
+}
+
+fn libNative(ctx: *Ctx, node: u32, which: Lib, a: []const Value, signed: u32, out: *Value) ?bool {
+    switch (which) {
+        // bytes(), bytes(n), bytes(items), bytes(b)
+        .bytes_of => {
+            if (a.len == 0) return bytesResult(ctx, node, value.newOwnedBytes(0), out);
+            if (a.len != 1) return null;
+            const x = a[0];
+            if (pyBytesOf(x) != null) {
+                value.incref(x);
+                out.* = x;
+                return true;
+            }
+            if (anyBytes(x)) |s| return bytesResult(ctx, node, value.bytesOf(s), out);
+            if (isInt(x)) {
+                if (x.asInt() < 0) return null;
+                const r = value.newOwnedBytes(@intCast(x.asInt())) orelse return oomFail(ctx, node);
+                @memset(value.bytesMemory(r), 0);
+                out.* = Value.obj(.bytes, &r.head);
+                return true;
+            }
+            if (x.kind() == .list or x.kind() == .tuple) {
+                const items = itemsOfSeq(x);
+                for (items) |it| if (!isInt(it) or it.asInt() < 0 or it.asInt() > 255) return null;
+                const r = value.newOwnedBytes(items.len) orelse return oomFail(ctx, node);
+                for (items, value.bytesMemory(r)) |it, *d| d.* = @intCast(it.asInt());
+                out.* = Value.obj(.bytes, &r.head);
+                return true;
+            }
+            return null;
+        },
+        // bytes.fromhex(s): pairs of hex digits, whitespace between them
+        .fromhex => {
+            if (a.len != 1 or a[0].kind() != .str) return null;
+            const s = @as(*value.Str, @ptrCast(a[0].ptr())).bytes();
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer buf.deinit(allocator);
+            var i: usize = 0;
+            while (i < s.len) {
+                if (std.ascii.isWhitespace(s[i])) {
+                    i += 1;
+                    continue;
+                }
+                if (i + 1 >= s.len) return null;
+                const hi = std.fmt.charToDigit(s[i], 16) catch return null;
+                const lo = std.fmt.charToDigit(s[i + 1], 16) catch return null;
+                buf.append(allocator, hi * 16 + lo) catch return oomFail(ctx, node);
+                i += 2;
+            }
+            return bytesResult(ctx, node, value.bytesOf(buf.items), out);
+        },
+        // int.from_bytes(b, byteorder, signed=...)
+        .from_bytes => {
+            if (a.len < 1 or a.len > 2) return null;
+            const s = anyBytes(a[0]) orelse return null;
+            const order: std.builtin.Endian = if (a.len == 2) byteOrder(a[1]) orelse return null else if (ph.minor >= 11) .big else return null;
+            if (s.len > 16) return null;
+            var x: u128 = 0;
+            for (0..s.len) |k| {
+                const byte = if (order == .big) s[k] else s[s.len - 1 - k];
+                x = (x << 8) | byte;
+            }
+            const is_signed = signed == 1;
+            var r: i128 = undefined;
+            if (is_signed and s.len > 0 and x >> @intCast(s.len * 8 - 1) & 1 != 0) {
+                // (two's complement of its width)
+                if (s.len == 16) r = @bitCast(x) else r = @as(i128, @intCast(x)) - (@as(i128, 1) << @intCast(s.len * 8));
+            } else {
+                if (x > std.math.maxInt(i128)) return null;
+                r = @intCast(x);
+            }
+            out.* = value.intValue(r) orelse return oomFail(ctx, node);
+            return true;
+        },
+        .crc32, .adler32 => {
+            if (a.len < 1 or a.len > 2) return null;
+            const s = anyBytes(a[0]) orelse return null;
+            var start: u32 = if (which == .crc32) 0 else 1;
+            if (a.len == 2) {
+                const w = value.wide(a[1]) orelse return null;
+                start = @truncate(@as(u128, @bitCast(w)));
+            }
+            const r: u32 = if (which == .crc32) blk: {
+                var c = std.hash.Crc32{ .crc = ~start };
+                c.update(s);
+                break :blk c.final();
+            } else blk: {
+                var lo: u32 = start & 0xffff;
+                var hi: u32 = start >> 16;
+                for (s) |byte| {
+                    lo = (lo + byte) % 65521;
+                    hi = (hi + lo) % 65521;
+                }
+                break :blk (hi << 16) | lo;
+            };
+            out.* = Value.pint(r);
+            return true;
+        },
+        .unpack, .unpack_from => {
+            if (a.len < 2 or a[0].kind() != .str) return null;
+            const fmt = @as(*value.Str, @ptrCast(a[0].ptr())).bytes();
+            const data = anyBytes(a[1]) orelse return null;
+            var at: usize = 0;
+            if (which == .unpack_from) {
+                if (a.len > 3) return null;
+                if (a.len == 3) {
+                    if (!isInt(a[2]) or a[2].asInt() < 0) return null;
+                    at = @intCast(a[2].asInt());
+                }
+            } else if (a.len != 2) return null;
+            const layout = structLayout(fmt) orelse return null;
+            if (at > data.len or data.len - at < layout.size) return null;
+            if (which == .unpack and data.len != layout.size) return null;
+            return structUnpack(ctx, node, fmt, data[at..], out);
+        },
+        .pack => {
+            if (a.len < 1 or a[0].kind() != .str) return null;
+            const fmt = @as(*value.Str, @ptrCast(a[0].ptr())).bytes();
+            return structPack(ctx, node, fmt, a[1..], out);
+        },
+        .calcsize => return null,
+    }
+}
+
+// ----------------------------------------------------------------------
+// struct (Modules/_struct.c's formats)
+// ----------------------------------------------------------------------
+
+const StructMode = struct { order: std.builtin.Endian, native: bool };
+
+const native_long: usize = if (@import("builtin").os.tag == .windows) 4 else 8;
+
+/// A format character's size (standard or native) and alignment, null for
+/// one not done natively (e, n, N, P, p)
+fn structSize(c: u8, native: bool) ?usize {
+    return switch (c) {
+        'x', 'c', 'b', 'B', '?', 's' => 1,
+        'h', 'H' => 2,
+        'i', 'I', 'f' => 4,
+        'l', 'L' => if (native) native_long else 4,
+        'q', 'Q', 'd' => 8,
+        else => null,
+    };
+}
+
+fn structMode(fmt: []const u8) struct { mode: StructMode, rest: []const u8 } {
+    if (fmt.len > 0) switch (fmt[0]) {
+        '<' => return .{ .mode = .{ .order = .little, .native = false }, .rest = fmt[1..] },
+        '>', '!' => return .{ .mode = .{ .order = .big, .native = false }, .rest = fmt[1..] },
+        '=' => return .{ .mode = .{ .order = @import("builtin").cpu.arch.endian(), .native = false }, .rest = fmt[1..] },
+        '@' => return .{ .mode = .{ .order = @import("builtin").cpu.arch.endian(), .native = true }, .rest = fmt[1..] },
+        else => {},
+    };
+    return .{ .mode = .{ .order = @import("builtin").cpu.arch.endian(), .native = true }, .rest = fmt };
+}
+
+const StructItem = struct { code: u8, count: usize, offset: usize };
+
+/// A format's items (each code, its count, where it starts) and size; null
+/// for one with codes not done natively, or malformed (Python's error then)
+fn structItems(fmt: []const u8, out: ?*std.ArrayListUnmanaged(StructItem)) ?usize {
+    const m = structMode(fmt);
+    var size: usize = 0;
+    var i: usize = 0;
+    const r = m.rest;
+    while (i < r.len) {
+        if (std.ascii.isWhitespace(r[i])) {
+            i += 1;
+            continue;
+        }
+        var count: usize = 1;
+        if (std.ascii.isDigit(r[i])) {
+            const from = i;
+            while (i < r.len and std.ascii.isDigit(r[i])) i += 1;
+            count = std.fmt.parseInt(usize, r[from..i], 10) catch return null;
+            if (i >= r.len) return null;
+        }
+        const c = r[i];
+        i += 1;
+        const sz = structSize(c, m.mode.native) orelse return null;
+        // (native: each item aligned to its size)
+        if (m.mode.native and c != 's' and c != 'x' and sz > 1) size = std.mem.alignForward(usize, size, sz);
+        if (out) |o| o.append(allocator, .{ .code = c, .count = count, .offset = size }) catch return null;
+        size = std.math.add(usize, size, std.math.mul(usize, sz, count) catch return null) catch return null;
+    }
+    return size;
+}
+
+fn structLayout(fmt: []const u8) ?struct { size: usize } {
+    return .{ .size = structItems(fmt, null) orelse return null };
+}
+
+fn structUnpack(ctx: *Ctx, node: u32, fmt: []const u8, data: []const u8, out: *Value) ?bool {
+    var items: std.ArrayListUnmanaged(StructItem) = .empty;
+    defer items.deinit(allocator);
+    _ = structItems(fmt, &items) orelse return null;
+    const order = structMode(fmt).mode.order;
+    var n: usize = 0;
+    for (items.items) |it| n += switch (it.code) {
+        'x' => 0,
+        's' => 1,
+        else => it.count,
+    };
+    const t = value.newTuple(n) orelse return oomFail(ctx, node);
+    const slots = t.slice();
+    for (slots) |*s| s.* = Value.none_v;
+    out.* = Value.obj(.tuple, &t.head);
+    var k: usize = 0;
+    for (items.items) |it| {
+        if (it.code == 'x') continue;
+        if (it.code == 's') {
+            slots[k] = Value.obj(.bytes, &(value.bytesOf(data[it.offset..][0..it.count]) orelse return oomFail(ctx, node)).head);
+            k += 1;
+            continue;
+        }
+        const sz = structSize(it.code, structMode(fmt).mode.native).?;
+        for (0..it.count) |j| {
+            const p = data[it.offset + j * sz ..][0..sz];
+            slots[k] = switch (it.code) {
+                'c' => Value.obj(.bytes, &(value.bytesOf(p) orelse return oomFail(ctx, node)).head),
+                '?' => Value.boolean(p[0] != 0),
+                'b' => Value.pint(@as(i8, @bitCast(p[0]))),
+                'B' => Value.pint(p[0]),
+                'h' => Value.pint(std.mem.readInt(i16, p[0..2], order)),
+                'H' => Value.pint(std.mem.readInt(u16, p[0..2], order)),
+                'i' => Value.pint(std.mem.readInt(i32, p[0..4], order)),
+                'I' => Value.pint(std.mem.readInt(u32, p[0..4], order)),
+                'l', 'q' => if (sz == 4) Value.pint(std.mem.readInt(i32, p[0..4], order)) else Value.pint(std.mem.readInt(i64, p[0..8], order)),
+                'L', 'Q' => if (sz == 4) Value.pint(std.mem.readInt(u32, p[0..4], order)) else value.intValue(std.mem.readInt(u64, p[0..8], order)) orelse return oomFail(ctx, node),
+                'f' => Value.float(@floatCast(@as(f32, @bitCast(std.mem.readInt(u32, p[0..4], order))))),
+                'd' => Value.float(@bitCast(std.mem.readInt(u64, p[0..8], order))),
+                else => unreachable,
+            };
+            k += 1;
+        }
+    }
+    return true;
+}
+
+fn structPack(ctx: *Ctx, node: u32, fmt: []const u8, vals: []const Value, out: *Value) ?bool {
+    var items: std.ArrayListUnmanaged(StructItem) = .empty;
+    defer items.deinit(allocator);
+    const size = structItems(fmt, &items) orelse return null;
+    const m = structMode(fmt).mode;
+    var want: usize = 0;
+    for (items.items) |it| want += switch (it.code) {
+        'x' => 0,
+        's' => 1,
+        else => it.count,
+    };
+    if (want != vals.len) return null;
+    // (checked first: anything Python refuses is its error, nothing made)
+    var k: usize = 0;
+    for (items.items) |it| {
+        if (it.code == 'x') continue;
+        const n = if (it.code == 's') 1 else it.count;
+        for (vals[k..][0..n]) |x| {
+            const ok = switch (it.code) {
+                's', 'c' => pyBytesOf(x) != null and (it.code == 's' or pyBytesOf(x).?.len == 1),
+                '?' => x.kind() == .bool or isInt(x),
+                'f', 'd' => x.kind() == .float or isInt(x),
+                else => blk: {
+                    if (!isInt(x)) break :blk false;
+                    const v = x.asInt();
+                    const sz = structSize(it.code, m.native).?;
+                    const unsigned = std.ascii.isUpper(it.code);
+                    if (unsigned) break :blk v >= 0 and (sz == 8 or v < (@as(i64, 1) << @intCast(sz * 8)));
+                    break :blk sz == 8 or (v >= -(@as(i64, 1) << @intCast(sz * 8 - 1)) and v < (@as(i64, 1) << @intCast(sz * 8 - 1)));
+                },
+            };
+            if (!ok) return null;
+            // (a float too big for 4 bytes: Python's OverflowError)
+            if (it.code == 'f') {
+                const f: f64 = if (x.kind() == .float) x.asFloat() else @floatFromInt(x.asInt());
+                if (!std.math.isInf(f) and !std.math.isNan(f) and @abs(f) > std.math.floatMax(f32)) return null;
+            }
+        }
+        k += n;
+    }
+    const r = value.newOwnedBytes(size) orelse return oomFail(ctx, node);
+    const mem = value.bytesMemory(r);
+    @memset(mem, 0);
+    k = 0;
+    for (items.items) |it| {
+        if (it.code == 'x') continue;
+        if (it.code == 's') {
+            const src = pyBytesOf(vals[k]).?;
+            const len = @min(src.len, it.count);
+            @memcpy(mem[it.offset..][0..len], src[0..len]);
+            k += 1;
+            continue;
+        }
+        const sz = structSize(it.code, m.native).?;
+        for (0..it.count) |j| {
+            const x = vals[k];
+            k += 1;
+            const p = mem[it.offset + j * sz ..][0..sz];
+            switch (it.code) {
+                'c' => p[0] = pyBytesOf(x).?[0],
+                '?' => p[0] = @intFromBool(value.truthy(x)),
+                'f' => std.mem.writeInt(u32, p[0..4], @bitCast(@as(f32, @floatCast(if (x.kind() == .float) x.asFloat() else @as(f64, @floatFromInt(x.asInt()))))), m.order),
+                'd' => std.mem.writeInt(u64, p[0..8], @bitCast(if (x.kind() == .float) x.asFloat() else @as(f64, @floatFromInt(x.asInt()))), m.order),
+                else => {
+                    const v: u64 = @bitCast(x.asInt());
+                    switch (sz) {
+                        1 => p[0] = @truncate(v),
+                        2 => std.mem.writeInt(u16, p[0..2], @truncate(v), m.order),
+                        4 => std.mem.writeInt(u32, p[0..4], @truncate(v), m.order),
+                        else => std.mem.writeInt(u64, p[0..8], v, m.order),
+                    }
+                },
+            }
+        }
+    }
+    out.* = Value.obj(.bytes, &r.head);
+    return true;
+}
+
+/// n.to_bytes(length, byteorder[, signed]) natively (null: Python's way)
+fn toBytes(ctx: *Ctx, node: u32, v: Value, args: []const Value, out: *Value) ?bool {
+    const x = value.wide(v) orelse return null;
+    if (args.len < 2 or args.len > 3) return null;
+    if (!isInt(args[0]) or args[0].asInt() < 0 or args[0].asInt() > 16) return null;
+    const len: usize = @intCast(args[0].asInt());
+    const order = byteOrder(args[1]) orelse return null;
+    const signed = args.len == 3 and value.truthy(args[2]);
+    // (what doesn't fit: Python's OverflowError)
+    if (!signed and x < 0) return null;
+    if (len < 16) {
+        const bits: u7 = @intCast(len * 8);
+        if (signed) {
+            if (len == 0) {
+                if (x != 0) return null;
+            } else if (x < -(@as(i128, 1) << (bits - 1)) or x >= (@as(i128, 1) << (bits - 1))) return null;
+        } else if (x >= (@as(i128, 1) << bits)) return null;
+    }
+    const r = value.newOwnedBytes(len) orelse return oomFail(ctx, node);
+    const m = value.bytesMemory(r);
+    const u: u128 = @bitCast(x);
+    for (0..len) |k| {
+        const byte: u8 = @truncate(u >> @intCast(k * 8));
+        if (order == .little) m[k] = byte else m[len - 1 - k] = byte;
+    }
+    out.* = Value.obj(.bytes, &r.head);
+    return true;
 }
 
 /// A function's result standing for a call it left to its caller
@@ -2073,6 +2862,13 @@ export fn zr_getitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
             out.* = items[i];
             return true;
         },
+        // (bytes at an int: the byte, an int)
+        .bytes => if (isInt(k)) {
+            const b: *value.Bytes = @ptrCast(@alignCast(v.ptr()));
+            const i = index(k.asInt(), b.len) orelse return failAs(ctx, node, py.PyExc_IndexError(), null, "index out of range", .{});
+            out.* = Value.pint(b.ptr[i]);
+            return true;
+        },
         .dict => {
             const d: *value.Dict = @ptrCast(@alignCast(v.ptr()));
             if (value.hashable(k)) {
@@ -2490,6 +3286,27 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
     const v = Value{ .tag = t, .bits = bits };
     // A set's methods: natively (Python would change a copy)
     if (v.kind() == .set) if (setMethod(ctx, node, v, name.bytes(), args[0..n], out)) |ok| return ok;
+    if (v.kind() == .bytes) if (bytesMethod(ctx, node, v, name.bytes(), args[0..n], out)) |ok| return ok;
+    // An int's to_bytes(length, byteorder[, signed]): natively; else Python's
+    // (signed given back as the keyword it was)
+    if (value.wide(v) != null and std.mem.eql(u8, name.bytes(), "to_bytes")) {
+        if (toBytes(ctx, node, v, args[0..n], out)) |ok| return ok;
+        if (n == 3) {
+            gil.allowBegin();
+            defer gil.allowEnd();
+            var objs: [3]*PyObject = undefined;
+            if (!objects(ctx, node, &.{ v, args[0], args[1] }, &objs)) return failPython(ctx, node);
+            defer for (objs) |o| py.Py_DecRef(o);
+            const meth = py.c.PyObject_GetAttrString(objs[0], "to_bytes") orelse return failPython(ctx, node);
+            defer py.Py_DecRef(meth);
+            const tuple = py.c.PyTuple_Pack(2, objs[1], objs[2]) orelse return failPython(ctx, node);
+            defer py.Py_DecRef(tuple);
+            const kw = py.c.PyDict_New() orelse return failPython(ctx, node);
+            defer py.Py_DecRef(kw);
+            if (py.c.PyDict_SetItemString(kw, "signed", if (value.truthy(args[2])) py.Py_True() else py.Py_False()) != 0) return failPython(ctx, node);
+            return fromResult(ctx, node, py.c.PyObject_Call(meth, tuple, kw), out);
+        }
+    }
     // A dict's get(): natively (Python would see a copy)
     if (v.kind() == .dict and std.mem.eql(u8, name.bytes(), "get") and (n == 1 or n == 2)) {
         const d: *value.Dict = @ptrCast(@alignCast(v.ptr()));
@@ -2639,6 +3456,36 @@ fn callMethodPython(ctx: *Ctx, node: u32, v: Value, name: *const value.Str, args
 /// A str method natively (true / false: an error), or null for one (or
 /// arguments, or a str) not done here.
 fn strMethod(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []const Value, out: *Value) ?bool {
+    // encode() (UTF-8; ASCII and Latin-1 of strs they hold): a bytes
+    if (std.mem.eql(u8, name, "encode") and args.len <= 1) {
+        const enc = if (args.len == 0) "utf-8" else blk: {
+            if (args[0].kind() != .str) return null;
+            break :blk @as(*value.Str, @ptrCast(args[0].ptr())).bytes();
+        };
+        const lower = std.ascii.eqlIgnoreCase;
+        const b = s.bytes();
+        if (lower(enc, "utf-8") or lower(enc, "utf8")) return bytesResult(ctx, node, value.bytesOf(b), out);
+        if (lower(enc, "ascii")) {
+            if (s.chars != s.len) return null;
+            return bytesResult(ctx, node, value.bytesOf(b), out);
+        }
+        if (lower(enc, "latin-1") or lower(enc, "latin1") or lower(enc, "iso-8859-1")) {
+            const r = value.newOwnedBytes(s.chars) orelse return oomFail(ctx, node);
+            const m = value.bytesMemory(r);
+            var it = std.unicode.Utf8View.initUnchecked(b).iterator();
+            var k: usize = 0;
+            while (it.nextCodepoint()) |cp| : (k += 1) {
+                if (cp > 0xff) {
+                    value.decref(Value.obj(.bytes, &r.head));
+                    return null;
+                }
+                m[k] = @intCast(cp);
+            }
+            out.* = Value.obj(.bytes, &r.head);
+            return true;
+        }
+        return null;
+    }
     if (strMethodAny(ctx, node, s, name, args, out)) |ok| return ok;
     return strMethodAscii(ctx, node, s, name, args, out);
 }
@@ -3094,6 +3941,7 @@ export fn zr_slice(ctx: *Ctx, node: u32, t: u64, bits: u64, lt: u64, lb: u64, ht
             .list => @intCast(@as(*value.List, @ptrCast(@alignCast(v.ptr()))).len),
             .tuple => @intCast(@as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).len),
             .str => @intCast(@as(*value.Str, @ptrCast(v.ptr())).chars),
+            .bytes => @intCast(@as(*value.Bytes, @ptrCast(@alignCast(v.ptr()))).len),
             else => break :native,
         };
         // (PySlice_AdjustIndices)
@@ -3148,6 +3996,26 @@ export fn zr_slice(ctx: *Ctx, node: u32, t: u64, bits: u64, lt: u64, lb: u64, ht
                     i += step;
                 }
                 out.* = Value.obj(.list, &l.head);
+            },
+            // (bytes: of their kind, a view of the same memory if the step's
+            // 1; else their bytes, a bytes of them as a zrun.Bytes' step
+            // slice is)
+            .bytes => {
+                const b: *value.Bytes = @ptrCast(@alignCast(v.ptr()));
+                if (step == 1) {
+                    const from: usize = if (count == 0) 0 else @intCast(start);
+                    const s = value.bytesSlice(b, from, from + count) orelse return oomFail(ctx, node);
+                    out.* = Value.obj(.bytes, &s.head);
+                    return true;
+                }
+                const s = value.newOwnedBytes(count) orelse return oomFail(ctx, node);
+                const dst = value.bytesMemory(s);
+                var i = start;
+                for (dst) |*d| {
+                    d.* = b.ptr[@intCast(i)];
+                    i += step;
+                }
+                out.* = Value.obj(.bytes, &s.head);
             },
             else => {
                 const items = @as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).slice();
@@ -3937,6 +4805,7 @@ export fn zr_type(t: u64, bits: u64, out: *Value) callconv(.c) void {
         .tuple => @ptrCast(@alignCast(py.types.typeObject("PyTuple_Type"))),
         .dict => @ptrCast(@alignCast(py.types.typeObject("PyDict_Type"))),
         .set => @ptrCast(@alignCast(py.types.typeObject("PySet_Type"))),
+        .bytes => if (@as(*value.Bytes, @ptrCast(@alignCast(v.ptr()))).isPyBytes()) @ptrCast(@alignCast(py.types.typeObject("PyBytes_Type"))) else @import("bytes.zig").BytesType,
         // (a lambda's, a nested def's: Python's function)
         .closure => @import("compile.zig").pyFunctionType() orelse @ptrCast(@alignCast(ph.typeOf(py.Py_None()))),
         .record => @as(*value.Record, @ptrCast(@alignCast(v.ptr()))).rtype.py_class orelse @import("proxies.zig").RecordType,
@@ -4024,6 +4893,7 @@ export fn zr_is_type(t: u64, bits: u64, code: u32) callconv(.c) bool {
         6 => v.kind() == .dict,
         7 => v.kind() == .none,
         8 => v.kind() == .function,
+        9 => v.kind() == .bytes and @as(*value.Bytes, @ptrCast(@alignCast(v.ptr()))).isPyBytes(),
         12 => v.kind() == .set,
         else => false,
     };
@@ -4116,6 +4986,8 @@ const helper_names = [_][]const u8{
     "zr_set",
     "zr_to_set",
     "zr_inplace",
+    "zr_lib",
+    "zr_sorted",
 };
 
 /// The names compiled code calls them by, and their addresses

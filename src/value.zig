@@ -81,25 +81,71 @@ pub const Closure = extern struct {
 /// the frame)
 pub const ENV_TAG: u64 = 0xFFFF_FFFD;
 
-/// Data compiled code reads (bytes.zig's zrun.Bytes, natively): part of the
-/// memory a zrun.Bytes object views, which it keeps
+/// Bytes compiled code reads: part of the memory a zrun.Bytes views (bytes.zig:
+/// the data a program reads, natively), or a Python `bytes` (PY_BYTES: its
+/// own memory, or memory of the value's own, OWNED_BYTES: bytes made
+/// natively). Read-only, as both are.
 pub const Bytes = extern struct {
     head: Obj,
     ptr: [*]const u8,
     len: u64,
-    /// The zrun.Bytes whose memory it is (owned)
-    py: *PyObject,
+    /// The Python object whose memory it is (owned): a zrun.Bytes, a bytes;
+    /// null for memory of its own
+    py: ?*PyObject,
 
     pub fn slice(self: *const Bytes) []const u8 {
         return self.ptr[0..self.len];
     }
+
+    /// A Python `bytes` (not a zrun.Bytes): what Python sees, what its
+    /// slices are
+    pub fn isPyBytes(self: *const Bytes) bool {
+        return self.head.flags & PY_BYTES != 0;
+    }
 };
+
+pub const PY_BYTES: u32 = 1 << 20;
+pub const OWNED_BYTES: u32 = 1 << 21;
 
 pub fn newBytes(ptr: [*]const u8, len: u64, owner: *PyObject) ?*Bytes {
     const b = allocator.create(Bytes) catch return null;
     py.Py_IncRef(owner);
     b.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.bytes) }, .ptr = ptr, .len = len, .py = owner };
     return b;
+}
+
+/// A Python `bytes` value of `len` bytes of its own (to fill: `ptr` is
+/// writable until it's shared)
+pub fn newOwnedBytes(len: usize) ?*Bytes {
+    const mem = allocator.alloc(u8, @max(len, 1)) catch return null;
+    const b = allocator.create(Bytes) catch {
+        allocator.free(mem);
+        return null;
+    };
+    b.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.bytes), .flags = PY_BYTES | OWNED_BYTES }, .ptr = mem.ptr, .len = len, .py = null };
+    return b;
+}
+
+/// A Python `bytes` value of these bytes (copied)
+pub fn bytesOf(data: []const u8) ?*Bytes {
+    const b = newOwnedBytes(data.len) orelse return null;
+    @memcpy(@constCast(b.ptr)[0..data.len], data);
+    return b;
+}
+
+/// A part of a bytes value, of its kind (a zrun.Bytes' a view of the same
+/// memory; a Python bytes' too, its owner kept; one of memory of its own:
+/// copied)
+pub fn bytesSlice(b: *const Bytes, from: usize, to: usize) ?*Bytes {
+    if (b.head.flags & OWNED_BYTES != 0) return bytesOf(b.ptr[from..to]);
+    const s = newBytes(b.ptr + from, to - from, b.py.?) orelse return null;
+    s.head.flags = b.head.flags & PY_BYTES;
+    return s;
+}
+
+/// The writable memory of a bytes value just made (newOwnedBytes)
+pub fn bytesMemory(b: *Bytes) []u8 {
+    return @constCast(b.ptr)[0..b.len];
 }
 
 /// A plain int beyond 64 bits (never one within: those are ints)
@@ -656,8 +702,12 @@ pub fn free(tag: Tag, o: *Obj) void {
         .big => allocator.destroy(@as(*Big, @ptrCast(@alignCast(o)))),
         .bytes => {
             const b: *Bytes = @ptrCast(@alignCast(o));
-            gil.ensure(@src());
-            py.Py_DecRef(b.py);
+            if (b.py) |owner| {
+                // (a count, not Python running: what strict mode allows)
+                gil.allowBegin();
+                defer gil.allowEnd();
+                py.Py_DecRef(owner);
+            } else allocator.free(@constCast(b.ptr)[0..@max(b.len, 1)]);
             allocator.destroy(b);
         },
         else => {},
@@ -838,7 +888,7 @@ pub fn typeName(v: Value) []const u8 {
         .host => "object",
         .rt => "CompiledRuntime",
         .big => "int",
-        .bytes => "Bytes",
+        .bytes => if (@as(*Bytes, @ptrCast(@alignCast(v.ptr()))).isPyBytes()) "bytes" else "Bytes",
         _ => "object",
     };
 }
@@ -1133,6 +1183,8 @@ fn hashOf(tag: u64, bits: u64) u64 {
             return std.hash.Wyhash.hash(1, std.mem.asBytes(&bits));
         },
         .big => return std.hash.Wyhash.hash(2, std.mem.asBytes(&@as(*Big, @ptrCast(@alignCast(v.ptr()))).v)),
+        // (bytes: by their bytes, as equal ones are equal)
+        .bytes => return std.hash.Wyhash.hash(6, @as(*Bytes, @ptrCast(@alignCast(v.ptr()))).slice()),
         .str => {
             const s: *Str = @ptrCast(v.ptr());
             if (s.hash != 0) return s.hash;
@@ -1372,15 +1424,23 @@ pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
         },
         // (rt reaching Python code: an rt object over its frames)
         .rt => return @import("bridge.zig").runtimeObject(v),
-        // (the zrun.Bytes it's of, or a slice of it: the same memory)
+        // (the zrun.Bytes it's of, or a slice of it: the same memory; a
+        // Python bytes: the one it is, or a bytes of its bytes)
         .bytes => {
             const b: *Bytes = @ptrCast(@alignCast(v.ptr()));
-            const whole = bytes_mod.as(b.py);
-            if (whole.ptr == b.ptr and whole.len == b.len) {
-                py.Py_IncRef(b.py);
-                return b.py;
+            if (b.isPyBytes()) {
+                if (b.py) |o| if (py.c.PyBytes_Size(o) == @as(isize, @intCast(b.len)) and @as([*]const u8, @ptrCast(py.c.PyBytes_AsString(o))) == b.ptr) {
+                    py.Py_IncRef(o);
+                    return o;
+                };
+                return py.c.PyBytes_FromStringAndSize(@ptrCast(b.ptr), @intCast(b.len));
             }
-            return bytes_mod.slice(b.py, b.ptr, b.len);
+            const whole = bytes_mod.as(b.py.?);
+            if (whole.ptr == b.ptr and whole.len == b.len) {
+                py.Py_IncRef(b.py.?);
+                return b.py.?;
+            }
+            return bytes_mod.slice(b.py.?, b.ptr, b.len);
         },
         _ => {
             ph.raise(py.PyExc_TypeError(), "an unknown value", .{});
@@ -1449,6 +1509,16 @@ fn convert(o: *PyObject, unique: bool) ?Value {
         return Value.obj(.bytes, &b.head);
     }
     const ty = ph.typeOf(o);
+    // (a bytes, exactly: its memory, natively (immutable, as it is))
+    if (ty == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyBytes_Type"))))) {
+        const p: [*]const u8 = @ptrCast(py.c.PyBytes_AsString(o) orelse return null);
+        const b = newBytes(p, @intCast(py.c.PyBytes_Size(o)), o) orelse {
+            _ = py.c.PyErr_NoMemory();
+            return null;
+        };
+        b.head.flags = PY_BYTES;
+        return Value.obj(.bytes, &b.head);
+    }
     // (an int: plain; zrun.I64, what rt gives Python: the program's)
     const is_i64 = @as(*PyObject, @ptrCast(@alignCast(ty))) == types.I64;
     if (ty == exact.int() or is_i64) big: {

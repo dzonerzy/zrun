@@ -291,6 +291,35 @@ fn bytesMethod(o: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
     return toBytes(as(o.?));
 }
 
+/// The buffer protocol, read only (struct.unpack(), int.from_bytes(),
+/// zlib.crc32(), memoryview() of a zrun.Bytes: its memory, not copied)
+fn getBuffer(o: ?*PyObject, view_: ?*anyopaque, flags: c_int) callconv(.c) c_int {
+    const view: *Py_buffer = @ptrCast(@alignCast(view_.?));
+    const b = as(o.?);
+    // (PyBUF_WRITABLE)
+    if (flags & 0x0001 != 0) {
+        ph.raise(py.PyExc_BufferError(), "zrun.Bytes is read-only", .{});
+        view.obj = null;
+        return -1;
+    }
+    view.* = .{
+        .buf = @ptrCast(@constCast(b.ptr)),
+        .obj = ref(o.?),
+        .len = @intCast(b.len),
+        .itemsize = 1,
+        .readonly = 1,
+        .ndim = 1,
+        // (PyBUF_FORMAT, PyBUF_ND, PyBUF_STRIDES: what's asked for)
+        .format = if (flags & 0x0004 != 0) @constCast(byte_format) else null,
+        .shape = if (flags & 0x0008 != 0) @ptrCast(&b.len) else null,
+        .strides = if (flags & 0x0018 == 0x0018) @constCast(&one) else null,
+    };
+    return 0;
+}
+
+const byte_format: [*:0]u8 = @constCast("B");
+var one: isize = 1;
+
 var methods = [_]py.c.PyMethodDef{
     .{ .ml_name = "__bytes__", .ml_meth = @ptrCast(@constCast(&bytesMethod)), .ml_flags = py.c.METH_NOARGS, .ml_doc = "Its bytes, copied." },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
@@ -307,6 +336,8 @@ var slots = [_]py.c.PyType_Slot{
     .{ .slot = py.c.Py_tp_hash, .pfunc = @ptrCast(@constCast(&hash)) },
     .{ .slot = py.c.Py_tp_repr, .pfunc = @ptrCast(@constCast(&repr)) },
     .{ .slot = py.c.Py_tp_methods, .pfunc = @ptrCast(@constCast(&methods)) },
+    // (Py_bf_getbuffer: 1, in PyType_FromSpec from 3.9)
+    .{ .slot = 1, .pfunc = @ptrCast(@constCast(&getBuffer)) },
     .{ .slot = py.c.Py_tp_doc, .pfunc = @ptrCast(@constCast("Bytes(data): a read-only view of data's memory (bytes, bytearray, memoryview, mmap), not copied; slices share it.")) },
     .{ .slot = 0, .pfunc = null },
 };

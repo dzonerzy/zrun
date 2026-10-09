@@ -215,6 +215,12 @@ pub fn pyHash(v: Value) ?i64 {
         .big => intHash(value.wide(v).?),
         .float => floatHash(v.asFloat()),
         .str => strHash(@as(*value.Str, @ptrCast(v.ptr())).bytes()),
+        // (bytes, a zrun.Bytes: siphash of the bytes themselves)
+        .bytes => blk: {
+            const s = @as(*value.Bytes, @ptrCast(@alignCast(v.ptr()))).slice();
+            if (sip_rounds == .none) break :blk null;
+            break :blk if (s.len == 0) 0 else sip(s);
+        },
         .tuple => tupleHash(@as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).slice()),
         // (a frozen dataclass compared by value: its fields' tuple's, as
         // dataclasses hash it)
