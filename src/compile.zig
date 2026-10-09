@@ -143,6 +143,10 @@ pub const SList = struct {
     made_at: u32 = NONE,
     /// A module's table only read (frozenTable): the object it is
     frozen: ?*PyObject = null,
+    /// `frozen` is a zrun.comptime function's result (comptimeValue): a
+    /// constant all through, native all through at run time; changing it
+    /// isn't compiled
+    comptime_result: bool = false,
     /// Its items are owned by it (copied out, `l[0]`, each a reference of
     /// its own) until they're taken: a run-time list made of them, a call
     /// given them, a tuple or another list sharing them. Not taken when the
@@ -160,6 +164,8 @@ pub const SDict = struct {
     made_at: u32 = NONE,
     /// A module's table only read (frozenTable): the object it is
     frozen: ?*PyObject = null,
+    /// `frozen` is a zrun.comptime function's result (as SList's)
+    comptime_result: bool = false,
 
     fn find(self: *const SDict, key: SVal) ?usize {
         for (self.keys.items, 0..) |k, i| if (sameKey(k, key)) return i;
@@ -736,6 +742,87 @@ pub fn declaredClass(mapping: *PyObject, analysis: *PyObject, idx: u32) error{Py
 }
 /// Modules' tables only read, native (Gen.frozenConst), by the table
 var frozen_natives: std.AutoHashMapUnmanaged(*PyObject, Value) = .empty;
+
+/// zrun.comptime functions' results, native (Gen.comptimeConst), by the
+/// result
+var comptime_natives: std.AutoHashMapUnmanaged(*PyObject, Value) = .empty;
+
+/// The lists, dicts and tuples a constant nests, at most (one deeper, or
+/// one holding itself: refused)
+const max_constant_depth = 64;
+
+/// A Python value as a native one all through (the lists, dicts and tuples
+/// in it native too, not Python's), immortal: a constant of the process.
+fn constantNative(o: *PyObject, depth: usize) Error!Value {
+    if (depth > max_constant_depth) {
+        ph.raise(py.PyExc_ValueError(), "a zrun.comptime result nested more than {d} deep (or holding itself)", .{max_constant_depth});
+        return error.Python;
+    }
+    const t = ph.typeOf(o);
+    const v: Value = if (t == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyList_Type"))))) blk: {
+        const n: usize = @intCast(py.c.PyList_Size(o));
+        const l = value.newList(n) orelse return error.OutOfMemory;
+        for (0..n) |i| if (!value.listPush(l, try constantNative(py.c.PyList_GetItem(o, @intCast(i)).?, depth + 1))) return error.OutOfMemory;
+        break :blk Value.obj(.list, &l.head);
+    } else if (t == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyDict_Type"))))) blk: {
+        const d = value.newDict() orelse return error.OutOfMemory;
+        var pos: py.Py_ssize_t = 0;
+        var key: ?*PyObject = null;
+        var val: ?*PyObject = null;
+        while (py.c.PyDict_Next(o, &pos, @ptrCast(&key), @ptrCast(&val)) != 0) {
+            const k = try constantNative(key.?, depth + 1);
+            const x = try constantNative(val.?, depth + 1);
+            if (!value.dictSet(d, k, x)) return error.OutOfMemory;
+        }
+        break :blk Value.obj(.dict, &d.head);
+    } else if (t == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyTuple_Type"))))) blk: {
+        const n: usize = @intCast(py.c.PyTuple_Size(o));
+        const tu = value.newTuple(n) orelse return error.OutOfMemory;
+        for (tu.slice()) |*slot| slot.* = Value.none_v;
+        for (tu.slice(), 0..) |*slot, i| slot.* = try constantNative(py.c.PyTuple_GetItem(o, @intCast(i)).?, depth + 1);
+        break :blk Value.obj(.tuple, &tu.head);
+    } else value.fromBorrowed(o) orelse return error.Python;
+    if (value.counted(v.tag)) v.ptr().rc = value.IMMORTAL;
+    return v;
+}
+
+/// zrun.comptime(fn): the attribute marking a function as one (its result
+/// for values known when compiling: computed then, a constant)
+pub const comptime_attr = "__zrun_comptime__";
+
+/// Whether `o` is a zrun.comptime function
+fn isComptime(o: *PyObject) bool {
+    const flag = py.c.PyObject_GetAttrString(o, comptime_attr) orelse {
+        py.c.PyErr_Clear();
+        return false;
+    };
+    defer py.Py_DecRef(flag);
+    return flag == py.Py_True();
+}
+
+/// zrun.comptime functions' results by (function, arguments): each
+/// computed once for the process (a dict; created when first needed)
+var comptime_results: ?*PyObject = null;
+
+/// `f(*args)` for a zrun.comptime function: its result (a new reference),
+/// the one computed before for these arguments if there's one; null with
+/// the exception it raised.
+fn comptimeResult(f: *PyObject, args: *PyObject) ?*PyObject {
+    if (comptime_results == null) comptime_results = py.c.PyDict_New() orelse return null;
+    const key = py.c.PyTuple_Pack(2, f, args) orelse return null;
+    defer py.Py_DecRef(key);
+    // (arguments that can't be a key: computed each time)
+    const known = py.c.PyDict_GetItemWithError(comptime_results.?, key);
+    if (known) |r| {
+        py.Py_IncRef(r);
+        return r;
+    }
+    const hashable = py.c.PyErr_Occurred() == null;
+    py.c.PyErr_Clear();
+    const r = py.c.PyObject_CallObject(f, args) orelse return null;
+    if (hashable and py.c.PyDict_SetItem(comptime_results.?, key, r) != 0) py.c.PyErr_Clear();
+    return r;
+}
 var readonly_checker: ?*PyObject = null;
 /// (the module dicts are kept: modules live as long)
 var rebound_cache: std.AutoHashMapUnmanaged(*PyObject, ScanEntry) = .empty;
@@ -2507,6 +2594,20 @@ const Gen = struct {
         return .{ .tag = self.k(@intCast(v.tag)), .bits = self.c.m.addrInt(v.bits), .shape = shape };
     }
 
+    /// A zrun.comptime function's result (a list or dict, comptimeValue) at
+    /// run time: native all through, made once for the process (immortal: a
+    /// constant), its address a constant.
+    fn comptimeConst(self: *Gen, o: *PyObject, shape: Shape) Error!Dyn {
+        const v = comptime_natives.get(o) orelse blk: {
+            const v = try constantNative(o, 0);
+            // (the result kept: its address is the key)
+            py.Py_IncRef(o);
+            try comptime_natives.put(std.heap.c_allocator, o, v);
+            break :blk v;
+        };
+        return .{ .tag = self.k(@intCast(v.tag)), .bits = self.c.m.addrInt(v.bits), .shape = shape };
+    }
+
     /// A Python list or dict as a native one (its items as values are:
     /// lists and dicts in it Python's).
     fn nativeCopy(o: *PyObject) Error!Value {
@@ -2571,7 +2672,7 @@ const Gen = struct {
                 break :blk try self.loadOut(.any);
             },
             .list => |l| blk: {
-                if (l.frozen) |o| break :blk try self.frozenConst(o, .list);
+                if (l.frozen) |o| break :blk if (l.comptime_result) try self.comptimeConst(o, .list) else try self.frozenConst(o, .list);
                 const d = try self.buildSequence("zr_list", l.items.items, at, .list);
                 l.taken = true;
                 try self.promote(v, d);
@@ -2579,7 +2680,7 @@ const Gen = struct {
             },
             .tuple => |t| self.buildSequence("zr_tuple", t, at, .tuple),
             .dict => |x| blk: {
-                if (x.frozen) |o| break :blk try self.frozenConst(o, .dict);
+                if (x.frozen) |o| break :blk if (x.comptime_result) try self.comptimeConst(o, .dict) else try self.frozenConst(o, .dict);
                 const d = try self.buildDict(x, at);
                 try self.promote(v, d);
                 break :blk d;
@@ -2656,6 +2757,7 @@ const Gen = struct {
     /// known list or dict no literal made, that variables refer to, can't
     /// follow inside run-time control flow.
     fn materializeToChange(self: *Gen, v: SVal, at: u32) Error!Dyn {
+        try self.refuseComptimeChange(v, "a change to");
         if (containerPtr(v)) |ptr| if (originOf(v) == null and self.aliased(ptr) and self.inFlow() and !self.straightFor(ptr))
             return self.c.unsupported("a list or dict made when compiling (not by a literal) changed inside run-time control flow isn't compiled yet", .{});
         return self.materialize(v, at);
@@ -4361,6 +4463,112 @@ const Gen = struct {
         return v;
     }
 
+    /// A call of a zrun.comptime function given values known here: its
+    /// result now (Python running it once for these arguments, for the
+    /// process), a constant of the code (comptimeValue); null if they
+    /// aren't all known (or it raised: the call made when the code runs,
+    /// raising then, as the reference mode does).
+    fn comptimeCall(self: *Gen, o: *PyObject, args: []const SVal) Error!?SVal {
+        for (args) |x| if (!comptimeArg(x)) return null;
+        const tuple = py.c.PyTuple_New(@intCast(args.len)) orelse return error.Python;
+        defer py.Py_DecRef(tuple);
+        for (args, 0..) |x, i| _ = py.c.PyTuple_SetItem(tuple, @intCast(i), try self.comptimePy(x));
+        const r = comptimeResult(o, tuple) orelse {
+            var buf: [512]u8 = undefined;
+            const text = ph.takeError(&buf);
+            try self.strictRefuses("the zrun.comptime function {s}() raised while compiling: {s}", .{ try self.pyName(o), text });
+            return null;
+        };
+        defer py.Py_DecRef(r);
+        return try self.comptimeValue(r);
+    }
+
+    /// What a zrun.comptime function can be given when compiling: a value
+    /// known all through (a scalar, a str, a tuple of them, a Python
+    /// object), a module's table only read, another one's result.
+    fn comptimeArg(x: SVal) bool {
+        return switch (x) {
+            .none, .bool, .int, .pint, .float, .str, .py => true,
+            .tuple => |t| for (t) |item| {
+                if (!comptimeArg(item)) break false;
+            } else true,
+            .list => |l| l.frozen != null,
+            .dict => |d| d.frozen != null,
+            else => false,
+        };
+    }
+
+    fn comptimePy(self: *Gen, x: SVal) Error!*PyObject {
+        const frozen = switch (x) {
+            .list => |l| l.frozen,
+            .dict => |d| d.frozen,
+            else => null,
+        };
+        if (frozen) |o| {
+            py.Py_IncRef(o);
+            return o;
+        }
+        if (x == .tuple) {
+            const out = py.c.PyTuple_New(@intCast(x.tuple.len)) orelse return error.Python;
+            for (x.tuple, 0..) |item, i| _ = py.c.PyTuple_SetItem(out, @intCast(i), try self.comptimePy(item));
+            return out;
+        }
+        return self.pyOf(x);
+    }
+
+    /// A zrun.comptime function's result as a value known here: a list or
+    /// dict known item by item (kept for the process: comptime_results),
+    /// native all through at run time (comptimeConst); a tuple of such
+    /// values; anything else as a constant is.
+    fn comptimeValue(self: *Gen, r: *PyObject) Error!SVal {
+        const t = ph.typeOf(r);
+        if (t == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyList_Type"))))) {
+            const l = try self.a().create(SList);
+            l.* = .{ .frozen = r, .comptime_result = true };
+            // (kept alive by the results' dict, or by comptime_natives once
+            // made native: referred to by address)
+            py.Py_IncRef(r);
+            const n: usize = @intCast(py.c.PyList_Size(r));
+            for (0..n) |i| try l.items.append(self.a(), try self.comptimeValue(py.c.PyList_GetItem(r, @intCast(i)).?));
+            return .{ .list = l };
+        }
+        if (t == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyDict_Type"))))) {
+            const d = try self.a().create(SDict);
+            d.* = .{ .frozen = r, .comptime_result = true };
+            py.Py_IncRef(r);
+            var pos: py.Py_ssize_t = 0;
+            var key: ?*PyObject = null;
+            var v: ?*PyObject = null;
+            while (py.c.PyDict_Next(r, &pos, @ptrCast(&key), @ptrCast(&v)) != 0) {
+                try d.keys.append(self.a(), try self.constant(key.?, self.atNode()));
+                try d.values.append(self.a(), try self.comptimeValue(v.?));
+            }
+            return .{ .dict = d };
+        }
+        if (t == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyTuple_Type"))))) {
+            const n: usize = @intCast(py.c.PyTuple_Size(r));
+            const items = try self.a().alloc(SVal, n);
+            for (items, 0..) |*it, i| it.* = try self.comptimeValue(py.c.PyTuple_GetItem(r, @intCast(i)).?);
+            return .{ .tuple = items };
+        }
+        return self.constant(r, self.atNode());
+    }
+
+    /// A zrun.comptime function's result being changed (`what`): not
+    /// compiled (it's a constant: the same object for every call); the
+    /// semantic runs as Python, where each call makes its own.
+    fn refuseComptimeChange(self: *Gen, obj: SVal, comptime what: []const u8) Error!void {
+        const is = switch (obj) {
+            .list => |l| l.comptime_result,
+            .dict => |d| d.comptime_result,
+            else => false,
+        };
+        if (!is) return;
+        const fmt = what ++ " a zrun.comptime function's result: a constant, the same for every call";
+        if (self.insts.items.len == 0) return self.c.unsupported(fmt, .{});
+        return self.c.unsupportedAt(self.insts.items[self.insts.items.len - 1].func, self.pos, fmt, .{});
+    }
+
     /// A constant all through: a str, a number, None, a bool, a tuple of
     /// them.
     fn allConstant(x: SVal) bool {
@@ -5229,6 +5437,7 @@ const Gen = struct {
     /// made a run-time one first: materialize).
     fn setItem(self: *Gen, inst: *Inst, obj: SVal, key: SVal, v: SVal, pos: front.Pos) Error!void {
         _ = pos;
+        try self.refuseComptimeChange(obj, "an item set in");
         switch (obj) {
             .list, .dict => if (inst.dyn_depth == 0 and key.isStatic() and isScalar(key)) {
                 if (obj == .dict) return self.sdictSet(obj.dict, key, v);
@@ -6403,6 +6612,7 @@ const Gen = struct {
     fn methodCall(self: *Gen, inst: *Inst, obj: SVal, name: []const u8, args: []const SVal, pos: front.Pos) Error!SVal {
         const c = self.c;
         const eq = std.mem.eql;
+        for (mutating_methods) |m| if (eq(u8, name, m)) try self.refuseComptimeChange(obj, "a method changing");
         // A known list or dict changed while nothing runs at run time: now
         if (inst.dyn_depth == 0) {
             switch (obj) {
@@ -7353,6 +7563,21 @@ const Gen = struct {
     /// the semantics (compiled inline), or a builtin.
     fn pyCall(self: *Gen, inst: *Inst, o: *PyObject, args: []const SVal, pos: front.Pos) Error!SVal {
         const c = self.c;
+        // A function declared computed when compiling (zrun.comptime),
+        // given values known here: its result now, a constant (any Python
+        // in it, run once); else called as any function is
+        if (isComptime(o)) {
+            if (try self.comptimeCall(o, args)) |v| return v;
+            // (strict: compiled with these values, or why it can't be)
+            if (c.lang.strict) {
+                const func = self.helperFunction(o) catch |e| {
+                    if (e != error.Unsupported) return e;
+                    const why = try self.a().dupe(u8, c.failure.message.items);
+                    return c.unsupportedAt(inst.func, pos, "strict: calls the zrun.comptime function {s}() with values known only at run time, and it can't be compiled: {s}", .{ try self.pyName(o), why });
+                };
+                return self.callHelper(func, inst.node, args);
+            }
+        }
         const pt = try pyTypes();
         // A bound method of a Python function: the function, its object
         // first
@@ -9361,12 +9586,14 @@ fn fpartReads(p: front.FPart, set: *std.AutoHashMapUnmanaged(u32, void), a: Allo
     }
 }
 
+/// The methods of lists and dicts that change them
+const mutating_methods = [_][]const u8{ "append", "extend", "insert", "pop", "remove", "clear", "update", "setdefault", "sort", "reverse", "popitem" };
+
 fn collectMutated(e: *const front.Expr, set: *std.AutoHashMapUnmanaged(u32, void), a: Allocator) !void {
     if (e.kind != .call) return;
     const func = e.kind.call.func;
     if (func.kind != .attr or func.kind.attr.obj.kind != .local) return;
-    const mutating = [_][]const u8{ "append", "extend", "insert", "pop", "remove", "clear", "update", "setdefault", "sort", "reverse", "popitem" };
-    for (mutating) |m| {
+    for (mutating_methods) |m| {
         if (std.mem.eql(u8, func.kind.attr.name, m)) {
             try set.put(a, func.kind.attr.obj.kind.local, {});
             return;

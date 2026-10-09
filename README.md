@@ -166,6 +166,27 @@ Integers are 64-bit and checked: an overflow is a runtime error at the node (`zr
 
 Semantics are compiled from their Python source. What compiles, and how to write semantics that compile to fast code, is in [the guide to writing fast semantics](https://github.com/dzonerzy/zrun/blob/main/docs/writing-fast-semantics.md); `lang.python_semantics()` lists the ones that run as Python, and why.
 
+### Computed when compiling
+
+A function whose result depends only on its arguments can say so with `@zrun.comptime`. Compiled code calling it with values known when compiling (constants, the program's tree's fields, other such results) calls it then, once for those values in the process, and its result is a constant of the code: any Python may be in it, the compilable subset or not, and none of it runs when the code does.
+
+```python
+@zrun.comptime
+def crc_table(poly):
+    def entry(i):                   # (a nested def: outside the subset, fine here)
+        for _ in range(8):
+            i = (i >> 1) ^ poly if i & 1 else i >> 1
+        return i
+    return [entry(i) for i in range(256)]
+
+@lang.eval("Crc32")
+def crc32(node, rt):
+    table = crc_table(node.poly)    # the spec's polynomial: called while compiling
+    ...                             # the loop over the bytes: native code, the table a constant
+```
+
+Lists, dicts and tuples in a result are native at run time, all through, and read-only: a semantic changing one isn't compiled (it runs as Python, where each call makes its own). Given values known only at run time, the function is called as any function is. The reference mode calls it as ever. A function that raises while compiling raises when the code runs it, as the reference mode does (in strict mode, it's a `CompileError`).
+
 ## Modes
 
 `program.run(mode=...)`:
@@ -274,6 +295,7 @@ Every class and method has its documentation in `help()` (and in the `.pyi` stub
 | `@lang.eval(kind)`, `@lang.exec(kind)` | the semantics of a node kind (`native=False`: run as Python) |
 | `lang.function(kind, ...)`, `@lang.host`, `lang.native_host(name, capsule)` | functions of the language, of Python, of a native library |
 | `lang.types(mapping)` | what values the language's types have |
+| `@zrun.comptime` | a function computed when compiling, given values known then: its result a constant |
 | `lang.load(source, path=None)` | parse and check a program: a `Program` |
 | `program.run(mode=..., report=False)` | run it from its start |
 | `program.call(name, *args, context=None)`, `program.map(name, items, threads=None)` | an engine's entry points |

@@ -362,7 +362,7 @@ pub const KIND_FRAME: u32 = 100;
 /// The counted tags: str..function (4-9), Big, Bytes; a bit each
 const counted_mask: u64 = 0x3F0 | (1 << @intFromEnum(Tag.big)) | (1 << @intFromEnum(Tag.bytes));
 
-inline fn counted(tag: u64) bool {
+pub inline fn counted(tag: u64) bool {
     return tag < 16 and (counted_mask >> @intCast(tag)) & 1 != 0;
 }
 
