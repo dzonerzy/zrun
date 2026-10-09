@@ -6,7 +6,7 @@ build-backend = "pyoz.backend"
 # The import name is `zrun` (module-name below); every zsuite package is
 # published as <name>-py
 name = "zrun-py"
-version = "0.4.1"
+version = "0.4.2"
 description = "Execution for languages built with zgram and zrules: semantics written as Python functions, compiled to native code."
 requires-python = ">=3.10"
 readme = "README.md"

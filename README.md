@@ -64,7 +64,7 @@ No call takes the GIL. Every way of running it (threads, `map()`, the reference 
 
 ### Compiling
 
-Compiled code is kept between runs (on disk, by what it compiles). A program run compiled whose optimized code isn't there yet is compiled fast first and starts at once, while the optimized code is made on other threads; later runs use it. `examples/lua/tests/programs.lua` with an empty cache: first run 3.3 s (26 s optimized at once); once its optimized code is all cached, 0.75 s for a new process's first run and 0.009 s a run after that.
+Compiled code is kept between runs (on disk, by what it compiles). A program run compiled whose optimized code isn't there yet is compiled fast first and starts at once, while the optimized code is made on other threads; later runs use it. `examples/lua/tests/programs.lua` with an empty cache: first run 3.3 s (26 s optimized at once); once its optimized code is all cached, 0.75 s for a new process's first run and 0.009 s a run after that. A program loaded again in the same process (a server, a test suite) runs the code its first load compiled: `fib(30)` in Lua loaded ten times, 1.55 s for the first load with an empty cache, then 0.040 s each.
 
 ## Installation
 

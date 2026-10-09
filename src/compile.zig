@@ -6195,8 +6195,13 @@ const Gen = struct {
                 // (kept alive by the object it belongs to, for constants: a
                 // reference is kept with the compiled program when used)
                 const sv = try self.constant(v, inst.node);
+                defer py.Py_DecRef(v);
+                // (an object that may change, or be another one by the time
+                // the code runs: `sys.stdout`, a class's counter... read
+                // then; a function, a class, a module, a value: decided now)
+                if (sv == .py and !py.PyLong_Check(v) and !try stablePy(v))
+                    return self.attr(inst, .{ .dyn = try self.materialize(obj, inst.node) }, name, pos);
                 if (sv == .py) _ = try c.objectIndex(v);
-                py.Py_DecRef(v);
                 return sv;
             },
             .dyn => |d| {

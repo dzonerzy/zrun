@@ -930,15 +930,25 @@ const Program = struct {
     /// The session it's an entry of (borrowed: the session keeps it, and
     /// clears this when it goes), or null
     _session: ?*Session = null,
+    /// A session's entry (checked with the names the entries before it
+    /// defined: its code is its session's, not shared)
+    _entry: bool = false,
 
     fn release(self: *Program) void {
         if (self._cglobals) |g| value_mod.decrefFrame(g);
         self._cglobals = null;
-        if (self._compiled) |c| c.destroy();
+        if (self._compiled) |c| c.drop();
         self._compiled = null;
-        if (self._pending) |p| p.abandon();
+        // (the optimized code being made: the program's next load's)
+        if (self._pending) |p| {
+            const key = if (self.seed()) |what| self.shareKey(&what) else blk: {
+                py.c.PyErr_Clear();
+                break :blk null;
+            };
+            if (key) |k| p.orphan(&k, .{ self._state, self._lang, self._path }) else p.abandon();
+        }
         self._pending = null;
-        for (self._retired.items) |c| c.destroy();
+        for (self._retired.items) |c| c.drop();
         self._retired.deinit(allocator);
         self._retired = .empty;
         self._declared.deinit(allocator);
@@ -1290,6 +1300,20 @@ const Program = struct {
         };
         if (self._compiled) |c| if (c.opt != 0 or want == .any or self._cglobals != null) return true;
         const what = self.seed() orelse return false;
+        // (the program loaded before: its optimized code, or the optimized
+        // code it was having made)
+        const key = self.shareKey(&what);
+        if (key != null and self._pending == null) {
+            if (driver.sharedCode(&key.?, 2)) |c| {
+                self.retire();
+                self._compiled = c;
+                return true;
+            }
+            if (driver.takeOrphan(&key.?)) |p| {
+                self._pending = p;
+                if (want == .optimized or p.ready()) return self.adoptPending();
+            }
+        }
         const lang = self.language();
         if (want == .any and driver.tiers) {
             // (nothing compiled yet: the optimized code made in the
@@ -1298,13 +1322,44 @@ const Program = struct {
                 self._pending = driver.compileInBackground(self.ctx().data, self.langView(), &lang._python, ztypes.CompileError, &what) orelse return false;
                 if (self._pending.?.ready()) return self.adoptPending();
             }
+            if (key) |k| if (driver.sharedCode(&k, 0)) |c| {
+                self._compiled = c;
+                return true;
+            };
             self._compiled = driver.compileProgram(self.ctx().data, self.langView(), &lang._python, ztypes.CompileError, &what, 0) orelse return false;
+            if (key) |k| self.share(self._compiled.?, &k);
             return true;
         }
         const c = driver.compileProgram(self.ctx().data, self.langView(), &lang._python, ztypes.CompileError, &what, 2) orelse return false;
         self.retire();
         self._compiled = c;
+        if (key) |k| self.share(c, &k);
         return true;
+    }
+
+    /// What the program's code is shared as (driver.share): its seed, its
+    /// language (the one object: its semantics' functions are the code's),
+    /// its path (the code's messages say it); null: not shared (a session's
+    /// entry).
+    fn shareKey(self: *Program, what: *const [32]u8) ?driver.ShareKey {
+        if (self._entry) return null;
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update(what);
+        h.update(std.mem.asBytes(&@intFromPtr(self._lang.?)));
+        if (self._path) |p| if (p != py.Py_None()) {
+            h.update(ph.utf8(p, "path") orelse {
+                py.c.PyErr_Clear();
+                return null;
+            });
+        };
+        var out: driver.ShareKey = undefined;
+        h.final(&out);
+        return out;
+    }
+
+    /// Its optimized code shared with the program's later loads.
+    fn share(self: *Program, c: *driver.Compiled, key: *const driver.ShareKey) void {
+        driver.share(c, key, .{ self._state, self._lang, self._path });
     }
 
     /// The optimized code made in the background, the program's from now
@@ -1315,6 +1370,9 @@ const Program = struct {
         const c = p.finish() orelse return false;
         self.retire();
         self._compiled = c;
+        if (self.seed()) |what| {
+            if (self.shareKey(&what)) |key| self.share(c, &key);
+        } else py.c.PyErr_Clear();
         return true;
     }
 
@@ -1336,6 +1394,13 @@ const Program = struct {
         if (self._compiled) |c| if (c.opt != 0 or self._cglobals != null) return true;
         if (self._pending) |p| return p.ready();
         const what = self.seed() orelse return null;
+        if (self.shareKey(&what)) |key| {
+            if (driver.isShared(&key)) return true;
+            if (driver.takeOrphan(&key)) |p| {
+                self._pending = p;
+                return p.ready();
+            }
+        }
         self._pending = driver.compileInBackground(self.ctx().data, self.langView(), &self.language()._python, ztypes.CompileError, &what) orelse {
             if (py.c.PyErr_ExceptionMatches(ztypes.CompileError) == 0) return null;
             py.c.PyErr_Clear();
@@ -2122,7 +2187,7 @@ pub const Session = struct {
             return null;
         };
         defer py.Py_DecRef(known);
-        var prog = Program{};
+        var prog = Program{ ._entry = true };
         prog._lang = ref(self._lang.?);
         prog._source = ref(source);
         if (!prog.setup(lang, tree, known)) {

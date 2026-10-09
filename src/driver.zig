@@ -96,6 +96,15 @@ pub const Compiled = struct {
     /// class's function (borrowed: the class keeps it), null for anything
     /// else (a staticmethod, a property...: Python finds those)
     methods: std.AutoHashMapUnmanaged(MethodKey, ?*PyObject) = .empty,
+    /// The programs running it (drop()): more than one once it's shared
+    /// (share())
+    users: usize = 1,
+    /// What it's shared as (share()), and what its compiler refers into,
+    /// referenced while it lives on after its program (shared, or its
+    /// making handed on: Pending.orphan): its first program's state,
+    /// language, path
+    share_key: ?ShareKey = null,
+    shared_refs: [3]?*PyObject = .{ null, null, null },
 
     pub const MethodKey = struct { rtype: *const value.RecordType, name: *const value.Str };
 
@@ -172,7 +181,32 @@ pub const Compiled = struct {
         return cache.objectOf(allocator, key);
     }
 
+    /// A program done with it: freed with its last program, unless it's
+    /// shared (then kept a while for a load to come: `retained`).
+    pub fn drop(self: *Compiled) void {
+        self.users -= 1;
+        if (self.users > 0) return;
+        if (self.share_key == null) return self.destroy();
+        retained.append(allocator, self) catch return self.unshare();
+        if (retained.items.len > retained_max) retained.orderedRemove(0).unshare();
+    }
+
+    /// No longer shared, and freed (no program runs it)
+    fn unshare(self: *Compiled) void {
+        _ = shared.remove(.{ .key = self.share_key.?, .opt = self.opt });
+        self.destroy();
+    }
+
+    /// What its compiler refers into, referenced from now (once)
+    fn keepRefs(self: *Compiled, refs: [3]?*PyObject) void {
+        if (self.shared_refs[0] != null) return;
+        self.shared_refs = refs;
+        for (refs) |o| if (o) |x| py.Py_IncRef(x);
+    }
+
     pub fn destroy(self: *Compiled) void {
+        const refs = self.shared_refs;
+        defer for (refs) |o| if (o) |x| py.Py_DecRef(x);
         for (self.modules.items) |*m| m.release();
         self.modules.deinit(allocator);
         self.keys.deinit(allocator);
@@ -578,6 +612,56 @@ fn types() type {
 var helpers_defined = false;
 var next_id: u64 = 0;
 
+/// Code shared by the loads of one program in the process (its language,
+/// its source, its path: Program.shareKey), at each level: a program loaded
+/// again runs the code the first load compiled. Compiling it again couldn't
+/// use the cache: its names would be another prefix's (prefixFor), so would
+/// its IR. Kept after its last program goes, the last `retained_max` (a
+/// program loaded once per test...). Optimized code being made when its
+/// program goes is the next load's (orphans).
+pub const ShareKey = [32]u8;
+const SharedAt = struct { key: ShareKey, opt: u32 };
+var shared: std.AutoHashMapUnmanaged(SharedAt, *Compiled) = .empty;
+var retained: std.ArrayListUnmanaged(*Compiled) = .empty;
+const retained_max = 8;
+var orphans: std.AutoHashMapUnmanaged(ShareKey, *Pending) = .empty;
+
+/// The code shared as `key` at level `opt`, for one more program (drop()
+/// it), or null.
+pub fn sharedCode(key: *const ShareKey, opt: u32) ?*Compiled {
+    const c = shared.get(.{ .key = key.*, .opt = opt }) orelse return null;
+    if (c.users == 0) {
+        const i = std.mem.indexOfScalar(*Compiled, retained.items, c).?;
+        _ = retained.orderedRemove(i);
+    }
+    c.users += 1;
+    return c;
+}
+
+/// Whether optimized code is shared as `key`
+pub fn isShared(key: *const ShareKey) bool {
+    return shared.contains(.{ .key = key.*, .opt = 2 });
+}
+
+/// A program's code shared from now as `key`, `refs` (what its compiler
+/// refers into) referenced while it is. Code shared already as `key` at its
+/// level (another load's, compiled meanwhile) stays: `c` is its program's.
+pub fn share(c: *Compiled, key: *const ShareKey, refs: [3]?*PyObject) void {
+    if (c.share_key != null) return;
+    const slot = shared.getOrPut(allocator, .{ .key = key.*, .opt = c.opt }) catch return;
+    if (slot.found_existing) return;
+    slot.value_ptr.* = c;
+    c.share_key = key.*;
+    c.keepRefs(refs);
+}
+
+/// The optimized code a program gone was having made, the caller's from
+/// now, or null.
+pub fn takeOrphan(key: *const ShareKey) ?*Pending {
+    const p = orphans.fetchRemove(key.*) orelse return null;
+    return p.value;
+}
+
 /// The names of a program's compiled code start with: what it is (`seed`:
 /// its language's definition and its source), so its IR, and its objects
 /// in the cache (by their IR), are the same in every process, whatever was
@@ -917,6 +1001,15 @@ pub const Pending = struct {
     pub fn abandon(self: *Pending) void {
         if (self.ready()) return self.drop();
         abandoned.append(allocator, self) catch self.drop();
+    }
+
+    /// Its program gone: the next load's of the program (shared as `key`,
+    /// `refs` what its compiler refers into, referenced from now), unless
+    /// one is waiting already (or `retained_max` are): given up.
+    pub fn orphan(self: *Pending, key: *const ShareKey, refs: [3]?*PyObject) void {
+        if (orphans.contains(key.*) or orphans.count() >= retained_max) return self.abandon();
+        orphans.put(allocator, key.*, self) catch return self.abandon();
+        self.compiled.keepRefs(refs);
     }
 
     /// Freed (its job done)
