@@ -4049,7 +4049,25 @@ pub fn raiseExc(ctx: *Ctx, at: u32, v: Value) bool {
     ctx.exc_kind = kind;
     ctx.exc_msg.clearRetainingCapacity();
     ctx.exc_msg.appendSlice(allocator, str_buf.items) catch {};
-    return fail(ctx, at, "{s}", .{msg.items});
+    // (a zrun.Error raised again: at its own node, where it happened)
+    return fail(ctx, if (kind == .ZrunError) e.node else at, "{s}", .{msg.items});
+}
+
+/// The error being raised, leaving a semantic: a zrun.Error from here (its
+/// node and message the error's), as the reference mode makes an exception
+/// leaving a semantic; an rt.Throw, a zrun.Error already: themselves.
+pub export fn zr_exc_wrap(ctx: *Ctx) callconv(.c) void {
+    if (!ctx.failed or ctx.pending != null or ctx.exc_kind == .Throw or ctx.exc_kind == .ZrunError) return;
+    if (ctx.exc) |e| {
+        gil.allowBegin();
+        defer gil.allowEnd();
+        py.Py_DecRef(e);
+        ctx.exc = null;
+    }
+    if (ctx.exc_value) |v| value.decref(v);
+    ctx.exc_value = null;
+    ctx.exc_kind = null;
+    ctx.exc_msg.clearRetainingCapacity();
 }
 
 /// The error being raised, caught as a value natively (`except ... as e`):
@@ -5412,6 +5430,7 @@ const helper_names = [_][]const u8{
     "zr_lib",
     "zr_sorted",
     "zr_type_name",
+    "zr_exc_wrap",
 };
 
 /// The names compiled code calls them by, and their addresses

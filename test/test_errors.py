@@ -110,6 +110,51 @@ def test_throw_caught_and_uncaught():
                 assert "thrown -7" in str(e)
 
 
+def _mixed_language(inner_native, outer_native):
+    lang = zrun.Language(tiny.PARSER, tiny.RULES)
+    lang.function("FuncDef")
+
+    @lang.exec("Return", native=outer_native)
+    def return_(node, rt):
+        try:
+            v = rt.eval(node.value)
+        except KeyError:
+            # (never: an error leaving a semantic is a zrun.Error)
+            v = "caught as a KeyError"
+        except zrun.Error as e:
+            if rt.eval(node.value.right) == 1:
+                v = "caught: " + e.diagnostic.message
+            else:
+                raise
+        raise rt.Return(v)
+
+    @lang.eval("BinOp", native=inner_native)
+    def binop(node, rt):
+        a = rt.eval(node.left)
+        if a == 1:
+            raise KeyError("out")
+        if a == 2:
+            return [][a]
+        return a
+
+    return lang.load("fn f(a, b) { return a + b; }", "f.tiny")
+
+
+def test_errors_leaving_a_semantic_run_as_python():
+    # (at the node they were raised at, whichever semantics run as Python)
+    for inner in (True, False):
+        for outer in (True, False):
+            p = _mixed_language(inner, outer)
+            for a, b in ((1, 0), (2, 0), (1, 1), (3, 0)):
+                r = {}
+                for mode in ("compiled", "python"):
+                    try:
+                        r[mode] = ("ok", p.call("f", a, b, mode=mode))
+                    except zrun.Error as e:
+                        r[mode] = ("error", str(e).splitlines()[0])
+                assert r["compiled"] == r["python"], (inner, outer, a, b, r)
+
+
 def native_errors_in_python(a, b):
     return ValueError("x", a)
 

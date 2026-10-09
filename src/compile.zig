@@ -1508,6 +1508,7 @@ pub const Compiler = struct {
         .{ "zr_lib", "bpiilplip" },
         .{ "zr_sorted", "bpillllllip" },
         .{ "zr_type_name", "bpillp" },
+        .{ "zr_exc_wrap", "vp" },
         .{ "zr_set_global", "bpilpll" },
         .{ "zr_raise_from", "bpillll" },
         .{ "zr_range", "bpiplp" },
@@ -1888,6 +1889,10 @@ const Inst = struct {
     /// A closure's env: the heap frame of the run it was made in (null:
     /// none, or not a closure)
     env: ?ir.Value = null,
+    /// A run of a semantic (rt.eval, rt.exec), not of a helper: an error
+    /// leaving it is a zrun.Error (an rt.Throw itself), as the reference
+    /// mode makes it (errorTarget)
+    semantic: bool = false,
 };
 
 /// A closure's env as an argument (its front.Function's parameter `own`)
@@ -2083,6 +2088,11 @@ const Gen = struct {
     /// it's the code of
     closure_fn: ?Dyn = null,
     closure_root: ?*const front.Function = null,
+    /// The next run (runBody) is a semantic's (runSemantic: Inst.semantic)
+    semantic_run: bool = false,
+    /// Blocks wrapping an error as it leaves a semantic (errorTarget), by
+    /// where they go on to
+    wrap_blocks: std.AutoHashMapUnmanaged(usize, ir.Block) = .empty,
     out_param: ir.Value = null,
     base_scopes: usize = 0,
     /// While loops being unrolled around the code
@@ -2461,6 +2471,13 @@ const Gen = struct {
                 break;
             }
         };
+        // (to a try's handlers from a semantic run inside its body: the error
+        // a zrun.Error as it leaves that semantic (zr_exc_wrap), as the
+        // reference mode makes it)
+        if (try_fr != null) for (leaving) |inst| if (inst.semantic) {
+            target = try self.wrapBlock(target);
+            break;
+        };
         for (leaving) |inst| if (holdsValues(inst)) {
             target = try self.releaseBlock(inst, null, target);
         };
@@ -2471,6 +2488,21 @@ const Gen = struct {
             break;
         };
         return target;
+    }
+
+    /// A block making the error the zrun.Error it is (zr_exc_wrap), then to
+    /// `next` (one per next)
+    fn wrapBlock(self: *Gen, next: ir.Block) Error!ir.Block {
+        if (self.wrap_blocks.get(@intFromPtr(next))) |b| return b;
+        const f = &self.f;
+        const here = f.current;
+        const b = try f.label("error_leaves_semantic");
+        try self.wrap_blocks.put(self.a(), @intFromPtr(next), b);
+        f.positionAt(b);
+        _ = self.call("zr_exc_wrap", &.{self.ctx});
+        try f.br(next);
+        f.positionAt(here);
+        return b;
     }
 
     /// A block dropping held operands (the last first), then to `next`
@@ -4131,6 +4163,7 @@ const Gen = struct {
     /// it can't be compiled, the compiler learns which semantic (the
     /// innermost) to run as Python instead.
     fn runSemantic(self: *Gen, func: *const front.Function, idx: u32) Error!SVal {
+        self.semantic_run = true;
         return self.runFunction(func, idx, &.{ .{ .node = idx }, .rt }) catch |e| {
             if (e == error.Unsupported and self.c.failed_semantic == null) self.c.failed_semantic = func.py_function;
             return e;
@@ -4928,7 +4961,8 @@ const Gen = struct {
         if (args.len != func.param_count) return self.c.unsupportedAt(func, .{ .line = func.first_line }, "called with {d} arguments, takes {d}", .{ args.len, func.param_count });
         for (args, 0..) |arg, i| locals[i] = .{ .static = arg };
         const inst = try self.a().create(Inst);
-        inst.* = .{ .func = func, .args = args, .node = at, .locals = locals, .exit_label = try self.f.label("ret"), .loop_level0 = self.loop_level };
+        inst.* = .{ .func = func, .args = args, .node = at, .locals = locals, .exit_label = try self.f.label("ret"), .loop_level0 = self.loop_level, .semantic = self.semantic_run };
+        self.semantic_run = false;
         try self.insts.append(self.a(), inst);
         defer _ = self.insts.pop();
         try self.closureLocals(inst);

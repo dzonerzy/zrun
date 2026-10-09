@@ -184,7 +184,13 @@ pub export fn zr_py_semantic(ctx: *Ctx, which: u32, idx: u32, frame_slot: **valu
         asRuntime(rt).ctx = null;
         py.Py_DecRef(rt);
     }
-    const r = py.c.PyObject_CallFunctionObjArgs(func, node, rt, @as(?*PyObject, null)) orelse return fromPythonError(ctx, idx, out);
+    const r = py.c.PyObject_CallFunctionObjArgs(func, node, rt, @as(?*PyObject, null)) orelse {
+        // (an exception leaving the semantic: the zrun.Error it is, as the
+        // reference mode makes it (an rt.Throw itself))
+        const status = fromPythonError(ctx, idx, out);
+        if (status == 0) helpers.zr_exc_wrap(ctx);
+        return status;
+    };
     defer py.Py_DecRef(r);
     if (w == .eval) {
         // (as rt.eval gives it: an int an I64)
@@ -398,24 +404,24 @@ fn raiseCompiledError(ctx: *Ctx) ?*PyObject {
         ctx.clearError();
         return null;
     }
-    // (a Python exception behind it: raised as itself, as in the reference
-    // mode)
-    if (ctx.exc != null or ctx.exc_kind != null) {
+    // (an rt.Throw of the native code's: itself, going on up, with the
+    // zrun.Error it is where it was raised, as recordThrow gives a Python
+    // one)
+    if (ctx.exc_kind == .Throw and ctx.exc_value != null) {
         const e = ctx.exceptionOf() orelse return null;
-        // (an rt.Throw of the native code's: the zrun.Error it is, where it
-        // was raised, as recordThrow gives a Python one)
-        if (ctx.exc_kind == .Throw and ctx.exc_value != null) {
-            const link = linkOf(ctx);
-            if (link.error_object(link.program, ctx.err_node, ctx.err_msg.items, ctx.err_stack.items)) |err| {
-                defer py.Py_DecRef(err);
-                if (py.c.PyObject_SetAttrString(e, "_zrun_error", err) != 0) py.c.PyErr_Clear();
-            } else py.c.PyErr_Clear();
-        }
+        const link = linkOf(ctx);
+        if (link.error_object(link.program, ctx.err_node, ctx.err_msg.items, ctx.err_stack.items)) |err| {
+            defer py.Py_DecRef(err);
+            if (py.c.PyObject_SetAttrString(e, "_zrun_error", err) != 0) py.c.PyErr_Clear();
+        } else py.c.PyErr_Clear();
         py.c.PyErr_SetObject(@ptrCast(@alignCast(ph.typeOf(e))), e);
         py.Py_DecRef(e);
         ctx.clearError();
         return null;
     }
+    // (any other error, a Python exception behind it or not: the zrun.Error
+    // at the node it was raised at, as the reference mode makes an exception
+    // leaving a semantic)
     const link = linkOf(ctx);
     const err = link.error_object(link.program, ctx.err_node, ctx.err_msg.items, ctx.err_stack.items) orelse return null;
     defer py.Py_DecRef(err);
