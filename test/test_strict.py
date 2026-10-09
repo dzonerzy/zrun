@@ -103,8 +103,10 @@ def test_a_semantic_outside_the_subset_refused_when_registered():
 
         @lang.eval("BinOp")
         def binop(node, rt):
-            with open(os.devnull):
-                return 0
+            class Inner:
+                pass
+
+            return 0
 
     with pytest.raises(zrun.CompileError) as e:
 

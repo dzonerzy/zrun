@@ -32,6 +32,7 @@ const value = @import("value.zig");
 const pool = @import("pool.zig");
 const proxies = @import("proxies.zig");
 const gil = @import("gil.zig");
+const set_mod = @import("set.zig");
 
 const Obj = value.Obj;
 const Value = value.Value;
@@ -226,7 +227,8 @@ inline fn eachChild(o: *Obj, ctx: anytype, comptime f: anytype) void {
     switch (o.kind) {
         @intFromEnum(Tag.list) => for (@as(*value.List, @ptrCast(@alignCast(o))).slice()) |v| child(v, ctx, f),
         @intFromEnum(Tag.tuple) => for (@as(*value.Tuple, @ptrCast(@alignCast(o))).slice()) |v| child(v, ctx, f),
-        @intFromEnum(Tag.dict), @intFromEnum(Tag.set) => {
+        @intFromEnum(Tag.set) => for (@as(*set_mod.Set, @ptrCast(@alignCast(o))).entries()) |e| if (set_mod.isItem(e)) child(e.key, ctx, f),
+        @intFromEnum(Tag.dict) => {
             const d: *value.Dict = @ptrCast(@alignCast(o));
             if (d.entries) |es| for (es[0..d.used]) |e| {
                 if (e.key.tag == value.DELETED) continue;
@@ -435,7 +437,8 @@ fn references(o: *Obj, out: *std.ArrayListUnmanaged(Value)) !void {
     switch (o.kind) {
         @intFromEnum(Tag.list) => for (@as(*value.List, @ptrCast(@alignCast(o))).slice()) |v| try Add.value_(out, v),
         @intFromEnum(Tag.tuple) => for (@as(*value.Tuple, @ptrCast(@alignCast(o))).slice()) |v| try Add.value_(out, v),
-        @intFromEnum(Tag.dict), @intFromEnum(Tag.set) => {
+        @intFromEnum(Tag.set) => for (@as(*set_mod.Set, @ptrCast(@alignCast(o))).entries()) |e| if (set_mod.isItem(e)) try Add.value_(out, e.key),
+        @intFromEnum(Tag.dict) => {
             const d: *value.Dict = @ptrCast(@alignCast(o));
             if (d.entries) |es| for (es[0..d.used]) |e| {
                 if (e.key.tag == value.DELETED) continue;

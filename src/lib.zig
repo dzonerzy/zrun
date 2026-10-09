@@ -3743,6 +3743,7 @@ fn moduleInit(module: *PyObject) callconv(.c) c_int {
     @import("bytes.zig").init(module) catch return -1;
     @import("native.zig").init(module) catch return -1;
     helpers.init() catch return -1;
+    @import("set.zig").init();
     name_program = ph.newString("<program>") orelse return -1;
     CallerType = py.c.PyType_FromSpec(&caller_spec) orelse return -1;
     // (compiled code words Python's errors as the reference mode does)

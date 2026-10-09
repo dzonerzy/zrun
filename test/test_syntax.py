@@ -2,6 +2,8 @@
 `raise ... from ...`, `import` inside a semantic, `*args` in calls. Each the
 same as the reference mode; those native in strict mode too."""
 
+from dataclasses import dataclass, field
+
 import pytest
 import zrun
 from test_intrinsics import _program, outcome, same_in_both
@@ -141,6 +143,99 @@ def unrolled_jumps(a, b):
 def test_break_and_continue_in_unrolled_loops():
     same_in_both(_program(unrolled_jumps), [(0, 0), (2, 3), (1, 1), (3, 4)])
     assert _program(unrolled_jumps, strict=True).call("f", 2, 3) == unrolled_jumps(2, 3)
+
+
+@dataclass
+class Tracker:
+    log: list
+    suppress: bool = False
+
+    def __enter__(self):
+        self.log.append("enter")
+        return len(self.log)
+
+    def __exit__(self, kind, exc, tb):
+        self.log.append("exit " + ("none" if kind is None else kind.__name__))
+        return self.suppress
+
+
+def using(a, b):
+    log = []
+    with Tracker(log) as n:
+        log.append(n)
+    with Tracker(log, True):
+        if a == 0:
+            raise ValueError("swallowed")
+        log.append("body")
+    for i in range(3):
+        with Tracker(log), Tracker(log) as m:
+            if i == b:
+                break
+            log.append(m)
+    if a == 1:
+        with Tracker(log):
+            raise KeyError("out")
+    return log
+
+
+def returning(a, b):
+    log = []
+    t = Tracker(log)
+    with t:
+        if a:
+            return log
+        log.append("after")
+    return log
+
+
+def test_with():
+    same_in_both(_program(using), [(0, 1), (1, 0), (2, 5)])
+    same_in_both(_program(returning), [(0, 0), (1, 0)])
+    assert _program(returning).call("f", 1, 0, mode="compiled") == ["enter", "exit none"]
+
+
+def test_with_a_record_in_strict_mode():
+    def strict_with(a, b):
+        log = []
+        with Tracker(log) as n:
+            log.append(n + a)
+        return log
+
+    same_in_both(_program(strict_with), [(1, 0)])
+    assert _program(strict_with, strict=True).call("f", 1, 0) == strict_with(1, 0)
+
+
+@dataclass
+class Point:
+    x: int
+    y: int = 0
+    tags: list = field(default_factory=list)
+
+
+def records(a, b):
+    p = Point(a)
+    q = Point(a, y=b)
+    r = Point(y=a, x=b)
+    q.tags.append(1)
+    return (p.x, p.y, p.tags, q.y, q.tags, r.x, r.y, p.tags is q.tags)
+
+
+def test_dataclass_keywords_and_defaults():
+    same_in_both(_program(records), [(1, 2), (5, -3)])
+    assert _program(records, strict=True).call("f", 1, 2) == records(1, 2)
+
+
+def python_manager(a, b):
+    import contextlib
+
+    out = []
+    with contextlib.suppress(ZeroDivisionError):
+        out.append(a / b)
+    return out
+
+
+def test_with_a_python_context_manager():
+    same_in_both(_program(python_manager), [(1, 2), (1, 0)])
 
 
 def add3(x, y, z):

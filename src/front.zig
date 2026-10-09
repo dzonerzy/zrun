@@ -4,15 +4,16 @@
 //! partial evaluator specializes for each program.
 //!
 //! The subset: values (int, float, str, bool, None, lists, tuples, dicts,
-//! records), assignment (also to fields and items, augmented), if, while,
-//! for, break, continue, return, raise (rt's control flow and errors),
-//! assert, pass, try, del, import, a def called where it's defined;
-//! expressions with operators, comparisons, conditional expressions,
-//! comprehensions, f-strings and `:=`; calls (rt, other semantics, helper
-//! functions of the module, records, builtins, methods of values), `*args`
-//! among their arguments. Outside it: with, lambda, a def used as a value,
-//! a nested class, yield, await, global and nonlocal. A construct outside
-//! the subset is an error at its line, when the semantic is registered.
+//! sets, records), assignment (also to fields and items, augmented), if,
+//! while, for, break, continue, return, raise (rt's control flow and
+//! errors), assert, pass, try, with, del, import, global, nonlocal, nested
+//! defs and lambdas (closures); expressions with operators, comparisons,
+//! conditional expressions, comprehensions, f-strings and `:=`; calls (rt,
+//! other semantics, helper functions of the module, records, builtins,
+//! methods of values), `*args` among their arguments. Outside it: a nested
+//! class, yield, await, match, defaults and *args of nested functions. A
+//! construct outside the subset is an error at its line, when the semantic
+//! is registered.
 //!
 //! Module-level names (helper functions, record classes, constants) are
 //! kept by name: they are resolved when a program is compiled, since a
@@ -83,6 +84,10 @@ pub const Expr = struct {
         cond: struct { test_: *Expr, then: *Expr, else_: *Expr },
         list: []const *Expr,
         tuple: []const *Expr,
+        /// `{a, b}`; `folded`: made as CPython makes one of more than two
+        /// constants (a frozenset of them first, copied)
+        set_: struct { items: []const *Expr, folded: bool },
+        set_comp: Comp,
         dict: struct { keys: []const *Expr, values: []const *Expr },
         list_comp: Comp,
         /// (x for ...): the list it gives, compiled (all() and any() of
@@ -623,6 +628,14 @@ const Reader = struct {
             const t = ph.attr(s, "target") orelse return error.Python;
             defer py.Py_DecRef(t);
             try self.collectTarget(t);
+        } else if (eq(k, "With")) {
+            const items = try listAttr(s, "items");
+            defer py.Py_DecRef(items);
+            for (0..@intCast(py.c.PyList_Size(items))) |i| {
+                const v = ph.attr(py.c.PyList_GetItem(items, @intCast(i)).?, "optional_vars") orelse return error.Python;
+                defer py.Py_DecRef(v);
+                if (v != py.Py_None()) try self.collectTarget(v);
+            }
         }
         inline for (.{ "body", "orelse", "finalbody" }) |f| {
             if (py.c.PyObject_HasAttrString(s, f) == 1) {
@@ -843,6 +856,13 @@ const Reader = struct {
             if (eq(k, "Pass")) break :blk .pass;
             // (read before the body: scopeDecls)
             if (eq(k, "Global") or eq(k, "Nonlocal")) break :blk .pass;
+            if (eq(k, "With")) {
+                const items = try listAttr(s, "items");
+                defer py.Py_DecRef(items);
+                const body = try listAttr(s, "body");
+                defer py.Py_DecRef(body);
+                break :blk .{ .seq = try self.withItems(items, 0, body, pos) };
+            }
             // (a def inside: read as a function of its own; nothing to run
             // where it's defined)
             if (eq(k, "FunctionDef")) {
@@ -852,6 +872,98 @@ const Reader = struct {
             return self.unsupported(pos, "{s} can't be compiled", .{stmtName(k)});
         };
         return .{ .pos = pos, .kind = kind };
+    }
+
+    /// `with item[i], ...: body`, as PEP 343 runs it (the rest of the items
+    /// inside, in turn):
+    ///
+    ///     mgr = EXPR
+    ///     value = mgr.__enter__()
+    ///     normal = True
+    ///     try:
+    ///         try:
+    ///             VAR = value
+    ///             BODY
+    ///         except BaseException as e:
+    ///             normal = False
+    ///             if not mgr.__exit__(type(e), e, e.__traceback__):
+    ///                 raise
+    ///     finally:
+    ///         if normal:
+    ///             mgr.__exit__(None, None, None)
+    ///
+    /// (the methods called as methods: a record's compiled, as any; its
+    /// variables locals of their own, named so no Python name is them)
+    fn withItems(self: *Reader, items: *PyObject, i: usize, body: *PyObject, pos: Pos) ReadError![]const Stmt {
+        const n: usize = @intCast(py.c.PyList_Size(items));
+        if (i == n) return self.stmtList(body);
+        const item = py.c.PyList_GetItem(items, @intCast(i)).?;
+        const id = self.locals.items.len;
+        const mgr = try self.declare(try std.fmt.allocPrint(self.alloc(), "<with {d} mgr>", .{id}));
+        const val = try self.declare(try std.fmt.allocPrint(self.alloc(), "<with {d} value>", .{id}));
+        const normal = try self.declare(try std.fmt.allocPrint(self.alloc(), "<with {d} normal>", .{id}));
+        const exc = try self.declare(try std.fmt.allocPrint(self.alloc(), "<with {d} exc>", .{id}));
+        const B = struct {
+            r: *Reader,
+            pos: Pos,
+            fn e(b: @This(), kind: Expr.Kind) ReadError!*Expr {
+                return b.r.new(b.pos, kind);
+            }
+            fn local(b: @This(), slot: u32) ReadError!*Expr {
+                return b.e(.{ .local = slot });
+            }
+            fn call(b: @This(), func: *Expr, args: []const *Expr) ReadError!*Expr {
+                return b.e(.{ .call = .{ .func = func, .args = try b.r.alloc().dupe(*Expr, args), .keywords = &.{} } });
+            }
+            fn typeOf(b: @This(), x: *Expr) ReadError!*Expr {
+                return b.call(try b.e(.{ .global = "type" }), &.{x});
+            }
+            fn assign(b: @This(), slot: u32, v: *Expr) ReadError!Stmt {
+                const ts = try b.r.alloc().alloc(Target, 1);
+                ts[0] = .{ .local = slot };
+                return .{ .pos = b.pos, .kind = .{ .assign = .{ .targets = ts, .value = v } } };
+            }
+            fn list(b: @This(), stmts: []const Stmt) ReadError![]const Stmt {
+                return b.r.alloc().dupe(Stmt, stmts);
+            }
+        };
+        const b = B{ .r = self, .pos = pos };
+        // (the item's expression and target, read in the function's scope)
+        const ctx_e = try self.exprAttr(item, "context_expr");
+        const vars = ph.attr(item, "optional_vars") orelse return error.Python;
+        defer py.Py_DecRef(vars);
+        const target_ = if (vars == py.Py_None()) null else try self.target(vars);
+        // The inner try's body: VAR = value, the rest
+        const rest = try self.withItems(items, i + 1, body, pos);
+        var inner: std.ArrayList(Stmt) = .empty;
+        if (target_) |t| {
+            const ts = try self.alloc().alloc(Target, 1);
+            ts[0] = t;
+            try inner.append(self.alloc(), .{ .pos = pos, .kind = .{ .assign = .{ .targets = ts, .value = try b.local(val) } } });
+        }
+        try inner.appendSlice(self.alloc(), rest);
+        // except BaseException as e: normal = False; if not exit(...): raise
+        const exit_m = try b.e(.{ .attr = .{ .obj = try b.local(mgr), .name = "__exit__" } });
+        const exit_call = try b.call(exit_m, &.{ try b.typeOf(try b.local(exc)), try b.local(exc), try b.e(.{ .attr = .{ .obj = try b.local(exc), .name = "__traceback__" } }) });
+        const reraise = try b.list(&.{.{ .pos = pos, .kind = .{ .raise_ = null } }});
+        const handler_body = try b.list(&.{
+            try b.assign(normal, try b.e(.{ .bool = false })),
+            .{ .pos = pos, .kind = .{ .if_ = .{ .test_ = try b.e(.{ .unary = .{ .op = .not_, .operand = exit_call } }), .body = reraise, .else_ = &.{} } } },
+        });
+        const handlers = try self.alloc().alloc(Handler, 1);
+        handlers[0] = .{ .pos = pos, .type_ = try b.e(.{ .global = "BaseException" }), .name = exc, .body = handler_body };
+        const inner_try = Stmt{ .pos = pos, .kind = .{ .try_ = .{ .body = inner.items, .handlers = handlers, .else_ = &.{}, .finally = &.{} } } };
+        // finally: if normal: exit(mgr, None, None, None)
+        const none = try b.e(.none);
+        const normal_exit = try b.list(&.{.{ .pos = pos, .kind = .{ .expr = try b.call(try b.e(.{ .attr = .{ .obj = try b.local(mgr), .name = "__exit__" } }), &.{ none, none, none }) } }});
+        const finally = try b.list(&.{.{ .pos = pos, .kind = .{ .if_ = .{ .test_ = try b.local(normal), .body = normal_exit, .else_ = &.{} } } }});
+        const outer_try = Stmt{ .pos = pos, .kind = .{ .try_ = .{ .body = try b.list(&.{inner_try}), .handlers = &.{}, .else_ = &.{}, .finally = finally } } };
+        return b.list(&.{
+            try b.assign(mgr, ctx_e),
+            try b.assign(val, try b.call(try b.e(.{ .attr = .{ .obj = try b.local(mgr), .name = "__enter__" } }), &.{})),
+            try b.assign(normal, try b.e(.{ .bool = true })),
+            outer_try,
+        });
     }
 
     /// A def inside the function: read as a function of its own
@@ -1192,6 +1304,24 @@ const Reader = struct {
         if (eq(k, "IfExp")) return self.new(pos, .{ .cond = .{ .test_ = try self.exprAttr(e, "test"), .then = try self.exprAttr(e, "body"), .else_ = try self.exprAttr(e, "orelse") } });
         if (eq(k, "List")) return self.new(pos, .{ .list = try self.exprList(e, "elts") });
         if (eq(k, "Tuple")) return self.new(pos, .{ .tuple = try self.exprList(e, "elts") });
+        if (eq(k, "Set")) {
+            // (more than two constants: CPython makes a frozenset of them,
+            // the set its copy: its table as that makes it)
+            const elts = try listAttr(e, "elts");
+            defer py.Py_DecRef(elts);
+            const n: usize = @intCast(py.c.PyList_Size(elts));
+            var folded = n > 2;
+            for (0..n) |i| {
+                if (!try isConstant(py.c.PyList_GetItem(elts, @intCast(i)).?)) folded = false;
+            }
+            return self.new(pos, .{ .set_ = .{ .items = try self.exprList(e, "elts"), .folded = folded } });
+        }
+        if (eq(k, "SetComp")) {
+            const mark = self.comp_scope.items.len;
+            defer self.comp_scope.shrinkRetainingCapacity(mark);
+            const gens = try self.generators(e);
+            return self.new(pos, .{ .set_comp = .{ .elt = try self.exprAttr(e, "elt"), .generators = gens } });
+        }
         if (eq(k, "Dict")) {
             const keys_l = try listAttr(e, "keys");
             defer py.Py_DecRef(keys_l);
@@ -1669,6 +1799,17 @@ const Dumper = struct {
                 try self.list(items);
                 try self.print(")", .{});
             },
+            .set_ => |s| {
+                try self.print("{{", .{});
+                try self.list(s.items);
+                try self.print("}}", .{});
+            },
+            .set_comp => |c| {
+                try self.print("{{", .{});
+                try self.expr(c.elt);
+                try self.generators(c.generators);
+                try self.print("}}", .{});
+            },
             .dict => |d| {
                 try self.print("{{", .{});
                 for (d.keys, d.values, 0..) |k, v, i| {
@@ -1758,6 +1899,34 @@ fn kindOf(obj: *PyObject) ReadError![]const u8 {
 
 fn isKind(obj: *PyObject, name: []const u8) ReadError!bool {
     return eq(try kindOf(obj), name);
+}
+
+/// Whether CPython's compiler takes an expression for a constant (its AST
+/// optimizer folds it): a literal, a sign before a number, a tuple of them
+fn isConstant(e: *PyObject) ReadError!bool {
+    const k = try kindOf(e);
+    if (eq(k, "Constant")) return true;
+    if (eq(k, "UnaryOp")) {
+        const op = ph.attr(e, "op") orelse return error.Python;
+        defer py.Py_DecRef(op);
+        const ok = try kindOf(op);
+        if (!eq(ok, "USub") and !eq(ok, "UAdd")) return false;
+        const x = ph.attr(e, "operand") orelse return error.Python;
+        defer py.Py_DecRef(x);
+        if (!try isKind(x, "Constant")) return false;
+        const v = ph.attr(x, "value") orelse return error.Python;
+        defer py.Py_DecRef(v);
+        return py.PyLong_Check(v) or py.PyFloat_Check(v);
+    }
+    if (eq(k, "Tuple")) {
+        const elts = try listAttr(e, "elts");
+        defer py.Py_DecRef(elts);
+        for (0..@intCast(py.c.PyList_Size(elts))) |i| {
+            if (!try isConstant(py.c.PyList_GetItem(elts, @intCast(i)).?)) return false;
+        }
+        return true;
+    }
+    return false;
 }
 
 fn listAttr(obj: *PyObject, name: [*:0]const u8) ReadError!*PyObject {

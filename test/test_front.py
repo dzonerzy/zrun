@@ -35,11 +35,11 @@ class TestSubset:
         "source, reason",
         [
             ("    f = lambda x=1: x\n", "a lambda's parameters must be plain ones (no defaults, keyword-only or positional-only ones)"),
-            ("    with open('x') as f:\n        pass\n", "`with` can't be compiled"),
+            ("    f = lambda *a: a\n", "a lambda's *args and **kwargs can't be compiled"),
             ("    f = inner\n    def inner():\n        pass\n", "the nested function inner used before its def can't be compiled"),
             ("    @staticmethod\n    def inner():\n        pass\n", "a nested def with decorators can't be compiled"),
             ("    class Inner:\n        pass\n", "a nested `class` can't be compiled"),
-            ("    return {1, 2}\n", "a set can't be compiled"),
+            ("    match node:\n        case 1:\n            pass\n", "`match` can't be compiled"),
             ("    return [*node.children]\n", "*unpacking can't be compiled"),
             ("    return node @ rt\n", "the operator MatMult can't be compiled"),
             ("    yield 1\n", "`yield` can't be compiled"),
@@ -66,13 +66,13 @@ class TestSubset:
     def test_the_line_in_a_real_file(self):
         def semantic(node, rt):
             x = 1
-            with open("f") as f:
-                x = 2
+            class Inner:
+                pass
             return x
 
         with pytest.raises(zrun.CompileError) as e:
             lang().ir(semantic)
-        assert e.value.line == line_of(semantic, "with ") and e.value.column == 13
+        assert e.value.line == line_of(semantic, "class ") and e.value.column == 13
 
     def test_parameters(self):
         def defaults(node, rt=None):

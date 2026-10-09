@@ -22,6 +22,7 @@ const proxies = @import("proxies.zig");
 const bytes_mod = @import("bytes.zig");
 const gil = @import("gil.zig");
 const gc = @import("gc.zig");
+const set_mod = @import("set.zig");
 
 /// What values are made with (and freed with: anything making one
 /// elsewhere uses it too)
@@ -546,13 +547,14 @@ pub const Freezer = struct {
         switch (tag) {
             .list => for (@as(*List, @ptrCast(@alignCast(o))).slice()) |x| try self.value(x),
             .tuple => for (@as(*Tuple, @ptrCast(@alignCast(o))).slice()) |x| try self.value(x),
-            .dict, .set => {
+            .dict => {
                 const d: *Dict = @ptrCast(@alignCast(o));
                 if (d.entries) |es| for (es[0..d.used]) |e| {
                     try self.value(e.key);
                     try self.value(e.value);
                 };
             },
+            .set => for (@as(*set_mod.Set, @ptrCast(@alignCast(o))).entries()) |e| if (set_mod.isItem(e)) try self.value(e.key),
             .record => for (@as(*Record, @ptrCast(@alignCast(o))).fields()) |x| if (x.tag != UNSET_TAG) try self.value(x),
             .function => if (@as(*Function, @ptrCast(@alignCast(o))).env) |e| try self.frame(e),
             .closure => if (@as(*Closure, @ptrCast(@alignCast(o))).env) |e| try self.frame(e),
@@ -579,7 +581,8 @@ fn dropReferences(o: *Obj) void {
     switch (o.kind) {
         @intFromEnum(Tag.list) => for (@as(*List, @ptrCast(@alignCast(o))).slice()) |item| decref(item),
         @intFromEnum(Tag.tuple) => for (@as(*Tuple, @ptrCast(@alignCast(o))).slice()) |item| decref(item),
-        @intFromEnum(Tag.dict), @intFromEnum(Tag.set) => {
+        @intFromEnum(Tag.set) => for (@as(*set_mod.Set, @ptrCast(@alignCast(o))).entries()) |e| if (set_mod.isItem(e)) decref(e.key),
+        @intFromEnum(Tag.dict) => {
             const d: *Dict = @ptrCast(@alignCast(o));
             if (d.entries) |es| for (es[0..d.used]) |e| {
                 if (e.key.tag == DELETED) continue;
@@ -612,7 +615,11 @@ pub fn freeBlock(o: *Obj) void {
             gc.free(o, list_block);
         },
         @intFromEnum(Tag.tuple) => gc.free(o, @sizeOf(Tuple) + @as(*Tuple, @ptrCast(@alignCast(o))).len * @sizeOf(Value)),
-        @intFromEnum(Tag.dict), @intFromEnum(Tag.set) => {
+        @intFromEnum(Tag.set) => {
+            set_mod.freeTable(@ptrCast(@alignCast(o)));
+            gc.free(o, @sizeOf(set_mod.Set));
+        },
+        @intFromEnum(Tag.dict) => {
             const d: *Dict = @ptrCast(@alignCast(o));
             if (d.entries) |es| allocator.free(es[0..d.cap]);
             if (d.index) |ix| allocator.free(ix[0 .. d.cap * 2]);
@@ -807,23 +814,6 @@ pub fn newDict() ?*Dict {
     return d;
 }
 
-/// An empty set (a Dict of kind set: its keys the items)
-pub fn newSet() ?*Dict {
-    const d = newDict() orelse return null;
-    d.head.kind = @intFromEnum(Tag.set);
-    return d;
-}
-
-/// s.add(x) (borrowed)
-pub fn setAdd(s: *Dict, x: Value) bool {
-    if (dictFind(s, x, hash(x)) != null) return true;
-    return dictSet(s, x, Value.none_v);
-}
-
-pub fn setHas(s: *Dict, x: Value) bool {
-    return dictFind(s, x, hash(x)) != null;
-}
-
 // ----------------------------------------------------------------------
 // Type names, truth, equality, hashing (Python's)
 // ----------------------------------------------------------------------
@@ -862,7 +852,8 @@ pub fn truthy(v: Value) bool {
         .str => @as(*Str, @ptrCast(v.ptr())).len != 0,
         .list => @as(*List, @ptrCast(@alignCast(v.ptr()))).len != 0,
         .tuple => @as(*Tuple, @ptrCast(@alignCast(v.ptr()))).len != 0,
-        .dict, .set => @as(*Dict, @ptrCast(@alignCast(v.ptr()))).len != 0,
+        .dict => @as(*Dict, @ptrCast(@alignCast(v.ptr()))).len != 0,
+        .set => @as(*set_mod.Set, @ptrCast(@alignCast(v.ptr()))).used != 0,
         .host => blk: {
             gil.ensure(@src());
             break :blk py.c.PyObject_IsTrue(@ptrFromInt(v.bits)) == 1;
@@ -1103,11 +1094,9 @@ pub fn equal(a: Value, b: Value) bool {
         .node => a.bits == b.bits,
         // (the same items)
         .set => blk: {
-            const x: *Dict = @ptrCast(@alignCast(a.ptr()));
-            const y: *Dict = @ptrCast(@alignCast(b.ptr()));
-            if (x.len != y.len) break :blk false;
-            for (dictEntries(x)) |e| if (!isDeleted(e) and !setHas(y, e.key)) break :blk false;
-            break :blk true;
+            const x: *set_mod.Set = @ptrCast(@alignCast(a.ptr()));
+            const y: *set_mod.Set = @ptrCast(@alignCast(b.ptr()));
+            break :blk x.used == y.used and set_mod.isSubset(x, y);
         },
         else => a.bits == b.bits,
     };
@@ -1361,11 +1350,10 @@ pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
         .function => return objects.newNativeFunction(@ptrCast(@alignCast(v.ptr())), nodeObject.owner),
         // (a set: a Python set of its items, a copy)
         .set => {
-            const s: *Dict = @ptrCast(@alignCast(v.ptr()));
             const out = py.c.PySet_New(null) orelse return null;
-            for (dictEntries(s)) |e| {
-                if (isDeleted(e)) continue;
-                const o = toPython(e.key, nodeObject) orelse {
+            var it = set_mod.iterate(@ptrCast(@alignCast(v.ptr())));
+            while (it.next()) |x| {
+                const o = toPython(x, nodeObject) orelse {
                     py.Py_DecRef(out);
                     return null;
                 };

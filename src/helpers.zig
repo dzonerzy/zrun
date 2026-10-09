@@ -503,6 +503,7 @@ export fn zr_binary(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u6
     const a = Value{ .tag = ta, .bits = ba };
     const b = Value{ .tag = tb, .bits = bb };
     const op: Op = @enumFromInt(op_code);
+    if (setBinary(ctx, node, op, a, b, out)) |ok| return ok;
     // (a Big among ints: in 128 bits)
     if ((a.kind() == .big or b.kind() == .big) and value.wide(a) != null and value.wide(b) != null) return wideBinary(ctx, node, op, a, b, out);
     if (isInt(a) and isInt(b)) {
@@ -990,7 +991,10 @@ export fn zr_compare(ctx: *Ctx, node: u32, cmp_code: u32, ta: u64, ba: u64, tb: 
             out.* = Value.boolean(if (cmp == .is) same else !same);
             return true;
         },
-        .lt, .le, .gt, .ge => if (orderOf(a, b)) |order| {
+        .lt, .le, .gt, .ge => if (setOrder(cmp, a, b)) |r| {
+            out.* = Value.boolean(r);
+            return true;
+        } else if (orderOf(a, b)) |order| {
             const r = switch (order) {
                 // (NaN: every comparison false)
                 .unordered => false,
@@ -1057,6 +1061,10 @@ fn contains(a: Value, b: Value) ?bool {
         .dict => {
             if (!value.hashable(a)) return null;
             return value.dictGet(@ptrCast(@alignCast(b.ptr())), a) != null;
+        },
+        .set => {
+            if (!value.hashable(a)) return null;
+            return set_mod.contains(setOf(b), a);
         },
         .str => {
             if (a.kind() != .str) return null;
@@ -1245,6 +1253,299 @@ fn callClosure(ctx: *Ctx, node: u32, c: *value.Closure, args: []const Value, out
         0 => false,
         else => fail(ctx, node, "rt.Return, rt.Break or rt.Continue raised out of a function a semantic made", .{}),
     };
+}
+
+// ----------------------------------------------------------------------
+// Sets (set.zig: CPython's table, its order)
+// ----------------------------------------------------------------------
+
+const set_mod = @import("set.zig");
+
+fn setOf(v: Value) *set_mod.Set {
+    return @ptrCast(@alignCast(v.ptr()));
+}
+
+fn unhashableItem(ctx: *Ctx, node: u32, v: Value) bool {
+    // (a Python object: its class's name, Python's)
+    if (v.kind() == .host) {
+        gil.allowBegin();
+        defer gil.allowEnd();
+        const t: *PyObject = @ptrCast(@alignCast(ph.typeOf(@ptrFromInt(v.bits))));
+        if (ph.attr(t, "__name__")) |n| {
+            defer py.Py_DecRef(n);
+            if (ph.utf8(n, "name")) |s| return failAs(ctx, node, py.PyExc_TypeError(), null, "unhashable type: '{s}'", .{s});
+        }
+        py.c.PyErr_Clear();
+    }
+    return failAs(ctx, node, py.PyExc_TypeError(), null, "unhashable type: '{s}'", .{value.typeName(v)});
+}
+
+/// `{a, b, ...}` (the items borrowed), added in turn; `folded`: as CPython
+/// makes one of constants (a frozenset of them, copied)
+export fn zr_set(ctx: *Ctx, node: u32, items: [*]const Value, n: u64, folded: u32, out: *Value) callconv(.c) bool {
+    for (items[0..n]) |x| if (!value.hashable(x)) return unhashableItem(ctx, node, x);
+    var s = set_mod.new() orelse return oomFail(ctx, node);
+    for (items[0..n]) |x| if (!set_mod.add(s, x)) {
+        value.decref(Value.obj(.set, &s.head));
+        return oomFail(ctx, node);
+    };
+    if (folded != 0) {
+        const c = set_mod.copy(s);
+        value.decref(Value.obj(.set, &s.head));
+        s = c orelse return oomFail(ctx, node);
+    }
+    out.* = Value.obj(.set, &s.head);
+    return true;
+}
+
+/// v's items added to s, as set.update(v) adds them (a set's merged, a
+/// dict's keys after one resize, anything else's in turn)
+fn setUpdate(ctx: *Ctx, node: u32, s: *set_mod.Set, v: Value) bool {
+    switch (v.kind()) {
+        .set => return set_mod.merge(s, setOf(v)) or oomFail(ctx, node),
+        .dict => {
+            const d: *value.Dict = @ptrCast(@alignCast(v.ptr()));
+            var keys: std.ArrayListUnmanaged(Value) = .empty;
+            defer keys.deinit(allocator);
+            for (value.dictEntries(d)) |e| if (!value.isDeleted(e)) keys.append(allocator, e.key) catch return oomFail(ctx, node);
+            return set_mod.mergeKeys(s, keys.items) or oomFail(ctx, node);
+        },
+        else => {
+            var l = Value.none_v;
+            if (!zr_items(ctx, node, v.tag, v.bits, &l)) return false;
+            defer value.decref(l);
+            for (@as(*value.List, @ptrCast(@alignCast(l.ptr()))).slice()) |x| {
+                if (!value.hashable(x)) return unhashableItem(ctx, node, x);
+                if (!set_mod.add(s, x)) return oomFail(ctx, node);
+            }
+            return true;
+        },
+    }
+}
+
+/// A set of v's items (set(v), a set comprehension's list)
+fn newSetOf(ctx: *Ctx, node: u32, v: Value) ?*set_mod.Set {
+    const s = set_mod.new() orelse {
+        _ = oomFail(ctx, node);
+        return null;
+    };
+    if (!setUpdate(ctx, node, s, v)) {
+        value.decref(Value.obj(.set, &s.head));
+        return null;
+    }
+    return s;
+}
+
+export fn zr_to_set(ctx: *Ctx, node: u32, t: u64, bits: u64, out: *Value) callconv(.c) bool {
+    const s = newSetOf(ctx, node, .{ .tag = t, .bits = bits }) orelse return false;
+    out.* = Value.obj(.set, &s.head);
+    return true;
+}
+
+fn setResult(ctx: *Ctx, node: u32, s: ?*set_mod.Set, out: *Value) bool {
+    const r = s orelse return oomFail(ctx, node);
+    out.* = Value.obj(.set, &r.head);
+    return true;
+}
+
+/// A set's method, natively (null: not one of those; Python's then). Its
+/// errors that Python words (a missing item's KeyError) are Python's, on a
+/// copy: nothing changed by then.
+fn setMethod(ctx: *Ctx, node: u32, v: Value, name: []const u8, args: []const Value, out: *Value) ?bool {
+    const s = setOf(v);
+    const eq = std.mem.eql;
+    const python = struct {
+        fn call(c: *Ctx, n: u32, sv: Value, nm: []const u8, a: []const Value, o: *Value) bool {
+            gil.allowBegin();
+            defer gil.allowEnd();
+            const str = value.newStr(nm) orelse return oomFail(c, n);
+            defer value.decref(Value.obj(.str, &str.head));
+            return callMethodPython(c, n, sv, str, a, o);
+        }
+    };
+    out.* = Value.none_v;
+    if (args.len == 1 and (eq(u8, name, "add") or eq(u8, name, "discard") or eq(u8, name, "remove"))) {
+        const x = args[0];
+        if (!value.hashable(x)) return unhashableItem(ctx, node, x);
+        if (eq(u8, name, "add")) return set_mod.add(s, x) or oomFail(ctx, node);
+        if (set_mod.discard(s, x) or eq(u8, name, "discard")) return true;
+        return python.call(ctx, node, v, name, args, out);
+    }
+    if (args.len == 0) {
+        if (eq(u8, name, "pop")) {
+            out.* = set_mod.pop(s) orelse return python.call(ctx, node, v, name, args, out);
+            return true;
+        }
+        if (eq(u8, name, "clear")) return set_mod.clear(s) or oomFail(ctx, node);
+        if (eq(u8, name, "copy")) return setResult(ctx, node, set_mod.copy(s), out);
+    }
+    if (eq(u8, name, "update")) {
+        for (args) |x| if (!setUpdate(ctx, node, s, x)) return false;
+        return true;
+    }
+    if (eq(u8, name, "union")) {
+        const r = set_mod.copy(s) orelse return oomFail(ctx, node);
+        out.* = Value.obj(.set, &r.head);
+        for (args) |x| if (!setUpdate(ctx, node, r, x)) return false;
+        return true;
+    }
+    if (args.len != 1) return null;
+    const other = args[0];
+    // (another iterable's items, in its order, for what Python goes over
+    // them for: intersection, difference)
+    if (other.kind() != .set and (eq(u8, name, "intersection") or eq(u8, name, "difference") or eq(u8, name, "intersection_update") or eq(u8, name, "difference_update"))) {
+        var l = Value.none_v;
+        if (!zr_items(ctx, node, other.tag, other.bits, &l)) return false;
+        defer value.decref(l);
+        const items = @as(*value.List, @ptrCast(@alignCast(l.ptr()))).slice();
+        for (items) |x| if (!value.hashable(x)) return unhashableItem(ctx, node, x);
+        if (eq(u8, name, "intersection")) return setResult(ctx, node, set_mod.intersectionItems(s, items), out);
+        if (eq(u8, name, "intersection_update")) return set_mod.intersectionUpdateItems(s, items) or oomFail(ctx, node);
+        if (eq(u8, name, "difference_update")) return set_mod.differenceUpdateItems(s, items) or oomFail(ctx, node);
+        // (a copy less them: Python's way with an iterable)
+        const r = set_mod.copy(s) orelse return oomFail(ctx, node);
+        out.* = Value.obj(.set, &r.head);
+        return set_mod.differenceUpdateItems(r, items) or oomFail(ctx, node);
+    }
+    // (the other one a set: Python's way with sets; another iterable made
+    // one first, where Python's result is the same)
+    const os: *set_mod.Set = if (other.kind() == .set) setOf(other) else newSetOf(ctx, node, other) orelse return false;
+    defer if (other.kind() != .set) value.decref(Value.obj(.set, &os.head));
+    if (eq(u8, name, "intersection")) return setResult(ctx, node, set_mod.intersection(s, os), out);
+    if (eq(u8, name, "difference")) return setResult(ctx, node, set_mod.difference(s, os), out);
+    if (eq(u8, name, "symmetric_difference")) return setResult(ctx, node, set_mod.symmetricDifference(s, os), out);
+    if (eq(u8, name, "intersection_update")) return set_mod.intersectionUpdate(s, os) or oomFail(ctx, node);
+    if (eq(u8, name, "difference_update")) return set_mod.differenceUpdate(s, os) or oomFail(ctx, node);
+    if (eq(u8, name, "symmetric_difference_update")) return set_mod.symmetricUpdate(s, os) or oomFail(ctx, node);
+    if (eq(u8, name, "issubset")) {
+        out.* = Value.boolean(set_mod.isSubset(s, os));
+        return true;
+    }
+    if (eq(u8, name, "issuperset")) {
+        out.* = Value.boolean(set_mod.isSubset(os, s));
+        return true;
+    }
+    if (eq(u8, name, "isdisjoint")) {
+        var it = set_mod.iterate(if (s.used <= os.used) s else os);
+        const big = if (s.used <= os.used) os else s;
+        while (it.next()) |x| if (set_mod.contains(big, x)) {
+            out.* = Value.boolean(false);
+            return true;
+        };
+        out.* = Value.boolean(true);
+        return true;
+    }
+    return null;
+}
+
+/// a | b, a & b, a - b, a ^ b of two sets (null: not two sets); a <= b,
+/// a < b, a >= b, a > b of them
+fn setBinary(ctx: *Ctx, node: u32, op: Op, a: Value, b: Value, out: *Value) ?bool {
+    if (a.kind() != .set or b.kind() != .set) return null;
+    const x = setOf(a);
+    const y = setOf(b);
+    return switch (op) {
+        .bitor => setResult(ctx, node, set_mod.union_(x, y), out),
+        .bitand => setResult(ctx, node, set_mod.intersection(x, y), out),
+        .sub => setResult(ctx, node, set_mod.difference(x, y), out),
+        .bitxor => setResult(ctx, node, set_mod.symmetricDifference(x, y), out),
+        else => null,
+    };
+}
+
+fn setOrder(cmp: Cmp, a: Value, b: Value) ?bool {
+    if (a.kind() != .set or b.kind() != .set) return null;
+    const x = setOf(a);
+    const y = setOf(b);
+    return switch (cmp) {
+        .le => set_mod.isSubset(x, y),
+        .lt => x.used < y.used and set_mod.isSubset(x, y),
+        .ge => set_mod.isSubset(y, x),
+        .gt => y.used < x.used and set_mod.isSubset(y, x),
+        else => null,
+    };
+}
+
+/// `a op= b`: in place where Python's is (a list's +=: extend; a set's |=,
+/// &=, -=, ^=; a dict's |=: update; a Python object's own); else a op b
+export fn zr_inplace(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u64, bb: u64, out: *Value) callconv(.c) bool {
+    const a = Value{ .tag = ta, .bits = ba };
+    const b = Value{ .tag = tb, .bits = bb };
+    const op: Op = @enumFromInt(op_code);
+    const in_place: bool = switch (a.kind()) {
+        .list => op == .add,
+        .set => op == .bitor or op == .bitand or op == .sub or op == .bitxor,
+        .dict => op == .bitor,
+        else => false,
+    };
+    if (in_place) {
+        switch (a.kind()) {
+            .list => {
+                const l: *value.List = @ptrCast(@alignCast(a.ptr()));
+                var items = Value.none_v;
+                if (!zr_items(ctx, node, b.tag, b.bits, &items)) return false;
+                defer value.decref(items);
+                // (a copy of the items first: `l += l` adds them once)
+                const src = @as(*value.List, @ptrCast(@alignCast(items.ptr()))).slice();
+                const copied = allocator.dupe(Value, src) catch return oomFail(ctx, node);
+                defer allocator.free(copied);
+                for (copied) |x| {
+                    value.incref(x);
+                    if (!value.listPush(l, x)) return oomFail(ctx, node);
+                }
+            },
+            .set => {
+                if (b.kind() != .set) {
+                    const sym = switch (op) {
+                        .bitor => "|=",
+                        .bitand => "&=",
+                        .sub => "-=",
+                        else => "^=",
+                    };
+                    return failAs(ctx, node, py.PyExc_TypeError(), null, "unsupported operand type(s) for {s}: 'set' and '{s}'", .{ sym, value.typeName(b) });
+                }
+                const s = setOf(a);
+                const ok = switch (op) {
+                    .bitor => set_mod.merge(s, setOf(b)),
+                    .bitand => set_mod.intersectionUpdate(s, setOf(b)),
+                    .sub => set_mod.differenceUpdate(s, setOf(b)),
+                    else => set_mod.symmetricUpdate(s, setOf(b)),
+                };
+                if (!ok) return oomFail(ctx, node);
+            },
+            else => {
+                var r = Value.none_v;
+                const upd = value.literal("update") orelse return oomFail(ctx, node);
+                if (!zr_call_method(ctx, node, a.tag, a.bits, upd, @ptrCast(&b), 1, &r)) return false;
+                value.decref(r);
+            },
+        }
+        value.incref(a);
+        out.* = a;
+        return true;
+    }
+    // (a Python object: its in-place operator, Python's)
+    if (a.kind() == .host) {
+        var objs: [2]*PyObject = undefined;
+        if (!objects(ctx, node, &.{ a, b }, &objs)) return failPython(ctx, node);
+        defer for (objs) |o| py.Py_DecRef(o);
+        const r = switch (op) {
+            .add => py.c.PyNumber_InPlaceAdd(objs[0], objs[1]),
+            .sub => py.c.PyNumber_InPlaceSubtract(objs[0], objs[1]),
+            .mul => py.c.PyNumber_InPlaceMultiply(objs[0], objs[1]),
+            .div => py.c.PyNumber_InPlaceTrueDivide(objs[0], objs[1]),
+            .floordiv => py.c.PyNumber_InPlaceFloorDivide(objs[0], objs[1]),
+            .mod => py.c.PyNumber_InPlaceRemainder(objs[0], objs[1]),
+            .pow => py.c.PyNumber_InPlacePower(objs[0], objs[1], py.Py_None()),
+            .lshift => py.c.PyNumber_InPlaceLshift(objs[0], objs[1]),
+            .rshift => py.c.PyNumber_InPlaceRshift(objs[0], objs[1]),
+            .bitor => py.c.PyNumber_InPlaceOr(objs[0], objs[1]),
+            .bitxor => py.c.PyNumber_InPlaceXor(objs[0], objs[1]),
+            .bitand => py.c.PyNumber_InPlaceAnd(objs[0], objs[1]),
+        };
+        return fromResult(ctx, node, r, out);
+    }
+    return zr_binary(ctx, node, op_code, ta, ba, tb, bb, out);
 }
 
 /// A function's result standing for a call it left to its caller
@@ -1949,6 +2250,18 @@ export fn zr_items(ctx: *Ctx, node: u32, t: u64, bits: u64, out: *Value) callcon
             out.* = Value.obj(.list, &l.head);
             return true;
         },
+        // (a set: its items in its table's order, Python's)
+        .set => {
+            const s = setOf(v);
+            const l = value.newList(s.used) orelse return oomFail(ctx, node);
+            var it = set_mod.iterate(s);
+            while (it.next()) |x| {
+                value.incref(x);
+                _ = value.listPush(l, x);
+            }
+            out.* = Value.obj(.list, &l.head);
+            return true;
+        },
         else => {},
     }
     if (collecting) {
@@ -2175,6 +2488,8 @@ export fn zr_extend_items(ctx: *Ctx, node: u32, t: u64, bits: u64, items: [*]con
 /// methods that don't change the value: str's, a dict's get...).
 export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value.Str, args: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
     const v = Value{ .tag = t, .bits = bits };
+    // A set's methods: natively (Python would change a copy)
+    if (v.kind() == .set) if (setMethod(ctx, node, v, name.bytes(), args[0..n], out)) |ok| return ok;
     // A dict's get(): natively (Python would see a copy)
     if (v.kind() == .dict and std.mem.eql(u8, name.bytes(), "get") and (n == 1 or n == 2)) {
         const d: *value.Dict = @ptrCast(@alignCast(v.ptr()));
@@ -3040,6 +3355,10 @@ export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64,
                 out.* = Value.pint(@intCast(@as(*value.Dict, @ptrCast(@alignCast(v.ptr()))).len));
                 return true;
             },
+            .set => {
+                out.* = Value.pint(@intCast(setOf(v).used));
+                return true;
+            },
             .str => {
                 out.* = Value.pint(@intCast(@as(*value.Str, @ptrCast(v.ptr())).chars));
                 return true;
@@ -3086,7 +3405,7 @@ export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64,
             else => {},
         },
         .bool => switch (v.kind()) {
-            .none, .bool, .int, .float, .str, .list, .tuple, .dict => {
+            .none, .bool, .int, .float, .str, .list, .tuple, .dict, .set => {
                 out.* = Value.boolean(value.truthy(v));
                 return true;
             },
@@ -3157,7 +3476,7 @@ export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64,
             },
             // (a dict's keys, a str's characters: a new list, as a loop
             // over them sees them)
-            .dict, .str => return zr_items(ctx, node, v.tag, v.bits, out),
+            .dict, .str, .set => return zr_items(ctx, node, v.tag, v.bits, out),
             else => {},
         },
     }
@@ -3617,6 +3936,9 @@ export fn zr_type(t: u64, bits: u64, out: *Value) callconv(.c) void {
         .list => @ptrCast(@alignCast(py.types.typeObject("PyList_Type"))),
         .tuple => @ptrCast(@alignCast(py.types.typeObject("PyTuple_Type"))),
         .dict => @ptrCast(@alignCast(py.types.typeObject("PyDict_Type"))),
+        .set => @ptrCast(@alignCast(py.types.typeObject("PySet_Type"))),
+        // (a lambda's, a nested def's: Python's function)
+        .closure => @import("compile.zig").pyFunctionType() orelse @ptrCast(@alignCast(ph.typeOf(py.Py_None()))),
         .record => @as(*value.Record, @ptrCast(@alignCast(v.ptr()))).rtype.py_class orelse @import("proxies.zig").RecordType,
         .function => @import("objects.zig").FunctionType,
         .node => @import("objects.zig").NodeType,
@@ -3702,6 +4024,7 @@ export fn zr_is_type(t: u64, bits: u64, code: u32) callconv(.c) bool {
         6 => v.kind() == .dict,
         7 => v.kind() == .none,
         8 => v.kind() == .function,
+        12 => v.kind() == .set,
         else => false,
     };
 }
@@ -3790,6 +4113,9 @@ const helper_names = [_][]const u8{
     "zr_delitem",
     "zr_closure",
     "zr_set_global",
+    "zr_set",
+    "zr_to_set",
+    "zr_inplace",
 };
 
 /// The names compiled code calls them by, and their addresses

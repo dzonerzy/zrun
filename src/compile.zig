@@ -1489,6 +1489,9 @@ pub const Compiler = struct {
         .{ "zr_float_hex", "bpilllp" },
         .{ "zr_delitem", "bpillll" },
         .{ "zr_closure", "bpilppp" },
+        .{ "zr_set", "bpiplip" },
+        .{ "zr_to_set", "bpillp" },
+        .{ "zr_inplace", "bpiillllp" },
         .{ "zr_set_global", "bpilpll" },
         .{ "zr_raise_from", "bpillll" },
         .{ "zr_range", "bpiplp" },
@@ -5735,28 +5738,68 @@ const Gen = struct {
             .local => |slot| {
                 const cur = try self.readLocal(inst, slot, pos);
                 const rhs = try self.expr(inst, value_e);
-                try self.assign(inst, t, try self.binary(inst, op, cur, rhs), pos);
+                try self.assign(inst, t, try self.inplace(inst, op, cur, rhs), pos);
             },
             .global => |name| {
                 const cur = try self.global(inst, name, pos);
                 const rhs = try self.expr(inst, value_e);
-                try self.assign(inst, t, try self.binary(inst, op, cur, rhs), pos);
+                try self.assign(inst, t, try self.inplace(inst, op, cur, rhs), pos);
             },
             .attr => |x| {
                 const obj = try self.expr(inst, x.obj);
                 const cur = try self.attr(inst, try self.copyOf(obj), x.name, pos);
                 const rhs = try self.expr(inst, value_e);
-                try self.setAttr(inst, obj, x.name, try self.binary(inst, op, cur, rhs), pos);
+                try self.setAttr(inst, obj, x.name, try self.inplace(inst, op, cur, rhs), pos);
             },
             .index => |x| {
                 const obj = try self.expr(inst, x.obj);
                 const key = try self.expr(inst, x.index);
                 const cur = try self.getItem(inst, try self.copyOf(obj), try self.copyOf(key));
                 const rhs = try self.expr(inst, value_e);
-                try self.setItem(inst, obj, key, try self.binary(inst, op, cur, rhs), pos);
+                try self.setItem(inst, obj, key, try self.inplace(inst, op, cur, rhs), pos);
             },
             .tuple => return self.c.unsupportedAt(inst.func, pos, "augmented assignment to a tuple", .{}),
         }
+    }
+
+    /// `cur op= rhs`'s value: in place where Python's is (a list's +=, a
+    /// set's |= &= -= ^=, a dict's |=, a Python object's own: zr_inplace,
+    /// the object itself), else cur op rhs. A run-time value that may be
+    /// either: its tag decides, numbers' arithmetic inline still.
+    fn inplace(self: *Gen, inst: *Inst, op: front.BinOp, cur: SVal, rhs: SVal) Error!SVal {
+        const maybe = switch (cur) {
+            .list, .dict, .py => true,
+            .dyn => |d| switch (d.shape) {
+                .any, .list, .dict, .record => true,
+                else => false,
+            },
+            else => false,
+        };
+        if (!maybe) return self.binary(inst, op, cur, rhs);
+        const ld = if (cur == .list or cur == .dict) try self.materializeToChange(cur, inst.node) else try self.materialize(cur, inst.node);
+        const rd = try self.materialize(rhs, inst.node);
+        const f = &self.f;
+        const T = value.Tag;
+        const slot = try self.valSlot();
+        const mut = try f.label("inplace");
+        const plain = try f.label("not_inplace");
+        const join = try f.label("inplace_done");
+        var is_mut = f.icmp(jit_c.LLVMIntEQ, ld.tag, self.k(@intFromEnum(T.host)));
+        for ([_]T{ .list, .set, .dict }) |t| is_mut = f.or_(is_mut, f.icmp(jit_c.LLVMIntEQ, ld.tag, self.k(@intCast(@intFromEnum(t)))));
+        try f.condBr(is_mut, mut, plain);
+        try f.block(mut);
+        const ok = self.call("zr_inplace", &.{ self.ctx, self.k32(inst.node), self.k32(@intFromEnum(op)), ld.tag, ld.bits, rd.tag, rd.bits, self.out });
+        try self.drop(.{ .dyn = rd });
+        try self.drop(.{ .dyn = ld });
+        try self.check(ok);
+        try self.storeSlot(slot, try self.loadOut(.any));
+        try f.br(join);
+        try f.block(plain);
+        const r = try self.materialize(try self.binary(inst, op, .{ .dyn = ld }, .{ .dyn = rd }), inst.node);
+        try self.storeSlot(slot, r);
+        try f.br(join);
+        try f.block(join);
+        return .{ .dyn = try self.loadSlot(slot, .any) };
     }
 
     fn readLocal(self: *Gen, inst: *Inst, slot: u32, pos: front.Pos) Error!SVal {
@@ -6249,6 +6292,27 @@ const Gen = struct {
                 return self.literal(.{ .list = l }, e, inst.node);
             },
             .list_comp, .gen_exp => |comp| return self.literal(try self.listComp(inst, comp, e.pos), e, inst.node),
+            // A set (natively: set.zig, CPython's table): its items added in
+            // turn, as Python adds them
+            .set_ => |s| {
+                const mark = self.inflight.items.len;
+                errdefer self.taken(mark);
+                const vals = try self.a().alloc(SVal, s.items.len);
+                for (vals, s.items) |*slot, ie| slot.* = try self.operand(inst, ie);
+                self.taken(mark);
+                const arr = try self.valueArray(vals, inst.node);
+                const ok = self.call("zr_set", &.{ self.ctx, self.k32(inst.node), arr, self.k(@intCast(vals.len)), self.k32(@intFromBool(s.folded)), self.out });
+                try self.dropArray(arr, vals.len);
+                try self.check(ok);
+                return .{ .dyn = try self.loadOut(.any) };
+            },
+            .set_comp => |comp| {
+                const l = try self.materialize(try self.listComp(inst, comp, e.pos), inst.node);
+                const ok = self.call("zr_to_set", &.{ self.ctx, self.k32(inst.node), l.tag, l.bits, self.out });
+                try self.drop(.{ .dyn = l });
+                try self.check(ok);
+                return .{ .dyn = try self.loadOut(.any) };
+            },
             .dict => |x| {
                 const d = try self.a().create(SDict);
                 d.* = .{ .origin = e };
@@ -7294,6 +7358,27 @@ const Gen = struct {
             for (all, full, 0..) |x, *slot, i| slot.* = x orelse (if (i < func.required) return c.unsupportedAt(inst.func, pos, "{s}() missing its argument {s}", .{ func.name, func.locals[i] }) else try self.defaultOf(func, i));
             return self.callHelper(func, inst.node, full);
         }
+        // A dataclass's keyword arguments: in their fields' places
+        if (kws.len > 0 and callee == .py) if (try c.recordType(callee.py)) |rtype| if (!rtype.slots) {
+            const all = try self.a().alloc(?SVal, rtype.fields.len);
+            @memset(all, null);
+            if (args.len > rtype.fields.len) return c.unsupportedAt(inst.func, pos, "{s}() takes {d} fields, given {d}", .{ rtype.name, rtype.fields.len, args.len });
+            for (args, 0..) |x, i| all[i] = x;
+            for (kws) |kw| {
+                const i = for (rtype.fields, 0..) |fname, j| {
+                    if (std.mem.eql(u8, fname, kw.name)) break j;
+                } else return c.unsupportedAt(inst.func, pos, "{s}() has no field {s}", .{ rtype.name, kw.name });
+                if (all[i] != null) return c.unsupportedAt(inst.func, pos, "{s}() given {s} twice", .{ rtype.name, kw.name });
+                all[i] = try self.operand(inst, kw.value);
+            }
+            self.taken(mark);
+            // (the ones not given: their defaults, pyCall's)
+            var n = all.len;
+            while (n > 0 and all[n - 1] == null) n -= 1;
+            const full = try self.a().alloc(SVal, n);
+            for (all[0..n], full, 0..) |x, *slot, i| slot.* = x orelse try self.fieldDefault(inst, callee.py, rtype, i, pos);
+            return self.pyCall(inst, callee.py, full, pos);
+        };
         for (kws) |kw| {
             if (callee == .rt_method and (callee.rt_method == .call or callee.rt_method == .tail_call) and std.mem.eql(u8, kw.name, "receiver")) {
                 receiver = try self.operand(inst, kw.value);
@@ -8016,9 +8101,13 @@ const Gen = struct {
         // A class whose objects are records: made natively
         if (try isInstanceOf(o, @ptrCast(@alignCast(py.types.typeObject("PyType_Type"))))) if (try c.recordType(o)) |rtype| {
             if (!rtype.slots) {
-                // (a dataclass: its fields, in order)
-                if (args.len != rtype.fields.len) return c.unsupportedAt(inst.func, pos, "{s}() takes {d} fields, given {d} (keywords and defaults aren't compiled yet)", .{ rtype.name, rtype.fields.len, args.len });
-                const arr = try self.valueArray(args, inst.node);
+                // (a dataclass: its fields, in order; those not given their
+                // defaults)
+                if (args.len > rtype.fields.len) return c.unsupportedAt(inst.func, pos, "{s}() takes {d} fields, given {d}", .{ rtype.name, rtype.fields.len, args.len });
+                const full = try self.a().alloc(SVal, rtype.fields.len);
+                @memcpy(full[0..args.len], args);
+                for (full[args.len..], args.len..) |*slot, i| slot.* = try self.fieldDefault(inst, o, rtype, i, pos);
+                const arr = try self.valueArray(full, inst.node);
                 try self.callCheck("zr_record", &.{ self.ctx, self.k32(inst.node), self.ptrConst(rtype), arr, self.out });
                 return .{ .dyn = try self.loadOut(.record) };
             }
@@ -8049,6 +8138,33 @@ const Gen = struct {
         // Anything else: called as Python does (its arguments as Python
         // objects)
         return self.callPython(inst, o, args);
+    }
+
+    /// A dataclass field's default, for a call not giving it: its `default`
+    /// (known when compiling), or what its `default_factory` makes, called
+    /// then (as the dataclass's __init__ does); none: a CompileError, as
+    /// Python's TypeError would be.
+    fn fieldDefault(self: *Gen, inst: *Inst, cls: *PyObject, rtype: *const value.RecordType, i: usize, pos: front.Pos) Error!SVal {
+        const c = self.c;
+        const fields = ph.attr(cls, "__dataclass_fields__") orelse return error.Python;
+        defer py.Py_DecRef(fields);
+        const key = ph.newString(rtype.fields[i]) orelse return error.Python;
+        defer py.Py_DecRef(key);
+        const f = py.c.PyDict_GetItem(fields, key) orelse return c.unsupportedAt(inst.func, pos, "{s}() missing its field {s}", .{ rtype.name, rtype.fields[i] });
+        const dc = py.c.PyImport_ImportModule("dataclasses") orelse return error.Python;
+        defer py.Py_DecRef(dc);
+        const missing = ph.attr(dc, "MISSING") orelse return error.Python;
+        defer py.Py_DecRef(missing);
+        const d = ph.attr(f, "default") orelse return error.Python;
+        defer py.Py_DecRef(d);
+        if (d != missing) return self.constant(d, inst.node);
+        const factory = ph.attr(f, "default_factory") orelse return error.Python;
+        defer py.Py_DecRef(factory);
+        if (factory != missing) {
+            _ = try c.objectIndex(factory);
+            return self.pyCall(inst, factory, &.{}, pos);
+        }
+        return c.unsupportedAt(inst.func, pos, "{s}() missing its field {s}", .{ rtype.name, rtype.fields[i] });
     }
 
     /// A native host function (native.zig): given arguments of the kinds
@@ -8360,6 +8476,33 @@ const Gen = struct {
             try self.check(ok);
             return SVal{ .dyn = try self.loadOut(.any) };
         }
+        // list(), dict(), tuple(): a new empty one, as `[]` makes one
+        if (args.len == 0) {
+            if (isBuiltin(o, "list")) {
+                const l = try self.a().create(SList);
+                l.* = .{};
+                return SVal{ .list = l };
+            }
+            if (isBuiltin(o, "dict")) {
+                const d = try self.a().create(SDict);
+                d.* = .{};
+                return SVal{ .dict = d };
+            }
+            if (isBuiltin(o, "tuple")) return SVal{ .tuple = &.{} };
+        }
+        // set(), set(items): natively (set.zig)
+        if (args.len <= 1 and isBuiltin(o, "set")) {
+            const ok = if (args.len == 0)
+                self.call("zr_set", &.{ self.ctx, self.k32(inst.node), self.c.m.nullPtr(), self.k(0), self.k32(0), self.out })
+            else blk: {
+                const d = try self.materialize(args[0], inst.node);
+                const r = self.call("zr_to_set", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, self.out });
+                try self.drop(.{ .dyn = d });
+                break :blk r;
+            };
+            try self.check(ok);
+            return SVal{ .dyn = try self.loadOut(.any) };
+        }
         // min(a, b, ...), max(a, b, ...): natively for numbers and strs
         // (zr_min_max)
         if (args.len >= 2) inline for (.{ .{ "min", 0 }, .{ "max", 1 } }) |m| if (isBuiltin(o, m[0])) {
@@ -8600,7 +8743,8 @@ const Gen = struct {
             5 => &.{@intFromEnum(T.tuple)},
             6 => &.{@intFromEnum(T.dict)},
             8 => &.{@intFromEnum(T.function)},
-            9...13 => &.{},
+            12 => &.{@intFromEnum(T.set)},
+            9...11, 13 => &.{},
             else => unreachable,
         };
         var native = self.c.m.k1(false);
@@ -9969,6 +10113,16 @@ const FoldedSize = struct {
             .and_, .or_, .list, .tuple => |xs| for (xs) |y| {
                 n += countExpr(y);
             },
+            .set_ => |s| for (s.items) |y| {
+                n += countExpr(y);
+            },
+            .set_comp => |c| {
+                n += countExpr(c.elt);
+                for (c.generators) |g| {
+                    n += countExpr(g.iter);
+                    for (g.ifs) |y| n += countExpr(y);
+                }
+            },
             .compare => |x| {
                 n += countExpr(x.first);
                 for (x.rest) |y| n += countExpr(y);
@@ -10137,6 +10291,15 @@ fn localReads(e: *const front.Expr, plain: bool, out: *std.ArrayListUnmanaged(Lo
         },
         .unary => |x| try localReads(x.operand, plain, out, a),
         .list, .tuple => |xs| for (xs) |y| try localReads(y, plain, out, a),
+        // (a set's items: hashed and kept, as a list's)
+        .set_ => |s| for (s.items) |y| try localReads(y, plain, out, a),
+        .set_comp => |c| {
+            try localReads(c.elt, false, out, a);
+            for (c.generators) |g| {
+                try localReads(g.iter, false, out, a);
+                for (g.ifs) |y| try localReads(y, false, out, a);
+            }
+        },
         .and_, .or_ => |xs| for (xs) |y| try localReads(y, false, out, a),
         .compare => |x| {
             try localReads(x.first, plain, out, a);
@@ -10244,6 +10407,11 @@ fn exprReads(e: *const front.Expr, set: *std.AutoHashMapUnmanaged(u32, void), a:
         },
         .unary => |x| try exprReads(x.operand, set, a),
         .and_, .or_, .list, .tuple => |xs| for (xs) |y| try exprReads(y, set, a),
+        .set_ => |s| for (s.items) |y| try exprReads(y, set, a),
+        .set_comp => |c| {
+            try exprReads(c.elt, set, a);
+            for (c.generators) |g| try genReads(g, set, a);
+        },
         .compare => |x| {
             try exprReads(x.first, set, a);
             for (x.rest) |y| try exprReads(y, set, a);
