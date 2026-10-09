@@ -85,6 +85,11 @@ pub fn build(b: *std.Build) void {
     const rt_lib = b.addLibrary(.{ .name = "zrun_rt", .linkage = .static, .root_module = rt_mod });
     const rt_step = b.step("rt", "The runtime of programs compiled to run without Python");
     rt_step.dependOn(&b.addInstallArtifact(rt_lib, .{}).step);
+    // (in the extension, for zrun.build_native to link with: Linux's)
+    const has_rt = target.result.os.tag == .linux;
+    build_options.addOption(bool, "has_rt", has_rt);
+    rt_options.addOption(bool, "has_rt", false);
+    if (has_rt) user_lib_mod.addAnonymousImport("zrun_rt_archive", .{ .root_source_file = rt_lib.getEmittedBin() });
 
     // .pyd for Windows, .so otherwise (by the target, for cross builds)
     const ext = if (target.result.os.tag == .windows) ".pyd" else ".so";

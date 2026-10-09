@@ -350,3 +350,43 @@ def build_executable(language, source, output, target=None, path=None, python=No
         os.chmod(out, 0o755)
         os.replace(out, output)
     return output
+
+
+def build_native(language, source, output, path=None, runtime=None):
+    """A standalone program: a strict language's program compiled ahead of
+    time, all of it, linked with zrun's runtime (`runtime`: libzrun_rt.a's
+    bytes) by the ziglang package's Zig. No Python in it. Returns its
+    path."""
+    if not runtime:
+        raise ValueError("this zrun has no runtime for standalone programs (one is in zrun's Linux builds)")
+    import zrun
+
+    lang = language if isinstance(language, zrun.Language) else getattr(importlib.import_module(language_of(language)[0]), language_of(language)[1])
+    if os.path.exists(source):
+        name = os.path.basename(source)
+        with open(source, encoding="utf-8") as f:
+            text = f.read()
+    else:
+        name, text = "program", source
+    name = path or name
+    objects = lang.load(text, name).native_objects()
+    try:
+        import ziglang  # noqa: F401
+    except ImportError:
+        raise RuntimeError("making standalone programs needs Zig: pip install ziglang (or zrun-py[exe])") from None
+    with tempfile.TemporaryDirectory() as tmp:
+        files = []
+        for i, o in enumerate(objects):
+            files.append(os.path.join(tmp, f"part{i}.o"))
+            with open(files[-1], "wb") as f:
+                f.write(o)
+        rt = os.path.join(tmp, "libzrun_rt.a")
+        with open(rt, "wb") as f:
+            f.write(runtime)
+        out = f"{output}.{os.getpid()}.tmp"
+        # (Zig's caches: its own for this build, the builds' shared one)
+        env = dict(os.environ, ZIG_LOCAL_CACHE_DIR=os.path.join(tmp, "zig-cache"), ZIG_GLOBAL_CACHE_DIR=os.path.join(cache_dir(), "zig"))
+        subprocess.run([sys.executable, "-m", "ziglang", "cc", "-s", "-o", out, *files, rt, "-lc", "-lm"], check=True, cwd=tmp, env=env)
+        os.chmod(out, 0o755)
+        os.replace(out, output)
+    return output

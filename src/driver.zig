@@ -1217,14 +1217,87 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
     const Tried = struct { func: usize, nargs: usize, rt_mask: u64 };
     var tried: std.AutoHashMapUnmanaged(Tried, void) = .empty;
     defer tried.deinit(allocator);
+    // (each in a module of its own, made into an object on a worker thread
+    // (LLVM's work, the most of it: every core at it), waited for at the
+    // end; one that fails dropped from its module, the module kept for
+    // the next)
+    const Batch = struct {
+        comp: *compile_mod.Compiler,
+        b: *standalone_build.Build,
+        n: usize = 0,
+        jobs: std.ArrayListUnmanaged(*Job) = .empty,
+        const size = 1;
+
+        fn start(self: *@This()) !void {
+            self.comp.batch = false;
+            try self.comp.newModule();
+            self.comp.batch = true;
+            self.n = 0;
+        }
+
+        fn added(self: *@This()) !void {
+            self.n += 1;
+            if (self.n >= size) try self.flush();
+        }
+
+        fn flush(self: *@This()) !void {
+            if (self.n == 0) return;
+            self.comp.batch = false;
+            try self.b.keepNames(&self.comp.m);
+            const job = inBackground(self.b.view, self.comp.m.take(), self.b.opt, null, true) orelse return error.OutOfMemory;
+            try self.jobs.append(allocator, job);
+            try self.start();
+        }
+
+        /// Every module's object, once it's made
+        fn wait(self: *@This()) !void {
+            defer self.jobs.clearRetainingCapacity();
+            var first_error: ?standalone_build.Error = null;
+            for (self.jobs.items) |job| {
+                while (!job.done.load(.acquire)) std.Io.sleep(cache.io(), .fromMilliseconds(1), .awake) catch {};
+                defer allocator.destroy(job);
+                const bytes = job.bytes orelse {
+                    if (first_error == null) first_error = self.b.rejected(&job.err);
+                    continue;
+                };
+                defer llvm.freeBytes(self.b.view, bytes);
+                if (first_error == null) self.b.addObject(bytes) catch |e| {
+                    first_error = e;
+                };
+            }
+            if (first_error) |e| return e;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.wait() catch {};
+            self.jobs.deinit(allocator);
+        }
+    };
+    var batch = Batch{ .comp = comp, .b = b };
+    defer batch.deinit();
+    batch.start() catch return oomB();
+    defer comp.batch = false;
+    // (the nodes the code can have as values: those it makes values of,
+    // and those under them)
+    const reachable = allocator.alloc(bool, data.nodes.len) catch return oomB();
+    defer allocator.free(reachable);
+    @memset(reachable, false);
+    var nodes_done: usize = 0;
     while (true) {
         var more = false;
+        while (nodes_done < aot.nodes.count()) : (nodes_done += 1) {
+            const m = aot.nodes.keys()[nodes_done];
+            if (m >= data.nodes.len) continue;
+            @memset(reachable[m..data.end(m)], true);
+            // (the sites tried again: more nodes for them)
+            sites_done = 0;
+        }
         while (sites_done < aot.run_sites.count()) : (sites_done += 1) {
-            more = true;
             const site = aot.run_sites.keys()[sites_done];
             const table = if (site.which == 0) comp.lang.eval_of else comp.lang.exec_of;
             for (0..data.nodes.len) |i| {
                 const n: u32 = @intCast(i);
+                if (!reachable[n]) continue;
                 // (code given its scope when it runs (a helper's out of
                 // line): any node, in its own)
                 const owner = if (site.owner == compile_mod.OWNER_PARAM) comp.ownerOf(n) else site.owner;
@@ -1232,6 +1305,7 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
                 const rid = data.rule(n);
                 if (rid >= table.len or table[rid] == null) continue;
                 if ((thunks_tried.getOrPut(allocator, .{ .node = n, .which = site.which, .owner = owner }) catch return oomB()).found_existing) continue;
+                more = true;
                 const made: ?[:0]const u8 = while (true) {
                     comp.failed_semantic = null;
                     comp.need_retry = false;
@@ -1244,8 +1318,8 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
                     };
                 };
                 const name = made orelse continue;
-                b.emit(&comp.m) catch |e| return failed(b, e, compile_error);
                 b.thunks.append(b.arena.allocator(), .{ .node = n, .which = site.which, .owner = owner, .name = name }) catch return oomB();
+                batch.added() catch |e| return failed(b, e, compile_error);
             }
         }
         // (the objects the code holds, and those in the values it refers to)
@@ -1272,12 +1346,15 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
                     };
                 };
                 const name = made orelse continue;
-                b.emit(&comp.m) catch |e| return failed(b, e, compile_error);
                 b.called.append(b.arena.allocator(), .{ .func = key.func, .nargs = key.nargs, .rt_mask = key.rt_mask, .name = name }) catch return oomB();
+                batch.added() catch |e| return failed(b, e, compile_error);
             }
         }
         if (!more) break;
     }
+    batch.flush() catch |e| return failed(b, e, compile_error);
+    comp.batch = false;
+    batch.wait() catch |e| return failed(b, e, compile_error);
     // The image
     const main_name = mainName(c) orelse return oomB();
     const grammar_desc = b.describeGrammar(data.grammar) catch return oomB();

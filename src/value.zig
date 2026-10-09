@@ -341,7 +341,8 @@ pub fn floatRepr(x: f64, buf: *[40]u8) []const u8 {
     if (std.math.isNan(x)) return "nan";
     if (std.math.isInf(x)) return if (x < 0) "-inf" else "inf";
     // (the shortest digits, Ryu's: "d.ddde±x")
-    var sci: [32]u8 = undefined;
+    // (the room render() asks for: less is undefined)
+    var sci: [std.fmt.float.min_buffer_size]u8 = undefined;
     const s = std.fmt.float.render(&sci, x, .{ .mode = .scientific }) catch return "nan";
     var i: usize = 0;
     const neg = s[0] == '-';

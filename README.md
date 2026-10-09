@@ -260,6 +260,26 @@ Run, it unpacks itself once into the platform's cache directory (`zrun/exe/<its 
 
 The targets are `x86_64-linux` (glibc 2.17 or newer) and `x86_64-windows`, from either. For this machine, the compiled code is made when building; for the other, zrun, zgram and zrules come from PyPI (the same versions' wheels), and the program is compiled the first time it runs, then cached. Building downloads the runtime once (about 30 MB, kept in the cache directory under `zrun/build`). An executable takes 30 to 40 MB, about 100 MB unpacked. Its first run unpacks it and compiles the grammar (about 1.2 s for Lua's); later runs start in about 0.16 s (zgram keeps compiled grammars on disk).
 
+## Standalone programs
+
+```python
+lang = zrun.Language(PARSER, RULES, strict=True)
+zrun.build_native(lang, "fib.tiny", "fib")        # ./fib: no Python in it
+```
+
+A strict language's program (`strict=True`: compiled code calling nothing in Python) can be compiled ahead of time, all of it, and linked with zrun's runtime into one executable that has no Python at all: about 1 MB for a small program, starting in a millisecond. What the JIT compiles as a program runs is compiled when building: the code of nodes evaluated by code that only knows them at run time, and the Python functions a language holds as values (a library in a table) for every way the code calls them. The values the semantics refer to (the module's tables, records, constants) are in the executable, made as it starts; a closure's captured variables are read when building.
+
+It writes what `print()`, `sys.stdout.write()` and `sys.stderr.write()` write, and a runtime error as the reference mode words it (exiting with 1):
+
+```
+fib.tiny:2:12: error: division by zero [runtime]
+    2 |     return 10 / n;
+      |            ^^^^^^
+  in f(), called at fib.tiny:4:18
+```
+
+Linux, for this machine (its CPU's code); needs the ziglang package (`pip install "zrun-py[exe]"`). Building takes a few seconds for a small language, more for a big one (the Lua example: its library compiled, about 12 s on many cores). `program.native_objects()` gives the object files to link yourself with zrun's runtime (`zig build rt`: libzrun_rt.a). Nothing that needs Python is in a standalone program: a host function that isn't compiled, a value Python alone knows (a complex number), an error Python words differs (zrun's own words then).
+
 ## Sessions and the REPL
 
 ```python
@@ -302,6 +322,7 @@ Every class and method has its documentation in `help()` (and in the `.pyi` stub
 | `program.report()`, `lang.python_semantics()` | what to look at to make it faster |
 | `lang.compile(source, output)`, `program.save(path)`, `lang.load_compiled(path)` | compiled modules |
 | `zrun.build_executable(language, source, output, target=None, python=None)` | the program as one executable file |
+| `zrun.build_native(language, source, output, path=None)`, `program.native_objects()` | a strict language's program as an executable with no Python |
 | `lang.session()`, `lang.repl()` | programs run one after another, sharing their names |
 | `zrun.Bytes(data)` | data read in place |
 | `zrun.configure(cache=, cache_size=, tiers=, perf_map=)`, `zrun.clear_cache()` | process-wide settings; the compiled-code cache |
@@ -384,7 +405,11 @@ src/
   native.zig            # Native host functions (zrun.native.v1)
   wrapping.zig          # rt.wrapping_add and the other 64-bit wrapping operations
   pyhelp.zig            # Helpers over the Python C API
-  exe/build.py          # zrun.build_executable(): the runtime, the packages, the payload
+  exe/build.py          # zrun.build_executable(): the runtime, the packages, the payload; build_native()'s linking
+  standalone_build.zig  # Standalone programs: compiled ahead of time, the image of their data
+  standalone.zig        # A standalone program's runtime: its start, its tables, its errors
+  image.zig             # The image: what compiled code refers to by address, built as it starts
+  rt.zig, pystub.zig    # The runtime library (libzrun_rt.a): the helpers, no Python
   exe/launcher.zig      # An executable's start: unpacks its payload, runs its Python
 test/
   test_modes.py         # Differential tests: every program in every mode
@@ -404,6 +429,8 @@ test/
   test_tiers.py         # Fast code first, optimized in the background
   test_aot.py           # Compiled modules
   test_exe.py           # Executables
+  test_native.py        # Standalone programs: built, run without Python, as the compiled mode runs them
+  test_output.py        # print(), sys.stdout.write(): str() and repr() of values natively
   test_session.py       # Sessions and the REPL
 examples/tiny/          # A small language: the quick start
 examples/typed/         # A typed language: structs, methods, lists, optionals

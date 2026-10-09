@@ -40,6 +40,9 @@ pub const Aot = struct {
     /// Where code evaluates nodes it only knows at run time: eval or exec,
     /// the scope it runs in
     run_sites: std.AutoArrayHashMapUnmanaged(RunSite, void) = .empty,
+    /// Nodes the code makes values of (what code knowing a node only at
+    /// run time can have: these, and the nodes under them, its fields)
+    nodes: std.AutoArrayHashMapUnmanaged(u32, void) = .empty,
 
     pub const CalledKey = struct { func: usize, nargs: usize };
     pub const Shape = struct { nargs: usize, rt_mask: u64 };
@@ -134,14 +137,26 @@ pub const Build = struct {
 
     /// A module compiled to an object (the module taken), its names kept.
     pub fn emit(self: *Build, m: *ir.Module) Error!void {
-        for (m.syms.items) |s| try self.syms.append(self.a(), .{ .name = try self.a().dupeZ(u8, s.name), .addr = s.addr });
+        try self.keepNames(m);
         var err: [2048]u8 = @splat(0);
-        const bytes = llvm.emitObject(self.view, m.take(), self.opt, &err) catch {
-            try self.why.print(self.a(), "LLVM rejected the compiled program (a zrun bug): {s}", .{std.mem.sliceTo(&err, 0)});
-            return error.Compile;
-        };
+        const bytes = llvm.emitObject(self.view, m.take(), self.opt, &err) catch return self.rejected(&err);
         defer llvm.freeBytes(self.view, bytes);
+        try self.addObject(bytes);
+    }
+
+    /// A module's names for addresses kept (for the image), before it's
+    /// compiled (here, or on another thread)
+    pub fn keepNames(self: *Build, m: *const ir.Module) Error!void {
+        for (m.syms.items) |s| try self.syms.append(self.a(), .{ .name = try self.a().dupeZ(u8, s.name), .addr = s.addr });
+    }
+
+    pub fn addObject(self: *Build, bytes: []const u8) Error!void {
         try self.objects.append(self.a(), try self.a().dupe(u8, bytes));
+    }
+
+    pub fn rejected(self: *Build, err: []const u8) Error {
+        try self.why.print(self.a(), "LLVM rejected the compiled program (a zrun bug): {s}", .{std.mem.sliceTo(err, 0)});
+        return error.Compile;
     }
 
     fn fail(self: *Build, comptime fmt: []const u8, args: anytype) Error {

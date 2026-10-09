@@ -1081,6 +1081,10 @@ pub const Compiler = struct {
     /// ahead of time, no tiers, what the code refers to noted; null in the
     /// JIT
     aot: ?*Aot = null,
+    /// A standalone build's code compiled ahead, many in one module
+    /// (newModule: the module kept), each a part of it from `item_mark`
+    batch: bool = false,
+    item_mark: usize = 0,
 
     /// In a field table: a node whose label isn't one child or none (a
     /// list of them, a value an action makes): zr_getattr's
@@ -1224,6 +1228,14 @@ pub const Compiler = struct {
     /// its layouts and functions, stays: what it compiled before is in
     /// the JIT, called by name).
     pub fn newModule(self: *Compiler) !void {
+        // (a standalone build's batch: more code in the same module, what
+        // a failure leaves dropped from it alone)
+        if (self.batch) {
+            self.new_fns.clearRetainingCapacity();
+            self.helpers_kept = self.helper_fns.items.len;
+            self.item_mark = self.m.mark();
+            return;
+        }
         self.m.deinit();
         self.m = ir.Module.init(self.a, self.m.prefix);
         self.new_fns.clearRetainingCapacity();
@@ -1234,6 +1246,7 @@ pub const Compiler = struct {
     /// The module being made failed: the functions it was to compile are
     /// still to compile.
     pub fn forgetModule(self: *Compiler) void {
+        if (self.batch) self.m.dropSince(self.item_mark);
         for (self.new_fns.items) |f| _ = self.compiled_fns.remove(f);
         self.new_fns.clearRetainingCapacity();
         self.queue.clearRetainingCapacity();
@@ -2841,7 +2854,12 @@ const Gen = struct {
             .pint => |n| self.konst(@intCast(value.PINT_TAG), n, .int),
             .float => |x| self.konst(3, @bitCast(x), .float),
             .str => |s| .{ .tag = self.k(4), .bits = self.f.ptrToInt(try self.c.m.string(s)), .shape = .str },
-            .node => |n| self.konst(11, n, .node),
+            .node => |n| blk: {
+                // (a standalone build: a node the code may evaluate by
+                // its value, it and what's under it)
+                if (self.c.aot) |x| try x.nodes.put(self.c.a, n, {});
+                break :blk self.konst(11, n, .node);
+            },
             // (a big int within 128 bits: a Big, made once for the program)
             .py => |o| if (ph.typeOf(o) == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyLong_Type")))) and value.bigOf(o) != null) blk: {
                 const b = try self.c.bigConst(value.bigOf(o).?);

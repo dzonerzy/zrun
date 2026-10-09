@@ -44,6 +44,8 @@ pub const Module = struct {
     strings: std.StringHashMapUnmanaged(Value) = .empty,
     /// Functions by name (helpers declared, the module's own)
     fns: std.StringHashMapUnmanaged(Fn) = .empty,
+    /// The module's own, in the order they're made (dropSince)
+    made: std.ArrayListUnmanaged(struct { name: []const u8, v: Value }) = .empty,
     /// Given to the JIT: no longer ours to free
     taken: bool = false,
     /// Addresses of this process the code refers to (objects, tables...),
@@ -110,6 +112,7 @@ pub const Module = struct {
         }
         self.strings.deinit(self.gpa);
         self.fns.deinit(self.gpa);
+        self.made.deinit(self.gpa);
         self.addrs.deinit(self.gpa);
         self.syms.deinit(self.gpa);
     }
@@ -150,16 +153,36 @@ pub const Module = struct {
     pub fn function(self: *Module, name: []const u8, ret: Type, params: []const Type, external: bool) !Fn {
         if (self.fns.get(name)) |f| return f;
         const ty = self.fnType(ret, params);
+        const key = try self.gpa.dupe(u8, name);
         const v = L("LLVMAddFunction")(self.mod, try self.z(name), ty);
         if (!external) L("LLVMSetLinkage")(v, c.LLVMInternalLinkage);
+        try self.made.append(self.gpa, .{ .name = key, .v = v });
         const f = Fn{ .v = v, .ty = ty };
         // (values, 16 bytes, written and read as two words: never as one
         // vector, whose read after two word writes waits for them to reach
         // the cache, as the runtime's helpers write theirs; floats explicit
         // still use their registers)
         self.attribute(f, "noimplicitfloat");
-        try self.fns.put(self.gpa, name, f);
+        try self.fns.put(self.gpa, key, f);
         return f;
+    }
+
+    /// Where the functions made so far end (dropSince's mark)
+    pub fn mark(self: *const Module) usize {
+        return self.made.items.len;
+    }
+
+    /// The functions made since a mark deleted (code that failed to
+    /// compile, the rest of the module kept): their uses (theirs alone)
+    /// made poison first.
+    pub fn dropSince(self: *Module, at: usize) void {
+        const gone = self.made.items[at..];
+        for (gone) |m| L("LLVMReplaceAllUsesWith")(m.v, L("LLVMGetPoison")(self.t.ptr));
+        for (gone) |m| {
+            L("LLVMDeleteFunction")(m.v);
+            _ = self.fns.remove(m.name);
+        }
+        self.made.shrinkRetainingCapacity(at);
     }
 
     fn attribute(self: *Module, f: Fn, name: []const u8) void {
