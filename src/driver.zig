@@ -479,7 +479,7 @@ pub const Compiled = struct {
         const fast = self.opt != 0 and tiers and self.installed and self.optimizeLater(key);
         const kept = if (fast) cache.keyOf(std.mem.span(text), 0) else key;
         if (fast) if (self.atHand(kept, err)) |module| return module;
-        const bytes = llvm.emitObject(self.view, self.compiler.m.take(), if (fast) 0 else self.opt, err) catch return null;
+        const bytes = llvm.emitObject(self.view, self.compiler.m.take(), if (fast) 0 else optFor(&self.compiler.m, self.opt), err) catch return null;
         defer llvm.freeBytes(self.view, bytes);
         self.keep(kept, bytes);
         return llvm.loadObject(self.view, bytes, err) catch null;
@@ -494,7 +494,7 @@ pub const Compiled = struct {
             allocator.free(path);
             return false;
         };
-        _ = inBackground(self.view, copy, self.opt, path, false);
+        _ = inBackground(self.view, copy, optFor(&self.compiler.m, self.opt), path, false);
         return true;
     }
 
@@ -1128,7 +1128,7 @@ pub fn compileInBackground(data: *program_mod.Data, lang: compile_mod.LangView, 
     // (where, worked out here: the cache's directory is found once)
     const path = cache.pathFor(allocator, key);
     p.cached = path != null;
-    p.job = inBackground(c.view, c.compiler.m.take(), 2, path, true) orelse {
+    p.job = inBackground(c.view, c.compiler.m.take(), optFor(&c.compiler.m, 2), path, true) orelse {
         p.drop();
         _ = py.c.PyErr_NoMemory();
         return null;

@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 - **Standalone builds 2.2x faster** (the Lua example's test programs: 60 s to 27 s together): each language function a module of its own and the top level's optimized alongside the rest, not before them; a module past 10000 blocks (Lua's pattern matcher) optimized a level down, its code as fast.
+- **The JIT's huge modules optimized a level down too** (past 10000 blocks, as standalone builds do): the Lua example's test programs compiled optimized in 16% less time again, their code as fast.
 - **Less code, compiled faster** (the JIT's optimized code: 21% less time): an error's way out gives counts back by calls, not inline; a helper inline 16 times in one function's code out of line after that; a field of a record a local holds read and written without taking a count of the record. Run time as before.
 
 ### Documentation
