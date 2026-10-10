@@ -83,6 +83,10 @@ pub fn build(b: *std.Build) void {
     rt_options.addOption(bool, "standalone", true);
     rt_mod.addOptions("build_options", rt_options);
     const rt_lib = b.addLibrary(.{ .name = "zrun_rt", .linkage = .static, .root_module = rt_mod });
+    // (a section per function and datum: a program linked with it keeps
+    // only what it calls, --gc-sections)
+    rt_lib.link_function_sections = true;
+    rt_lib.link_data_sections = true;
     const rt_step = b.step("rt", "The runtime of programs compiled to run without Python");
     rt_step.dependOn(&b.addInstallArtifact(rt_lib, .{}).step);
     // (in the extension, for zrun.build_native to link with: Linux's)

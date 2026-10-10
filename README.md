@@ -267,7 +267,7 @@ lang = zrun.Language(PARSER, RULES, strict=True)
 zrun.build_native(lang, "fib.tiny", "fib")        # ./fib: no Python in it
 ```
 
-A strict language's program (`strict=True`: compiled code calling nothing in Python) can be compiled ahead of time, all of it, and linked with zrun's runtime into one executable that has no Python at all: about 1 MB for a small program, starting in a millisecond. What the JIT compiles as a program runs is compiled when building: the code of nodes evaluated by code that only knows them at run time, and the Python functions a language holds as values (a library in a table) for every way the code calls them. The values the semantics refer to (the module's tables, records, constants) are in the executable, made as it starts; a closure's captured variables are read when building.
+A strict language's program (`strict=True`: compiled code calling nothing in Python) can be compiled ahead of time, all of it, and linked with zrun's runtime into one executable that has no Python at all: about 180 KB for a small program (only what it reaches of the runtime is linked), starting in a millisecond. What the JIT compiles as a program runs is compiled when building: the code of nodes evaluated by code that only knows them at run time, and the Python functions a language holds as values (a library in a table) for every way the code calls them. The values the semantics refer to (the module's tables, records, constants) are in the executable, made as it starts; a closure's captured variables are read when building.
 
 It writes what `print()`, `sys.stdout.write()` and `sys.stderr.write()` write, and a runtime error as the reference mode words it (exiting with 1):
 

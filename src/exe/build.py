@@ -386,7 +386,8 @@ def build_native(language, source, output, path=None, runtime=None):
         out = f"{output}.{os.getpid()}.tmp"
         # (Zig's caches: its own for this build, the builds' shared one)
         env = dict(os.environ, ZIG_LOCAL_CACHE_DIR=os.path.join(tmp, "zig-cache"), ZIG_GLOBAL_CACHE_DIR=os.path.join(cache_dir(), "zig"))
-        subprocess.run([sys.executable, "-m", "ziglang", "cc", "-s", "-o", out, *files, rt, "-lc", "-lm"], check=True, cwd=tmp, env=env)
+        # (only what the program reaches of the runtime: a section each)
+        subprocess.run([sys.executable, "-m", "ziglang", "cc", "-s", "-Wl,--gc-sections", "-o", out, *files, rt, "-lc", "-lm"], check=True, cwd=tmp, env=env)
         os.chmod(out, 0o755)
         os.replace(out, output)
     return output
