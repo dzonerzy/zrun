@@ -102,6 +102,41 @@ def test_output_of_values(zig, tmp_path, capsys):
     assert got[1] == "[3, 4, (3,)] | {3: [4]} | {3} | 0.75 | -0.0 | 1180591620717411303424 | x'y | (1.5, None, True)\n"
 
 
+def _strict_lua(monkeypatch):
+    # (the Lua example made strict: its module loaded again with
+    # zrun.Language(strict=True))
+    monkeypatch.syspath_prepend(os.path.join(HERE, "..", "examples", "lua"))
+    spec = importlib.util.spec_from_file_location("lua_strict", os.path.join(HERE, "..", "examples", "lua", "lua.py"))
+    module = importlib.util.module_from_spec(spec)
+    # (a module of its own, as imported: its tables the semantics' state)
+    monkeypatch.setitem(sys.modules, "lua_strict", module)
+    plain = zrun.Language
+    monkeypatch.setattr(zrun, "Language", lambda *a, **k: plain(*a, **k, strict=True))
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(zrun, "Language", plain)
+    return module
+
+
+@pytest.mark.slow
+def test_pruned(zig, tmp_path, monkeypatch):
+    # (prune=True: only the library functions the program names compiled:
+    # the same output, smaller; one named only at run time stops it, saying
+    # why)
+    lua = _strict_lua(monkeypatch)
+    src = 'print("hi", string.rep("ab", 2))\nlocal f = _G["string"][("up" .. "per")]\nprint(f("x"))\n'
+    lua.set_args("p.lua", ())
+    left = []
+    pruned = zrun.build_native(lua.lang, src, str(tmp_path / "pruned"), path="p.lua", prune=True, left_out=left)
+    whole = zrun.build_native(lua.lang, src, str(tmp_path / "whole"), path="p.lua")
+    assert "string_upper" in left and "string_rep" not in left and "lua_print" not in left
+    assert os.path.getsize(pruned) < os.path.getsize(whole) / 2
+    r = subprocess.run([pruned], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 1 and r.stdout == "hi\tabab\n"
+    assert "string_upper() wasn't compiled ahead of time: the build was pruned" in r.stderr
+    r = subprocess.run([whole], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and r.stdout == "hi\tabab\nX\n"
+
+
 def test_not_strict(tmp_path):
     from conftest import tiny as plain
 
@@ -114,15 +149,7 @@ def test_not_strict(tmp_path):
 def test_lua(zig, tmp_path, name, monkeypatch):
     # (the Lua example made strict: every test program, standalone, as
     # real Lua runs it)
-    monkeypatch.syspath_prepend(os.path.join(HERE, "..", "examples", "lua"))
-    spec = importlib.util.spec_from_file_location("lua_strict", os.path.join(HERE, "..", "examples", "lua", "lua.py"))
-    module = importlib.util.module_from_spec(spec)
-    # (a module of its own, as imported: its tables the semantics' state)
-    monkeypatch.setitem(sys.modules, "lua_strict", module)
-    plain = zrun.Language
-    monkeypatch.setattr(zrun, "Language", lambda *a, **k: plain(*a, **k, strict=True))
-    spec.loader.exec_module(module)
-    monkeypatch.setattr(zrun, "Language", plain)
+    module = _strict_lua(monkeypatch)
     module.set_args(name, ())
     src = open(os.path.join(LUA_TESTS, name)).read()
     code, out, err = native(module.lang, src, tmp_path, name)

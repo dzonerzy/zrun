@@ -53,6 +53,9 @@ pub const Desc = extern struct {
     syms_len: u64,
     /// The image's items built (once, before anything runs)
     init: *const fn () callconv(.c) void,
+    /// Built with prune=True (1): what wasn't compiled may have been left
+    /// out by name
+    pruned: u64,
 };
 
 /// A symbol: its scope node (NONE: global), the node whose frame holds its

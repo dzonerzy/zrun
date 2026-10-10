@@ -278,7 +278,14 @@ fib.tiny:2:12: error: division by zero [runtime]
   in f(), called at fib.tiny:4:18
 ```
 
-Linux, for this machine (its CPU's code); needs the ziglang package (`pip install "zrun-py[exe]"`). Building takes a few seconds for a small language, more for a big one (the Lua example: its library compiled, about 12 s on many cores). `program.native_objects()` gives the object files to link yourself with zrun's runtime (`zig build rt`: libzrun_rt.a). Nothing that needs Python is in a standalone program: a host function that isn't compiled, a value Python alone knows (a complex number), an error Python words differs (zrun's own words then).
+A language's library in a table (Lua's `string`, `print`...) is all compiled, as any of it may be called. `prune=True` compiles only what the program can name: the functions in tables under a name that is one of the program's words, or a str the code uses. A 10-line Lua program is then 1.3 MB, not 3.6 MB, and builds in 3.5 s. A function the program reaches by a name it makes as it runs (`_G["pr" .. "int"]`) isn't compiled then: calling it stops the program, saying so. `left_out=[]` gets the names of those left out.
+
+```python
+left = []
+zrun.build_native(lua.lang, "script.lua", "script", prune=True, left_out=left)
+```
+
+Linux, for this machine (its CPU's code); needs the ziglang package (`pip install "zrun-py[exe]"`). Building takes a few seconds for a small language, more for a big one (the Lua example: its library compiled, about 8 s on many cores; 3 to 10 s pruned). `program.native_objects()` gives the object files to link yourself with zrun's runtime (`zig build rt`: libzrun_rt.a). Nothing that needs Python is in a standalone program: a host function that isn't compiled, a value Python alone knows (a complex number), an error Python words differs (zrun's own words then).
 
 ## Sessions and the REPL
 

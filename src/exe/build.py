@@ -352,11 +352,11 @@ def build_executable(language, source, output, target=None, path=None, python=No
     return output
 
 
-def build_native(language, source, output, path=None, runtime=None):
+def build_native(language, source, output, path=None, runtime=None, prune=False, left_out=None):
     """A standalone program: a strict language's program compiled ahead of
-    time, all of it, linked with zrun's runtime (`runtime`: libzrun_rt.a's
-    bytes) by the ziglang package's Zig. No Python in it. Returns its
-    path."""
+    time, all of it (prune: the library functions it can name), linked
+    with zrun's runtime (`runtime`: libzrun_rt.a's bytes) by the ziglang
+    package's Zig. No Python in it. Returns its path."""
     if not runtime:
         raise ValueError("this zrun has no runtime for standalone programs (one is in zrun's Linux builds)")
     import zrun
@@ -369,7 +369,7 @@ def build_native(language, source, output, path=None, runtime=None):
     else:
         name, text = "program", source
     name = path or name
-    objects = lang.load(text, name).native_objects()
+    objects = lang.load(text, name).native_objects(prune=bool(prune), left_out=left_out)
     try:
         import ziglang  # noqa: F401
     except ImportError:

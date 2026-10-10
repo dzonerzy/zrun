@@ -1176,7 +1176,7 @@ fn oomT() ?Thunk {
 /// time, all of it (standalone_build.zig), its objects (owned: deinit and
 /// destroy); null with an exception (zrun.CompileError when the program
 /// can't be).
-pub fn buildStandalone(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject, seed: *const [32]u8, opt: u32, max_depth: u64, path: []const u8) ?*standalone_build.Build {
+pub fn buildStandalone(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject, seed: *const [32]u8, opt: u32, max_depth: u64, path: []const u8, prune: bool) ?*standalone_build.Build {
     var aot: Aot = .{};
     const c = prepare(data, lang, python, compile_error, seed, opt, &aot) orelse return null;
     defer c.destroy();
@@ -1185,7 +1185,7 @@ pub fn buildStandalone(data: *program_mod.Data, lang: compile_mod.LangView, pyth
         return null;
     };
     b.* = standalone_build.Build.init(c.view, opt);
-    if (!aheadOfTime(c, b, &aot, data, max_depth, path, compile_error)) {
+    if (!aheadOfTime(c, b, &aot, data, max_depth, path, compile_error, prune)) {
         b.deinit();
         allocator.destroy(b);
         return null;
@@ -1193,7 +1193,7 @@ pub fn buildStandalone(data: *program_mod.Data, lang: compile_mod.LangView, pyth
     return b;
 }
 
-fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *program_mod.Data, max_depth: u64, path: []const u8, compile_error: *PyObject) bool {
+fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *program_mod.Data, max_depth: u64, path: []const u8, compile_error: *PyObject, prune: bool) bool {
     const comp = &c.compiler;
     const failed = struct {
         fn f(made: *standalone_build.Build, e: standalone_build.Error, err_class: *PyObject) bool {
@@ -1363,7 +1363,13 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
         var held: std.ArrayListUnmanaged(*PyObject) = .empty;
         defer held.deinit(allocator);
         held.appendSlice(allocator, comp.objects.items) catch return oomB();
-        standalone_build.heldObjects(allocator, &aot.notes, &held) catch return oomB();
+        // (pruned: those of the values only by a name the program can make)
+        if (prune) {
+            var names: std.StringHashMapUnmanaged(void) = .empty;
+            defer names.deinit(allocator);
+            standalone_build.programNames(allocator, data, &aot.notes, &names) catch return oomB();
+            standalone_build.reachableObjects(allocator, &aot.notes, &names, &held) catch return oomB();
+        } else standalone_build.heldObjects(allocator, &aot.notes, &held) catch return oomB();
         for (held.items) |o| {
             // (a closure too: its code for it, the variables it captured
             // read as they are now, as the front reads them)
@@ -1393,6 +1399,21 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
     batch.flush() catch |e| return failed(b, e, compile_error);
     comp.batch = false;
     batch.wait() catch |e| return failed(b, e, compile_error);
+    // (pruned: the Python functions held in the values not compiled, by
+    // name, for the build's report)
+    if (prune) {
+        var all: std.ArrayListUnmanaged(*PyObject) = .empty;
+        defer all.deinit(allocator);
+        standalone_build.heldObjects(allocator, &aot.notes, &all) catch return oomB();
+        var compiled: std.AutoHashMapUnmanaged(usize, void) = .empty;
+        defer compiled.deinit(allocator);
+        for (b.called.items) |e| compiled.put(allocator, e.func, {}) catch return oomB();
+        for (all.items) |o| {
+            if (pt == null or ph.typeOf(o) != @as(*py.c.PyTypeObject, @ptrCast(@alignCast(pt.?)))) continue;
+            if (compiled.contains(@intFromPtr(o))) continue;
+            b.left_out.append(b.arena.allocator(), standalone_build.qualnameOf(b.arena.allocator(), o) catch return oomB()) catch return oomB();
+        }
+    }
     // The image
     const main_name = mainName(c) orelse return oomB();
     const grammar_desc = b.describeGrammar(data.grammar) catch return oomB();
@@ -1421,6 +1442,7 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
         .sym_of = data.sym_of,
         .owners = owners,
         .syms = syms,
+        .pruned = prune,
     }) catch |e| return failed(b, e, compile_error);
     return true;
 }

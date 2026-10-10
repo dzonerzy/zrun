@@ -639,8 +639,11 @@ fn standaloneCall(ctx: *Ctx, node: u32, callee: *PyObject, args: []const Value, 
         given[n] = if (checked) a.checked() else a;
         n += 1;
     }
-    const code_p = standalone.calledOf(@intFromPtr(callee), args.len, mask) orelse
+    const code_p = standalone.calledOf(@intFromPtr(callee), args.len, mask) orelse {
+        if (standalone.program.?.pruned != 0)
+            return helpers.fail(ctx, node, "{s}() wasn't compiled ahead of time: the build was pruned (prune=True), and the program doesn't name it (build without prune to have it)", .{standalone.nameOf(callee)});
         return helpers.fail(ctx, node, "{s}() wasn't compiled ahead of time for a call of {d} arguments (a standalone program runs only what its build compiled)", .{ standalone.nameOf(callee), args.len });
+    };
     const code: driver.Helper = @ptrCast(@alignCast(code_p));
     const status = code(ctx, frame, &given, node, owner, null, null, out);
     switch (status) {

@@ -5,6 +5,19 @@ All notable changes to zrun are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`build_native(..., prune=True)`**: only the library functions a program can name compiled (those in the language's tables under one of the program's words or a str the code uses): a 10-line Lua program 1.3 MB instead of 3.6 MB, built in 3.5 s. One reached by a name made at run time stops the program, saying the build was pruned; `left_out=[]` gets the names of those left out. `program.native_objects(prune=..., left_out=...)` too.
+- **Natively**: `a ** b` of numbers (ints exactly within 128 bits, floats as CPython's float_pow: the C library's pow, its special cases and errors), `str.partition` and `rpartition`, `int(s, base)` of ints up to 128 bits.
+
+### Performance
+- **Standalone builds 2.2x faster** (the Lua example's test programs: 60 s to 27 s together): each language function a module of its own and the top level's optimized alongside the rest, not before them; a module past 10000 blocks (Lua's pattern matcher) optimized a level down, its code as fast.
+- **Less code, compiled faster** (the JIT's optimized code: 21% less time): an error's way out gives counts back by calls, not inline; a helper inline 16 times in one function's code out of line after that; a field of a record a local holds read and written without taking a count of the record. Run time as before.
+
+### Fixed
+- **Code compiled as a program runs needing a function's frame** (a library function calling back into the program, a node evaluated at run time) failed instead of compiling the function again with its variables in a frame, as the program's own code does.
+
 ## [0.5.0] - 2026-10-10
 
 Needs zgram 0.5.2 (its LLVM capsule's `LLVMAddAlias2`, for standalone programs).

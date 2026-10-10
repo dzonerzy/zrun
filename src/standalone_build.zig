@@ -102,6 +102,84 @@ fn heldIn(a: Allocator, v: Value, visited: *std.AutoHashMapUnmanaged(usize, void
     }
 }
 
+/// A Python object's name for reports (its __qualname__), copied
+pub fn qualnameOf(a: Allocator, o: *PyObject) ![]const u8 {
+    return a.dupe(u8, Build.pyName(o));
+}
+
+/// heldObjects for a pruned build (build_native(prune=True)): only the
+/// Python objects reachable by a name the program can make. A dict entry
+/// keyed by a str is followed only if the key is among `names` (the
+/// program's words, the strs the code uses, strs reachable so far: a
+/// library in a table by name, only what's named); anything else is
+/// followed. Till no more names are found.
+pub fn reachableObjects(a: Allocator, notes: *const std.AutoHashMapUnmanaged(usize, image.Note), names: *std.StringHashMapUnmanaged(void), out: *std.ArrayListUnmanaged(*PyObject)) !void {
+    var seen: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    defer seen.deinit(a);
+    for (out.items) |o| try seen.put(a, @intFromPtr(o), {});
+    while (true) {
+        const before = names.count();
+        var visited: std.AutoHashMapUnmanaged(usize, void) = .empty;
+        defer visited.deinit(a);
+        var it = notes.iterator();
+        while (it.next()) |e| switch (e.value_ptr.*) {
+            .value => |tag| try reachIn(a, .{ .tag = tag, .bits = e.key_ptr.* }, &visited, &seen, names, out),
+            else => {},
+        };
+        if (names.count() == before) return;
+    }
+}
+
+fn reachIn(a: Allocator, v: Value, visited: *std.AutoHashMapUnmanaged(usize, void), seen: *std.AutoHashMapUnmanaged(usize, void), names: *std.StringHashMapUnmanaged(void), out: *std.ArrayListUnmanaged(*PyObject)) !void {
+    switch (v.kind()) {
+        .host => {
+            if ((try seen.getOrPut(a, v.bits)).found_existing) return;
+            try out.append(a, @ptrFromInt(v.bits));
+        },
+        .str => try names.put(a, @as(*value.Str, @ptrCast(v.ptr())).bytes(), {}),
+        .list, .tuple, .dict, .set, .record => {
+            if ((try visited.getOrPut(a, v.bits)).found_existing) return;
+            switch (v.kind()) {
+                .list => for (@as(*value.List, @ptrCast(@alignCast(v.ptr()))).slice()) |x| try reachIn(a, x, visited, seen, names, out),
+                .tuple => for (@as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).slice()) |x| try reachIn(a, x, visited, seen, names, out),
+                .record => for (@as(*value.Record, @ptrCast(@alignCast(v.ptr()))).fields()) |x| try reachIn(a, x, visited, seen, names, out),
+                .dict => {
+                    const d: *value.Dict = @ptrCast(@alignCast(v.ptr()));
+                    if (d.entries) |entries| for (entries[0..d.used]) |en| {
+                        if (en.key.tag == value.DELETED) continue;
+                        // (an entry by a name the program can't make: left out)
+                        if (en.key.kind() == .str and !names.contains(@as(*value.Str, @ptrCast(en.key.ptr())).bytes())) continue;
+                        try reachIn(a, en.key, visited, seen, names, out);
+                        try reachIn(a, en.value, visited, seen, names, out);
+                    };
+                },
+                else => {
+                    var items = set_mod.iterate(@ptrCast(@alignCast(v.ptr())));
+                    while (items.next()) |x| try reachIn(a, x, visited, seen, names, out);
+                },
+            }
+        },
+        else => {},
+    }
+}
+
+/// The names a pruned build follows: every word of the program (its nodes'
+/// texts, short ones; a quoted one without its quotes too), every str the
+/// compiled code uses
+pub fn programNames(a: Allocator, data: anytype, notes: *const std.AutoHashMapUnmanaged(usize, image.Note), names: *std.StringHashMapUnmanaged(void)) !void {
+    for (data.nodes, 0..) |_, i| {
+        const t = data.text(@intCast(i));
+        if (t.len > 64) continue;
+        try names.put(a, t, {});
+        if (t.len >= 2 and (t[0] == '"' or t[0] == '\'' or t[0] == '`') and t[t.len - 1] == t[0]) try names.put(a, t[1 .. t.len - 1], {});
+    }
+    var it = notes.iterator();
+    while (it.next()) |e| switch (e.value_ptr.*) {
+        .str => try names.put(a, @as(*value.Str, @ptrFromInt(e.key_ptr.*)).bytes(), {}),
+        else => {},
+    };
+}
+
 /// A thunk compiled ahead: for a node's eval or exec in a scope's frames
 pub const ThunkMade = struct { node: u32, which: u32, owner: u32, name: [:0]const u8 };
 /// A Python function's code compiled ahead, for calls of its shape
@@ -122,6 +200,8 @@ pub const Build = struct {
     called: std.ArrayListUnmanaged(CalledMade) = .empty,
     /// Why it failed (Error.Compile, Unknown)
     why: std.ArrayListUnmanaged(u8) = .empty,
+    /// A pruned build's Python functions not compiled (their names)
+    left_out: std.ArrayListUnmanaged([]const u8) = .empty,
 
     pub fn init(view: *const llvm.LlvmView, opt: u32) Build {
         return .{ .arena = std.heap.ArenaAllocator.init(std.heap.c_allocator), .view = view, .opt = opt };
@@ -361,6 +441,7 @@ pub const Build = struct {
         sym_of: []const u32,
         owners: []const u32,
         syms: []const @import("standalone.zig").SymInfo,
+        pruned: bool = false,
     };
 
     /// The grammar, as the standalone runtime reads nodes with it
@@ -513,7 +594,7 @@ pub const Build = struct {
             try self.constBytes(&m, p.grammar),           ir.Module.kInt(t.i64, p.grammar.len),
             try self.constBytes(&m, std.mem.sliceAsBytes(p.sym_of)), try self.constBytes(&m, std.mem.sliceAsBytes(p.owners)),
             try self.constBytes(&m, std.mem.sliceAsBytes(p.syms)), ir.Module.kInt(t.i64, p.syms.len),
-            init_fn,
+            init_fn,                                                ir.Module.kInt(t.i64, @intFromBool(p.pruned)),
         };
         const desc = try self.constGlobal(&m, "zr_img_program", L("LLVMConstStructInContext")(ctx, &desc_fields, desc_fields.len, 0));
         {
