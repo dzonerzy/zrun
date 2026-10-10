@@ -4,6 +4,7 @@ same errors as the reference mode, for values of every kind (what they
 don't do natively, Python does: the same again)."""
 
 import math
+import re
 import sys
 
 import pytest
@@ -241,7 +242,7 @@ def test_percent_format():
             continue
         # (a float's digits: the C library's, natively where it's the one
         # Python formats with (Linux); elsewhere Python's own)
-        if sys.platform != "linux" and (isinstance(v, float) or FORMATS[i][-1] in "eEfFgG"):
+        if sys.platform != "linux" and (isinstance(v, float) or re.search(r"%[^a-zA-Z%]*[eEfFgG]", FORMATS[i])):
             continue
         try:
             got = strict.call("f", v, i)
