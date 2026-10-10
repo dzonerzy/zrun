@@ -1315,9 +1315,11 @@ export fn zr_set(ctx: *Ctx, node: u32, items: [*]const Value, n: u64, folded: u3
         return oomFail(ctx, node);
     };
     if (folded != 0) {
-        // (the frozenset's copy, as set_merge makes it; the items given in
-        // an order making the frozenset CPython's (the front's))
-        const c = set_mod.copy(s);
+        // (the frozenset's copy, as set_merge makes it, the items given in
+        // the order the front found: up to four, a table the copy's size,
+        // copied as it's laid out (an order laying it out as CPython's);
+        // more, a bigger one, its items put in in its order (CPython's))
+        const c = if (s.used <= 4) set_mod.copy(s) else set_mod.mergedInOrder(items[0..n], s.used);
         value.decref(Value.obj(.set, &s.head));
         s = c orelse return oomFail(ctx, node);
     }

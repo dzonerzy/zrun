@@ -307,20 +307,13 @@ const source_helper =
     \\            first.append(i)
     \\        else:
     \\            rest = [i for i in range(len(vals)) if i not in used]
-    \\            # (the source's order, its frozenset made again in the order
-    \\            # it goes over them (as merging constants makes it), the
-    \\            # frozenset's own; every order, for a few)
-    \\            def again(t):
-    \\                f = list(frozenset(vals[i] for i in t))
-    \\                return [next(i for i in t if type(vals[i]) is type(x) and vals[i] == x) for x in f]
-    \\            tries = [first, sorted(first)]
-    \\            for t in (sorted(first), first):
-    \\                for _ in range(3):
-    \\                    t = again(t)
-    \\                    tries.append(t)
-    \\            if len(first) <= 6:
-    \\                tries += [list(p) for p in itertools.permutations(first)]
-    \\            for t in tries:
+    \\            # (more than four: its copy is a smaller table, the items
+    \\            # put in in the frozenset's order: that order. Up to four:
+    \\            # its copy the same size, slot for slot: an order laying it
+    \\            # out the same (every order tried))
+    \\            if len(first) > 4:
+    \\                return first + rest
+    \\            for t in [first] + [list(p) for p in itertools.permutations(first)]:
     \\                if same(list(frozenset(vals[i] for i in t)), live):
     \\                    return t + rest
     \\    return None

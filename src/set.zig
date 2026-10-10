@@ -446,6 +446,24 @@ pub fn merge(s: *Set, other: *const Set) bool {
 }
 
 /// A dict's keys added (set_update_internal of a dict: one resize first)
+/// A new set merged from a frozenset of `distinct` items going over them in
+/// `keys`' order, its table another size (set_merge into an empty set:
+/// its room made once, the items put in in that order)
+pub fn mergedInOrder(keys: []const Value, distinct: usize) ?*Set {
+    const s = new() orelse return null;
+    if ((s.fill + distinct) * 5 >= s.mask * 3) {
+        if (!resize(s, (s.used + distinct) * 2)) {
+            value.decref(Value.obj(.set, &s.head));
+            return null;
+        }
+    }
+    for (keys) |k| if (!add(s, k)) {
+        value.decref(Value.obj(.set, &s.head));
+        return null;
+    };
+    return s;
+}
+
 pub fn mergeKeys(s: *Set, keys: []const Value) bool {
     if ((s.fill + keys.len) * 5 >= s.mask * 3) {
         if (!resize(s, (s.used + keys.len) * 2)) return false;

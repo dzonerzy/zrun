@@ -241,7 +241,7 @@ def test_percent_format():
             continue
         # (a float's digits: the C library's, natively where it's the one
         # Python formats with (Linux); elsewhere Python's own)
-        if isinstance(v, float) and sys.platform != "linux":
+        if sys.platform != "linux" and (isinstance(v, float) or FORMATS[i][-1] in "eEfFgG"):
             continue
         try:
             got = strict.call("f", v, i)

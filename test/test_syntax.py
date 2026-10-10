@@ -2,6 +2,7 @@
 `raise ... from ...`, `import` inside a semantic, `*args` in calls. Each the
 same as the reference mode; those native in strict mode too."""
 
+import os
 from dataclasses import dataclass, field
 
 import pytest
@@ -87,7 +88,9 @@ def importing(a, b):
 
 def test_import_inside():
     same_in_both(_program(importing), [(2.5, 4), (7, 9)])
-    assert _program(importing, strict=True).call("f", 2.5, 4) == importing(2.5, 4)
+    # (strict: os.path all Python; Windows' ntpath calls nt's C functions)
+    if os.name == "posix":
+        assert _program(importing, strict=True).call("f", 2.5, 4) == importing(2.5, 4)
 
 
 def other_constants(a, b):
