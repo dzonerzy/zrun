@@ -1499,7 +1499,24 @@ pub const Compiler = struct {
         try self.declareRuntime();
         try self.computeLayouts();
         try self.genFunction(NONE);
+        // (a standalone build: the language functions compiled one by one
+        // after, each a module of its own (compileQueued), optimized side
+        // by side; the top level's helpers with it)
+        if (self.aot != null) return self.drainHelpers();
         try self.drainQueues();
+    }
+
+    /// The helpers out of line the code made so far calls (the language
+    /// functions it calls left queued)
+    fn drainHelpers(self: *Compiler) Error!void {
+        while (self.helper_queue.pop()) |h| try self.genHelper(h);
+    }
+
+    /// A standalone build's queued language function `fnode` compiled, with
+    /// the helpers it calls (the functions it calls queued in turn).
+    pub fn compileQueued(self: *Compiler, fnode: u32) Error!void {
+        try self.genFunction(fnode);
+        try self.drainHelpers();
     }
 
     /// The runtime's helpers (helpers.zig), by name and signature: the

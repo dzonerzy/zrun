@@ -44,6 +44,8 @@ pub const Module = struct {
     strings: std.StringHashMapUnmanaged(Value) = .empty,
     /// Functions by name (helpers declared, the module's own)
     fns: std.StringHashMapUnmanaged(Fn) = .empty,
+    /// Blocks made in it (its size, for how much LLVM optimizes it)
+    blocks: usize = 0,
     /// The module's own, in the order they're made (dropSince)
     made: std.ArrayListUnmanaged(struct { name: []const u8, v: Value }) = .empty,
     /// Given to the JIT: no longer ours to free
@@ -314,6 +316,7 @@ pub const Function = struct {
     /// A fresh block.
     pub fn label(self: *Function, prefix: []const u8) !Block {
         self.next_label += 1;
+        self.m.blocks += 1;
         var buf: [64]u8 = undefined;
         const name = std.fmt.bufPrintZ(&buf, "{s}{d}", .{ prefix[0..@min(prefix.len, 40)], self.next_label }) catch "b";
         const blk = L("LLVMAppendBasicBlockInContext")(self.m.ctx, self.fv, name);

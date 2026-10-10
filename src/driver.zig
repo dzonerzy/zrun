@@ -1204,7 +1204,6 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
             return false;
         }
     }.f;
-    b.emit(&comp.m) catch |e| return failed(b, e, compile_error);
     // What's compiled as a program runs in the JIT, compiled now: the
     // thunks of nodes code evaluates knowing them only at run time (each
     // node of the scope the code runs in, with a semantic for it), the
@@ -1245,7 +1244,7 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
             if (self.n == 0) return;
             self.comp.batch = false;
             try self.b.keepNames(&self.comp.m);
-            const job = inBackground(self.b.view, self.comp.m.take(), self.b.opt, null, true) orelse return error.OutOfMemory;
+            const job = inBackground(self.b.view, self.comp.m.take(), optFor(&self.comp.m, self.b.opt), null, true) orelse return error.OutOfMemory;
             try self.jobs.append(allocator, job);
             try self.start();
         }
@@ -1276,8 +1275,44 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
     };
     var batch = Batch{ .comp = comp, .b = b };
     defer batch.deinit();
-    batch.start() catch return oomB();
+    // (the top level's module, made into an object alongside the rest)
+    batch.n = 1;
+    batch.flush() catch return oomB();
     defer comp.batch = false;
+    // The language functions, each in a module of its own (as many as
+    // the program has: optimized side by side, not one module after the
+    // top level's); one that fails compiled again as the JIT's are (a
+    // literal made at run time, its variables in a frame), else the
+    // program's CompileError
+    while (comp.queue.pop()) |fnode| {
+        const saved = comp.a.dupe(u32, comp.queue.items) catch return oomB();
+        while (true) {
+            comp.failed_semantic = null;
+            comp.need_retry = false;
+            comp.newModule() catch return oomB();
+            // (compiled from here: a call of itself doesn't queue it again)
+            comp.compiled_fns.put(comp.a, fnode, {}) catch return oomB();
+            comp.compileQueued(fnode) catch |e| {
+                comp.forgetModule();
+                // (not compiled after all; the queue as it was)
+                _ = comp.compiled_fns.remove(fnode);
+                comp.queue.clearRetainingCapacity();
+                comp.queue.appendSlice(comp.a, saved) catch return oomB();
+                switch (e) {
+                    error.Unsupported => {
+                        if (comp.need_retry) continue;
+                        if (comp.framesForRetry() catch return oomB()) continue;
+                        ph.raise(compile_error, "{s}", .{c.failure.message.items});
+                    },
+                    error.OutOfMemory => _ = py.c.PyErr_NoMemory(),
+                    error.Python => {},
+                }
+                return false;
+            };
+            batch.added() catch |e| return failed(b, e, compile_error);
+            break;
+        }
+    }
     // (the nodes the code can have as values: those it makes values of,
     // and those under them)
     const reachable = allocator.alloc(bool, data.nodes.len) catch return oomB();
@@ -1388,6 +1423,16 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
         .syms = syms,
     }) catch |e| return failed(b, e, compile_error);
     return true;
+}
+
+/// The level a module is optimized at: `opt`, but for a module so big
+/// LLVM's work on it outlasts the rest of a program's together (a
+/// library's pattern matcher: its time grows faster than its size), the
+/// level below
+const huge_module_blocks = 10000;
+
+fn optFor(m: *const @import("ir.zig").Module, opt: u32) u32 {
+    return if (opt > 1 and m.blocks > huge_module_blocks) opt - 1 else opt;
 }
 
 fn oomB() bool {
