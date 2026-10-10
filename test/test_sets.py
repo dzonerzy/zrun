@@ -45,7 +45,7 @@ def ordered(a, b):
 
 def test_order_is_pythons():
     p = _program(ordered)
-    words = ["w%d" % i for i in range(40)]
+    words = [f"w{i}" for i in range(40)]
     same_in_both(p, [
         (list(range(30)), list(range(20, 50))),
         ([-1, -2, 2**40, 2**62, 7.5, -0.25, 1e300], [7.5, 2**40, 3]),
@@ -85,8 +85,8 @@ def operations(ops, b):
 def test_random_operations_in_pythons_order():
     p = _program(operations)
     rng = random.Random(7)
-    pool = list(range(-20, 60)) + ["k%d" % i for i in range(60)] + [i * 0.5 for i in range(20)]
-    pool += [(i, "t") for i in range(10)] + [2**70 + i for i in range(5)] + [-(2**63) - i for i in range(3)] + ["ü%d" % i for i in range(5)]
+    pool = list(range(-20, 60)) + [f"k{i}" for i in range(60)] + [i * 0.5 for i in range(20)]
+    pool += [(i, "t") for i in range(10)] + [2**70 + i for i in range(5)] + [-(2**63) - i for i in range(3)] + [f"ü{i}" for i in range(5)]
     cases = []
     for _ in range(200):
         ops = []

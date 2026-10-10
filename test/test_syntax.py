@@ -45,7 +45,7 @@ def test_del():
 def reading_after_del(a, b):
     t = a
     del t
-    return t
+    return t  # noqa: F821 (the read after del under test)
 
 
 def test_reading_after_del_is_refused():

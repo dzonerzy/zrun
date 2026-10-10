@@ -6,14 +6,14 @@ build-backend = "pyoz.backend"
 # The import name is `zrun` (module-name below); every zsuite package is
 # published as <name>-py
 name = "zrun-py"
-version = "0.4.2"
+version = "0.5.0"
 description = "Execution for languages built with zgram and zrules: semantics written as Python functions, compiled to native code."
 requires-python = ">=3.10"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Daniele Linguaglossa" }]
-dependencies = ["zgram-py>=0.5.0", "zrules-py>=0.2.0"]
+dependencies = ["zgram-py>=0.5.2", "zrules-py>=0.2.0"]
 # zrun.build_executable(): Zig, to link an executable's launcher
 optional-dependencies = { exe = ["ziglang>=0.16"] }
 classifiers = [

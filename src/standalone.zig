@@ -197,9 +197,14 @@ fn noNode(_: *anyopaque, _: u32) callconv(.c) ?*anyopaque {
     return null;
 }
 
-/// The program's main (the image's `main` calls it): 0, or 1 after a
-/// runtime error written to the standard error
-export fn zr_rt_main(desc: *const Desc, argc: c_int, argv: [*]const [*:0]const u8) callconv(.c) c_int {
+// The program's main, zr_rt_main (the image's `main` calls it): 0, or 1
+// after a runtime error written to the standard error. The runtime
+// library's alone (the extension has no use for it)
+comptime {
+    if (helpers.standalone) @export(&rtMain, .{ .name = "zr_rt_main" });
+}
+
+fn rtMain(desc: *const Desc, argc: c_int, argv: [*]const [*:0]const u8) callconv(.c) c_int {
     _ = argc;
     _ = argv;
     program = desc;

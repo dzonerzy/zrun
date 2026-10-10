@@ -5,7 +5,9 @@ All notable changes to zrun are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.2] - 2026-10-09
+## [0.5.0] - 2026-10-10
+
+Needs zgram 0.5.2 (its LLVM capsule's `LLVMAddAlias2`, for standalone programs).
 
 ### Added
 - **Strict mode: `zrun.Language(..., strict=True)`.** Compiled code calling nothing in Python, or the reason it can't: a semantic outside the compilable subset (or `native=False`) is a `CompileError` when it's registered; code that would call into Python (a Python function or builtin, a Python object as a value, `isinstance()` of a class not the language's, a module variable a function rebinds, a semantic run as Python) a `CompileError` when the program compiles, at the semantic's line; what only shows as the code runs (a host function in Python) a `zrun.StrictError` (a `CompileError`) at the program's line, saying what it called. Errors (still Python's exceptions) and code compiled while the program runs are allowed. In `run()`, `call()` and `map()`.
