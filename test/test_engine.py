@@ -307,12 +307,18 @@ def test_map_runs_threads_at_once():
     program = lang.load(MAPPED, "mapped")
     work = [24] * 16
     program.map("fib", work[:1])
-    t = time.perf_counter()
-    one = program.map("fib", work, threads=1)
-    alone = time.perf_counter() - t
-    t = time.perf_counter()
-    many = program.map("fib", work, threads=4)
-    together = time.perf_counter() - t
+
+    # (the best of 3: a shared CI machine's other work aside)
+    def best(threads):
+        times = []
+        for _ in range(3):
+            t = time.perf_counter()
+            r = program.map("fib", work, threads=threads)
+            times.append(time.perf_counter() - t)
+        return r, min(times)
+
+    one, alone = best(1)
+    many, together = best(4)
     assert one == many
     import os
 
