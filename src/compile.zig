@@ -9323,11 +9323,22 @@ const Gen = struct {
             va = try self.expr(inst, ae);
         }
         // Known values: as type() and `is` do it
-        if (va != .dyn or (vb != null and vb.? != .dyn)) {
+        if (va != .dyn and (vb == null or vb.? != .dyn)) {
             const ta = (try self.builtinCall(inst, type_obj, &.{va}, pos)).?;
             const tb = if (vb) |bv| (try self.builtinCall(inst, type_obj, &.{bv}, pos)).? else SVal{ .py = cls.? };
             return try self.compare(inst, op, ta, tb);
         }
+        // (one known, the other not: the known one a run-time value too,
+        // both types' keys compared, no class object made)
+        // (made first, then stored: the union written as it's read else)
+        if (va != .dyn) {
+            const d = try self.materialize(va, inst.node);
+            va = .{ .dyn = d };
+        }
+        if (vb) |bv| if (bv != .dyn) {
+            const d = try self.materialize(bv, inst.node);
+            vb = .{ .dyn = d };
+        };
         const ka = try self.typeKey(va.dyn);
         const kb = if (vb) |bv| try self.typeKey(bv.dyn) else TypeKey{ .key = cls_key.?, .host = self.c.m.k1(false) };
         const fast = try f.label("type_fast");
@@ -10048,7 +10059,9 @@ const Gen = struct {
             try self.storeSlot(slot, n);
             try f.br(join);
             try f.block(join);
-            v = .{ .dyn = try self.loadSlot(slot, if (n.shape == v.dyn.shape) n.shape else .any) };
+            // (made first, then stored: the union written as it's read else)
+        const joined = try self.loadSlot(slot, if (n.shape == v.dyn.shape) n.shape else .any);
+        v = .{ .dyn = joined };
         }
         return v;
     }

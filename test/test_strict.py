@@ -189,3 +189,23 @@ def test_type_of_a_known_value():
     p.run(mode="compiled")
     assert p.call("f", 40, 2) == 42
     assert p.call("f", 40, 2, mode="python") == 42
+
+
+def same_type(a, b):
+    return type(a) is type(b)
+
+
+def test_type_of_a_known_value_and_one_of_run_time():
+    # `type(None) is type(b)`, b known only at run time: both types' keys
+    # compared natively, no class object made
+    lang = _language(True)
+
+    @lang.eval("BinOp")
+    def binop(node, rt):
+        a = rt.eval(node.left)
+        b = rt.eval(node.right)
+        return [same_type(None, b), same_type(b, 1.5), type(a) is not type(None), same_type(a, b)]
+
+    p = lang.load("fn f(a, b) { return a + b; }", "type.tiny")
+    for a, b in [(1, 2), (1, 2.5), (1, "x"), (1.5, 2.5)]:
+        assert p.call("f", a, b) == p.call("f", a, b, mode="python")
