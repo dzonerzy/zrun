@@ -5,7 +5,9 @@ All notable changes to zrun are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-10-10
+
+Needs zgram 0.5.2, as 0.5.0 did.
 
 ### Added
 - **`build_native(..., prune=True)`**: only the library functions a program can name compiled (those in the language's tables under one of the program's words or a str the code uses): a 10-line Lua program 0.9 MB instead of 1.7 MB, built in under a second. One reached by a name made at run time stops the program, saying the build was pruned; `left_out=[]` gets the names of those left out. `program.native_objects(prune=..., left_out=...)` too.
