@@ -195,6 +195,8 @@ pub const Build = struct {
     /// The target the objects are for (LLVM's triple: any machine of it),
     /// or null: this machine
     triple: ?[:0]const u8 = null,
+    /// A library's objects (the C API), not an executable's
+    shared: bool = false,
     /// The objects compiled (the image's last)
     objects: std.ArrayListUnmanaged([]u8) = .empty,
     /// Every module's names for addresses
@@ -448,6 +450,10 @@ pub const Build = struct {
         pruned: bool = false,
         /// The setup's index in `objects` + 1 (0: none)
         setup: u64 = 0,
+        /// A library's (zrun_init, the C API), not an executable's (main)
+        shared: bool = false,
+        /// The top level's names (standalone.Desc.names)
+        names: []const u8 = "",
     };
 
     /// The grammar, as the standalone runtime reads nodes with it
@@ -607,15 +613,28 @@ pub const Build = struct {
             try self.constBytes(&m, std.mem.sliceAsBytes(p.syms)), ir.Module.kInt(t.i64, p.syms.len),
             init_fn,                                                ir.Module.kInt(t.i64, @intFromBool(p.pruned)),
             ir.Module.kInt(t.i64, p.setup),
+            try self.constBytes(&m, p.names),             ir.Module.kInt(t.i64, p.names.len),
         };
         const desc = try self.constGlobal(&m, "zr_img_program", L("LLVMConstStructInContext")(ctx, &desc_fields, desc_fields.len, 0));
         {
+            // (an executable's main, or a library's zrun_init (zrun.h),
+            // given the program's description)
             var rt_params = [_]ir.Type{ t.ptr, t.i32, t.ptr };
             const rt_ty = L("LLVMFunctionType")(t.i32, &rt_params, rt_params.len, 0);
-            const rt_main = L("LLVMAddFunction")(m.mod, "zr_rt_main", rt_ty);
+            const rt_main = L("LLVMAddFunction")(m.mod, if (p.shared) "zr_rt_init" else "zr_rt_main", rt_ty);
             var main_params = [_]ir.Type{ t.i32, t.ptr };
             const main_ty = L("LLVMFunctionType")(t.i32, &main_params, main_params.len, 0);
-            const main = L("LLVMAddFunction")(m.mod, "main", main_ty);
+            const main = L("LLVMAddFunction")(m.mod, if (p.shared) "zrun_init" else "main", main_ty);
+            if (p.shared) {
+                // (the rest of the C API, the runtime's: kept by the
+                // library's own table of it)
+                const call_fn = L("LLVMAddFunction")(m.mod, "zrun_call", void_fn);
+                const error_fn = L("LLVMAddFunction")(m.mod, "zrun_error", void_fn);
+                var api = [_]ir.Value{ call_fn, error_fn };
+                const table_g = L("LLVMAddGlobal")(m.mod, L("LLVMArrayType2")(t.ptr, api.len), "zrun_api");
+                L("LLVMSetInitializer")(table_g, L("LLVMConstArray2")(t.ptr, &api, api.len));
+                L("LLVMSetGlobalConstant")(table_g, 1);
+            }
             const b = L("LLVMCreateBuilderInContext")(ctx);
             defer L("LLVMDisposeBuilder")(b);
             L("LLVMPositionBuilderAtEnd")(b, L("LLVMAppendBasicBlockInContext")(ctx, main, "entry"));

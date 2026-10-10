@@ -62,6 +62,10 @@ pub const Desc = extern struct {
     /// + 1 (0: none), called with the program's path and arguments before
     /// the top level runs
     setup: u64,
+    /// The top level's names: each its slot (u32), its length (u32), its
+    /// bytes (a library's zrun_call finds a function by them)
+    names: [*]const u8,
+    names_len: u64,
 };
 
 /// A symbol: its scope node (NONE: global), the node whose frame holds its
@@ -206,35 +210,201 @@ fn noNode(_: *anyopaque, _: u32) callconv(.c) ?*anyopaque {
     return null;
 }
 
-// The program's main, zr_rt_main (the image's `main` calls it): 0, or 1
-// after a runtime error written to the standard error. The runtime
-// library's alone (the extension has no use for it)
+// The program's main, zr_rt_main (an executable's `main` calls it): 0, or
+// 1 after a runtime error written to the standard error. A library's C
+// API (build_native(shared=True): zrun.h): zr_rt_init (its zrun_init
+// calls it), zrun_call, zrun_error. The runtime library's alone (the
+// extension has no use for them)
 comptime {
-    if (helpers.standalone) @export(&rtMain, .{ .name = "zr_rt_main" });
+    if (helpers.standalone) {
+        @export(&rtMain, .{ .name = "zr_rt_main" });
+        @export(&rtInit, .{ .name = "zr_rt_init" });
+        @export(&zrunCall, .{ .name = "zrun_call" });
+        @export(&zrunError, .{ .name = "zrun_error" });
+    }
 }
 
-fn rtMain(desc: *const Desc, argc: c_int, argv: [*]const [*:0]const u8) callconv(.c) c_int {
+/// The program's run: its context, its objects, its globals (an
+/// executable's, a library's between its calls)
+var run_ctx: Ctx = undefined;
+var run_objects: std.ArrayListUnmanaged(*@import("pyhelp.zig").PyObject) = .empty;
+var run_globals: ?*value.Frame = null;
+var no_node: u8 = 0;
+
+/// The program set up and its top level run (its setup first, given its
+/// arguments): false with the error in run_ctx
+fn startProgram(desc: *const Desc, argc: c_int, argv: [*]const [*:0]const u8) bool {
     program = desc;
     makeData(desc);
     desc.init();
-    var objects: std.ArrayListUnmanaged(*@import("pyhelp.zig").PyObject) =.{ .items = @ptrCast(@constCast(desc.objects[0..desc.objects_len])), .capacity = desc.objects_len };
-    var dummy: u8 = 0;
-    var ctx = Ctx{
-        .node_maker = .{ .ctx = &dummy, .make_fn = @ptrCast(&noNode) },
-        .objects = &objects,
+    run_objects = .{ .items = @ptrCast(@constCast(desc.objects[0..desc.objects_len])), .capacity = desc.objects_len };
+    run_ctx = Ctx{
+        .node_maker = .{ .ctx = &no_node, .make_fn = @ptrCast(&noNode) },
+        .objects = &run_objects,
         .max_depth = @intCast(desc.max_depth),
     };
-    const globals = helpers.zr_frame_new(null, desc.globals) orelse {
-        writeErr("zrun: out of memory\n");
-        return 1;
-    };
-    const ok = runSetup(desc, &ctx, argv[1..@intCast(@max(argc, 1))]) and desc.main(&ctx, globals);
+    run_globals = helpers.zr_frame_new(null, desc.globals) orelse return helpers.fail(&run_ctx, program_mod.NONE, "out of memory", .{});
+    const args = if (argc > 0) argv[1..@intCast(argc)] else argv[0..0];
+    return runSetup(desc, &run_ctx, args) and desc.main(&run_ctx, run_globals.?);
+}
+
+fn rtMain(desc: *const Desc, argc: c_int, argv: [*]const [*:0]const u8) callconv(.c) c_int {
+    const ok = startProgram(desc, argc, argv);
+    helpers.flushOutput();
     if (!ok) {
-        helpers.flushOutput();
-        report(desc, &ctx);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        report(desc, &run_ctx, &out);
+        writeErr(out.items);
         return 1;
     }
+    return 0;
+}
+
+// ----------------------------------------------------------------------
+// A library's C API (zrun.h, build_native writes it)
+// ----------------------------------------------------------------------
+
+/// A value as C has it: none, a bool or an int (`i`), a float (`f`), a
+/// str (`s`: UTF-8, valid till the next call), another (`s`: its str())
+pub const CValue = extern struct {
+    kind: Kind,
+    as: extern union {
+        i: i64,
+        f: f64,
+        s: extern struct { ptr: ?[*]const u8, len: usize },
+    },
+    pub const Kind = enum(c_int) { none = 0, bool = 1, int = 2, float = 3, str = 4, other = 5 };
+};
+
+/// The last error's words (zrun_error's), the last str returned
+var last_error: std.ArrayListUnmanaged(u8) = .empty;
+var last_str: std.ArrayListUnmanaged(u8) = .empty;
+/// The program's top-level names, their slots in its globals (made at the
+/// first call)
+var global_slots: std.StringHashMapUnmanaged(u32) = .empty;
+var slots_made = false;
+
+/// zrun_init(argc, argv): the program set up and its top level run, once:
+/// 0, or -1 (zrun_error says why)
+fn rtInit(desc: *const Desc, argc: c_int, argv: [*]const [*:0]const u8) callconv(.c) c_int {
+    if (program != null) return 0;
+    const ok = startProgram(desc, argc, argv);
     helpers.flushOutput();
+    if (!ok) return failed();
+    return 0;
+}
+
+/// -1, the error kept for zrun_error (as the reference mode words it)
+fn failed() c_int {
+    last_error.clearRetainingCapacity();
+    report(program.?, &run_ctx, &last_error);
+    // (a line: the trailing newline not part of it)
+    if (last_error.items.len > 0 and last_error.items[last_error.items.len - 1] == '\n') last_error.items.len -= 1;
+    last_error.append(allocator, 0) catch {};
+    run_ctx.clearError();
+    return -1;
+}
+
+fn failWith(comptime fmt: []const u8, args: anytype) c_int {
+    _ = helpers.fail(&run_ctx, program_mod.NONE, fmt, args);
+    return failed();
+}
+
+/// zrun_error(): the last error's words ("" if none)
+fn zrunError() callconv(.c) [*:0]const u8 {
+    if (last_error.items.len == 0) return "";
+    return @ptrCast(last_error.items.ptr);
+}
+
+/// zrun_call(name, args, n, out): the program's function `name` (one its
+/// top level defines) called with the arguments: 0 with its result in
+/// *out, or -1 (zrun_error says why)
+fn zrunCall(name: [*:0]const u8, args: [*]const CValue, n: usize, out: *CValue) callconv(.c) c_int {
+    const p = program orelse return failNoProgram();
+    const slot = globalSlot(p, std.mem.span(name)) orelse return failWith("{s} isn't a name the program's top level defines", .{name});
+    const f = run_globals.?.slots()[slot];
+    if (f.kind() != .function and f.kind() != .closure) return failWith("{s} isn't a function (a {s})", .{ name, value.typeName(f) });
+    const vals = allocator.alloc(Value, n) catch return failWith("out of memory", .{});
+    defer allocator.free(vals);
+    var made: usize = 0;
+    defer for (vals[0..made]) |v| value.decref(v);
+    for (args[0..n], vals) |a, *v| {
+        v.* = fromC(a) orelse return failWith("an argument of {s}() isn't a value zrun has (its kind {d})", .{ name, @intFromEnum(a.kind) });
+        made += 1;
+    }
+    var result: Value = Value.none_v;
+    const ok = helpers.zr_call(&run_ctx, program_mod.NONE, f.tag, f.bits, vals.ptr, n, null, &result);
+    helpers.flushOutput();
+    if (!ok) return failed();
+    defer value.decref(result);
+    return toC(result, out);
+}
+
+fn failNoProgram() c_int {
+    last_error.clearRetainingCapacity();
+    last_error.appendSlice(allocator, "zrun_init() wasn't called\x00") catch {};
+    return -1;
+}
+
+/// A top-level name's slot in the globals (the image's table of them)
+fn globalSlot(p: *const Desc, name: []const u8) ?u32 {
+    if (!slots_made) {
+        slots_made = true;
+        const t = p.names[0..p.names_len];
+        var at: usize = 0;
+        while (at + 8 <= t.len) {
+            const slot = std.mem.readInt(u32, t[at..][0..4], .little);
+            const len = std.mem.readInt(u32, t[at + 4 ..][0..4], .little);
+            at += 8;
+            const key = t[at..][0..len];
+            at += len;
+            const e = global_slots.getOrPut(allocator, key) catch continue;
+            if (!e.found_existing) e.value_ptr.* = slot;
+        }
+    }
+    return global_slots.get(name);
+}
+
+fn fromC(a: CValue) ?Value {
+    return switch (a.kind) {
+        .none => Value.none_v,
+        .bool => Value.boolean(a.as.i != 0),
+        .int => Value.int(a.as.i),
+        .float => Value.float(a.as.f),
+        .str => blk: {
+            const bytes = if (a.as.s.ptr) |ptr| ptr[0..a.as.s.len] else "";
+            if (!std.unicode.utf8ValidateSlice(bytes)) return null;
+            const s = value.newStr(bytes) orelse return null;
+            break :blk Value.obj(.str, &s.head);
+        },
+        .other => null,
+    };
+}
+
+/// A result as C has it: a str's (and another's str()) bytes kept till the
+/// next call
+fn toC(v: Value, out: *CValue) c_int {
+    switch (v.kind()) {
+        .none => out.* = .{ .kind = .none, .as = .{ .i = 0 } },
+        .bool => out.* = .{ .kind = .bool, .as = .{ .i = @intCast(v.bits) } },
+        .int => out.* = .{ .kind = .int, .as = .{ .i = v.asInt() } },
+        .float => out.* = .{ .kind = .float, .as = .{ .f = v.asFloat() } },
+        else => {
+            var text = v;
+            var owned = false;
+            defer if (owned) value.decref(text);
+            const kind: CValue.Kind = if (v.kind() == .str) .str else .other;
+            if (kind == .other) {
+                if (!helpers.zr_builtin(&run_ctx, program_mod.NONE, @intFromEnum(helpers.Builtin.str), 0, v.tag, v.bits, &text)) return failed();
+                owned = true;
+            }
+            const bytes = @as(*value.Str, @ptrCast(@alignCast(text.ptr()))).bytes();
+            last_str.clearRetainingCapacity();
+            last_str.appendSlice(allocator, bytes) catch return failWith("out of memory", .{});
+            last_str.append(allocator, 0) catch return failWith("out of memory", .{});
+            out.* = .{ .kind = kind, .as = .{ .s = .{ .ptr = last_str.items.ptr, .len = bytes.len } } };
+        },
+    }
     return 0;
 }
 
@@ -314,9 +484,7 @@ fn chars(s: []const u8) usize {
 /// A runtime error, as the reference mode's zrun.Error renders it: where,
 /// the message, the line with the node underlined, the calls that led
 /// there (innermost first)
-fn report(desc: *const Desc, ctx: *Ctx) void {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(allocator);
+fn report(desc: *const Desc, ctx: *Ctx, out: *std.ArrayListUnmanaged(u8)) void {
     const src = desc.source[0..desc.source_len];
     const path = desc.path[0..desc.path_len];
     const msg = if (ctx.err_msg.items.len > 0) ctx.err_msg.items else "error";
@@ -342,5 +510,4 @@ fn report(desc: *const Desc, ctx: *Ctx) void {
             out.print(allocator, "  in {s}(), called at {s}:{d}:{d}\n", .{ name, path, at.line, at.col }) catch return;
         } else out.print(allocator, "  in {s}()\n", .{name}) catch return;
     }
-    writeErr(out.items);
 }

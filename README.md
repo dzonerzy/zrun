@@ -297,6 +297,19 @@ For this machine (its CPU's code), on Linux or Windows; `target="x86_64-linux"` 
 zrun.build_native(lua.lang, "script.lua", "script", target="x86_64-windows")    # script.exe
 ```
 
+`shared=True` makes a library instead (`.so`, `.dll`), with a C API in a header beside it: `zrun_init()` runs the program's top level, `zrun_call(name, args, n, &out)` calls a function it defines, `zrun_error()` says why one failed (a runtime error, as the program's would be written). Values are none, bools, ints, floats and strs (another result is its `str()`).
+
+```python
+zrun.build_native(lang, "engine.tiny", "engine", shared=True)    # engine.so and engine.h
+```
+
+```c
+#include "engine.h"
+zrun_init(argc, argv);
+zrun_value args[2] = {{ZRUN_INT, {.i = 40}}, {ZRUN_INT, {.i = 2}}}, out;
+if (zrun_call("add", args, 2, &out) == 0) printf("%lld\n", (long long)out.as.i);   /* 42 */
+```
+
 Needs the ziglang package (`pip install "zrun-py[exe]"`). Building takes a few seconds for a small language, more for a big one (the Lua example: its library compiled, about 2 s on many cores; under a second pruned). The objects are kept in zrun's cache, as the JIT's are: a program built again links them, another program of the language compiles only its own code. `program.native_objects()` gives the object files to link yourself with zrun's runtime (`zig build rt`: libzrun_rt.a). Nothing that needs Python is in a standalone program: a host function that isn't compiled, a value Python alone knows (a complex number), an error Python words differs (zrun's own words then).
 
 ## Sessions and the REPL
@@ -341,7 +354,7 @@ Every class and method has its documentation in `help()` (and in the `.pyi` stub
 | `program.report()`, `lang.python_semantics()` | what to look at to make it faster |
 | `lang.compile(source, output)`, `program.save(path)`, `lang.load_compiled(path)` | compiled modules |
 | `zrun.build_executable(language, source, output, target=None, python=None)` | the program as one executable file |
-| `zrun.build_native(language, source, output, path=None, prune=False, left_out=None, setup=None, target=None)`, `program.native_objects()` | a strict language's program as an executable with no Python |
+| `zrun.build_native(language, source, output, path=None, prune=False, left_out=None, setup=None, target=None, shared=False)`, `program.native_objects()` | a strict language's program as an executable with no Python |
 | `lang.session()`, `lang.repl()` | programs run one after another, sharing their names |
 | `zrun.Bytes(data)` | data read in place |
 | `zrun.configure(cache=, cache_size=, tiers=, perf_map=)`, `zrun.clear_cache()` | process-wide settings; the compiled-code cache |

@@ -123,6 +123,8 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     });
     mod.addIncludePath(b.path("vendor/llvm/include"));
     mod.addOptions("build_options", options);
+    // (position-independent: in a library (build_native(shared=True)) too)
+    mod.pic = true;
     const lib = b.addLibrary(.{ .name = "zrun_rt", .linkage = .static, .root_module = mod });
     // (a section per function and datum: a program linked with it keeps
     // only what it calls, --gc-sections)

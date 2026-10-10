@@ -4702,7 +4702,7 @@ pub const Builtin = enum(u32) { int, float, len, abs, str, bool, list, floor, ce
 /// A builtin of one argument (`code`), natively for native values, as
 /// Python does it; anything else (and the errors) by the builtin itself
 /// (objects[callee_index]).
-export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64, bits: u64, out: *Value) callconv(.c) bool {
+pub export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: u64, bits: u64, out: *Value) callconv(.c) bool {
     const v = Value{ .tag = t, .bits = bits };
     // (a Big: int(), floor(), ceil() itself, abs() in 128 bits, float()
     // rounded, str() its digits, bool() true)

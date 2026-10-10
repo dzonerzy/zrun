@@ -352,7 +352,46 @@ def build_executable(language, source, output, target=None, path=None, python=No
     return output
 
 
-def build_native(language, source, output, path=None, runtime=None, prune=False, left_out=None, setup=None, target=None, zig_target=None):
+HEADER = """\
+/* The C API of a library zrun.build_native(..., shared=True) made: a
+   program compiled ahead of time, no Python in it. One program per process,
+   called from one thread at a time. */
+#ifndef ZRUN_H
+#define ZRUN_H
+#include <stddef.h>
+#include <stdint.h>
+
+typedef enum { ZRUN_NONE, ZRUN_BOOL, ZRUN_INT, ZRUN_FLOAT, ZRUN_STR, ZRUN_OTHER } zrun_kind;
+
+/* A value: none, a bool or an int (i), a float (f), a str (s, UTF-8), or
+   another (s: its str(), as Python writes it). The bytes of a str zrun
+   gives are valid until the next call. */
+typedef struct {
+    zrun_kind kind;
+    union {
+        int64_t i;
+        double f;
+        struct { const char *ptr; size_t len; } s;
+    } as;
+} zrun_value;
+
+/* The program set up and its top level run, once (argv: its setup's
+   arguments, argv[0] its name): 0, or -1 (zrun_error() says why). */
+int zrun_init(int argc, char **argv);
+
+/* The program's function `name` (one its top level defines) called with n
+   arguments: 0 with its result in *out, or -1 (zrun_error() says why: a
+   runtime error, as the program's would be written). */
+int zrun_call(const char *name, const zrun_value *args, size_t n, zrun_value *out);
+
+/* The last error's words ("" if none), valid until the next call. */
+const char *zrun_error(void);
+
+#endif
+"""
+
+
+def build_native(language, source, output, path=None, runtime=None, prune=False, left_out=None, setup=None, target=None, zig_target=None, shared=False):
     """A standalone program: a strict language's program compiled ahead of
     time, all of it (prune: the library functions it can name), linked
     with zrun's runtime (`runtime`: the target's libzrun_rt's bytes) by the
@@ -360,7 +399,9 @@ def build_native(language, source, output, path=None, runtime=None, prune=False,
     Python in it. `setup` (a function, or 'module:function') compiled with
     it, called with the program's path and arguments as it starts.
     `target`: 'x86_64-linux' or 'x86_64-windows', any machine of it (None:
-    this machine, its CPU's code). Returns its path."""
+    this machine, its CPU's code). `shared`: a library (.so, .dll) with a
+    C API (zrun.h, written beside it), not an executable. Returns its
+    path."""
     if not runtime:
         raise ValueError("this zrun has no runtime for standalone programs")
     import zrun
@@ -380,15 +421,16 @@ def build_native(language, source, output, path=None, runtime=None, prune=False,
     else:
         name, text = "program", source
     name = path or name
-    objects = lang.load(text, name).native_objects(prune=bool(prune), left_out=left_out, setup=setup, target=target)
+    objects = lang.load(text, name).native_objects(prune=bool(prune), left_out=left_out, setup=setup, target=target, shared=bool(shared))
     try:
         import ziglang  # noqa: F401
     except ImportError:
         raise RuntimeError("making standalone programs needs Zig: pip install ziglang (or zrun-py[exe])") from None
     windows = "windows" in zig_target
-    # (a Windows program's name: Windows runs it by its .exe)
-    if windows and not os.path.splitext(output)[1]:
-        output += ".exe"
+    # (a Windows program's name: Windows runs it by its .exe; a library's,
+    # .dll or .so)
+    if not os.path.splitext(output)[1]:
+        output += (".dll" if windows else ".so") if shared else (".exe" if windows else "")
     with tempfile.TemporaryDirectory() as tmp:
         files = []
         for i, o in enumerate(objects):
@@ -404,6 +446,8 @@ def build_native(language, source, output, path=None, runtime=None, prune=False,
         # (only what the program reaches of the runtime: a section each;
         # Windows' linker keeps only that by default)
         flags = ["-s"] if windows else ["-s", "-Wl,--gc-sections"]
+        if shared:
+            flags.append("-shared")
         # (Windows' arguments read as UTF-16: CommandLineToArgvW's)
         libs = ["-lc", "-lshell32"] if windows else ["-lc", "-lm"]
         # (the objects named in a file: Windows' command lines are short)
@@ -413,4 +457,7 @@ def build_native(language, source, output, path=None, runtime=None, prune=False,
         subprocess.run([sys.executable, "-m", "ziglang", "cc", "-target", zig_target, *flags, "-o", out, "@" + rsp, *libs], check=True, cwd=tmp, env=env)
         os.chmod(out, 0o755)
         os.replace(out, output)
+    if shared:
+        with open(os.path.splitext(output)[0] + ".h", "w", encoding="utf-8") as f:
+            f.write(HEADER)
     return output

@@ -177,6 +177,61 @@ def test_targets(zig, tmp_path, target):
         assert (r.returncode, r.stdout.replace("\r\n", "\n")) == (0, "".join(f"{n}\n" for n in (0, 1, 1, 2, 3, 5, 8, 13, 21, 34)))
 
 
+def test_shared(zig, tmp_path):
+    # (a library with a C API: zrun_init, zrun_call, zrun_error (zrun.h);
+    # called here through ctypes as C would)
+    import ctypes
+
+    src = (
+        "let base = 100;\n"
+        "fn add(a, b) { return a + b + base; }\n"
+        "fn half(x) { return x / 2; }\n"
+        "fn twice(s) { return s + s; }\n"
+        "fn boom(n) { return 10 / n; }\n"
+    )
+    lib_path = zrun.build_native(tiny.lang, src, str(tmp_path / "prog"), path="prog.tiny", shared=True)
+    assert lib_path.endswith(".dll" if sys.platform == "win32" else ".so")
+    assert "int zrun_call(" in open(str(tmp_path / "prog.h")).read()
+
+    class S(ctypes.Structure):
+        _fields_ = [("ptr", ctypes.c_char_p), ("len", ctypes.c_size_t)]
+
+    class U(ctypes.Union):
+        _fields_ = [("i", ctypes.c_int64), ("f", ctypes.c_double), ("s", S)]
+
+    class V(ctypes.Structure):
+        _fields_ = [("kind", ctypes.c_int), ("as_", U)]
+
+    lib = ctypes.CDLL(lib_path)
+    lib.zrun_error.restype = ctypes.c_char_p
+    assert lib.zrun_init(0, None) == 0
+
+    def call(name, *args):
+        vals = (V * max(len(args), 1))()
+        for v, a in zip(vals, args):
+            if isinstance(a, int):
+                v.kind, v.as_.i = 2, a
+            elif isinstance(a, float):
+                v.kind, v.as_.f = 3, a
+            else:
+                b = a.encode()
+                v.kind, v.as_.s = 4, S(b, len(b))
+        out = V()
+        if lib.zrun_call(name.encode(), vals, len(args), ctypes.byref(out)) != 0:
+            return ("error", lib.zrun_error().decode())
+        return {2: lambda: out.as_.i, 3: lambda: out.as_.f, 4: lambda: out.as_.s.ptr[: out.as_.s.len].decode()}[out.kind]()
+
+    assert call("add", 1, 2) == 103
+    # (tiny's /: ints' floored, as the compiled mode's)
+    assert call("half", 5) == 2
+    assert call("half", 5.0) == 2.0
+    assert call("twice", "hé") == "héhé"
+    kind, msg = call("boom", 0)
+    assert kind == "error" and msg.startswith("prog.tiny:5:21: error: division by zero [runtime]") and "in boom()" in msg
+    assert call("add", 1, 1) == 102
+    assert call("nope") == ("error", "prog.tiny: error: nope isn't a name the program's top level defines [runtime]")
+
+
 def test_not_strict(tmp_path):
     from conftest import tiny as plain
 

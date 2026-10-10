@@ -1187,7 +1187,7 @@ fn oomT() ?Thunk {
 /// time, all of it (standalone_build.zig), its objects (owned: deinit and
 /// destroy); null with an exception (zrun.CompileError when the program
 /// can't be).
-pub fn buildStandalone(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject, seed: *const [32]u8, opt: u32, max_depth: u64, path: []const u8, prune: bool, setup: ?*PyObject, triple: ?[:0]const u8) ?*standalone_build.Build {
+pub fn buildStandalone(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject, seed: *const [32]u8, opt: u32, max_depth: u64, path: []const u8, prune: bool, setup: ?*PyObject, triple: ?[:0]const u8, library: bool) ?*standalone_build.Build {
     var aot: Aot = .{};
     const c = prepare(data, lang, python, compile_error, seed, opt, &aot) orelse return null;
     defer c.destroy();
@@ -1197,6 +1197,7 @@ pub fn buildStandalone(data: *program_mod.Data, lang: compile_mod.LangView, pyth
     };
     b.* = standalone_build.Build.init(c.view, opt);
     b.triple = triple;
+    b.shared = library;
     if (!aheadOfTime(c, b, &aot, data, max_depth, path, compile_error, prune, setup)) {
         b.deinit();
         allocator.destroy(b);
@@ -1634,6 +1635,16 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
         .slot = comp.slot_of.get(@intCast(i)) orelse program_mod.NONE,
         .builtin = @intFromBool(sym.builtin),
     };
+    // (the top level's names, by slot: a library's zrun_call finds a
+    // function by its name, as program.call does)
+    var names: std.ArrayListUnmanaged(u8) = .empty;
+    for (data.syms, syms) |sym, s| {
+        if (sym.builtin or s.home != program_mod.NONE or s.slot == program_mod.NONE) continue;
+        names.appendSlice(ba, std.mem.asBytes(&s.slot)) catch return oomB();
+        const len: u32 = @intCast(sym.name.len);
+        names.appendSlice(ba, std.mem.asBytes(&len)) catch return oomB();
+        names.appendSlice(ba, sym.name) catch return oomB();
+    }
     b.emitImage(&aot.notes, .{
         .main_name = main_name,
         .globals = c.globals,
@@ -1650,6 +1661,8 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
         .syms = syms,
         .pruned = prune,
         .setup = setup_index,
+        .shared = b.shared,
+        .names = names.items,
     }) catch |e| return failed(b, e, compile_error);
     return true;
 }

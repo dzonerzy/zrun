@@ -1458,7 +1458,7 @@ const Program = struct {
     /// without Python (a strict language's), as object files to link with
     /// zrun's runtime (libzrun_rt.a): a list of bytes (zrun.build_native
     /// links them).
-    pub fn native_objects(self: *Program, args: pyoz.Args(struct { prune: bool = false, left_out: ?*PyObject = null, setup: ?*PyObject = null, target: ?*PyObject = null })) ?*PyObject {
+    pub fn native_objects(self: *Program, args: pyoz.Args(struct { prune: bool = false, left_out: ?*PyObject = null, setup: ?*PyObject = null, target: ?*PyObject = null, shared: bool = false })) ?*PyObject {
         const prune = args.value.prune;
         const left_out = optional(args.value.left_out);
         const setup_fn = optional(args.value.setup);
@@ -1475,7 +1475,7 @@ const Program = struct {
         }
         const s = self.seed() orelse return null;
         const path: []const u8 = if (self._path) |p| (if (p == py.Py_None()) "<program>" else ph.utf8(p, "path") orelse return null) else "<program>";
-        const b = driver.buildStandalone(self.ctx().data, self.langView(), &self.language()._python, ztypes.CompileError, &s, 2, @intCast(self.language()._max_depth), path, prune, setup_fn, triple) orelse return null;
+        const b = driver.buildStandalone(self.ctx().data, self.langView(), &self.language()._python, ztypes.CompileError, &s, 2, @intCast(self.language()._max_depth), path, prune, setup_fn, triple, args.value.shared) orelse return null;
         defer {
             b.deinit();
             std.heap.c_allocator.destroy(b);
@@ -2096,7 +2096,7 @@ const Program = struct {
     pub const save__params__ = "path";
     pub const report__doc__: [*:0]const u8 = "report(): what to look at to make the compiled program faster: python_crossings (where compiled code went through Python, in the last run with report=True), module_state, cache (modules loaded / compiled), code ('fast', 'optimized' or None), optimizing, gil_taken, speculated (typed entries made for functions' argument kinds).";
     pub const compiled_ir__doc__: [*:0]const u8 = "compiled_ir(): the LLVM IR the program compiles to (before LLVM optimizes it), as text.";
-    pub const native_objects__doc__: [*:0]const u8 = "native_objects(prune=False, left_out=None): the program compiled ahead of time to run without Python (a strict language's: zrun.CompileError otherwise), as object files to link with zrun's runtime, libzrun_rt.a: a list of bytes. zrun.build_native() links them. prune: compile only the Python functions held in the language's tables under a name the program can make (its words, the strs the code uses): a smaller, faster build; a function left out that's reached anyway stops the program with an error naming it. left_out: a list, the names of the functions left out appended. setup: a Python function compiled with the program, called with the program's path and its arguments (a list of strs) before its top level runs. target: 'x86_64-linux' or 'x86_64-windows', the objects for any machine of it (None: this machine's CPU).";
+    pub const native_objects__doc__: [*:0]const u8 = "native_objects(prune=False, left_out=None): the program compiled ahead of time to run without Python (a strict language's: zrun.CompileError otherwise), as object files to link with zrun's runtime, libzrun_rt.a: a list of bytes. zrun.build_native() links them. prune: compile only the Python functions held in the language's tables under a name the program can make (its words, the strs the code uses): a smaller, faster build; a function left out that's reached anyway stops the program with an error naming it. left_out: a list, the names of the functions left out appended. setup: a Python function compiled with the program, called with the program's path and its arguments (a list of strs) before its top level runs. target: 'x86_64-linux' or 'x86_64-windows', the objects for any machine of it (None: this machine's CPU). shared: a library's objects (zrun_init, zrun_call, zrun_error: zrun.h), not an executable's.";
     pub const source__doc__: [*:0]const u8 = "The program's source.";
     pub const tree__doc__: [*:0]const u8 = "The zgram Tree.";
     pub const analysis__doc__: [*:0]const u8 = "The zrules Analysis (None without rules).";
@@ -3815,7 +3815,7 @@ fn targetNamed(name: ?*PyObject) ?Target {
 
 /// zrun.build_native(language, source, output, path=None): exe/build.py's,
 /// given the runtime to link with.
-fn buildNative(args: pyoz.Args(struct { language: *PyObject, source: *PyObject, output: *PyObject, path: ?*PyObject = null, prune: ?*PyObject = null, left_out: ?*PyObject = null, setup: ?*PyObject = null, target: ?*PyObject = null })) ?*PyObject {
+fn buildNative(args: pyoz.Args(struct { language: *PyObject, source: *PyObject, output: *PyObject, path: ?*PyObject = null, prune: ?*PyObject = null, left_out: ?*PyObject = null, setup: ?*PyObject = null, target: ?*PyObject = null, shared: ?*PyObject = null })) ?*PyObject {
     const v = args.value;
     const target = targetNamed(optional(v.target)) orelse return null;
     const ns = exe_builder orelse blk: {
@@ -3841,6 +3841,7 @@ fn buildNative(args: pyoz.Args(struct { language: *PyObject, source: *PyObject, 
     if (optional(v.left_out)) |o| if (py.c.PyDict_SetItemString(kw, "left_out", o) != 0) return null;
     if (optional(v.setup)) |o| if (py.c.PyDict_SetItemString(kw, "setup", o) != 0) return null;
     if (optional(v.target)) |o| if (py.c.PyDict_SetItemString(kw, "target", o) != 0) return null;
+    if (optional(v.shared)) |o| if (py.c.PyDict_SetItemString(kw, "shared", o) != 0) return null;
     if (py.c.PyDict_SetItemString(kw, "zig_target", zig_target) != 0) return null;
     return py.c.PyObject_Call(build, pos, kw);
 }
@@ -3872,7 +3873,7 @@ pub const Module = pyoz.module(.{
         pyoz.func("clear_cache", clearCache, "clear_cache(): delete the compiled code kept in the cache."),
         pyoz.func("comptime", comptimeMark, "@zrun.comptime: a function whose result depends only on its arguments (its author says so: any Python, the subset or not). Compiled code calling it with values known when compiling (the program's tree's, constants, other such results) calls it then, once for those values in the process: its result is a constant of the code (lists, dicts and tuples in it native, read-only). With values known only at run time it's called as any function is. The reference mode calls it as ever."),
         pyoz.kwfunc("build_executable", buildExecutable, "build_executable(language, source, output, target=None, path=None, python=None, setup=None): one executable file running the program: a Python runtime, zrun and its packages, the language's module (and the modules beside it), the program and its compiled code. language: the Language, or 'module:attribute'; source: the program's text or its file; target: 'x86_64-linux' or 'x86_64-windows' (default: this machine's); python: '3.10' ... '3.14' (default: this one's); setup: 'module:function', a function of a module beside the language's called with the program's path and its arguments before it runs (Lua's `arg`).Needs the ziglang package (pip install zrun-py[exe]); downloads the runtime (python-build-standalone's) once. Returns the executable's path."),
-        pyoz.kwfunc("build_native", buildNative, "build_native(language, source, output, path=None, prune=False, left_out=None, setup=None, target=None): a standalone program: a strict language's program compiled ahead of time, all of it, and linked with zrun's runtime into one executable with no Python in it (for this machine; target: 'x86_64-linux' or 'x86_64-windows', any machine of that system, from either: a Windows program's name ends in .exe). language: the Language, or 'module:attribute'; source: the program's text or its file; path: the name its errors give it; prune: only the library functions the program can name compiled (smaller, faster to build; one reached anyway stops the program with an error naming it); left_out: a list, the names of those left out appended; setup: a function (or 'module:function', a function of a module beside the language's), compiled too, called with the program's path and its arguments (a list of strs) before it runs: 'lua:set_args' makes Lua's `arg`. Needs the ziglang package (pip install zrun-py[exe]). Its runtime errors are written as the reference mode words them, exiting with 1. Returns the executable's path."),
+        pyoz.kwfunc("build_native", buildNative, "build_native(language, source, output, path=None, prune=False, left_out=None, setup=None, target=None, shared=False): a standalone program (shared: a library, .so or .dll, with a C API in a header beside it: zrun_init, zrun_call, zrun_error): a strict language's program compiled ahead of time, all of it, and linked with zrun's runtime into one executable with no Python in it (for this machine; target: 'x86_64-linux' or 'x86_64-windows', any machine of that system, from either: a Windows program's name ends in .exe). language: the Language, or 'module:attribute'; source: the program's text or its file; path: the name its errors give it; prune: only the library functions the program can name compiled (smaller, faster to build; one reached anyway stops the program with an error naming it); left_out: a list, the names of those left out appended; setup: a function (or 'module:function', a function of a module beside the language's), compiled too, called with the program's path and its arguments (a list of strs) before it runs: 'lua:set_args' makes Lua's `arg`. Needs the ziglang package (pip install zrun-py[exe]). Its runtime errors are written as the reference mode words them, exiting with 1. Returns the executable's path."),
         pyoz.kwfunc("configure", configure, "configure(cache=None, cache_size=None, perf_map=None, tiers=None): process-wide settings (those not given stay). cache: True (the platform's place for caches: %LOCALAPPDATA%\\zrun\\Cache on Windows, ~/Library/Caches/zrun on macOS, $XDG_CACHE_HOME/zrun or ~/.cache/zrun elsewhere), False (no cache), or a directory; cache_size: the most the cache takes, in bytes (default 1 GiB; 0: no limit): past it, the least recently used compiled code is deleted, down to 80% of it; perf_map: name compiled functions for Linux's perf (/tmp/perf-<pid>.map); tiers: True (default: a program run compiled whose optimized code isn't cached is compiled fast first, optimized in the background, the optimized code running from the run after it's done) or False (optimized at once)."),
     },
     .classes = &.{
