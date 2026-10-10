@@ -95,6 +95,17 @@ pub fn build(b: *std.Build) void {
     rt_options.addOption(bool, "has_rt", false);
     if (has_rt) user_lib_mod.addAnonymousImport("zrun_rt_archive", .{ .root_source_file = rt_lib.getEmittedBin() });
 
+    // Zig's own tests: those of the parts with no Python (floatfmt's
+    // digits against glibc's printf)
+    const unit = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/floatfmt.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    }) });
+    const test_step = b.step("test", "Zig's tests of zrun's parts with no Python");
+    test_step.dependOn(&b.addRunArtifact(unit).step);
+
     // .pyd for Windows, .so otherwise (by the target, for cross builds)
     const ext = if (target.result.os.tag == .windows) ".pyd" else ".so";
     const install = b.addInstallArtifact(lib, .{

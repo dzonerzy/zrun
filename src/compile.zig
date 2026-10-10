@@ -6910,9 +6910,13 @@ const Gen = struct {
                 } else {
                     all_known = false;
                     const d = try self.materialize(x, inst.node);
-                    const spec_s = try self.c.m.string(if (spec == .str) spec.str else return self.c.unsupportedAt(inst.func, pos, "a format spec only known at run time isn't compiled yet", .{}));
+                    // (a spec known only at run time: the str its own
+                    // f-string made)
+                    const spec_d: ?Dyn = if (spec == .str) null else try self.materialize(spec, inst.node);
+                    const spec_s = if (spec_d) |sd| self.f.intToPtr(sd.bits) else try self.c.m.string(spec.str);
                     const ok = self.call("zr_format", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, self.k32(v.conversion), spec_s, self.out });
                     try self.drop(.{ .dyn = d });
+                    if (spec_d) |sd| try self.drop(.{ .dyn = sd });
                     try self.check(ok);
                     pieces[i] = .{ .dyn = try self.loadOut(.str) };
                 }

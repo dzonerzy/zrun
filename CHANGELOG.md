@@ -10,7 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **`build_native(..., prune=True)`**: only the library functions a program can name compiled (those in the language's tables under one of the program's words or a str the code uses): a 10-line Lua program 1.3 MB instead of 3.6 MB, built in 3.5 s. One reached by a name made at run time stops the program, saying the build was pruned; `left_out=[]` gets the names of those left out. `program.native_objects(prune=..., left_out=...)` too.
 - **`build_native(..., setup=...)`**: a standalone program's arguments. A function (or `'module:function'`) compiled with the program, called with its path and its arguments (a list of strs) as it starts: `setup="lua:set_args"` makes Lua's `arg`, as `build_executable(setup=...)` does. `program.native_objects(setup=...)` too.
-- **Natively**: `a ** b` of numbers (ints exactly within 128 bits, floats as CPython's float_pow: the C library's pow, its special cases and errors), `str.partition` and `rpartition`, `int(s, base)` of ints up to 128 bits.
+- **Natively**: `a ** b` of numbers (ints exactly within 128 bits, floats as CPython's float_pow: the C library's pow, its special cases and errors; Linux and Windows), `str.partition` and `rpartition`, `int(s, base)` of ints up to 128 bits.
+- **A float's digits natively on every platform** (`%e %f %g`, `{:.3f}`...): Windows' were Python's (and refused in strict mode). The digits of the double's binary value rounded half to even, as CPython's own conversion: glibc's printf on Linux, zrun's own exact conversion elsewhere (checked against glibc on 60,000 values, `zig build test`).
+- **An f-string's format spec known only at run time** (`f"{x:{spec}}"`) compiled, natively for ints, floats and strs; it was a `CompileError` in strict mode.
 
 ### Performance
 - **Standalone builds 2.2x faster** (the Lua example's test programs: 60 s to 27 s together): each language function a module of its own and the top level's optimized alongside the rest, not before them; a module past 10000 blocks (Lua's pattern matcher) optimized a level down, its code as fast.
@@ -20,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **[Strict languages](docs/strict-languages.md)**: what `strict=True` refuses, its errors, how to fix what they point at, the Lua example as a case.
 
 ### Fixed
+- **Format specs, natively as Python has them** (found with 120,000 random specs): zero padding with a separator puts separators in the zeros (`f"{1234:010,}"`: `00,001,234`); `0` with an alignment and no fill pads with zeros (`f"{-1:>08}"`: `000000-1`); a sign in a str's spec is Python's ValueError; `#` with no type gives a float in exponent form its point (`1.e-07`).
 - **`type(a) is type(b)` with one side known while compiling and the other not** refused in strict mode (the known side a Python object), and could crash: both compared natively now.
 - **CI runs every supported Python** (3.10 to 3.14), not 3.10, 3.12 and 3.14 only.
 - **Code compiled as a program runs needing a function's frame** (a library function calling back into the program, a node evaluated at run time) failed instead of compiling the function again with its variables in a frame, as the program's own code does.

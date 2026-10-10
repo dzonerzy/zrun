@@ -47,6 +47,11 @@ jobs:
               with:
                   python-version: "3.10"
 
+            # (the parts with no Python: floatfmt's digits against glibc's)
+            - name: Zig tests
+              if: matrix.platform == 'Linux'
+              run: zig build test
+
             - name: Install PyOZ
               # (0.13.10: a Windows build refuses constants holding the
               # address of an import slot, Python's data taken for known)

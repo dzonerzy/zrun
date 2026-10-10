@@ -550,6 +550,9 @@ fn powNative(ctx: *Ctx, node: u32, a: Value, b: Value, out: *Value) ?bool {
 }
 
 /// CPython's float_pow (Objects/floatobject.c), case by case
+/// The C library's strerror(ERANGE): an OverflowError's words
+const erange = if (@import("builtin").os.tag == .windows) "Result too large" else "Numerical result out of range";
+
 fn floatPow(ctx: *Ctx, node: u32, iv_in: f64, iw: f64, out: *Value) ?bool {
     var iv = iv_in;
     const isOdd = struct {
@@ -592,7 +595,7 @@ fn floatPow(ctx: *Ctx, node: u32, iv_in: f64, iw: f64, out: *Value) ?bool {
     const lm = libm orelse return null;
     var ix = lm.pow(iv, iw);
     if (negate) ix = -ix;
-    if (std.math.isInf(ix)) return failAs(ctx, node, .OverflowError, "(34, 'Numerical result out of range')", "OverflowError: (34, 'Numerical result out of range')", .{});
+    if (std.math.isInf(ix)) return failAs(ctx, node, .OverflowError, "(34, '" ++ erange ++ "')", "OverflowError: (34, '" ++ erange ++ "')", .{});
     return done(out, ix);
 }
 
@@ -743,12 +746,11 @@ export fn zr_binary(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u6
     return pythonBinary(ctx, node, op, a, b, out);
 }
 
-extern "c" fn snprintf(buf: [*]u8, n: usize, fmt: [*:0]const u8, ...) c_int;
+const floatfmt = @import("floatfmt.zig");
 
 /// fmt % arg, printf-style, as Python's str formats it: %d %i %u (a float
-/// truncated), %o %x %X (`#`: 0o, 0x, 0X), %c, %s, %r, %%, and on Linux %e
-/// %E %f %F %g %G (C's printf there: correctly rounded, as CPython's own
-/// conversion); flags `-+ 0#` (`0` with a precision too, as Python has
+/// truncated), %o %x %X (`#`: 0o, 0x, 0X), %c, %s, %r, %%, %e %E %f %F %g
+/// %G (floatfmt: correctly rounded, as CPython's own conversion); flags `-+ 0#` (`0` with a precision too, as Python has
 /// it), a width and a precision (or `*`). Null for what isn't done here
 /// (%(key)s, values that aren't numbers or strs, an error: Python's then,
 /// its words).
@@ -835,7 +837,6 @@ fn percentFormat(ctx: *Ctx, node: u32, fmt_s: *value.Str, arg: Value, out: *Valu
                         if (!std.math.isFinite(x)) return null;
                         // (beyond 128 bits: its exact digits, C's printf's)
                         if (@abs(x) >= 1.7e38) {
-                            if (@import("builtin").os.tag != .linux) return null;
                             huge = x;
                             break :blk if (x < 0) -1 else 1;
                         }
@@ -846,9 +847,7 @@ fn percentFormat(ctx: *Ctx, node: u32, fmt_s: *value.Str, arg: Value, out: *Valu
                 const mag: u128 = @abs(n);
                 var w = std.Io.Writer.fixed(&tbuf);
                 if (huge) |x| {
-                    const got = snprintf(&tbuf, tbuf.len, "%.0f", @abs(x));
-                    if (got < 0 or @as(usize, @intCast(got)) >= tbuf.len) return null;
-                    w.end = @intCast(got);
+                    w.end = (floatfmt.format(&tbuf, 'f', 0, false, @abs(x)) orelse return null).len;
                 } else switch (conv) {
                     'o' => w.print("{o}", .{mag}) catch return null,
                     'x' => w.print("{x}", .{mag}) catch return null,
@@ -884,7 +883,6 @@ fn percentFormat(ctx: *Ctx, node: u32, fmt_s: *value.Str, arg: Value, out: *Valu
                 text = digits;
             },
             'e', 'E', 'f', 'F', 'g', 'G' => {
-                if (@import("builtin").os.tag != .linux) return null;
                 const x: f64 = switch (v.kind()) {
                     .float => v.asFloat(),
                     .bool, .int => @floatFromInt(v.asInt()),
@@ -892,12 +890,7 @@ fn percentFormat(ctx: *Ctx, node: u32, fmt_s: *value.Str, arg: Value, out: *Valu
                 };
                 // (C's printf: the digits, no sign (ours, Python's flags);
                 // `#` its alternate form, the same as Python's)
-                var cf: [16]u8 = undefined;
-                const cfs = std.fmt.bufPrintZ(&cf, "%{s}.*{c}", .{ if (alt) "#" else "", conv }) catch return null;
-                const p: c_int = @intCast(prec orelse 6);
-                const got = snprintf(&tbuf, tbuf.len, cfs.ptr, p, @abs(x));
-                if (got < 0 or @as(usize, @intCast(got)) >= tbuf.len) return null;
-                text = tbuf[0..@intCast(got)];
+                text = floatfmt.format(&tbuf, conv, prec orelse 6, alt, @abs(x)) orelse return null;
                 var hn: usize = 0;
                 if (std.math.signbit(x) and !std.math.isNan(x)) {
                     hb[0] = '-';
@@ -5087,16 +5080,33 @@ var libm_looked = false;
 pub fn findLibm() void {
     if (libm_looked) return;
     libm_looked = true;
-    if (@import("builtin").os.tag != .linux) return;
-    // (Python's, loaded already; a standalone program's, loaded now)
-    const h = std.c.dlopen("libm.so.6", .{ .LAZY = true, .NOLOAD = !standalone }) orelse return;
     var t: Libm = undefined;
-    inline for (@typeInfo(Libm).@"struct".fields) |fd| {
-        const p = std.c.dlsym(h, fd.name) orelse return;
-        @field(t, fd.name) = @ptrCast(@alignCast(p));
+    switch (@import("builtin").os.tag) {
+        .linux => {
+            // (Python's, loaded already; a standalone program's, loaded now)
+            const h = std.c.dlopen("libm.so.6", .{ .LAZY = true, .NOLOAD = !standalone }) orelse return;
+            inline for (@typeInfo(Libm).@"struct".fields) |fd| {
+                const p = std.c.dlsym(h, fd.name) orelse return;
+                @field(t, fd.name) = @ptrCast(@alignCast(p));
+            }
+        },
+        .windows => {
+            // (the Universal CRT's: Python's math is it, loaded already)
+            const h = win.GetModuleHandleA("ucrtbase.dll") orelse return;
+            inline for (@typeInfo(Libm).@"struct".fields) |fd| {
+                const p = win.GetProcAddress(h, fd.name) orelse return;
+                @field(t, fd.name) = @ptrCast(@alignCast(p));
+            }
+        },
+        else => return,
     }
     libm = t;
 }
+
+const win = struct {
+    extern "kernel32" fn GetModuleHandleA(name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+};
 
 /// A number as math's functions take it (an int, a bool, a float), or null
 fn floatOf(v: Value) ?f64 {
@@ -5648,11 +5658,13 @@ fn formatSpec(v: Value, spec: []const u8, out: *std.ArrayListUnmanaged(u8)) ?voi
     // The spec
     var i: usize = 0;
     var fill: []const u8 = " ";
+    var fill_given = false;
     var alignment: u8 = 0;
     if (spec.len > 0) {
         const n = std.unicode.utf8ByteSequenceLength(spec[0]) catch return null;
         if (spec.len > n and std.mem.indexOfScalar(u8, "<>=^", spec[n]) != null) {
             fill = spec[0..n];
+            fill_given = true;
             alignment = spec[n];
             i = n + 1;
         } else if (std.mem.indexOfScalar(u8, "<>=^", spec[0]) != null) {
@@ -5661,8 +5673,10 @@ fn formatSpec(v: Value, spec: []const u8, out: *std.ArrayListUnmanaged(u8)) ?voi
         }
     }
     var sign: u8 = '-';
+    var sign_given = false;
     if (i < spec.len and std.mem.indexOfScalar(u8, "+- ", spec[i]) != null) {
         sign = spec[i];
+        sign_given = true;
         i += 1;
     }
     var alt = false;
@@ -5670,11 +5684,12 @@ fn formatSpec(v: Value, spec: []const u8, out: *std.ArrayListUnmanaged(u8)) ?voi
         alt = true;
         i += 1;
     }
+    // (`0`: the fill, if none's given; sign-aware, if no alignment is: a
+    // number's (a str's alignment stays its own, `<`))
+    var zero_flag = false;
     if (i < spec.len and spec[i] == '0') {
-        if (alignment == 0) {
-            fill = "0";
-            alignment = '=';
-        }
+        if (!fill_given) fill = "0";
+        zero_flag = alignment == 0;
         i += 1;
     }
     var width: usize = 0;
@@ -5707,7 +5722,7 @@ fn formatSpec(v: Value, spec: []const u8, out: *std.ArrayListUnmanaged(u8)) ?voi
         // (a str: its characters, cut to the precision)
         .str => {
             if (ty != 0 and ty != 's') return null;
-            if (sign != '-' or alt or group != 0 or alignment == '=') return null;
+            if (sign_given or alt or group != 0 or alignment == '=') return null;
             const s = @as(*value.Str, @ptrCast(v.ptr())).bytes();
             var end = s.len;
             if (prec) |p| {
@@ -5720,7 +5735,7 @@ fn formatSpec(v: Value, spec: []const u8, out: *std.ArrayListUnmanaged(u8)) ?voi
         },
         .int, .float => {
             const is_int = v.kind() == .int;
-            if (alignment == 0) alignment = '>';
+            if (alignment == 0) alignment = if (zero_flag) '=' else '>';
             const int_ty = ty == 0 or ty == 'd' or ty == 'x' or ty == 'X' or ty == 'o' or ty == 'b';
             if (is_int and int_ty) {
                 if (prec != null) return null;
@@ -5747,10 +5762,10 @@ fn formatSpec(v: Value, spec: []const u8, out: *std.ArrayListUnmanaged(u8)) ?voi
                     2 => std.fmt.bufPrint(&digits, "{b}", .{mag}),
                     else => std.fmt.bufPrint(&digits, "{d}", .{mag}),
                 } catch return null;
-                body = grouped(raw, group, if (base == 10) 3 else 4, &buf) orelse return null;
+                const signed: usize = @intFromBool(negative or sign == '+' or sign == ' ');
+                body = grouped(raw, group, if (base == 10) 3 else 4, zeroWidth(fill, alignment, width, signed + prefix.len), &buf) orelse return null;
             } else {
                 if (int_ty and ty != 0) return null;
-                if (@import("builtin").os.tag != .linux) return null;
                 const x: f64 = if (is_int) @floatFromInt(v.asInt()) else v.asFloat();
                 negative = std.math.signbit(x) and !std.math.isNan(x);
                 const mag = @abs(x);
@@ -5763,16 +5778,17 @@ fn formatSpec(v: Value, spec: []const u8, out: *std.ArrayListUnmanaged(u8)) ?voi
                     text = value.floatRepr(mag, &fb);
                     @memcpy(tbuf[0..text.len], text);
                     text = tbuf[0..text.len];
+                    // (`#`: a point always, `1.e-07`)
+                    if (alt and std.mem.indexOfScalar(u8, text, '.') == null) if (std.mem.indexOfScalar(u8, text, 'e')) |e| {
+                        std.mem.copyBackwards(u8, tbuf[e + 1 .. text.len + 1], text[e..]);
+                        tbuf[e] = '.';
+                        text = tbuf[0 .. text.len + 1];
+                    };
                 } else {
                     if (ty == 0) return null;
                     const conv: u8 = if (ty == '%') 'f' else ty;
                     if (std.mem.indexOfScalar(u8, "eEfFgG", conv) == null) return null;
-                    var cf: [16]u8 = undefined;
-                    const cfs = std.fmt.bufPrintZ(&cf, "%{s}.*{c}", .{ if (alt) "#" else "", conv }) catch return null;
-                    const p: c_int = @intCast(prec orelse 6);
-                    const got = snprintf(&tbuf, tbuf.len - 1, cfs.ptr, p, if (ty == '%') mag * 100 else mag);
-                    if (got < 0 or @as(usize, @intCast(got)) >= tbuf.len - 1) return null;
-                    text = tbuf[0..@intCast(got)];
+                    text = floatfmt.format(tbuf[0 .. tbuf.len - 1], conv, prec orelse 6, alt, if (ty == '%') mag * 100 else mag) orelse return null;
                     if (ty == '%') {
                         tbuf[text.len] = '%';
                         text = tbuf[0 .. text.len + 1];
@@ -5782,7 +5798,8 @@ fn formatSpec(v: Value, spec: []const u8, out: *std.ArrayListUnmanaged(u8)) ?voi
                     // (the integer part's digits grouped)
                     const end = std.mem.indexOfAny(u8, text, ".eE%") orelse text.len;
                     for (text[0..end]) |c| if (!std.ascii.isDigit(c)) return null;
-                    const g = grouped(text[0..end], group, 3, &buf) orelse return null;
+                    const signed: usize = @intFromBool(negative or sign == '+' or sign == ' ');
+                    const g = grouped(text[0..end], group, 3, zeroWidth(fill, alignment, width, signed + text.len - end), &buf) orelse return null;
                     if (g.len + text.len - end > buf.len) return null;
                     @memcpy(buf[g.len..][0 .. text.len - end], text[end..]);
                     body = buf[0 .. g.len + text.len - end];
@@ -5819,29 +5836,53 @@ fn formatSpec(v: Value, spec: []const u8, out: *std.ArrayListUnmanaged(u8)) ?voi
     for (0..right) |_| out.appendSlice(allocator, fill) catch return null;
 }
 
-/// Digits with a separator every `every` (none: themselves)
-fn grouped(digits: []const u8, sep: u8, every: usize, buf: []u8) ?[]const u8 {
+/// Digits with a separator every `every` (none: themselves), zeros added
+/// in groups till they're `min_width` wide (zero padding: `0` or `0=`), as
+/// CPython's _PyUnicode_InsertThousandsGrouping does it (a group of zeros
+/// not starting with a separator: one wider then)
+fn grouped(digits: []const u8, sep: u8, every: usize, min_width: usize, buf: []u8) ?[]const u8 {
     if (sep == 0) {
         if (digits.len > buf.len) return null;
         @memcpy(buf[0..digits.len], digits);
         return buf[0..digits.len];
     }
-    const n = digits.len + (digits.len - 1) / every;
-    if (n > buf.len) return null;
-    var o: usize = n;
-    var k: usize = 0;
-    var j = digits.len;
-    while (j > 0) {
-        j -= 1;
-        if (k > 0 and k % every == 0) {
+    // (right to left, from the end of buf)
+    var o: usize = buf.len;
+    var remaining: isize = @intCast(digits.len);
+    var width: isize = @intCast(min_width);
+    const step: isize = @intCast(every);
+    var first = true;
+    while (true) {
+        const l = @min(step, @max(@max(remaining, width), 1));
+        const n_zeros: usize = @intCast(@max(0, l - remaining));
+        const n_chars: usize = @intCast(@max(0, @min(remaining, l)));
+        if (o < n_zeros + n_chars + @intFromBool(!first)) return null;
+        if (!first) {
             o -= 1;
             buf[o] = sep;
         }
-        o -= 1;
-        buf[o] = digits[j];
-        k += 1;
+        first = false;
+        const r: usize = @intCast(remaining);
+        o -= n_chars;
+        @memcpy(buf[o..][0..n_chars], digits[r - n_chars .. r]);
+        o -= n_zeros;
+        @memset(buf[o..][0..n_zeros], '0');
+        remaining -= @intCast(n_chars);
+        width -= l;
+        if (remaining <= 0 and width <= 0) break;
+        width -= 1;
     }
+    const n = buf.len - o;
+    std.mem.copyForwards(u8, buf[0..n], buf[o..]);
     return buf[0..n];
+}
+
+/// The width zero padding fills with digits (and separators), past the
+/// sign, prefix and what follows the digits (`used`): what's left of the
+/// width; 0 but for zero padding
+fn zeroWidth(fill: []const u8, alignment: u8, width: usize, used: usize) usize {
+    if (alignment != '=' or !std.mem.eql(u8, fill, "0")) return 0;
+    return if (width > used) width - used else 0;
 }
 
 /// Strings joined (an f-string's pieces): n strs, borrowed.

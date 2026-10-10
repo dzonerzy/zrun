@@ -4,8 +4,6 @@ same errors as the reference mode, for values of every kind (what they
 don't do natively, Python does: the same again)."""
 
 import math
-import re
-import sys
 
 import pytest
 import zrun
@@ -247,15 +245,37 @@ def test_percent_format():
             continue
         if FORMATS[i] == "%r" and isinstance(v, str) and not v.isascii():
             continue
-        # (a float's digits: the C library's, natively where it's the one
-        # Python formats with (Linux); elsewhere Python's own)
-        if sys.platform != "linux" and (isinstance(v, float) or re.search(r"%[^a-zA-Z%]*[eEfFgG]", FORMATS[i])):
-            continue
         try:
             got = strict.call("f", v, i)
         except zrun.StrictError as e:
             raise AssertionError(f"{FORMATS[i]!r} % {v!r}: {e}") from None
         assert got == want, (v, FORMATS[i])
+
+
+def float_digits(a, b):
+    # (b a format spec: printf's too, but `%`, the spec's alone)
+    return (None if b.endswith("%") else ("%" + b) % a, f"{a:{b}}")
+
+
+def test_float_digits():
+    # (a float's digits natively, every platform: those of its binary value
+    # rounded half to even, as Python's own conversion; strict, no Python)
+    import random
+    import struct
+
+    rng = random.Random(5)
+    p = _program(float_digits, strict=True)
+    xs = [0.5, 1.5, 2.5, 0.125, 2.675, 1e22, 1e23, 5e-324, 1.7976931348623157e308, 9.5, 999999.5, 0.0001, 1e16, 4.35, 0.15]
+    xs += [struct.unpack("<d", struct.pack("<Q", rng.getrandbits(63)))[0] for _ in range(150)]
+    xs += [rng.random() * 10.0 ** rng.randint(-8, 18) for _ in range(150)]
+    xs = [x for x in xs if math.isfinite(x)]
+    for i, x in enumerate(xs):
+        for conv in "eEfFgG%"[i % 7] + "eg":
+            prec = rng.choice([0, 1, 2, 3, 6, 10, 17, 25])
+            alt = "#" if rng.random() < 0.2 else ""
+            spec = f"{alt}.{prec}{conv}"
+            for v in (x, -x):
+                assert p.call("f", v, spec) == float_digits(v, spec), (v, spec)
 
 
 def power(a, b):
