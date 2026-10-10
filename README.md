@@ -291,7 +291,7 @@ The program's arguments go to `setup=`, a function (or `"module:function"`) comp
 zrun.build_native(lua.lang, "script.lua", "script", setup=lua.set_args)    # ./script a b: arg[1] == "a"
 ```
 
-Linux, for this machine (its CPU's code); needs the ziglang package (`pip install "zrun-py[exe]"`). Building takes a few seconds for a small language, more for a big one (the Lua example: its library compiled, about 2 s on many cores; under a second pruned). `program.native_objects()` gives the object files to link yourself with zrun's runtime (`zig build rt`: libzrun_rt.a). Nothing that needs Python is in a standalone program: a host function that isn't compiled, a value Python alone knows (a complex number), an error Python words differs (zrun's own words then).
+Linux, for this machine (its CPU's code); needs the ziglang package (`pip install "zrun-py[exe]"`). Building takes a few seconds for a small language, more for a big one (the Lua example: its library compiled, about 2 s on many cores; under a second pruned). The objects are kept in zrun's cache, as the JIT's are: a program built again links them, another program of the language compiles only its own code. `program.native_objects()` gives the object files to link yourself with zrun's runtime (`zig build rt`: libzrun_rt.a). Nothing that needs Python is in a standalone program: a host function that isn't compiled, a value Python alone knows (a complex number), an error Python words differs (zrun's own words then).
 
 ## Sessions and the REPL
 

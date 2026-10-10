@@ -257,6 +257,10 @@ pub const Note = union(enum) {
     /// A Python object the code holds (a host function as a value): a
     /// stand-in, the same object to the code
     pyobj,
+    /// A word: a Python object's index among the program's (Ctx.objects),
+    /// read by the code (the same code the same text in every program:
+    /// Gen.objRef)
+    index: u64,
 };
 
 /// An item: a static object's bytes, a table of words, or a description

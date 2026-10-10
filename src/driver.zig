@@ -844,7 +844,9 @@ fn prepare(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonS
     out.* = .{ .arena = std.heap.ArenaAllocator.init(allocator), .compiler = undefined, .python = python, .view = view, .main = undefined, .globals = 0, .opt = opt };
     next_id += 1;
     out.id = next_id;
-    const prefix = prefixFor(out.arena.allocator(), seed, opt) orelse {
+    // (a standalone build's names: the executable's alone, the same in
+    // every build (the same code the same text: its object cached))
+    const prefix = if (aot != null) "zrs" else prefixFor(out.arena.allocator(), seed, opt) orelse {
         out.arena.deinit();
         allocator.destroy(out);
         return oom();
@@ -897,6 +899,8 @@ const Job = struct {
     /// in `err`); else it's freed when done
     waited: bool,
     bytes: ?[]u8 = null,
+    /// `bytes` the cache's (allocator's), not LLVM's: no work to do
+    cached: bool = false,
     err: [2048]u8 = @splat(0),
     done: std.atomic.Value(bool) = .init(false),
 
@@ -1226,7 +1230,107 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
         b: *standalone_build.Build,
         n: usize = 0,
         jobs: std.ArrayListUnmanaged(*Job) = .empty,
+        /// A group's modules made (an item's and its helpers'), submitted
+        /// once all are (commit); the names they keep from `syms_mark`
+        held: std.ArrayListUnmanaged(Held) = .empty,
+        syms_mark: usize = 0,
+        /// The helpers out of line the group's code calls, to make: each
+        /// in a module of its own (the same code the same text in every
+        /// build: its object cached, a library's shared by the programs
+        /// calling it)
+        pending: std.ArrayListUnmanaged(*compile_mod.HelperSpec) = .empty,
+        /// The modules' bases (renameSyms: each one's own)
+        bases: std.StringHashMapUnmanaged(void) = .empty,
+        /// The language functions the group calls made with it (the
+        /// build's loop over them done)
+        fns_here: bool = false,
+        /// The language functions queued as the group began (abort's)
+        queued: std.ArrayListUnmanaged(u32) = .empty,
+        queue_saved: bool = false,
         const size = 1;
+        const Held = struct { module: llvm.c.LLVMModuleRef, opt: u32, key: cache.Key, bytes: ?[]u8 };
+
+        /// An item and the helpers it calls, made as one from here
+        fn begin(self: *@This()) void {
+            self.comp.beginGroup();
+            self.syms_mark = self.b.syms.items.len;
+            self.queued.clearRetainingCapacity();
+            self.queued.appendSlice(allocator, self.comp.queue.items) catch {
+                self.queue_saved = false;
+                return;
+            };
+            self.queue_saved = true;
+        }
+
+        /// The item just compiled (in the compiler's module) its module,
+        /// then each helper it calls (and they call) one of its own: the
+        /// group's error (the caller's to see to, abort()) or done
+        fn finishItem(self: *@This(), base: []const u8) compile_mod.Error!void {
+            try self.take();
+            self.added(base) catch return error.OutOfMemory;
+            while (true) {
+                if (self.pending.pop()) |h| {
+                    try self.comp.newModule();
+                    try self.comp.compileHelper(h);
+                    try self.take();
+                    self.added(h.name) catch return error.OutOfMemory;
+                } else if (self.fns_here) if (self.comp.queue.pop()) |fnode| {
+                    // (the language functions they call, once the build's
+                    // own loop over them is done: with the group)
+                    try self.comp.newModule();
+                    try self.comp.compileQueued(fnode);
+                    try self.take();
+                    const fbase = std.fmt.allocPrint(self.comp.a, "zrs_f{d}", .{fnode}) catch return error.OutOfMemory;
+                    self.added(fbase) catch return error.OutOfMemory;
+                } else break else break;
+            }
+        }
+
+        fn take(self: *@This()) error{OutOfMemory}!void {
+            try self.pending.appendSlice(allocator, self.comp.helper_queue.items);
+            self.comp.helper_queue.clearRetainingCapacity();
+        }
+
+        /// The group made: its modules to their objects
+        fn commit(self: *@This()) error{OutOfMemory}!void {
+            defer self.held.clearRetainingCapacity();
+            self.comp.group = false;
+            for (self.held.items) |h| try self.submit(h);
+        }
+
+        /// The group given up (a failure): its modules freed, the names
+        /// they'd keep forgotten (the compiler's own forgetModule())
+        fn abort(self: *@This()) void {
+            if (!self.comp.group) return;
+            for (self.held.items) |h| {
+                if (h.bytes) |bytes| allocator.free(bytes);
+                if (h.module) |mod| {
+                    const ctx = jit_f("LLVMGetModuleContext")(mod);
+                    jit_f("LLVMDisposeModule")(mod);
+                    jit_f("LLVMContextDispose")(ctx);
+                }
+            }
+            self.held.clearRetainingCapacity();
+            self.pending.clearRetainingCapacity();
+            self.b.syms.shrinkRetainingCapacity(self.syms_mark);
+            // (the language functions queued as they were: those it took
+            // made again)
+            if (self.queue_saved) {
+                self.comp.queue.clearRetainingCapacity();
+                self.comp.queue.appendSlice(self.comp.a, self.queued.items) catch {};
+            }
+            self.comp.group = false;
+        }
+
+        fn submit(self: *@This(), h: Held) error{OutOfMemory}!void {
+            const job = if (h.bytes) |bytes| blk: {
+                const j = try allocator.create(Job);
+                j.* = .{ .view = self.b.view, .module = null, .opt = h.opt, .path = null, .waited = true, .bytes = bytes, .cached = true };
+                j.done.store(true, .release);
+                break :blk j;
+            } else inBackground(self.b.view, h.module, h.opt, cache.pathFor(allocator, h.key), true) orelse return error.OutOfMemory;
+            try self.jobs.append(allocator, job);
+        }
 
         fn start(self: *@This()) !void {
             self.comp.batch = false;
@@ -1235,17 +1339,40 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
             self.n = 0;
         }
 
-        fn added(self: *@This()) !void {
+        /// The module's item made (`base`: its name, the names of the
+        /// addresses its code refers to made of it)
+        fn added(self: *@This(), base: []const u8) !void {
             self.n += 1;
-            if (self.n >= size) try self.flush();
+            if (self.n >= size) try self.flush(base);
         }
 
-        fn flush(self: *@This()) !void {
+        /// The module made into an object: the one cached for its text if
+        /// there's one (the same code made by an earlier build, of any
+        /// program: a library's functions), else by LLVM on a worker
+        /// thread, then kept in the cache
+        fn flush(self: *@This(), base: []const u8) !void {
             if (self.n == 0) return;
             self.comp.batch = false;
-            try self.b.keepNames(&self.comp.m);
-            const job = inBackground(self.b.view, self.comp.m.take(), optFor(&self.comp.m, self.b.opt), null, true) orelse return error.OutOfMemory;
-            try self.jobs.append(allocator, job);
+            const m = &self.comp.m;
+            // (a base of its own: a module of a function's code made
+            // already (a helper's: its name) has more code in it)
+            var own = base;
+            var k: usize = 0;
+            // (one referring to nothing: no names to make, none taken)
+            if (m.syms.items.len > 0) {
+                while ((try self.bases.getOrPut(allocator, own)).found_existing) : (k += 1)
+                    own = try std.fmt.allocPrint(self.comp.a, "{s}_m{d}", .{ base, k });
+                m.renameSyms(own);
+            }
+            try self.b.keepNames(m);
+            const opt = optFor(m, self.b.opt);
+            const text = jit_f("LLVMPrintModuleToString")(m.mod);
+            const key = cache.keyOf(std.mem.span(text), opt);
+            jit_f("LLVMDisposeMessage")(text);
+            // (one cached: the module itself freed with the next one's start)
+            const bytes = cache.objectOf(allocator, key);
+            const h = Held{ .module = if (bytes == null) m.take() else null, .opt = opt, .key = key, .bytes = bytes };
+            if (self.comp.group) try self.held.append(allocator, h) else try self.submit(h);
             try self.start();
         }
 
@@ -1260,7 +1387,7 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
                     if (first_error == null) first_error = self.b.rejected(&job.err);
                     continue;
                 };
-                defer llvm.freeBytes(self.b.view, bytes);
+                defer if (job.cached) allocator.free(bytes) else llvm.freeBytes(self.b.view, bytes);
                 if (first_error == null) self.b.addObject(bytes) catch |e| {
                     first_error = e;
                 };
@@ -1269,16 +1396,26 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
         }
 
         fn deinit(self: *@This()) void {
+            self.abort();
             self.wait() catch {};
             self.jobs.deinit(allocator);
+            self.held.deinit(allocator);
+            self.pending.deinit(allocator);
+            self.bases.deinit(allocator);
+            self.queued.deinit(allocator);
         }
     };
     var batch = Batch{ .comp = comp, .b = b };
     defer batch.deinit();
-    // (the top level's module, made into an object alongside the rest)
+    // (the top level's module, its helpers in it, made into an object
+    // alongside the rest)
     batch.n = 1;
-    batch.flush() catch return oomB();
+    batch.flush("zrs_main") catch return oomB();
     defer comp.batch = false;
+    // Each item below (a language function, the setup, a thunk, a Python
+    // function's code) made with the helpers it calls as one group: each
+    // in a module of its own, all given up if one fails (the item then
+    // compiled again, or left out, as before)
     // The language functions, each in a module of its own (as many as
     // the program has: optimized side by side, not one module after the
     // top level's); one that fails compiled again as the JIT's are (a
@@ -1290,10 +1427,18 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
             comp.failed_semantic = null;
             comp.need_retry = false;
             comp.newModule() catch return oomB();
+            batch.begin();
             // (compiled from here: a call of itself doesn't queue it again)
             comp.compiled_fns.put(comp.a, fnode, {}) catch return oomB();
-            comp.compileQueued(fnode) catch |e| {
+            const base = std.fmt.allocPrint(comp.a, "zrs_f{d}", .{fnode}) catch return oomB();
+            const failure: ?compile_mod.Error = blk: {
+                comp.compileQueued(fnode) catch |e| break :blk e;
+                batch.finishItem(base) catch |e| break :blk e;
+                break :blk null;
+            };
+            if (failure) |e| {
                 comp.forgetModule();
+                batch.abort();
                 // (not compiled after all; the queue as it was)
                 _ = comp.compiled_fns.remove(fnode);
                 comp.queue.clearRetainingCapacity();
@@ -1308,11 +1453,13 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
                     error.Python => {},
                 }
                 return false;
-            };
-            batch.added() catch |e| return failed(b, e, compile_error);
+            }
+            batch.commit() catch return oomB();
             break;
         }
     }
+    // (from here, the language functions an item calls made with it)
+    batch.fns_here = true;
     // The setup (build_native(setup=...)): compiled for its call as the
     // program starts (two values: the path, the arguments), one of the
     // objects for the runtime to find it by; one that can't be is the
@@ -1328,8 +1475,15 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
         const name = while (true) {
             comp.failed_semantic = null;
             comp.need_retry = false;
-            break comp.compileCalled(f, 2, 0, false) catch |e| {
+            batch.begin();
+            const made: compile_mod.Error![:0]const u8 = blk: {
+                const nm = comp.compileCalled(f, 2, 0, false) catch |e| break :blk e;
+                batch.finishItem(nm) catch |e| break :blk e;
+                break :blk nm;
+            };
+            break made catch |e| {
                 comp.forgetModule();
+                batch.abort();
                 if (e == error.Unsupported and comp.need_retry) continue;
                 if (e == error.Unsupported and (comp.framesForRetry() catch return oomB())) continue;
                 switch (e) {
@@ -1340,8 +1494,8 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
                 return false;
             };
         };
+        batch.commit() catch return oomB();
         b.called.append(b.arena.allocator(), .{ .func = @intFromPtr(f), .nargs = 2, .rt_mask = 0, .name = name }) catch return oomB();
-        batch.added() catch |e| return failed(b, e, compile_error);
     }
     // (the nodes the code can have as values: those it makes values of,
     // and those under them)
@@ -1375,8 +1529,15 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
                 const made: ?[:0]const u8 = while (true) {
                     comp.failed_semantic = null;
                     comp.need_retry = false;
-                    break comp.compileThunk(n, @enumFromInt(site.which), owner) catch |e| {
+                    batch.begin();
+                    const r: compile_mod.Error![:0]const u8 = blk: {
+                        const nm = comp.compileThunk(n, @enumFromInt(site.which), owner) catch |e| break :blk e;
+                        batch.finishItem(nm) catch |e| break :blk e;
+                        break :blk nm;
+                    };
+                    break r catch |e| {
                         comp.forgetModule();
+                        batch.abort();
                         if (e == error.Unsupported and comp.need_retry) continue;
                         if (e == error.Unsupported and (comp.framesForRetry() catch false)) continue;
                         // (a node it can't be: an error if it's ever run)
@@ -1385,8 +1546,8 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
                     };
                 };
                 const name = made orelse continue;
+                batch.commit() catch return oomB();
                 b.thunks.append(b.arena.allocator(), .{ .node = n, .which = site.which, .owner = owner, .name = name }) catch return oomB();
-                batch.added() catch |e| return failed(b, e, compile_error);
             }
         }
         // (the objects the code holds, and those in the values it refers to)
@@ -1411,8 +1572,15 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
                 const made: ?[:0]const u8 = while (true) {
                     comp.failed_semantic = null;
                     comp.need_retry = false;
-                    break comp.compileCalled(o, s.nargs, s.rt_mask, false) catch |e| {
+                    batch.begin();
+                    const r: compile_mod.Error![:0]const u8 = blk: {
+                        const nm = comp.compileCalled(o, s.nargs, s.rt_mask, false) catch |e| break :blk e;
+                        batch.finishItem(nm) catch |e| break :blk e;
+                        break :blk nm;
+                    };
+                    break r catch |e| {
                         comp.forgetModule();
+                        batch.abort();
                         if (e == error.Unsupported and comp.need_retry) continue;
                         if (e == error.Unsupported and (comp.framesForRetry() catch false)) continue;
                         py.c.PyErr_Clear();
@@ -1420,13 +1588,13 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
                     };
                 };
                 const name = made orelse continue;
+                batch.commit() catch return oomB();
                 b.called.append(b.arena.allocator(), .{ .func = key.func, .nargs = key.nargs, .rt_mask = key.rt_mask, .name = name }) catch return oomB();
-                batch.added() catch |e| return failed(b, e, compile_error);
             }
         }
         if (!more) break;
     }
-    batch.flush() catch |e| return failed(b, e, compile_error);
+    batch.flush("zrs_rest") catch |e| return failed(b, e, compile_error);
     comp.batch = false;
     batch.wait() catch |e| return failed(b, e, compile_error);
     // (pruned: the Python functions held in the values not compiled, by

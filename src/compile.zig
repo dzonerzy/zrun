@@ -889,7 +889,7 @@ pub const OWNER_PARAM: u32 = NONE - 3;
 /// arguments it's made for (rt, Python objects, bools: its code depends on
 /// them most), the others (`.dyn` here: nodes, strs, values) given at run
 /// time
-const HelperSpec = struct {
+pub const HelperSpec = struct {
     func: *const front.Function,
     args: []const SVal,
     name: [:0]const u8,
@@ -1042,6 +1042,8 @@ pub const Compiler = struct {
     /// generate. `helpers_kept`: how many the JIT has (a failed module's
     /// are forgotten).
     helper_fns: std.ArrayListUnmanaged(*HelperSpec) = .empty,
+    /// A standalone build's helper names (helperName)
+    aot_names: std.StringHashMapUnmanaged(void) = .empty,
     /// Helpers known to return or not (neverReturns)
     never_returns: std.AutoHashMapUnmanaged(*const front.Function, bool) = .empty,
     /// Helpers known to leave by a jump or not (mayJump), those being
@@ -1099,6 +1101,10 @@ pub const Compiler = struct {
     /// (newModule: the module kept), each a part of it from `item_mark`
     batch: bool = false,
     item_mark: usize = 0,
+    /// A standalone build's item and the helpers it calls, made in modules
+    /// of their own as one: what a failure gives up the whole of them
+    /// (newModule keeps where they began: forgetModule's)
+    group: bool = false,
 
     /// In a field table: a node whose label isn't one child or none (a
     /// list of them, a value an action makes): zr_getattr's
@@ -1245,16 +1251,29 @@ pub const Compiler = struct {
         // (a standalone build's batch: more code in the same module, what
         // a failure leaves dropped from it alone)
         if (self.batch) {
-            self.new_fns.clearRetainingCapacity();
-            self.helpers_kept = self.helper_fns.items.len;
+            if (!self.group) {
+                self.new_fns.clearRetainingCapacity();
+                self.helpers_kept = self.helper_fns.items.len;
+            }
             self.item_mark = self.m.mark();
             return;
         }
         self.m.deinit();
         self.m = ir.Module.init(self.a, self.m.prefix);
+        if (!self.group) {
+            self.new_fns.clearRetainingCapacity();
+            self.helpers_kept = self.helper_fns.items.len;
+        }
+        try self.declareRuntime();
+        self.item_mark = self.m.mark();
+    }
+
+    /// A standalone build's group begun (an item and the helpers it calls,
+    /// in modules of their own): what forgetModule gives up from here
+    pub fn beginGroup(self: *Compiler) void {
         self.new_fns.clearRetainingCapacity();
         self.helpers_kept = self.helper_fns.items.len;
-        try self.declareRuntime();
+        self.group = true;
     }
 
     /// The module being made failed: the functions it was to compile are
@@ -1273,6 +1292,8 @@ pub const Compiler = struct {
                 break;
             };
         };
+        // (their names free again: made again, the same)
+        for (self.helper_fns.items[self.helpers_kept..]) |h| _ = self.aot_names.remove(h.name);
         self.helper_fns.shrinkRetainingCapacity(self.helpers_kept);
         self.helper_queue.clearRetainingCapacity();
     }
@@ -1283,10 +1304,18 @@ pub const Compiler = struct {
         while (true) {
             if (self.queue.pop()) |f| {
                 try self.genFunction(f);
-            } else if (self.helper_queue.pop()) |h| {
+            } else if (self.aot == null) if (self.helper_queue.pop()) |h| {
                 try self.genHelper(h);
-            } else return;
+            } else return else return;
         }
+    }
+
+    /// A standalone build's helper compiled, in a module of its own (the
+    /// same code the same text in every build: its object cached, a
+    /// library's shared by programs); the helpers and language functions
+    /// it calls queued (the build's to make).
+    pub fn compileHelper(self: *Compiler, h: *HelperSpec) Error!void {
+        try self.genHelper(h);
     }
 
     /// A helper's code out of line: `i32 <name>(ctx, frame, args, at,
@@ -1364,6 +1393,63 @@ pub const Compiler = struct {
 
     /// A Python function as the front reads it (once: the language keeps
     /// it).
+    /// A helper's code's name (`kind`: c called, h out of line, s a
+    /// specialization, l a closure's): the JIT's numbered, unique in the
+    /// process with the program's prefix; a standalone build's what it is
+    /// (the function, what it's made for), the same in every build making
+    /// it (the same code the same text: its object cached), unique in the
+    /// executable.
+    fn helperName(self: *Compiler, kind: []const u8, h: *const HelperSpec) Error![:0]const u8 {
+        if (self.aot == null) return std.fmt.allocPrintSentinel(self.a, "{s}_{s}{d}", .{ self.m.prefix, kind, self.helper_fns.items.len }, 0);
+        // (a call's arguments as given the same code as a helper's out of
+        // line (HelperSpec.matches): one name, whichever is made first)
+        const plain = h.raw and !h.closure and !h.func.vararg and h.args.len == h.func.param_count and h.layout == null;
+        const raw = h.raw and !plain;
+        const letter = if (plain) "h" else kind;
+        var w = std.hash.Wyhash.init(0);
+        inline for (.{ h.func.file, h.func.qualname, h.func.name }) |s| {
+            w.update(s);
+            w.update(&.{0});
+        }
+        w.update(std.mem.asBytes(&h.func.first_line));
+        for (h.args) |x| specHash(&w, x, 4);
+        if (h.layout) |l| for (l) |b| w.update(&.{@intFromBool(b)});
+        w.update(&.{ @intFromBool(raw), @intFromBool(h.closure) });
+        const hash = w.final();
+        var n: u32 = 0;
+        while (true) : (n += 1) {
+            const name = if (n == 0)
+                try std.fmt.allocPrintSentinel(self.a, "{s}_{s}{x}", .{ self.m.prefix, letter, hash }, 0)
+            else
+                try std.fmt.allocPrintSentinel(self.a, "{s}_{s}{x}_{d}", .{ self.m.prefix, letter, hash, n }, 0);
+            const slot = try self.aot_names.getOrPut(self.a, name);
+            if (!slot.found_existing) return name;
+        }
+    }
+
+    /// What a helper's known argument is, for its name (helperName): its
+    /// kind, its value if it's a scalar (a Python object's: where it is,
+    /// the process's)
+    fn specHash(w: *std.hash.Wyhash, x: SVal, depth: u32) void {
+        w.update(&.{@intFromEnum(std.meta.activeTag(x))});
+        switch (x) {
+            .bool => |b| w.update(&.{@intFromBool(b)}),
+            .int, .pint => |i| w.update(std.mem.asBytes(&i)),
+            .float => |f| w.update(std.mem.asBytes(&f)),
+            .str => |s| {
+                w.update(std.mem.asBytes(&s.len));
+                w.update(s);
+            },
+            .node => |n| w.update(std.mem.asBytes(&n)),
+            .py => |o| w.update(std.mem.asBytes(&o)),
+            .rt_method => |m| w.update(&.{@intFromEnum(m)}),
+            .tuple => |t| if (depth > 0) for (t) |y| specHash(w, y, depth - 1),
+            .list => |l| w.update(std.mem.asBytes(&l)),
+            .dict => |d| w.update(std.mem.asBytes(&d)),
+            else => {},
+        }
+    }
+
     /// Whether a helper never returns: no `return` in it, and every way
     /// through its body ends raising (a `raise`, a call of a helper that
     /// never returns, an `if` both of whose branches do). Its calls are an
@@ -1668,7 +1754,8 @@ pub const Compiler = struct {
             if (made.matches(func, key, true)) return made.name;
         };
         const h = try self.a.create(HelperSpec);
-        h.* = .{ .func = func, .args = key, .name = try std.fmt.allocPrintSentinel(self.a, "{s}_c{d}", .{ self.m.prefix, self.helper_fns.items.len }, 0), .semantic = null, .closure = closure, .raw = true };
+        h.* = .{ .func = func, .args = key, .name = "", .semantic = null, .closure = closure, .raw = true };
+        h.name = try self.helperName("c", h);
         try self.helper_fns.append(self.a, h);
         try self.helper_queue.append(self.a, h);
         try self.drainQueues();
@@ -1695,7 +1782,8 @@ pub const Compiler = struct {
             }
         };
         const h = try self.a.create(HelperSpec);
-        h.* = .{ .func = func, .args = args, .name = try std.fmt.allocPrintSentinel(self.a, "{s}_c{d}", .{ self.m.prefix, self.helper_fns.items.len }, 0), .semantic = null, .raw = true };
+        h.* = .{ .func = func, .args = args, .name = "", .semantic = null, .raw = true };
+        h.name = try self.helperName("c", h);
         try self.helper_fns.append(self.a, h);
         try self.helper_queue.append(self.a, h);
         try aot.called.put(self.a, key, h.name);
@@ -1718,7 +1806,8 @@ pub const Compiler = struct {
         self.specialized += 1;
         const blocks0 = self.helper_blocks;
         const h = try self.a.create(HelperSpec);
-        h.* = .{ .func = s.func, .args = s.args, .name = try std.fmt.allocPrintSentinel(self.a, "{s}_s{d}", .{ self.m.prefix, self.helper_fns.items.len }, 0), .semantic = s.semantic, .layout = s.layout };        try self.helper_fns.append(self.a, h);
+        h.* = .{ .func = s.func, .args = s.args, .name = "", .semantic = s.semantic, .layout = s.layout };
+        h.name = try self.helperName("s", h);        try self.helper_fns.append(self.a, h);
         try self.helper_queue.append(self.a, h);
         try self.drainQueues();
         // (code too big to be worth compiling: LLVM's time grows with it,
@@ -1797,14 +1886,20 @@ pub const Compiler = struct {
         try self.genFunction(NONE);
         // (a standalone build: the language functions compiled one by one
         // after, each a module of its own (compileQueued), optimized side
-        // by side; the top level's helpers with it)
-        if (self.aot != null) return self.drainHelpers();
+        // by side; the top level's helpers with it, in its module: what
+        // fails there the program's retries' to see to)
+        if (self.aot != null) {
+            while (self.helper_queue.pop()) |h| try self.genHelper(h);
+            return;
+        }
         try self.drainQueues();
     }
 
     /// The helpers out of line the code made so far calls (the language
     /// functions it calls left queued)
     fn drainHelpers(self: *Compiler) Error!void {
+        // (a standalone build's: modules of their own, compileHelper)
+        if (self.aot != null) return;
         while (self.helper_queue.pop()) |h| try self.genHelper(h);
     }
 
@@ -2578,6 +2673,18 @@ const Gen = struct {
         return self.c.a;
     }
 
+    /// A Python object's index (Compiler.objectIndex's) for the runtime's
+    /// helpers: a constant; a standalone build's read from the image (the
+    /// index the program gives it: the code the same text in every
+    /// program, its object cached)
+    fn objRef(self: *Gen, idx: usize) ir.Value {
+        if (self.c.aot == null) return self.k(@intCast(idx));
+        const o = self.c.objects.items[idx];
+        // (a key of its own: objects are aligned, an odd address no other)
+        const cell = self.c.m.ptrOf(@intFromPtr(o) | 1, .{ .index = idx });
+        return self.f.load(self.c.m.t.i64, cell);
+    }
+
     /// An i64 constant.
     fn k(self: *Gen, n: i64) ir.Value {
         return self.c.m.k64(n);
@@ -3228,7 +3335,7 @@ const Gen = struct {
                 // held, what's done with it checked where it's done)
                 if (self.c.lang.strict and !isExceptionClass(o) and !isSourceConstant(o)) try self.strictRefuses("uses {s}, a Python object, as a value", .{try self.pyName(o)});
                 const idx = try self.c.objectIndex(o);
-                _ = self.call("zr_object", &.{ self.ctx, self.k(@intCast(idx)), self.out });
+                _ = self.call("zr_object", &.{ self.ctx, self.objRef(idx), self.out });
                 break :blk try self.loadOut(.any);
             },
             .list => |l| blk: {
@@ -4723,7 +4830,7 @@ const Gen = struct {
                 const n: usize = if (kind == .Return) 1 else 0;
                 const arr = try self.valueSlots(1);
                 if (n == 1) try self.storeSlot(self.elem(arr, 0), ret orelse self.noneDyn());
-                try self.callCheck("zr_call_python", &.{ self.ctx, self.k32(self.atNode()), self.k(@intCast(try self.c.objectIndex(cls))), arr, self.k(@intCast(n)), self.out });
+                try self.callCheck("zr_call_python", &.{ self.ctx, self.k32(self.atNode()), self.objRef(try self.c.objectIndex(cls)), arr, self.k(@intCast(n)), self.out });
                 const exc = try self.loadOut(.any);
                 // (the value the exception holds now: the jump's given up
                 // here, before the handler: code after this is never run)
@@ -5331,7 +5438,8 @@ const Gen = struct {
             // (the semantic: the outermost one run here, or the one this
             // helper's code runs for)
             const semantic = self.helper_semantic orelse if (self.insts.items.len > 0) self.insts.items[0].func.py_function else null;
-            h.* = .{ .func = func, .args = key, .name = try std.fmt.allocPrintSentinel(c.a, "{s}_h{d}", .{ c.m.prefix, c.helper_fns.items.len }, 0), .semantic = semantic };
+            h.* = .{ .func = func, .args = key, .name = "", .semantic = semantic };
+            h.name = try c.helperName("h", h);
             try c.helper_fns.append(c.a, h);
             try c.helper_queue.append(c.a, h);
             break :blk h;
@@ -5540,7 +5648,8 @@ const Gen = struct {
             const h = try c.a.create(HelperSpec);
             const semantic = self.helper_semantic orelse if (self.insts.items.len > 0) self.insts.items[0].func.py_function else null;
             // (`_l`: `_k` names constants)
-            h.* = .{ .func = func, .args = key, .name = try std.fmt.allocPrintSentinel(c.a, "{s}_l{d}", .{ c.m.prefix, c.helper_fns.items.len }, 0), .semantic = semantic };
+            h.* = .{ .func = func, .args = key, .name = "", .semantic = semantic };
+            h.name = try c.helperName("l", h);
             try c.helper_fns.append(c.a, h);
             try c.helper_queue.append(c.a, h);
             break :blk h;
@@ -6039,7 +6148,7 @@ const Gen = struct {
             const next = try f.label("next_handler");
             if (classes[i]) |idx| {
                 const yes = try f.label("matched");
-                try f.condBr(self.call("zr_exc_matches", &.{ self.ctx, self.k(@intCast(idx)), self.k(@bitCast(masks[i])) }), yes, next);
+                try f.condBr(self.call("zr_exc_matches", &.{ self.ctx, self.objRef(idx), self.k(@bitCast(masks[i])) }), yes, next);
                 try f.block(yes);
             }
             try self.callCheck("zr_exc_catch", &.{ self.ctx, self.k32(inst.node), self.out });
@@ -6179,7 +6288,7 @@ const Gen = struct {
                 defer py.Py_DecRef(globals);
                 const idx = try self.c.objectIndex(globals);
                 const d = try self.materialize(v, inst.node);
-                const ok = self.call("zr_set_global", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), try self.c.m.string(name), d.tag, d.bits });
+                const ok = self.call("zr_set_global", &.{ self.ctx, self.k32(inst.node), self.objRef(idx), try self.c.m.string(name), d.tag, d.bits });
                 try self.drop(.{ .dyn = d });
                 try self.check(ok);
             },
@@ -7129,7 +7238,7 @@ const Gen = struct {
         try f.br(join);
         try f.block(slow);
         const idx = try self.c.objectIndex(len_obj);
-        const ok = self.call("zr_builtin", &.{ self.ctx, self.k32(inst.node), self.k32(@intFromEnum(helpers.Builtin.len)), self.k(@intCast(idx)), d.tag, d.bits, self.out });
+        const ok = self.call("zr_builtin", &.{ self.ctx, self.k32(inst.node), self.k32(@intFromEnum(helpers.Builtin.len)), self.objRef(idx), d.tag, d.bits, self.out });
         try self.drop(.{ .dyn = d });
         try self.check(ok);
         const g = try self.loadOut(.int);
@@ -7321,7 +7430,7 @@ const Gen = struct {
             try self.strictRefuses("reads the module variable {s}, which a function rebinds (`global {s}`)", .{ name, name });
             const idx = try self.c.objectIndex(globals);
             const s = try self.c.m.string(name);
-            try self.callCheck("zr_global", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), s, self.out });
+            try self.callCheck("zr_global", &.{ self.ctx, self.k32(inst.node), self.objRef(idx), s, self.out });
             return .{ .dyn = try self.loadOut(.any) };
         }
         if (py.c.PyDict_GetItem(globals, key)) |v| {
@@ -8528,7 +8637,7 @@ const Gen = struct {
         // (made apart: no jump to it from the code here)
         const after = f.current;
         f.positionAt(host_err);
-        _ = self.call("zr_host_failed", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)) });
+        _ = self.call("zr_host_failed", &.{ self.ctx, self.k32(inst.node), self.objRef(idx) });
         try f.br(outer);
         f.positionAt(after);
         return try self.checkedVal(v);
@@ -8620,7 +8729,7 @@ const Gen = struct {
         try f.condBr(f.icmp(jit_c.LLVMIntEQ, status, m.k32(0)), failed, jumped);
         // (its error, as the reference mode words a host function's)
         try f.block(failed);
-        const failed_ok = self.call("zr_host_failed", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)) });
+        const failed_ok = self.call("zr_host_failed", &.{ self.ctx, self.k32(inst.node), self.objRef(idx) });
         const failed_end = f.current;
         try f.br(join);
         try f.block(jumped);
@@ -8628,7 +8737,7 @@ const Gen = struct {
         const jumped_end = f.current;
         try f.br(join);
         try f.block(first);
-        const ok_first = self.call("zr_call_site", &.{ self.ctx, self.k32(inst.node), slot_p, self.k(@intCast(idx)), arr, self.k(@intCast(n)), self.out });
+        const ok_first = self.call("zr_call_site", &.{ self.ctx, self.k32(inst.node), slot_p, self.objRef(idx), arr, self.k(@intCast(n)), self.out });
         const first_end = f.current;
         try f.br(join);
         try f.block(join);
@@ -8945,7 +9054,7 @@ const Gen = struct {
     fn libCall(self: *Gen, inst: *Inst, which: helpers.Lib, o: *PyObject, args: []const SVal, signed: u32) Error!SVal {
         const idx = try self.c.objectIndex(o);
         const arr = try self.valueArray(args, inst.node);
-        const ok = self.call("zr_lib", &.{ self.ctx, self.k32(inst.node), self.k32(@intFromEnum(which)), self.k(@intCast(idx)), arr, self.k(@intCast(args.len)), self.k32(signed), self.out });
+        const ok = self.call("zr_lib", &.{ self.ctx, self.k32(inst.node), self.k32(@intFromEnum(which)), self.objRef(idx), arr, self.k(@intCast(args.len)), self.k32(signed), self.out });
         try self.dropArray(arr, args.len);
         try self.check(ok);
         return .{ .dyn = try self.loadOut(.any) };
@@ -9026,7 +9135,7 @@ const Gen = struct {
         const code = f.call(.{ .v = self.ptrConst(n.native.call), .ty = fn_ty }, &.{ state, arr, self.k(@intCast(args.len)), result });
         try f.condBr(f.icmp(jit_c.LLVMIntEQ, code, m.k32(0)), done_direct, failed);
         try f.block(failed);
-        _ = self.call("zr_native_fail", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), code });
+        _ = self.call("zr_native_fail", &.{ self.ctx, self.k32(inst.node), self.objRef(idx), code });
         try f.br(try self.errorTarget());
         try f.block(done_direct);
         const bits = f.load(t.i64, result);
@@ -9055,7 +9164,7 @@ const Gen = struct {
         if (self.c.lang.strict) try self.strictRefuses("calls the host function {s}()", .{try self.pyName(self.c.objects.items[idx])});
         const arr = try self.valueSlots(@max(ds.len, 1));
         for (ds, 0..) |d, i| try self.storeSlot(self.elem(arr, i), d);
-        _ = self.call("zr_object", &.{ self.ctx, self.k(@intCast(idx)), self.out });
+        _ = self.call("zr_object", &.{ self.ctx, self.objRef(idx), self.out });
         const h = try self.loadOut(.any);
         const ok = self.call("zr_call", &.{ self.ctx, self.k32(inst.node), h.tag, h.bits, arr, self.k(@intCast(ds.len)), self.c.m.nullPtr(), self.out });
         try self.drop(.{ .dyn = h });
@@ -9099,8 +9208,8 @@ const Gen = struct {
         // compiled code knows (errors.Kind): natively)
         const ok = if (isExceptionClass(o)) blk: {
             const kind: u32 = if (@import("errors.zig").kindOfClass(o)) |ek| @intFromEnum(ek) else helpers.no_kind;
-            break :blk self.call("zr_new_exception", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), self.k32(kind), arr, self.k(@intCast(args.len)), self.out });
-        } else self.call("zr_call_python", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), arr, self.k(@intCast(args.len)), self.out });
+            break :blk self.call("zr_new_exception", &.{ self.ctx, self.k32(inst.node), self.objRef(idx), self.k32(kind), arr, self.k(@intCast(args.len)), self.out });
+        } else self.call("zr_call_python", &.{ self.ctx, self.k32(inst.node), self.objRef(idx), arr, self.k(@intCast(args.len)), self.out });
         try self.dropArray(arr, args.len);
         try self.check(ok);
         return .{ .dyn = try self.loadOut(.any) };
@@ -9284,7 +9393,7 @@ const Gen = struct {
             if (intOf(args[1])) |base| if (base == 0 or (base >= 2 and base <= 36)) {
                 const d = try self.materialize(args[0], inst.node);
                 const idx = try c.objectIndex(o);
-                const ok = self.call("zr_int_base", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), d.tag, d.bits, self.k32(@intCast(base)), self.out });
+                const ok = self.call("zr_int_base", &.{ self.ctx, self.k32(inst.node), self.objRef(idx), d.tag, d.bits, self.k32(@intCast(base)), self.out });
                 try self.drop(.{ .dyn = d });
                 try self.check(ok);
                 return SVal{ .dyn = try self.loadOut(.any) };
@@ -9293,7 +9402,7 @@ const Gen = struct {
                 const d = try self.materialize(args[0], inst.node);
                 const bd = args[1].dyn;
                 const idx = try c.objectIndex(o);
-                const ok = self.call("zr_int_base_of", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), d.tag, d.bits, bd.tag, bd.bits, self.out });
+                const ok = self.call("zr_int_base_of", &.{ self.ctx, self.k32(inst.node), self.objRef(idx), d.tag, d.bits, bd.tag, bd.bits, self.out });
                 try self.drop(.{ .dyn = d });
                 try self.drop(args[1]);
                 try self.check(ok);
@@ -9304,7 +9413,7 @@ const Gen = struct {
         if (args.len == 1 and (args[0] == .dyn or isScalar(args[0])) and isTypeAttr(o, "PyFloat_Type", "hex")) {
             const d = try self.materialize(args[0], inst.node);
             const idx = try c.objectIndex(o);
-            const ok = self.call("zr_float_hex", &.{ self.ctx, self.k32(inst.node), self.k(@intCast(idx)), d.tag, d.bits, self.out });
+            const ok = self.call("zr_float_hex", &.{ self.ctx, self.k32(inst.node), self.objRef(idx), d.tag, d.bits, self.out });
             try self.drop(.{ .dyn = d });
             try self.check(ok);
             return SVal{ .dyn = try self.loadOut(.any) };
@@ -9348,7 +9457,7 @@ const Gen = struct {
         if (args.len >= 2) inline for (.{ .{ "min", 0 }, .{ "max", 1 } }) |m| if (isBuiltin(o, m[0])) {
             const idx = try c.objectIndex(o);
             const arr = try self.valueArray(args, inst.node);
-            const ok = self.call("zr_min_max", &.{ self.ctx, self.k32(inst.node), self.k32(m[1]), self.k(@intCast(idx)), arr, self.k(@intCast(args.len)), self.out });
+            const ok = self.call("zr_min_max", &.{ self.ctx, self.k32(inst.node), self.k32(m[1]), self.objRef(idx), arr, self.k(@intCast(args.len)), self.out });
             try self.dropArray(arr, args.len);
             try self.check(ok);
             return SVal{ .dyn = try self.loadOut(.any) };
@@ -9361,7 +9470,7 @@ const Gen = struct {
                 helpers.findLibm();
                 const idx = try c.objectIndex(o);
                 const arr = try self.valueArray(args, inst.node);
-                const ok = self.call("zr_math", &.{ self.ctx, self.k32(inst.node), self.k32(fd.value), self.k(@intCast(idx)), self.k(@intCast(args.len)), arr, self.out });
+                const ok = self.call("zr_math", &.{ self.ctx, self.k32(inst.node), self.k32(fd.value), self.objRef(idx), self.k(@intCast(args.len)), arr, self.out });
                 try self.dropArray(arr, args.len);
                 try self.check(ok);
                 const f: helpers.MathFn = @enumFromInt(fd.value);
@@ -9382,7 +9491,7 @@ const Gen = struct {
                 if ((args[0] != .list and args[0] != .dict or takes_containers) and (if (module) |m| isModuleAttr(o, m, fd.name) else isBuiltin(o, fd.name))) {
                     const d = try self.materialize(args[0], inst.node);
                     const idx = try c.objectIndex(o);
-                    const ok = self.call("zr_builtin", &.{ self.ctx, self.k32(inst.node), self.k32(fd.value), self.k(@intCast(idx)), d.tag, d.bits, self.out });
+                    const ok = self.call("zr_builtin", &.{ self.ctx, self.k32(inst.node), self.k32(fd.value), self.objRef(idx), d.tag, d.bits, self.out });
                     try self.drop(.{ .dyn = d });
                     try self.check(ok);
                     // (len() is always an int, bool() a bool, list() a list;
@@ -9545,7 +9654,7 @@ const Gen = struct {
         if (self.c.lang.strict) try self.strictRefuses("asks isinstance() of the class {s}", .{try self.pyName(o)});
         const d = try self.materialize(v, inst.node);
         const idx = try c.objectIndex(o);
-        try self.callCheck("zr_isinstance", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, self.k(@intCast(idx)), self.out });
+        try self.callCheck("zr_isinstance", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, self.objRef(idx), self.out });
         try self.drop(.{ .dyn = d });
         return .{ .dyn = try self.loadOut(.bool) };
     }

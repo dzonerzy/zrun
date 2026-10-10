@@ -251,6 +251,19 @@ pub const Module = struct {
         return g;
     }
 
+    /// The names of the addresses it refers to made its own (`base`, a name
+    /// of its code's, then their order in it), not the program's count: the
+    /// same code the same text in every build (a standalone build's object
+    /// cache).
+    pub fn renameSyms(self: *Module, base: []const u8) void {
+        for (self.syms.items, 0..) |*s, i| {
+            const g = self.addrs.get(s.addr) orelse continue;
+            const name = std.fmt.allocPrintSentinel(self.gpa, "{s}_k{d}", .{ base, i }, 0) catch @panic("out of memory");
+            L("LLVMSetValueName2")(g, name.ptr, name.len);
+            s.name = name;
+        }
+    }
+
     /// An address as an int constant (ptrConst's name).
     pub fn addrInt(self: *Module, addr: usize) Value {
         return L("LLVMConstPtrToInt")(self.ptrConst(addr), self.t.i64);

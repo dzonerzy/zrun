@@ -262,6 +262,7 @@ pub const Build = struct {
         const i = try it.img.reserve(addr);
         switch (note) {
             .str => it.img.set(i, .{ .static = try image.strBytes(self.a(), @ptrFromInt(addr)) }),
+            .index => |n| it.img.set(i, .{ .static = try self.a().dupe(u8, std.mem.asBytes(&n)) }),
             .big => it.img.set(i, .{ .static = try image.bigBytes(self.a(), @ptrFromInt(addr)) }),
             .value => |tag| {
                 var w = image.Writer{ .a = self.a() };
@@ -541,6 +542,11 @@ pub const Build = struct {
         // The code's names for them: aliases of their objects (past the
         // header)
         const add_alias: *const fn (c.LLVMModuleRef, ir.Type, c_uint, ir.Value, [*:0]const u8) callconv(.c) ir.Value = @ptrCast(llvm.optional("LLVMAddAlias2") orelse return self.fail("this zgram's LLVM can't make standalone programs (no LLVMAddAlias2): a newer zgram can", .{}));
+        // (one name each: LLVM would rename a second one, the code naming
+        // it taking the first one's object)
+        var named: std.StringHashMapUnmanaged(void) = .empty;
+        for (self.syms.items) |s| if ((try named.getOrPut(self.a(), s.name)).found_existing)
+            return self.fail("two things the compiled code refers to by one name ({s}): a zrun bug", .{s.name});
         for (self.syms.items, sym_items) |s, i| _ = add_alias(m.mod, t.i8, 0, at(&m, globals[i]), s.name.ptr);
 
         // Every item's address, by index (zr_image_build's table)
