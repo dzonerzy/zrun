@@ -442,6 +442,8 @@ pub const Build = struct {
         owners: []const u32,
         syms: []const @import("standalone.zig").SymInfo,
         pruned: bool = false,
+        /// The setup's index in `objects` + 1 (0: none)
+        setup: u64 = 0,
     };
 
     /// The grammar, as the standalone runtime reads nodes with it
@@ -595,6 +597,7 @@ pub const Build = struct {
             try self.constBytes(&m, std.mem.sliceAsBytes(p.sym_of)), try self.constBytes(&m, std.mem.sliceAsBytes(p.owners)),
             try self.constBytes(&m, std.mem.sliceAsBytes(p.syms)), ir.Module.kInt(t.i64, p.syms.len),
             init_fn,                                                ir.Module.kInt(t.i64, @intFromBool(p.pruned)),
+            ir.Module.kInt(t.i64, p.setup),
         };
         const desc = try self.constGlobal(&m, "zr_img_program", L("LLVMConstStructInContext")(ctx, &desc_fields, desc_fields.len, 0));
         {

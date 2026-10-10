@@ -352,16 +352,25 @@ def build_executable(language, source, output, target=None, path=None, python=No
     return output
 
 
-def build_native(language, source, output, path=None, runtime=None, prune=False, left_out=None):
+def build_native(language, source, output, path=None, runtime=None, prune=False, left_out=None, setup=None):
     """A standalone program: a strict language's program compiled ahead of
     time, all of it (prune: the library functions it can name), linked
     with zrun's runtime (`runtime`: libzrun_rt.a's bytes) by the ziglang
-    package's Zig. No Python in it. Returns its path."""
+    package's Zig. No Python in it. `setup` (a function, or
+    'module:function') compiled with it, called with the program's path
+    and arguments as it starts. Returns its path."""
     if not runtime:
         raise ValueError("this zrun has no runtime for standalone programs (one is in zrun's Linux builds)")
     import zrun
 
     lang = language if isinstance(language, zrun.Language) else getattr(importlib.import_module(language_of(language)[0]), language_of(language)[1])
+    if isinstance(setup, str):
+        if ":" not in setup:
+            raise TypeError("setup must be a function or 'module:function'")
+        smod, _, sfunc = setup.partition(":")
+        setup = getattr(importlib.import_module(smod), sfunc, None)
+        if setup is None:
+            raise ValueError(f"setup: {smod} has no function {sfunc}")
     if os.path.exists(source):
         name = os.path.basename(source)
         with open(source, encoding="utf-8") as f:
@@ -369,7 +378,7 @@ def build_native(language, source, output, path=None, runtime=None, prune=False,
     else:
         name, text = "program", source
     name = path or name
-    objects = lang.load(text, name).native_objects(prune=bool(prune), left_out=left_out)
+    objects = lang.load(text, name).native_objects(prune=bool(prune), left_out=left_out, setup=setup)
     try:
         import ziglang  # noqa: F401
     except ImportError:

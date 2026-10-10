@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **`build_native(..., prune=True)`**: only the library functions a program can name compiled (those in the language's tables under one of the program's words or a str the code uses): a 10-line Lua program 1.3 MB instead of 3.6 MB, built in 3.5 s. One reached by a name made at run time stops the program, saying the build was pruned; `left_out=[]` gets the names of those left out. `program.native_objects(prune=..., left_out=...)` too.
+- **`build_native(..., setup=...)`**: a standalone program's arguments. A function (or `'module:function'`) compiled with the program, called with its path and its arguments (a list of strs) as it starts: `setup="lua:set_args"` makes Lua's `arg`, as `build_executable(setup=...)` does. `program.native_objects(setup=...)` too.
 - **Natively**: `a ** b` of numbers (ints exactly within 128 bits, floats as CPython's float_pow: the C library's pow, its special cases and errors), `str.partition` and `rpartition`, `int(s, base)` of ints up to 128 bits.
 
 ### Performance

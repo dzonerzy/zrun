@@ -1176,7 +1176,7 @@ fn oomT() ?Thunk {
 /// time, all of it (standalone_build.zig), its objects (owned: deinit and
 /// destroy); null with an exception (zrun.CompileError when the program
 /// can't be).
-pub fn buildStandalone(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject, seed: *const [32]u8, opt: u32, max_depth: u64, path: []const u8, prune: bool) ?*standalone_build.Build {
+pub fn buildStandalone(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject, seed: *const [32]u8, opt: u32, max_depth: u64, path: []const u8, prune: bool, setup: ?*PyObject) ?*standalone_build.Build {
     var aot: Aot = .{};
     const c = prepare(data, lang, python, compile_error, seed, opt, &aot) orelse return null;
     defer c.destroy();
@@ -1185,7 +1185,7 @@ pub fn buildStandalone(data: *program_mod.Data, lang: compile_mod.LangView, pyth
         return null;
     };
     b.* = standalone_build.Build.init(c.view, opt);
-    if (!aheadOfTime(c, b, &aot, data, max_depth, path, compile_error, prune)) {
+    if (!aheadOfTime(c, b, &aot, data, max_depth, path, compile_error, prune, setup)) {
         b.deinit();
         allocator.destroy(b);
         return null;
@@ -1193,7 +1193,7 @@ pub fn buildStandalone(data: *program_mod.Data, lang: compile_mod.LangView, pyth
     return b;
 }
 
-fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *program_mod.Data, max_depth: u64, path: []const u8, compile_error: *PyObject, prune: bool) bool {
+fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *program_mod.Data, max_depth: u64, path: []const u8, compile_error: *PyObject, prune: bool, setup: ?*PyObject) bool {
     const comp = &c.compiler;
     const failed = struct {
         fn f(made: *standalone_build.Build, e: standalone_build.Error, err_class: *PyObject) bool {
@@ -1312,6 +1312,36 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
             batch.added() catch |e| return failed(b, e, compile_error);
             break;
         }
+    }
+    // The setup (build_native(setup=...)): compiled for its call as the
+    // program starts (two values: the path, the arguments), one of the
+    // objects for the runtime to find it by; one that can't be is the
+    // build's CompileError
+    var setup_index: u64 = 0;
+    if (setup) |f| {
+        if (pt == null or ph.typeOf(f) != @as(*py.c.PyTypeObject, @ptrCast(@alignCast(pt.?)))) {
+            ph.raise(py.PyExc_TypeError(), "setup must be a Python function (or 'module:function')", .{});
+            return false;
+        }
+        setup_index = 1 + (comp.objectIndex(f) catch return oomB());
+        tried.put(allocator, .{ .func = @intFromPtr(f), .nargs = 2, .rt_mask = 0 }, {}) catch return oomB();
+        const name = while (true) {
+            comp.failed_semantic = null;
+            comp.need_retry = false;
+            break comp.compileCalled(f, 2, 0, false) catch |e| {
+                comp.forgetModule();
+                if (e == error.Unsupported and comp.need_retry) continue;
+                if (e == error.Unsupported and (comp.framesForRetry() catch return oomB())) continue;
+                switch (e) {
+                    error.Unsupported => ph.raise(compile_error, "the setup can't be compiled: {s}", .{c.failure.message.items}),
+                    error.OutOfMemory => _ = py.c.PyErr_NoMemory(),
+                    error.Python => {},
+                }
+                return false;
+            };
+        };
+        b.called.append(b.arena.allocator(), .{ .func = @intFromPtr(f), .nargs = 2, .rt_mask = 0, .name = name }) catch return oomB();
+        batch.added() catch |e| return failed(b, e, compile_error);
     }
     // (the nodes the code can have as values: those it makes values of,
     // and those under them)
@@ -1443,6 +1473,7 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
         .owners = owners,
         .syms = syms,
         .pruned = prune,
+        .setup = setup_index,
     }) catch |e| return failed(b, e, compile_error);
     return true;
 }

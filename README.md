@@ -285,6 +285,12 @@ left = []
 zrun.build_native(lua.lang, "script.lua", "script", prune=True, left_out=left)
 ```
 
+The program's arguments go to `setup=`, a function (or `"module:function"`) compiled with the program and called with its path and its arguments (a list of strs) before it runs: `setup="lua:set_args"` makes Lua's `arg`, as `build_executable`'s does.
+
+```python
+zrun.build_native(lua.lang, "script.lua", "script", setup=lua.set_args)    # ./script a b: arg[1] == "a"
+```
+
 Linux, for this machine (its CPU's code); needs the ziglang package (`pip install "zrun-py[exe]"`). Building takes a few seconds for a small language, more for a big one (the Lua example: its library compiled, about 8 s on many cores; 3 to 10 s pruned). `program.native_objects()` gives the object files to link yourself with zrun's runtime (`zig build rt`: libzrun_rt.a). Nothing that needs Python is in a standalone program: a host function that isn't compiled, a value Python alone knows (a complex number), an error Python words differs (zrun's own words then).
 
 ## Sessions and the REPL
@@ -329,7 +335,7 @@ Every class and method has its documentation in `help()` (and in the `.pyi` stub
 | `program.report()`, `lang.python_semantics()` | what to look at to make it faster |
 | `lang.compile(source, output)`, `program.save(path)`, `lang.load_compiled(path)` | compiled modules |
 | `zrun.build_executable(language, source, output, target=None, python=None)` | the program as one executable file |
-| `zrun.build_native(language, source, output, path=None)`, `program.native_objects()` | a strict language's program as an executable with no Python |
+| `zrun.build_native(language, source, output, path=None, prune=False, left_out=None, setup=None)`, `program.native_objects()` | a strict language's program as an executable with no Python |
 | `lang.session()`, `lang.repl()` | programs run one after another, sharing their names |
 | `zrun.Bytes(data)` | data read in place |
 | `zrun.configure(cache=, cache_size=, tiers=, perf_map=)`, `zrun.clear_cache()` | process-wide settings; the compiled-code cache |

@@ -137,6 +137,31 @@ def test_pruned(zig, tmp_path, monkeypatch):
     assert r.returncode == 0 and r.stdout == "hi\tabab\nX\n"
 
 
+@pytest.mark.slow
+def test_setup(zig, tmp_path, monkeypatch):
+    # (setup=: a function compiled with the program, called with its path
+    # and arguments as it starts: Lua's `arg`)
+    lua = _strict_lua(monkeypatch)
+    src = 'print(#arg, arg[0])\nfor i = 1, #arg do io.write(arg[i], ";") end\nprint(tonumber(arg[1]) + 1)\n'
+    exe = zrun.build_native(lua.lang, src, str(tmp_path / "args"), path="args.lua", prune=True, setup=lua.set_args)
+    r = subprocess.run([exe, "41", "héllo", ""], capture_output=True, encoding="utf-8", timeout=60)
+    assert (r.returncode, r.stdout) == (0, "3\targs.lua\n41;héllo;;42\n")
+    r = subprocess.run([exe], capture_output=True, encoding="utf-8", timeout=60)
+    assert r.returncode == 1 and r.stdout == "0\targs.lua\n" and "arithmetic on a nil value" in r.stderr
+
+
+def test_setup_not_compiled(tmp_path, monkeypatch):
+    lua = _strict_lua(monkeypatch)
+
+    def setup(path, args, **kw):
+        pass
+
+    with pytest.raises(zrun.CompileError, match="the setup can't be compiled.*kwargs"):
+        lua.lang.load("print(1)", "x.lua").native_objects(setup=setup)
+    with pytest.raises(TypeError, match="setup must be a Python function"):
+        lua.lang.load("print(1)", "x.lua").native_objects(setup=print)
+
+
 def test_not_strict(tmp_path):
     from conftest import tiny as plain
 

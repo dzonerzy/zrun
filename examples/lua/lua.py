@@ -2423,7 +2423,8 @@ def string_gsub(rt, node, args):
 
 def set_args(path, args):
     """`arg`: the script's path (arg[0]) and its arguments (an executable's
-    setup: zrun.build_executable(..., setup="lua:set_args"))."""
+    setup: zrun.build_executable(..., setup="lua:set_args"), and
+    zrun.build_native's)."""
     a = Table()
     a.set(0, path)
     for i, v in enumerate(args, 1):

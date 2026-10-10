@@ -79,6 +79,7 @@ A strict language's program builds into an executable with no Python:
 ```python
 zrun.build_native(lang, "script.lua", "script")                  # everything the program may call
 zrun.build_native(lang, "script.lua", "script", prune=True)      # only what it names: smaller, faster to build
+zrun.build_native(lang, "script.lua", "script", setup="lua:set_args")   # its arguments: Lua's `arg`
 ```
 
 See [Standalone programs](../README.md#standalone-programs) for what's in one and what isn't.

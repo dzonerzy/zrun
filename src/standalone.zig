@@ -16,6 +16,8 @@ const grammar_mod = @import("grammar.zig");
 const Ctx = helpers.Ctx;
 const Value = value.Value;
 const allocator = std.heap.c_allocator;
+/// A Python function's compiled code (driver.Helper's signature)
+const Helper = *const fn (*Ctx, ?*value.Frame, [*]const Value, u32, u32, ?*const Value, ?*const Value, *Value) callconv(.c) i32;
 
 /// The program, as the image lays it out (standalone_build.zig writes it:
 /// every field a word)
@@ -56,6 +58,10 @@ pub const Desc = extern struct {
     /// Built with prune=True (1): what wasn't compiled may have been left
     /// out by name
     pruned: u64,
+    /// The language's setup (build_native(setup=...)): its object's index
+    /// + 1 (0: none), called with the program's path and arguments before
+    /// the top level runs
+    setup: u64,
 };
 
 /// A symbol: its scope node (NONE: global), the node whose frame holds its
@@ -208,8 +214,6 @@ comptime {
 }
 
 fn rtMain(desc: *const Desc, argc: c_int, argv: [*]const [*:0]const u8) callconv(.c) c_int {
-    _ = argc;
-    _ = argv;
     program = desc;
     makeData(desc);
     desc.init();
@@ -224,7 +228,7 @@ fn rtMain(desc: *const Desc, argc: c_int, argv: [*]const [*:0]const u8) callconv
         writeErr("zrun: out of memory\n");
         return 1;
     };
-    const ok = desc.main(&ctx, globals);
+    const ok = runSetup(desc, &ctx, argv[1..@intCast(@max(argc, 1))]) and desc.main(&ctx, globals);
     if (!ok) {
         helpers.flushOutput();
         report(desc, &ctx);
@@ -232,6 +236,32 @@ fn rtMain(desc: *const Desc, argc: c_int, argv: [*]const [*:0]const u8) callconv
     }
     helpers.flushOutput();
     return 0;
+}
+
+/// The language's setup, if the build has one: its code called (compiled
+/// ahead for two values) with the program's path, a str, and its
+/// arguments, a list of strs. False with the error in `ctx`.
+fn runSetup(desc: *const Desc, ctx: *Ctx, args: []const [*:0]const u8) bool {
+    if (desc.setup == 0) return true;
+    const callee = desc.objects[desc.setup - 1];
+    const code_p = calledOf(callee, 2, 0) orelse return helpers.fail(ctx, 0, "the setup wasn't compiled ahead of time", .{});
+    const code: Helper = @ptrCast(@alignCast(code_p));
+    const path = value.newStr(desc.path[0..desc.path_len]) orelse return helpers.fail(ctx, 0, "out of memory", .{});
+    const list = value.newList(args.len) orelse return helpers.fail(ctx, 0, "out of memory", .{});
+    var given = [2]Value{ Value.obj(.str, &path.head), Value.obj(.list, &list.head) };
+    defer for (given) |v| value.decref(v);
+    for (args) |a| {
+        const s = value.newStr(std.mem.span(a)) orelse return helpers.fail(ctx, 0, "out of memory", .{});
+        if (!value.listPush(list, Value.obj(.str, &s.head))) return helpers.fail(ctx, 0, "out of memory", .{});
+    }
+    var out: Value = Value.none_v;
+    const status = code(ctx, null, &given, 0, 0, null, null, &out);
+    value.decref(out);
+    return switch (status) {
+        1 => true,
+        0 => false,
+        else => helpers.fail(ctx, 0, "rt.Return, rt.Break or rt.Continue raised out of the setup", .{}),
+    };
 }
 
 fn writeErr(s: []const u8) void {
