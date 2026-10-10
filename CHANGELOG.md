@@ -15,7 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Standalone builds 2.2x faster** (the Lua example's test programs: 60 s to 27 s together): each language function a module of its own and the top level's optimized alongside the rest, not before them; a module past 10000 blocks (Lua's pattern matcher) optimized a level down, its code as fast.
 - **Less code, compiled faster** (the JIT's optimized code: 21% less time): an error's way out gives counts back by calls, not inline; a helper inline 16 times in one function's code out of line after that; a field of a record a local holds read and written without taking a count of the record. Run time as before.
 
+### Documentation
+- **[Strict languages](docs/strict-languages.md)**: what `strict=True` refuses, its errors, how to fix what they point at, the Lua example as a case.
+
 ### Fixed
+- **`type(a) is type(b)` with one side known while compiling and the other not** refused in strict mode (the known side a Python object), and could crash: both compared natively now.
+- **CI runs every supported Python** (3.10 to 3.14), not 3.10, 3.12 and 3.14 only.
 - **Code compiled as a program runs needing a function's frame** (a library function calling back into the program, a node evaluated at run time) failed instead of compiling the function again with its variables in a frame, as the program's own code does.
 
 ## [0.5.0] - 2026-10-10

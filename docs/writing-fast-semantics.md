@@ -36,12 +36,14 @@ compiles, for a `BinOp` node whose `op` is `"+"`, to the code of its two operand
 | Builtins | `len`, `int`, `float`, `str`, `bool`, `abs`, `isinstance`, `type`, `range`, `zip`, `enumerate`, `print`; the others (`min`, `max`, `round`, `ord`, ...) are worked out while compiling when their arguments are known, and called through Python otherwise |
 | Methods | of `str`: `upper`, `lower`, `strip`, `lstrip`, `rstrip`, `startswith`, `endswith`, `find`, `join`, `isdigit`, `isalpha`, `isspace`, `count`, `format`; of lists and dicts: `append`, `extend`, `insert`, `pop`, `index`, `count`, `sort`, `reverse`, `copy`, `get`, `keys`, `values`, `items`, `setdefault` |
 
-Not compiled: `with`, `lambda`, `yield`, `global` / `nonlocal`, `del`, sets, `**` unpacking, keyword arguments to most builtins. A semantic using them is reported, and runs as Python:
+Also compiled: `with`, `lambda` and nested `def`s (closures), `global` / `nonlocal`, `del`, `:=`, sets, bytes, `*args`, `import` inside a function, `raise ... from`. Not compiled: `yield`, `async`, a class defined inside a function, `match`, `**kwargs`, keyword arguments to most builtins. A semantic using them is reported, and runs as Python:
 
 ```
 >>> lang.python_semantics()
-{'with_': "subset.py:10:5: in with_(): `with` can't be compiled"}
+{'gen': "subset.py:10:5: in gen(): `yield` can't be compiled"}
 ```
+
+A language whose compiled code must never go into Python says so: see [Strict languages](strict-languages.md).
 
 Mark a semantic `@lang.eval(kind, native=False)` to run it as Python on purpose (anything goes there: I/O, other libraries).
 

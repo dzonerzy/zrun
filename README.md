@@ -164,7 +164,7 @@ Tail calls are the language's to decide: a semantic calls `rt.tail_call(f, args)
 
 Integers are 64-bit and checked: an overflow is a runtime error at the node (`zrun.IntegerOverflow`), not a silent wraparound; the `wrapping_` functions are for languages that want one (Lua, hashes).
 
-Semantics are compiled from their Python source. What compiles, and how to write semantics that compile to fast code, is in [the guide to writing fast semantics](https://github.com/dzonerzy/zrun/blob/main/docs/writing-fast-semantics.md); `lang.python_semantics()` lists the ones that run as Python, and why.
+Semantics are compiled from their Python source. What compiles, and how to write semantics that compile to fast code, is in [the guide to writing fast semantics](https://github.com/dzonerzy/zrun/blob/main/docs/writing-fast-semantics.md); `lang.python_semantics()` lists the ones that run as Python, and why. A language whose compiled code must never go into Python is made with `strict=True`: [the guide to strict languages](https://github.com/dzonerzy/zrun/blob/main/docs/strict-languages.md) says what that refuses and how to fix it.
 
 ### Computed when compiling
 
