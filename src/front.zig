@@ -259,6 +259,88 @@ pub const Failure = struct {
 
 const ReadError = error{ Python, OutOfMemory, Unsupported };
 
+/// A function's source (inspect.getsource's), or that of a frozen module's
+/// function from the module's file (Python 3.12's posixpath...: its code
+/// names `<frozen posixpath>`, its module's __file__ the file); null with
+/// the exception
+const source_helper =
+    \\import inspect, linecache, sys
+    \\def source_of(f):
+    \\    try:
+    \\        return inspect.getsource(f)
+    \\    except OSError:
+    \\        code = getattr(f, "__code__", None)
+    \\        name = code.co_filename if code is not None else ""
+    \\        if name.startswith("<frozen ") and name.endswith(">"):
+    \\            path = getattr(sys.modules.get(name[8:-1]), "__file__", None)
+    \\            lines = linecache.getlines(path) if path else []
+    \\            if len(lines) >= code.co_firstlineno:
+    \\                return "".join(inspect.getblock(lines[code.co_firstlineno - 1:]))
+    \\        raise
+    \\def folded_order(func, elts):
+    \\    # (a set literal of constants: the frozenset CPython made of them,
+    \\    # in the function's code, laid out as the order they were put in
+    \\    # makes it (the source's; a .pyc's, made by another process: that
+    \\    # one's): an order of the items making one laid out the same, made
+    \\    # here as compiled code makes it)
+    \\    import ast, itertools
+    \\    vals = [ast.literal_eval(e) for e in elts]
+    \\    want = frozenset(vals)
+    \\    def frozensets(code):
+    \\        for c in code.co_consts:
+    \\            if isinstance(c, frozenset):
+    \\                yield c
+    \\            elif hasattr(c, "co_consts"):
+    \\                yield from frozensets(c)
+    \\    def same(a, b):
+    \\        return len(a) == len(b) and all(type(x) is type(y) and x == y for x, y in zip(a, b))
+    \\    for c in frozensets(func.__code__):
+    \\        if c != want:
+    \\            continue
+    \\        live = list(c)
+    \\        used, first = set(), []
+    \\        for x in live:
+    \\            i = next((i for i, v in enumerate(vals) if i not in used and type(v) is type(x) and v == x), None)
+    \\            if i is None:
+    \\                break
+    \\            used.add(i)
+    \\            first.append(i)
+    \\        else:
+    \\            rest = [i for i in range(len(vals)) if i not in used]
+    \\            # (the source's order, its frozenset made again in the order
+    \\            # it goes over them (as merging constants makes it), the
+    \\            # frozenset's own; every order, for a few)
+    \\            def again(t):
+    \\                f = list(frozenset(vals[i] for i in t))
+    \\                return [next(i for i in t if type(vals[i]) is type(x) and vals[i] == x) for x in f]
+    \\            tries = [first, sorted(first)]
+    \\            for t in (sorted(first), first):
+    \\                for _ in range(3):
+    \\                    t = again(t)
+    \\                    tries.append(t)
+    \\            if len(first) <= 6:
+    \\                tries += [list(p) for p in itertools.permutations(first)]
+    \\            for t in tries:
+    \\                if same(list(frozenset(vals[i] for i in t)), live):
+    \\                    return t + rest
+    \\    return None
+;
+var helper_ns: ?*PyObject = null;
+
+fn helper(name: [*:0]const u8) ?*PyObject {
+    const ns = helper_ns orelse blk: {
+        const ns = @import("compile.zig").runPython(source_helper) orelse return null;
+        helper_ns = ns;
+        break :blk ns;
+    };
+    return py.c.PyDict_GetItemString(ns, name);
+}
+
+fn sourceOf(func: *PyObject) ?*PyObject {
+    const f = helper("source_of") orelse return null;
+    return py.c.PyObject_CallFunctionObjArgs(f, func, @as(?*PyObject, null));
+}
+
 /// Read a Python function: its source, parsed, checked against the
 /// subset. On error.Unsupported, `failure` says what and where (with the
 /// function's file and first line, the caller makes it a CompileError).
@@ -279,7 +361,16 @@ pub fn read(gpa: Allocator, func: *PyObject, failure: *Failure) ReadError!*Funct
     defer py.Py_DecRef(textwrap);
     const ast_mod = py.c.PyImport_ImportModule("ast") orelse return error.Python;
     defer py.Py_DecRef(ast_mod);
-    const raw = py.c.PyObject_CallMethod(inspect, "getsource", "(O)", func) orelse return error.Python;
+    const raw = sourceOf(func) orelse {
+        // (one whose source isn't there (a builtin, a module without its
+        // file): not compiled, Python runs it)
+        if (py.c.PyErr_ExceptionMatches(py.PyExc_OSError()) != 0 or py.c.PyErr_ExceptionMatches(py.PyExc_TypeError()) != 0) {
+            py.c.PyErr_Clear();
+            const fname = try r.strAttr(func, "__qualname__");
+            return r.unsupported(.{}, "the source of {s}() isn't available", .{fname});
+        }
+        return error.Python;
+    };
     defer py.Py_DecRef(raw);
     const source = py.c.PyObject_CallMethod(textwrap, "dedent", "(O)", raw) orelse return error.Python;
     defer py.Py_DecRef(source);
@@ -1172,6 +1263,28 @@ const Reader = struct {
         return try self.expr(v);
     }
 
+    /// A folded set literal's items' order in the frozenset CPython made of
+    /// them (folded_order), or null if it isn't found
+    fn foldedOrder(self: *Reader, elts: *PyObject, n: usize) ReadError!?[]const usize {
+        const f = helper("folded_order") orelse return error.Python;
+        const r = py.c.PyObject_CallFunctionObjArgs(f, self.py_function, elts, @as(?*PyObject, null)) orelse {
+            py.c.PyErr_Clear();
+            return null;
+        };
+        defer py.Py_DecRef(r);
+        if (r == py.Py_None() or py.c.PyList_Size(r) != @as(isize, @intCast(n))) return null;
+        const out = try self.alloc().alloc(usize, n);
+        for (out, 0..) |*slot, i| {
+            const x = py.c.PyLong_AsLongLong(py.c.PyList_GetItem(r, @intCast(i)).?);
+            if (x < 0 or x >= n) {
+                py.c.PyErr_Clear();
+                return null;
+            }
+            slot.* = @intCast(x);
+        }
+        return out;
+    }
+
     fn exprList(self: *Reader, obj: *PyObject, name: [*:0]const u8) ReadError![]const *Expr {
         const l = try listAttr(obj, name);
         defer py.Py_DecRef(l);
@@ -1335,7 +1448,16 @@ const Reader = struct {
             for (0..n) |i| {
                 if (!try isConstant(py.c.PyList_GetItem(elts, @intCast(i)).?)) folded = false;
             }
-            return self.new(pos, .{ .set_ = .{ .items = try self.exprList(e, "elts"), .folded = folded } });
+            const items = try self.exprList(e, "elts");
+            // (folded: its items in the order of CPython's frozenset of them
+            // (constants: when they're made doesn't matter), the frozenset
+            // compiled code makes then laid out as that one)
+            if (folded) if (try self.foldedOrder(elts, n)) |order| {
+                const sorted = try self.alloc().alloc(*Expr, n);
+                for (sorted, order) |*slot, i| slot.* = items[i];
+                return self.new(pos, .{ .set_ = .{ .items = sorted, .folded = true } });
+            };
+            return self.new(pos, .{ .set_ = .{ .items = items, .folded = folded } });
         }
         if (eq(k, "SetComp")) {
             const mark = self.comp_scope.items.len;

@@ -59,6 +59,9 @@ Needs zgram 0.5.2 (its LLVM capsule's `LLVMAddAlias2`, for standalone programs).
 - **Helpers with native paths no longer take the GIL first**: unpacking a list or tuple, methods of strs, lists and dicts done natively, `int()`, `str()`, `abs()`, `bool()`, `len()` of native values. Code running them on several threads (`map()`) doesn't take turns for them.
 
 ### Fixed
+- **A function of a frozen module (Python 3.12's `os.path`) couldn't be read** (`inspect` finds no source for `<frozen posixpath>`): its source is read from the module's file; one with no source at all is a function Python runs, not an error.
+- **Errors worded as this Python words them**: from 3.14, `division by zero` for every division, `cannot use 'list' as a set element (unhashable type: 'list')`; 3.13's `float modulo by zero`.
+- **A set literal of constants loaded from a .pyc** goes over its items as Python's does: the .pyc's frozenset is laid out as the process that wrote it made it (another hash secret), and compiled code makes its copy so. Sets of strs and bytes on Windows too (the hash secret read from Python's DLL).
 - **`repr()` of a float in compiled code wrote past Zig's formatting buffer** (smaller than its formatter asks for): undefined behavior, harmless so far by luck, an endless loop in a standalone program.
 - **A list appended to itself** (`l.append(l)`, or to a list it's in) crashed compiling (a known list holding itself without end) or held a copy: it's the list itself now, as in Python.
 - **A host function's native error** (compiled code's `KeyError`...) went up from `rt.call` as itself: it's the zrun.Error the reference mode raises for a host function's exception (an rt.Throw going on as itself).

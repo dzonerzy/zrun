@@ -4,6 +4,7 @@ same errors as the reference mode, for values of every kind (what they
 don't do natively, Python does: the same again)."""
 
 import math
+import sys
 
 import pytest
 import zrun
@@ -237,6 +238,10 @@ def test_percent_format():
         except (TypeError, ValueError, OverflowError):
             continue
         if FORMATS[i] == "%r" and isinstance(v, str) and not v.isascii():
+            continue
+        # (a float's digits: the C library's, natively where it's the one
+        # Python formats with (Linux); elsewhere Python's own)
+        if isinstance(v, float) and sys.platform != "linux":
             continue
         try:
             got = strict.call("f", v, i)

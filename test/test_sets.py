@@ -172,6 +172,40 @@ def test_iterating_and_type():
     same_in_both(_program(it), [(3, 4), ("q", "r")])
 
 
+LITERALS = '''
+def lits(a, b):
+    return (list({"x", "y", "z"}), list({"p", "q", "r", "s"}), list({"k1", "k2", "k3", "k4", "k5", "k6", "k7"}),
+            list({1.5, "a", (1, 2)}), list({b"a", b"b", b"c"}))
+'''
+
+CHECK = """
+import sys
+sys.path[:0] = [sys.argv[1], sys.argv[2]]
+import lits_mod
+from test_intrinsics import _program
+p = _program(lits_mod.lits)
+print(p.call("f", 1, 2, mode="compiled") == lits_mod.lits(1, 2))
+"""
+
+
+def test_literals_in_the_order_of_a_pyc(tmp_path):
+    # (a set literal of constants is a frozenset in the function's code: a
+    # .pyc made by another process (another hash secret) lays it out as that
+    # one's order of its items made it: the set the same as Python's either
+    # way, made from source and loaded from the .pyc)
+    import os
+    import subprocess
+    import sys
+
+    from conftest import HERE
+
+    (tmp_path / "lits_mod.py").write_text(LITERALS)
+    for seed in ("11", "12", "13", "14"):
+        env = dict(os.environ, PYTHONHASHSEED=seed)
+        r = subprocess.run([sys.executable, "-c", CHECK, str(tmp_path), HERE], capture_output=True, text=True, env=env, timeout=120)
+        assert r.stdout.strip() == "True", (seed, r.stdout, r.stderr[-2000:])
+
+
 def test_report_has_no_python_for_sets():
     p = _program(ordered)
     p.call("f", [1, 2], [2], mode="compiled")

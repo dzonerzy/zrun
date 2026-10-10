@@ -420,7 +420,7 @@ fn wideBinary(ctx: *Ctx, node: u32, op: Op, a: Value, b: Value, out: *Value) boo
             break :blk if (s[1] != 0) null else s[0];
         },
         .floordiv, .mod => blk: {
-            if (y == 0) return failAs(ctx, node, .ZeroDivisionError, "integer division or modulo by zero", "division by zero", .{});
+            if (y == 0) return failAs(ctx, node, .ZeroDivisionError, zeroDivision(.int), "division by zero", .{});
             if (x == std.math.minInt(i128) and y == -1) break :blk null;
             break :blk if (op == .floordiv) @divFloor(x, y) else @mod(x, y);
         },
@@ -529,7 +529,7 @@ export fn zr_binary(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u6
                 return true;
             },
             .floordiv, .mod => {
-                if (y == 0) return failAs(ctx, node, .ZeroDivisionError, "integer division or modulo by zero", "division by zero", .{});
+                if (y == 0) return failAs(ctx, node, .ZeroDivisionError, zeroDivision(.int), "division by zero", .{});
                 if (x == std.math.minInt(i64) and y == -1) {
                     if (op == .mod) {
                         out.* = mk(0);
@@ -585,17 +585,17 @@ export fn zr_binary(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u6
                 return true;
             },
             .div => {
-                if (y == 0) return failAs(ctx, node, .ZeroDivisionError, "float division by zero", "division by zero", .{});
+                if (y == 0) return failAs(ctx, node, .ZeroDivisionError, zeroDivision(.float_div), "division by zero", .{});
                 out.* = Value.float(x / y);
                 return true;
             },
             .floordiv => {
-                if (y == 0) return failAs(ctx, node, .ZeroDivisionError, "float floor division by zero", "division by zero", .{});
+                if (y == 0) return failAs(ctx, node, .ZeroDivisionError, zeroDivision(.float_floor), "division by zero", .{});
                 out.* = Value.float(@floor(x / y));
                 return true;
             },
             .mod => {
-                if (y == 0) return failAs(ctx, node, .ZeroDivisionError, "float modulo", "division by zero", .{});
+                if (y == 0) return failAs(ctx, node, .ZeroDivisionError, zeroDivision(.float_mod), "division by zero", .{});
                 out.* = Value.float(floatMod(x, y));
                 return true;
             },
@@ -1278,11 +1278,31 @@ fn unhashableItem(ctx: *Ctx, node: u32, v: Value) bool {
         const t: *PyObject = @ptrCast(@alignCast(ph.typeOf(@ptrFromInt(v.bits))));
         if (ph.attr(t, "__name__")) |n| {
             defer py.Py_DecRef(n);
-            if (ph.utf8(n, "name")) |s| return failAs(ctx, node, .TypeError, null, "unhashable type: '{s}'", .{s});
+            if (ph.utf8(n, "name")) |s| return unhashableElement(ctx, node, s);
         }
         py.c.PyErr_Clear();
     }
-    return failAs(ctx, node, .TypeError, null, "unhashable type: '{s}'", .{value.typeName(v)});
+    return unhashableElement(ctx, node, value.typeName(v));
+}
+
+/// A value of type `name` put in a set, unhashable: as this Python words it
+/// (from 3.14 saying where it was used)
+fn unhashableElement(ctx: *Ctx, node: u32, name: []const u8) bool {
+    if (ph.minor >= 14)
+        return failAs(ctx, node, .TypeError, null, "cannot use '{s}' as a set element (unhashable type: '{s}')", .{ name, name });
+    return failAs(ctx, node, .TypeError, null, "unhashable type: '{s}'", .{name});
+}
+
+/// Python's words for a division by zero, which changed: 3.13 (a float's
+/// modulo), 3.14 (one for all)
+fn zeroDivision(comptime op: enum { int, float_div, float_floor, float_mod }) []const u8 {
+    if (ph.minor >= 14) return "division by zero";
+    return switch (op) {
+        .int => "integer division or modulo by zero",
+        .float_div => "float division by zero",
+        .float_floor => "float floor division by zero",
+        .float_mod => if (ph.minor >= 13) "float modulo by zero" else "float modulo",
+    };
 }
 
 /// `{a, b, ...}` (the items borrowed), added in turn; `folded`: as CPython
@@ -1295,6 +1315,8 @@ export fn zr_set(ctx: *Ctx, node: u32, items: [*]const Value, n: u64, folded: u3
         return oomFail(ctx, node);
     };
     if (folded != 0) {
+        // (the frozenset's copy, as set_merge makes it; the items given in
+        // an order making the frozenset CPython's (the front's))
         const c = set_mod.copy(s);
         value.decref(Value.obj(.set, &s.head));
         s = c orelse return oomFail(ctx, node);

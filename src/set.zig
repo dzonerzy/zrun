@@ -110,11 +110,21 @@ pub fn init() void {
     // (short strings hashed otherwise (a build's cutoff): zrun's hash then)
     if (py.c.PyLong_AsLong(cutoff) != 0) return;
     const name = ph.utf8(algo, "algorithm") orelse return py.c.PyErr_Clear();
-    // (the interpreter's symbols, the process's: on Linux and macOS)
+    // (the interpreter's symbols: the process's on Linux and macOS, Python's
+    // DLL's on Windows (sys.dllhandle: python3X.dll))
     const builtin = @import("builtin");
-    if (builtin.os.tag != .linux and !builtin.os.tag.isDarwin()) return;
-    const self_handle = std.c.dlopen(null, .{ .LAZY = true }) orelse return;
-    const secret = std.c.dlsym(self_handle, "_Py_HashSecret") orelse return;
+    const secret: *const anyopaque = if (builtin.os.tag == .windows) blk: {
+        const W = struct {
+            extern "kernel32" fn GetProcAddress(module: *opaque {}, name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
+        };
+        const handle = py.c.PySys_GetObject("dllhandle") orelse return;
+        const module = py.c.PyLong_AsVoidPtr(handle) orelse return py.c.PyErr_Clear();
+        break :blk W.GetProcAddress(@ptrCast(module), "_Py_HashSecret") orelse return;
+    } else blk: {
+        if (builtin.os.tag != .linux and !builtin.os.tag.isDarwin()) return;
+        const self_handle = std.c.dlopen(null, .{ .LAZY = true }) orelse return;
+        break :blk std.c.dlsym(self_handle, "_Py_HashSecret") orelse return;
+    };
     // (siphash's k0, k1: the secret's first 16 bytes, as stored)
     @memcpy(&sip_key, @as([*]const u8, @ptrCast(secret))[0..16]);
     if (std.mem.eql(u8, name, "siphash24")) sip_rounds = .sip24 else if (std.mem.eql(u8, name, "siphash13")) sip_rounds = .sip13;
