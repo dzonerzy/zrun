@@ -906,8 +906,12 @@ const HelperSpec = struct {
     /// parameter: defaults and *args made of them
     raw: bool = false,
 
-    fn matches(self: *const HelperSpec, func: *const front.Function, args: []const SVal) bool {
-        if (self.func != func or self.args.len != args.len or self.layout != null or self.raw) return false;
+    /// `raw_ok`: a call's arguments as given (compileCalled's) serve, the
+    /// same code as one per parameter when they're all the parameters, none
+    /// of them *args, for no closure (a standalone build's: its size)
+    fn matches(self: *const HelperSpec, func: *const front.Function, args: []const SVal, raw_ok: bool) bool {
+        if (self.func != func or self.args.len != args.len or self.layout != null) return false;
+        if (self.raw and (!raw_ok or self.closure or func.vararg or args.len != func.param_count)) return false;
         for (self.args, args) |x, y| if (!sameSpec(x, y)) return false;
         return true;
     }
@@ -1038,6 +1042,16 @@ pub const Compiler = struct {
     /// generate. `helpers_kept`: how many the JIT has (a failed module's
     /// are forgotten).
     helper_fns: std.ArrayListUnmanaged(*HelperSpec) = .empty,
+    /// Helpers known to return or not (neverReturns)
+    never_returns: std.AutoHashMapUnmanaged(*const front.Function, bool) = .empty,
+    /// Helpers known to leave by a jump or not (mayJump), those being
+    /// worked out, how deep; methods by module and name (methodsMayJump)
+    may_jump: std.AutoHashMapUnmanaged(*const front.Function, bool) = .empty,
+    jump_busy: std.AutoHashMapUnmanaged(*const front.Function, u32) = .empty,
+    jump_depth: u32 = 0,
+    /// The shallowest busy one an answer being worked out relied on
+    jump_taint: u32 = std.math.maxInt(u32),
+    methods_jump: std.StringHashMapUnmanaged(bool) = .empty,
     helper_queue: std.ArrayListUnmanaged(*HelperSpec) = .empty,
     helpers_kept: usize = 0,
     /// Record fields by module and name (Gen.fieldCandidates)
@@ -1282,7 +1296,7 @@ pub const Compiler = struct {
     /// reported at node `at`, the caller's receiver and varargs given.
     fn genHelper(self: *Compiler, h: *HelperSpec) Error!void {
         const fun = try self.helperFn(h.name);
-        var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = NONE, .layout = try self.layoutOf(NONE), .thunk = true, .detached = true, .helper_semantic = h.semantic, .unit = std.hash.Wyhash.hash(1, h.name), .specialized = h.layout != null };
+        var g = Gen{ .c = self, .f = ir.Function.init(&self.m, fun.v), .fnode = NONE, .layout = try self.layoutOf(NONE), .thunk = true, .detached = true, .helper_semantic = h.semantic, .unit = std.hash.Wyhash.hash(1, h.name), .specialized = h.layout != null, .no_jumps = self.aot != null and !try self.mayJump(h.func) };
         // (one that can't be compiled: its semantic runs as Python)
         errdefer if (self.failed_semantic == null) {
             self.failed_semantic = h.semantic;
@@ -1350,6 +1364,276 @@ pub const Compiler = struct {
 
     /// A Python function as the front reads it (once: the language keeps
     /// it).
+    /// Whether a helper never returns: no `return` in it, and every way
+    /// through its body ends raising (a `raise`, a call of a helper that
+    /// never returns, an `if` both of whose branches do). Its calls are an
+    /// error's way: out of line (its code inline at every error site grows
+    /// code for nothing). (Being worked out, called again: it returns.)
+    pub fn neverReturns(self: *Compiler, func: *const front.Function) Error!bool {
+        if (self.never_returns.get(func)) |r| return r;
+        try self.never_returns.put(self.a, func, false);
+        const r = !hasReturn(func.body) and try self.endsRaising(func, func.body);
+        try self.never_returns.put(self.a, func, r);
+        return r;
+    }
+
+    fn hasReturn(body: []const front.Stmt) bool {
+        for (body) |s| switch (s.kind) {
+            .return_ => return true,
+            .if_ => |x| if (hasReturn(x.body) or hasReturn(x.else_)) return true,
+            .while_ => |x| if (hasReturn(x.body) or hasReturn(x.else_)) return true,
+            .for_ => |x| if (hasReturn(x.body) or hasReturn(x.else_)) return true,
+            .try_ => |x| {
+                if (hasReturn(x.body) or hasReturn(x.else_) or hasReturn(x.finally)) return true;
+                for (x.handlers) |h| if (hasReturn(h.body)) return true;
+            },
+            .seq => |x| if (hasReturn(x)) return true,
+            else => {},
+        };
+        return false;
+    }
+
+    /// Whether a function's statements, run in turn, end raising
+    fn endsRaising(self: *Compiler, func: *const front.Function, body: []const front.Stmt) Error!bool {
+        for (body) |s| {
+            const raises = switch (s.kind) {
+                // (an error: a jump (rt.Return...) is its caller's to take)
+                .raise_ => |e| if (e) |x| !try self.raisesJump(func, x) else false,
+                .raise_from => |x| !try self.raisesJump(func, x.exc),
+                .if_ => |x| x.else_.len > 0 and try self.endsRaising(func, x.body) and try self.endsRaising(func, x.else_),
+                .seq => |x| try self.endsRaising(func, x),
+                .expr => |e| try self.callNeverReturns(func, e),
+                else => false,
+            };
+            if (raises) return true;
+        }
+        return false;
+    }
+
+    /// Whether an expression is a call of a helper of the module (a name of
+    /// it) that never returns
+    fn callNeverReturns(self: *Compiler, func: *const front.Function, e: *const front.Expr) Error!bool {
+        if (e.kind != .call or e.kind.call.func.kind != .global) return false;
+        const callee = try self.moduleFunction(func, e.kind.call.func.kind.global) orelse return false;
+        return self.neverReturns(callee);
+    }
+
+    /// A name of a function's module that's a Python function compiled
+    /// code can have (read), or null
+    fn moduleFunction(self: *Compiler, func: *const front.Function, name: []const u8) Error!?*const front.Function {
+        const globals = ph.attr(func.py_function, "__globals__") orelse return error.Python;
+        defer py.Py_DecRef(globals);
+        const key = ph.newString(name) orelse return error.Python;
+        defer py.Py_DecRef(key);
+        const o = py.c.PyDict_GetItem(globals, key) orelse return null;
+        return self.readIfFunction(o);
+    }
+
+    fn readIfFunction(self: *Compiler, o: *PyObject) Error!?*const front.Function {
+        const pt = pyFunctionType() orelse return null;
+        if (ph.typeOf(o) != @as(*py.c.PyTypeObject, @ptrCast(@alignCast(pt)))) return null;
+        return self.readFunction(o) catch |err| switch (err) {
+            error.Unsupported => return null,
+            else => |x| return x,
+        };
+    }
+
+    /// Whether a helper's code can leave by a jump (a status but done or
+    /// error: rt.Return, rt.Break, rt.Continue raised out of it, a tail
+    /// call pending): it raises one, runs nodes known at run time (rt.exec,
+    /// rt.eval, rt.loop, rt.tail_call: their semantics may), or calls a
+    /// helper or method that can. (A call through a value can't: the jump
+    /// is an error there.) Its calls out of line see to the jumps only if
+    /// it can. (Being worked out, called again: it can't, for now; an
+    /// answer relying on one being worked out around it isn't kept.)
+    pub fn mayJump(self: *Compiler, func: *const front.Function) Error!bool {
+        if (self.may_jump.get(func)) |r| return r;
+        if (self.jump_busy.get(func)) |d| {
+            self.jump_taint = @min(self.jump_taint, d);
+            return false;
+        }
+        self.jump_depth += 1;
+        const depth = self.jump_depth;
+        try self.jump_busy.put(self.a, func, depth);
+        const outer = self.jump_taint;
+        self.jump_taint = std.math.maxInt(u32);
+        defer {
+            _ = self.jump_busy.remove(func);
+            self.jump_depth -= 1;
+        }
+        const r = try self.stmtsJump(func, func.body);
+        // (relying on itself only, or on nothing being worked out: kept)
+        const taint = self.jump_taint;
+        if (r or taint >= depth) try self.may_jump.put(self.a, func, r);
+        self.jump_taint = @min(outer, if (taint >= depth) std.math.maxInt(u32) else taint);
+        return r;
+    }
+
+    fn stmtsJump(self: *Compiler, func: *const front.Function, body: []const front.Stmt) Error!bool {
+        for (body) |s| {
+            const j = switch (s.kind) {
+                .assign => |x| try self.exprJumps(func, x.value) or try self.targetsJump(func, x.targets),
+                .aug => |x| try self.exprJumps(func, x.value) or try self.targetsJump(func, &.{x.target}),
+                .expr => |e| try self.exprJumps(func, e),
+                .if_ => |x| try self.exprJumps(func, x.test_) or try self.stmtsJump(func, x.body) or try self.stmtsJump(func, x.else_),
+                .while_ => |x| try self.exprJumps(func, x.test_) or try self.stmtsJump(func, x.body) or try self.stmtsJump(func, x.else_),
+                .for_ => |x| try self.exprJumps(func, x.iter) or try self.stmtsJump(func, x.body) or try self.stmtsJump(func, x.else_),
+                .return_ => |e| if (e) |x| try self.exprJumps(func, x) else false,
+                .raise_ => |e| if (e) |x| try self.raisesJump(func, x) else true,
+                .raise_from => |x| try self.raisesJump(func, x.exc) or try self.exprJumps(func, x.cause),
+                .assert_ => |x| try self.exprJumps(func, x.test_) or (if (x.msg) |m| try self.exprJumps(func, m) else false),
+                .try_ => |x| blk: {
+                    if (try self.stmtsJump(func, x.body) or try self.stmtsJump(func, x.else_) or try self.stmtsJump(func, x.finally)) break :blk true;
+                    for (x.handlers) |h| if (try self.stmtsJump(func, h.body)) break :blk true;
+                    break :blk false;
+                },
+                .del_item => |x| try self.exprJumps(func, x.obj) or try self.exprJumps(func, x.index),
+                .seq => |x| try self.stmtsJump(func, x),
+                .break_, .continue_, .pass, .del_local => false,
+            };
+            if (j) return true;
+        }
+        return false;
+    }
+
+    fn targetsJump(self: *Compiler, func: *const front.Function, targets: []const front.Target) Error!bool {
+        for (targets) |t| switch (t) {
+            .local, .global => {},
+            .tuple => |ts| if (try self.targetsJump(func, ts)) return true,
+            .attr => |x| if (try self.exprJumps(func, x.obj)) return true,
+            .index => |x| if (try self.exprJumps(func, x.obj) or try self.exprJumps(func, x.index)) return true,
+        };
+        return false;
+    }
+
+    /// `raise e`: a jump unless e is made by calling a class of the module
+    /// or a builtin's (an error)
+    fn raisesJump(self: *Compiler, func: *const front.Function, e: *const front.Expr) Error!bool {
+        if (e.kind == .call and e.kind.call.func.kind == .global) {
+            for (e.kind.call.args) |x| if (try self.exprJumps(func, x)) return true;
+            return false;
+        }
+        if (e.kind == .call and e.kind.call.func.kind == .attr) {
+            const name = e.kind.call.func.kind.attr.name;
+            if (isJumpName(name)) return true;
+            for (e.kind.call.args) |x| if (try self.exprJumps(func, x)) return true;
+            return false;
+        }
+        return true;
+    }
+
+    fn isJumpName(name: []const u8) bool {
+        inline for (.{ "Return", "Break", "Continue", "exec", "eval", "loop", "tail_call" }) |n| if (std.mem.eql(u8, name, n)) return true;
+        return false;
+    }
+
+    fn exprJumps(self: *Compiler, func: *const front.Function, e: *const front.Expr) Error!bool {
+        switch (e.kind) {
+            .int, .big, .object, .float, .str, .bool, .none, .local, .global, .make_closure, .import_, .outline => return false,
+            .attr => |x| return self.exprJumps(func, x.obj),
+            .index => |x| return try self.exprJumps(func, x.obj) or try self.exprJumps(func, x.index),
+            .slice => |x| {
+                if (try self.exprJumps(func, x.obj)) return true;
+                inline for (.{ x.lo, x.hi, x.step }) |p| if (p) |y| if (try self.exprJumps(func, y)) return true;
+                return false;
+            },
+            .call => |x| {
+                for (x.args) |y| if (try self.exprJumps(func, y)) return true;
+                for (x.keywords) |k| if (try self.exprJumps(func, k.value)) return true;
+                switch (x.func.kind) {
+                    .global => |name| if (try self.moduleFunction(func, name)) |callee| return self.mayJump(callee) else return false,
+                    .attr => |at| {
+                        if (isJumpName(at.name)) return true;
+                        if (try self.exprJumps(func, at.obj)) return true;
+                        return self.methodsMayJump(func, at.name);
+                    },
+                    else => return self.exprJumps(func, x.func),
+                }
+            },
+            .call_nested => |x| {
+                for (x.args) |y| if (try self.exprJumps(func, y)) return true;
+                return self.mayJump(x.func);
+            },
+            .named => |x| return self.exprJumps(func, x.value),
+            .starred => |x| return self.exprJumps(func, x),
+            .binary => |x| return try self.exprJumps(func, x.left) or try self.exprJumps(func, x.right),
+            .unary => |x| return self.exprJumps(func, x.operand),
+            .and_, .or_, .list, .tuple => |xs| {
+                for (xs) |y| if (try self.exprJumps(func, y)) return true;
+                return false;
+            },
+            .set_ => |s| {
+                for (s.items) |y| if (try self.exprJumps(func, y)) return true;
+                return false;
+            },
+            .compare => |x| {
+                if (try self.exprJumps(func, x.first)) return true;
+                for (x.rest) |y| if (try self.exprJumps(func, y)) return true;
+                return false;
+            },
+            .cond => |x| return try self.exprJumps(func, x.test_) or try self.exprJumps(func, x.then) or try self.exprJumps(func, x.else_),
+            .dict => |x| {
+                for (x.keys) |y| if (try self.exprJumps(func, y)) return true;
+                for (x.values) |y| if (try self.exprJumps(func, y)) return true;
+                return false;
+            },
+            .set_comp, .list_comp, .gen_exp => |c| return try self.exprJumps(func, c.elt) or try self.generatorsJump(func, c.generators),
+            .dict_comp => |c| return try self.exprJumps(func, c.key) or try self.exprJumps(func, c.value) or try self.generatorsJump(func, c.generators),
+            .fstring => |parts| return self.fpartsJump(func, parts),
+        }
+    }
+
+    fn generatorsJump(self: *Compiler, func: *const front.Function, gens: []const front.Generator) Error!bool {
+        for (gens) |g| {
+            if (try self.exprJumps(func, g.iter)) return true;
+            for (g.ifs) |y| if (try self.exprJumps(func, y)) return true;
+        }
+        return false;
+    }
+
+    fn fpartsJump(self: *Compiler, func: *const front.Function, parts: []const front.FPart) Error!bool {
+        for (parts) |p| switch (p) {
+            .text => {},
+            .value => |v| if (try self.exprJumps(func, v.expr) or try self.fpartsJump(func, v.spec)) return true,
+        };
+        return false;
+    }
+
+    /// Whether a method called by name (`x.name(...)`, x not known here)
+    /// can jump: one of a class of the function's module by that name can
+    fn methodsMayJump(self: *Compiler, func: *const front.Function, name: []const u8) Error!bool {
+        const globals = ph.attr(func.py_function, "__globals__") orelse return error.Python;
+        defer py.Py_DecRef(globals);
+        const key = try std.fmt.allocPrint(self.a, "{x}:{s}", .{ @intFromPtr(globals), name });
+        if (self.methods_jump.get(key)) |r| return r;
+        const outer = self.jump_taint;
+        self.jump_taint = std.math.maxInt(u32);
+        const name_z = try self.a.dupeZ(u8, name);
+        var r = false;
+        var pos: isize = 0;
+        var k: ?*PyObject = null;
+        var v: ?*PyObject = null;
+        while (py.c.PyDict_Next(globals, &pos, &k, &v) != 0) {
+            const cls = v orelse continue;
+            if (py.c.PyType_Check(cls) == 0) continue;
+            const m = ph.attr(cls, name_z) orelse {
+                py.c.PyErr_Clear();
+                continue;
+            };
+            defer py.Py_DecRef(m);
+            const method = try self.readIfFunction(m) orelse continue;
+            if (try self.mayJump(method)) {
+                r = true;
+                break;
+            }
+        }
+        // (relying on none being worked out: kept)
+        const taint = self.jump_taint;
+        if (r or taint > self.jump_depth) try self.methods_jump.put(self.a, key, r);
+        self.jump_taint = @min(outer, taint);
+        return r;
+    }
+
     pub fn readFunction(self: *Compiler, o: *PyObject) Error!*const front.Function {
         if (self.lang.read.get(o)) |f| return f;
         var failure = front.Failure{};
@@ -1377,6 +1661,12 @@ pub const Compiler = struct {
         const key = try self.a.alloc(SVal, nargs + @intFromBool(closure));
         for (key, 0..) |*slot, i| slot.* = if (i < nargs and rt_mask & (@as(u64, 1) << @intCast(i)) != 0) .rt else .{ .dyn = undefined };
         _ = try self.objectIndex(o);
+        // (the same code made already, for a helper's calls out of line)
+        // (a standalone build's: its size; the JIT's own is a little
+        // faster)
+        if (self.aot != null and !closure and !func.vararg and nargs == func.param_count) for (self.helper_fns.items) |made| {
+            if (made.matches(func, key, true)) return made.name;
+        };
         const h = try self.a.create(HelperSpec);
         h.* = .{ .func = func, .args = key, .name = try std.fmt.allocPrintSentinel(self.a, "{s}_c{d}", .{ self.m.prefix, self.helper_fns.items.len }, 0), .semantic = null, .closure = closure, .raw = true };
         try self.helper_fns.append(self.a, h);
@@ -1398,6 +1688,12 @@ pub const Compiler = struct {
         const args = try self.a.alloc(SVal, nargs);
         for (args) |*slot| slot.* = .{ .dyn = undefined };
         _ = try self.objectIndex(o);
+        if (!func.vararg and nargs == func.param_count) for (self.helper_fns.items) |made| {
+            if (made.matches(func, args, true)) {
+                try aot.called.put(self.a, key, made.name);
+                return made.name;
+            }
+        };
         const h = try self.a.create(HelperSpec);
         h.* = .{ .func = func, .args = args, .name = try std.fmt.allocPrintSentinel(self.a, "{s}_c{d}", .{ self.m.prefix, self.helper_fns.items.len }, 0), .semantic = null, .raw = true };
         try self.helper_fns.append(self.a, h);
@@ -1684,9 +1980,13 @@ pub const Compiler = struct {
         }
         try f.br(done);
         try f.block(other);
-        try f.condBr(f.icmp(jit_c.LLVMIntEQ, tag, m.k64(10)), python, done);
-        try f.block(python);
-        _ = f.callName(python_helper, &.{ tag, bits });
+        // (a standalone program's Python objects are stand-ins, counted by
+        // nothing: no code for them at each count)
+        if (self.aot == null) {
+            try f.condBr(f.icmp(jit_c.LLVMIntEQ, tag, m.k64(10)), python, done);
+            try f.block(python);
+            _ = f.callName(python_helper, &.{ tag, bits });
+        }
         try f.br(done);
         try f.block(done);
         try f.retVoid();
@@ -1989,6 +2289,9 @@ const Inst = struct {
     /// A break or continue of an unrolled iteration, at its own level: the
     /// rest of the iteration is dead (the unrolling sees which)
     jumped: ?enum { brk, cont } = null,
+    /// Returns made in run-time control flow (an unrolled loop's iteration
+    /// leaving it as the code runs: the rest a loop at run time)
+    dyn_returns: u32 = 0,
     /// Slots of values it holds for a while (a run-time loop's items):
     /// None but while held, released with its locals
     temps: std.ArrayListUnmanaged(ir.Value) = .empty,
@@ -2188,6 +2491,10 @@ const Gen = struct {
     /// semantic run as Python): it returns a status, its value in
     /// `out_param`; the first `base_scopes` scopes are the caller's
     thunk: bool = false,
+    /// A helper's code its calls take as leaving by no jump (mayJump): one
+    /// it makes anyway (the analysis wrong) an error saying so, not a
+    /// status its callers don't see to
+    no_jumps: bool = false,
     /// A helper's code out of line: the semantic it runs for, and the node
     /// its errors are reported at (a parameter: AT_PARAM stands for it)
     helper_semantic: ?*PyObject = null,
@@ -4338,6 +4645,15 @@ const Gen = struct {
 
     /// After a call reporting a status (0 error, 1 done, 2 Return with the
     /// value in `out`, 3 Break, 4 Continue): each to where it goes.
+    /// A call's status, its code known not to leave by a jump (mayJump):
+    /// done, or an error (its code makes a jump an error: Gen.no_jumps)
+    fn statusChecked(self: *Gen, status: ir.Value) Error!void {
+        const f = &self.f;
+        const done = try f.label("done");
+        try f.condBr(f.icmp(jit_c.LLVMIntEQ, status, self.c.m.k32(1)), done, try self.errorTarget());
+        try f.block(done);
+    }
+
     fn statusJumps(self: *Gen, status: ir.Value, at: u32) Error!void {
         const f = &self.f;
         const done = try f.label("done");
@@ -4501,7 +4817,9 @@ const Gen = struct {
             _ = try self.leaveTries(0, .tail_call, null);
             _ = self.call("zr_tail_put", &.{ self.ctx, keep });
         }
-        if (self.thunk) {
+        if (self.no_jumps) {
+            try self.strayJump(at);
+        } else if (self.thunk) {
             try self.releaseAbove(0);
             self.releaseScopesAbove(self.base_scopes);
             try f.ret(self.c.m.k32(5));
@@ -4517,10 +4835,20 @@ const Gen = struct {
         }
     }
 
+    /// A jump out of a helper's code its calls take as making none
+    /// (no_jumps): an error saying so
+    fn strayJump(self: *Gen, at: u32) Error!void {
+        try self.failAt(at, "zrun: a jump (rt.Return, rt.Break, rt.Continue, rt.tail_call) out of a helper compiled as one that makes none");
+    }
+
     fn returnWith(self: *Gen, d: Dyn, at: u32) Error!void {
         // (through the try statements here: caught (the value given to the
         // exception), or their finally run)
         if (try self.leaveTries(0, .Return, d)) return;
+        if (self.no_jumps) {
+            try self.drop(.{ .dyn = d });
+            return self.strayJump(at);
+        }
         if (self.thunk) {
             try self.releaseAbove(0);
             self.releaseScopesAbove(self.base_scopes);
@@ -4547,6 +4875,7 @@ const Gen = struct {
         const stop = if (self.loops.items.len > 0) self.loops.items[self.loops.items.len - 1].tries else 0;
         if (try self.leaveTries(stop, kind, null)) return;
         if (self.loops.items.len == 0) {
+            if (self.no_jumps) return self.strayJump(at);
             if (self.thunk) {
                 try self.releaseAbove(0);
                 self.releaseScopesAbove(self.base_scopes);
@@ -4572,6 +4901,11 @@ const Gen = struct {
         // tree, which ends)
         for (self.insts.items) |i| if (i.func == func and !(self.insts.items.len < max_tree_depth and otherNode(i, args)))
             return self.outOfLine(func, at, args);
+        // (one that never returns: an error's way, cold; out of line, its
+        // code made once for every call: a standalone build's, its size.
+        // The JIT's inline: the frames a call out of line sees the
+        // variables through slow the code around it a little)
+        if (self.c.aot != null and func.size > tiny_size and outOfLineable(args) and try self.c.neverReturns(func)) return self.outOfLine(func, at, args);
         // (one inline here many times already, not tiny: out of line, its
         // code made once (a library's helper called at every turn of a
         // big function grows it past what LLVM optimizes in a reasonable
@@ -4946,6 +5280,14 @@ const Gen = struct {
     /// functions live as long as their language)
     var long_loops: std.AutoHashMapUnmanaged(*const front.Expr, void) = .empty;
 
+    /// A loop's test that's a literal (`while True:`): the same each time
+    fn constantTest(e: *const front.Expr) bool {
+        return switch (e.kind) {
+            .bool, .int, .float, .str => true,
+            else => false,
+        };
+    }
+
     /// A loop body worth unrolling: a few statements, no loops in it.
     fn smallBody(body: []const front.Stmt) bool {
         var n: usize = 0;
@@ -4983,7 +5325,7 @@ const Gen = struct {
             if (slot.* == .dyn) given += 1;
         }
         const spec = for (c.helper_fns.items) |h| {
-            if (h.matches(func, key)) break h;
+            if (h.matches(func, key, c.aot != null)) break h;
         } else blk: {
             const h = try c.a.create(HelperSpec);
             // (the semantic: the outermost one run here, or the one this
@@ -5024,7 +5366,10 @@ const Gen = struct {
         self.reloadMirrors();
         if (fr.made) try self.reloadFrame(fr.frame);
         for (ds) |d| try self.drop(.{ .dyn = d });
-        try self.statusJumps(status, at);
+        // (a helper that can't leave by a jump: no code for one, each way
+        // releasing all that's held here; a standalone build's, its size:
+        // the JIT's code as fast either way)
+        if (c.aot == null or try c.mayJump(func)) try self.statusJumps(status, at) else try self.statusChecked(status);
         return .{ .dyn = try self.loadOut(.any) };
     }
 
@@ -5190,7 +5535,7 @@ const Gen = struct {
         const key = try c.a.alloc(SVal, func.param_count);
         for (key) |*k_| k_.* = .{ .dyn = undefined };
         const spec = for (c.helper_fns.items) |h| {
-            if (h.matches(func, key)) break h;
+            if (h.matches(func, key, false)) break h;
         } else blk: {
             const h = try c.a.create(HelperSpec);
             const semantic = self.helper_semantic orelse if (self.insts.items.len > 0) self.insts.items[0].func.py_function else null;
@@ -5398,6 +5743,7 @@ const Gen = struct {
                             }
                             const next = try self.f.label("next");
                             try inst.loops.append(self.a(), .{ .brk = exit, .cont = next, .tries = self.tries.items.len, .unrolled = w.test_, .dyn_depth = inst.dyn_depth, .in_try = inst.in_try });
+                            const returns = inst.dyn_returns;
                             try self.stmts(inst, w.body);
                             _ = inst.loops.pop();
                             const jumped = inst.jumped;
@@ -5408,6 +5754,13 @@ const Gen = struct {
                                 try self.f.block(exit);
                                 return;
                             }
+                            // (a standalone build's `while True:` returning
+                            // as the code runs: how many iterations run is
+                            // the data's, its test the same each time; the
+                            // rest a loop at run time, each unrolled one
+                            // more code. The JIT's keep them: a pattern
+                            // matcher's loops a little faster)
+                            if (self.c.aot != null and inst.dyn_returns != returns and constantTest(w.test_)) break;
                         },
                         .dyn => |cond| {
                             entry = cond;
@@ -5447,6 +5800,7 @@ const Gen = struct {
             .for_ => |fr| try self.forLoop(inst, fr.target, fr.iter, fr.body, fr.else_, s.pos),
             .return_ => |r| {
                 const v = if (r) |e| try self.expr(inst, e) else SVal.none;
+                if (inst.dyn_depth > 0) inst.dyn_returns += 1;
                 try self.setResult(inst, v);
             },
             .raise_ => |r| {
