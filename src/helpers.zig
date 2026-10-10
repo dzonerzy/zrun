@@ -502,12 +502,108 @@ fn floatMod(a: f64, b: f64) f64 {
 }
 
 /// a <op> b, Python's way, in `out`.
+/// a ** b of numbers, natively: ints to a power not negative exactly
+/// (within 128 bits; an I64 among them, checked), anything else as
+/// CPython's float_pow makes it (its special cases, the C library's pow);
+/// null for Python's (a complex result, a big int, no C library known)
+fn powNative(ctx: *Ctx, node: u32, a: Value, b: Value, out: *Value) ?bool {
+    if (value.wide(a)) |x| if (value.wide(b)) |y| {
+        if (y < 0) return floatPow(ctx, node, @floatFromInt(x), @floatFromInt(y), out);
+        const checked = a.tag == @intFromEnum(Tag.int) or b.tag == @intFromEnum(Tag.int);
+        var r: i128 = 1;
+        var base = x;
+        var e = y;
+        var over = false;
+        while (e > 0 and !over) {
+            if (e & 1 != 0) {
+                const m = @mulWithOverflow(r, base);
+                over = m[1] != 0;
+                r = m[0];
+            }
+            e >>= 1;
+            if (e > 0 and !over) {
+                const m = @mulWithOverflow(base, base);
+                over = m[1] != 0;
+                base = m[0];
+            }
+        }
+        if (checked) {
+            if (over or r < std.math.minInt(i64) or r > std.math.maxInt(i64)) return zr_overflow(ctx, node);
+            out.* = Value.int(@intCast(r));
+            return true;
+        }
+        if (over) return null;
+        out.* = value.intValue(r) orelse return oomFail(ctx, node);
+        return true;
+    };
+    const fa: f64 = switch (a.kind()) {
+        .float => a.asFloat(),
+        .int, .bool, .big => @floatFromInt(value.wide(a) orelse return null),
+        else => return null,
+    };
+    const fb: f64 = switch (b.kind()) {
+        .float => b.asFloat(),
+        .int, .bool, .big => @floatFromInt(value.wide(b) orelse return null),
+        else => return null,
+    };
+    return floatPow(ctx, node, fa, fb, out);
+}
+
+/// CPython's float_pow (Objects/floatobject.c), case by case
+fn floatPow(ctx: *Ctx, node: u32, iv_in: f64, iw: f64, out: *Value) ?bool {
+    var iv = iv_in;
+    const isOdd = struct {
+        fn f(x: f64) bool {
+            return @mod(@abs(x), 2.0) == 1.0;
+        }
+    }.f;
+    const done = struct {
+        fn f(o: *Value, x: f64) bool {
+            o.* = Value.float(x);
+            return true;
+        }
+    }.f;
+    if (iw == 0) return done(out, 1.0);
+    if (std.math.isNan(iv)) return done(out, iv);
+    if (std.math.isNan(iw)) return done(out, if (iv == 1.0) 1.0 else iw);
+    if (std.math.isInf(iw)) {
+        const av = @abs(iv);
+        if (av == 1.0) return done(out, 1.0);
+        return done(out, if ((iw > 0.0) == (av > 1.0)) @abs(iw) else 0.0);
+    }
+    if (std.math.isInf(iv)) {
+        const odd = isOdd(iw);
+        if (iw > 0.0) return done(out, if (odd) iv else @abs(iv));
+        return done(out, if (odd) std.math.copysign(@as(f64, 0.0), iv) else 0.0);
+    }
+    if (iv == 0.0) {
+        if (iw < 0.0) return failAs(ctx, node, .ZeroDivisionError, if (ph.minor >= 14) "zero to a negative power" else "0.0 cannot be raised to a negative power", "division by zero", .{});
+        return done(out, if (isOdd(iw)) iv else 0.0);
+    }
+    var negate = false;
+    if (iv < 0.0) {
+        // (a fraction of a negative number: a complex, Python's)
+        if (iw != @floor(iw)) return null;
+        iv = -iv;
+        negate = isOdd(iw);
+    }
+    if (iv == 1.0) return done(out, if (negate) -1.0 else 1.0);
+    if (comptime standalone) findLibm();
+    const lm = libm orelse return null;
+    var ix = lm.pow(iv, iw);
+    if (negate) ix = -ix;
+    if (std.math.isInf(ix)) return failAs(ctx, node, .OverflowError, "(34, 'Numerical result out of range')", "OverflowError: (34, 'Numerical result out of range')", .{});
+    return done(out, ix);
+}
+
 export fn zr_binary(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u64, bb: u64, out: *Value) callconv(.c) bool {
     const a = Value{ .tag = ta, .bits = ba };
     const b = Value{ .tag = tb, .bits = bb };
     const op: Op = @enumFromInt(op_code);
     if (setBinary(ctx, node, op, a, b, out)) |ok| return ok;
     if (bytesBinary(ctx, node, op, a, b, out)) |ok| return ok;
+    // (a power of numbers: natively where it can be)
+    if (op == .pow) if (powNative(ctx, node, a, b, out)) |ok| return ok;
     // (a Big among ints: in 128 bits)
     if ((a.kind() == .big or b.kind() == .big) and value.wide(a) != null and value.wide(b) != null) return wideBinary(ctx, node, op, a, b, out);
     if (isInt(a) and isInt(b)) {
@@ -3186,6 +3282,8 @@ pub fn init() !void {
         s.head.rc = value.IMMORTAL;
         ascii_chars[c] = s;
     }
+    // (the C library's math, Python's own: powers natively)
+    findLibm();
 }
 
 fn charStr(bytes: []const u8) ?*value.Str {
@@ -3602,6 +3700,26 @@ fn strMethodAny(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []c
         }
     }.of;
 
+    // partition(sep), rpartition(sep): (before, sep, after) at the first
+    // (last) sep; not found: (s, "", "") (("", "", s))
+    if ((eq(u8, name, "partition") or eq(u8, name, "rpartition")) and args.len == 1) {
+        const sep = strOf(args[0]) orelse return failAs(ctx, node, .TypeError, null, "must be str, not {s}", .{value.typeName(args[0])});
+        if (sep.len == 0) return failAs(ctx, node, .ValueError, null, "empty separator", .{});
+        const last = eq(u8, name, "rpartition");
+        const at = if (last) std.mem.lastIndexOf(u8, b, sep) else std.mem.indexOf(u8, b, sep);
+        const parts: [3][]const u8 = if (at) |i| .{ b[0..i], sep, b[i + sep.len ..] } else if (last) .{ "", "", b } else .{ b, "", "" };
+        const t = value.newTuple(3) orelse return oomFail(ctx, node);
+        for (t.slice()) |*x| x.* = Value.none_v;
+        for (parts, t.slice()) |p, *slot| {
+            const r = value.newStr(p) orelse {
+                value.decref(Value.obj(.tuple, &t.head));
+                return oomFail(ctx, node);
+            };
+            slot.* = Value.obj(.str, &r.head);
+        }
+        out.* = Value.obj(.tuple, &t.head);
+        return true;
+    }
     // find, rfind, index, rindex, count (sub[, start[, end]])
     const finds = [_][]const u8{ "find", "rfind", "index", "rindex", "count" };
     for (finds) |m| if (eq(u8, name, m) and args.len >= 1 and args.len <= 3) {
@@ -5151,7 +5269,9 @@ fn pyFloat(s: []const u8) ?f64 {
     return std.fmt.parseFloat(f64, buf[0..n]) catch null;
 }
 
-const IntParse = union(enum) { int: i64, too_big, invalid };
+/// An int read (within 128 bits: a plain int, or a Big), one too big for
+/// that (Python's), or not an int
+const IntParse = union(enum) { int: i128, too_big, invalid };
 
 /// int(s, base) of an ASCII str as Python reads it (base 2 to 36, or 0:
 /// from its prefix): whitespace around, a sign, a prefix (0x, 0o, 0b) the
@@ -5183,7 +5303,7 @@ fn parseIntBase(s: []const u8, base_given: u32) IntParse {
     }
     const auto = base == 0;
     if (auto) base = 10;
-    var acc: i128 = 0;
+    var acc: u128 = 0;
     var too_big = false;
     var digits: usize = 0;
     var leading_zero = false;
@@ -5204,15 +5324,20 @@ fn parseIntBase(s: []const u8, base_given: u32) IntParse {
         digits += 1;
         after_digit = true;
         if (!too_big) {
-            acc = acc * base + d;
-            if (acc > std.math.maxInt(i64) + 1) too_big = true;
+            const m = @mulWithOverflow(acc, @as(u128, base));
+            const s2 = @addWithOverflow(m[0], @as(u128, d));
+            if (m[1] != 0 or s2[1] != 0) too_big = true else acc = s2[0];
         }
     }
     if (digits == 0) return .invalid;
     if (auto and !prefixed and leading_zero and nonzero) return .invalid;
     if (too_big) return .too_big;
-    if (neg) acc = -acc;
-    if (acc > std.math.maxInt(i64)) return .too_big;
+    // (within 128 bits, as a Big holds it: -2**127 the least)
+    if (neg) {
+        if (acc > @as(u128, 1) << 127) return .too_big;
+        return .{ .int = if (acc == @as(u128, 1) << 127) std.math.minInt(i128) else -@as(i128, @intCast(acc)) };
+    }
+    if (acc > std.math.maxInt(i128)) return .too_big;
     return .{ .int = @intCast(acc) };
 }
 
@@ -5227,7 +5352,7 @@ export fn zr_int_base(ctx: *Ctx, node: u32, callee_index: u64, t: u64, bits: u64
             const s: *value.Str = @ptrCast(v.ptr());
             if (s.chars == s.len) switch (parseIntBase(s.bytes(), base)) {
                 .int => |x| {
-                    out.* = Value.pint(x);
+                    out.* = value.intValue(x) orelse return oomFail(ctx, node);
                     return true;
                 },
                 .invalid => {

@@ -1735,6 +1735,19 @@ pub const Compiler = struct {
 
     /// A function's variables (and its block scopes') in frames: one not
     /// compiled yet, whose code needs its frame.
+    /// After code failed to compile (its module forgotten): the function
+    /// whose code needed its frame (need_frames) given one, if it isn't
+    /// compiled yet (its layout can still change); true: compile again.
+    pub fn framesForRetry(self: *Compiler) !bool {
+        if (!self.need_frames) return false;
+        self.need_frames = false;
+        const fnode = self.need_frames_of;
+        if (fnode == NONE or self.compiled_fns.contains(fnode)) return false;
+        if ((try self.layoutOf(fnode)).heap) return false;
+        try self.heapFunction(fnode);
+        return true;
+    }
+
     pub fn heapFunction(self: *Compiler, fnode: u32) !void {
         (try self.layoutOf(fnode)).heap = true;
         var it = self.layouts.iterator();
@@ -2129,6 +2142,11 @@ const Gen = struct {
     /// The last count taken in hot code (refcount): given back right after
     /// (nothing between them in its block), neither is made
     last_inc: ?struct { inst: ir.Value, tag: ir.Value, bits: ir.Value } = null,
+    /// Making cold code (an error's way out, a slow path): counts changed
+    /// by calls (refcount)
+    cold: u32 = 0,
+    /// The copies of each helper run inline in this code (callHelper)
+    inline_copies: std.AutoHashMapUnmanaged(*const front.Function, u32) = .empty,
     err_inflight: usize = 0,
     ret_label: ir.Block = null,
     /// rt.loop targets, innermost last
@@ -2195,6 +2213,12 @@ const Gen = struct {
     /// made only for a counted tag (most values aren't: ints, None,
     /// bools, nodes; one branch instead of a call).
     fn refcount(self: *Gen, dec: bool, tag: ir.Value, bits: ir.Value) Error!void {
+        // (cold code (an error's way out): a call, no code inline: most of
+        // what LLVM optimizes in a big function is counts inline)
+        if (self.cold > 0) {
+            _ = self.call(if (dec) "zr_decref" else "zr_incref", &.{ tag, bits });
+            return;
+        }
         if (self.hot()) {
             // (a count taken and given back with nothing between them, in
             // the same block: neither; LLVM keeps both, each checking the
@@ -2605,6 +2629,8 @@ const Gen = struct {
         if (self.release_blocks.items.len >= 64) _ = self.release_blocks.orderedRemove(0);
         try self.release_blocks.append(self.a(), .{ .sig = sig.items, .block = release });
         f.positionAt(release);
+        self.cold += 1;
+        defer self.cold -= 1;
         var i = held.len;
         while (i > 0) {
             i -= 1;
@@ -2657,6 +2683,8 @@ const Gen = struct {
         if (self.release_blocks.items.len >= 64) _ = self.release_blocks.orderedRemove(0);
         try self.release_blocks.append(self.a(), .{ .sig = sig.items, .block = release });
         f.positionAt(release);
+        self.cold += 1;
+        defer self.cold -= 1;
         if (only) |slots| {
             for (slots) |slot| {
                 // (as they are here; the handlers see them unset)
@@ -4527,6 +4555,16 @@ const Gen = struct {
         // tree, which ends)
         for (self.insts.items) |i| if (i.func == func and !(self.insts.items.len < max_tree_depth and otherNode(i, args)))
             return self.outOfLine(func, at, args);
+        // (one inline here many times already, not tiny: out of line, its
+        // code made once (a library's helper called at every turn of a
+        // big function grows it past what LLVM optimizes in a reasonable
+        // time); hot code, calling each once or twice, keeps it inline)
+        if (func.size > tiny_size and outOfLineable(args)) {
+            const e = try self.inline_copies.getOrPut(self.a(), func);
+            if (!e.found_existing) e.value_ptr.* = 0;
+            if (e.value_ptr.* >= max_inline_copies) return self.outOfLine(func, at, args);
+            e.value_ptr.* += 1;
+        }
         // (big with what's known here: out of line, its code seeing the
         // variables here through frames, made for the call if need be)
         if (func.size > inline_size and try self.foldedSize(func, args) > folded_inline_size) {
@@ -4542,6 +4580,20 @@ const Gen = struct {
 
     /// The biggest helper run inline as what's known makes it (FoldedSize)
     const folded_inline_size = 40;
+    /// The copies of one helper run inline in a function's code, past which
+    /// its calls there are out of line; a helper this small always inline
+    const max_inline_copies = 16;
+    const tiny_size = 8;
+
+    /// Whether a helper's arguments can be given to its code out of line
+    /// (outOfLine's)
+    fn outOfLineable(args: []const SVal) bool {
+        for (args) |x| switch (x) {
+            .rt_method, .control, .method => return false,
+            else => {},
+        };
+        return true;
+    }
     /// How deep helpers run inline walking down the tree (otherNode)
     const max_tree_depth = 64;
 
@@ -5788,6 +5840,11 @@ const Gen = struct {
                 const mark = self.inflight.items.len;
                 errdefer self.taken(mark);
                 try self.inflight.append(self.a(), v);
+                // (a local's record: its value, no reference of its own)
+                if (try self.localDyn(inst, x.obj)) |d| {
+                    self.taken(mark);
+                    return self.setAttrOf(inst, .{ .dyn = d }, x.name, v, pos, true);
+                }
                 const obj = try self.expr(inst, x.obj);
                 self.taken(mark);
                 try self.setAttr(inst, obj, x.name, v, pos);
@@ -5807,6 +5864,11 @@ const Gen = struct {
 
     /// obj.name = v (both taken)
     fn setAttr(self: *Gen, inst: *Inst, obj: SVal, name: []const u8, v: SVal, pos: front.Pos) Error!void {
+        return self.setAttrOf(inst, obj, name, v, pos, false);
+    }
+
+    /// setAttr; `lent`: obj a local's value, not taken
+    fn setAttrOf(self: *Gen, inst: *Inst, obj: SVal, name: []const u8, v: SVal, pos: front.Pos, lent: bool) Error!void {
         // (a Python object the module keeps, an instance: as Python does it
         // when the code runs; a module's or class's attributes are read
         // when compiling, they can't change)
@@ -5852,7 +5914,7 @@ const Gen = struct {
         try f.br(join);
         try f.block(join);
         try self.drop(.{ .dyn = vd });
-        try self.drop(obj);
+        if (!lent) try self.drop(obj);
     }
 
     /// obj[key] = v (all taken): a known container changed now (outside
@@ -5956,6 +6018,18 @@ const Gen = struct {
         try f.br(join);
         try f.block(join);
         return .{ .dyn = try self.loadSlot(slot, .any) };
+    }
+
+    /// A local's value known only at run time, read without a reference of
+    /// its own (the local keeps it, nothing reassigning it while it's
+    /// used); null for an expression that isn't one
+    fn localDyn(self: *Gen, inst: *Inst, e: *const front.Expr) Error!?Dyn {
+        if (e.kind != .local) return null;
+        return switch (inst.locals[e.kind.local]) {
+            .static => |v| if (v == .dyn and v.dyn.state == null) v.dyn else null,
+            .slot => |s| try self.loadSlot(s.ptr, s.shape),
+            .unset => null,
+        };
     }
 
     fn readLocal(self: *Gen, inst: *Inst, slot: u32, pos: front.Pos) Error!SVal {
@@ -6365,6 +6439,13 @@ const Gen = struct {
                         const t = (try self.builtinCall(inst, callee.py, &.{v}, e.pos)).?;
                         return self.attr(inst, t, x.name, e.pos);
                     }
+                }
+                // (a field of a record a local holds: the local's value read
+                // without a reference of its own, the local keeping it as
+                // the field's read: no count taken and given back)
+                if (try self.localDyn(inst, x.obj)) |d| {
+                    const cands = try self.fieldCandidates(inst, x.name, false);
+                    if (cands.len > 0) return self.recordField(inst, d, x.name, cands, true);
                 }
                 const obj = try self.expr(inst, x.obj);
                 return self.attr(inst, obj, x.name, e.pos);
@@ -7035,7 +7116,7 @@ const Gen = struct {
                 // it is (its type checked); anything else (a Python
                 // object's attribute...) by zr_getattr
                 const cands = try self.fieldCandidates(inst, name, false);
-                if (cands.len > 0) return self.recordField(inst, d, name, cands);
+                if (cands.len > 0) return self.recordField(inst, d, name, cands, false);
                 return .{ .dyn = try self.genericGetattr(inst, d, name) };
             },
             // A jump caught (an except's name: Gen.tryStmt): its arguments,
@@ -7168,7 +7249,9 @@ const Gen = struct {
     /// obj.name read where it is in a record of one of the candidates'
     /// types; anything else (or a slot never assigned: its error) by
     /// zr_getattr.
-    fn recordField(self: *Gen, inst: *Inst, d: Dyn, name: []const u8, cands: []const FieldCandidate) Error!SVal {
+    /// `lent`: `d` a local's value, not a reference of the read's (not
+    /// given up after).
+    fn recordField(self: *Gen, inst: *Inst, d: Dyn, name: []const u8, cands: []const FieldCandidate, lent: bool) Error!SVal {
         const f = &self.f;
         const t = self.c.m.t;
         const result = try self.valSlot();
@@ -7193,12 +7276,18 @@ const Gen = struct {
             try self.increfDyn(v);
             try self.storeSlot(result, v);
             // (the record: dropped, the field's taken)
-            try self.drop(.{ .dyn = d });
+            if (!lent) try self.drop(.{ .dyn = d });
             try f.br(join);
             try f.block(no);
         }
         try f.br(generic);
         try f.block(generic);
+        // (the generic way takes a reference: one of its own)
+        if (lent) {
+            self.cold += 1;
+            defer self.cold -= 1;
+            try self.increfDyn(d);
+        }
         try self.storeSlot(result, try self.genericGetattr(inst, d, name));
         try f.br(join);
         try f.block(join);

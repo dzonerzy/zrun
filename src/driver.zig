@@ -256,8 +256,10 @@ pub const Compiled = struct {
                 break :blk e;
             }) {
                 error.Unsupported => {
-                    // (a literal now made at run time: compiled again)
+                    // (a literal now made at run time, a function's
+                    // variables now in a frame: compiled again)
                     if (c.need_retry) continue;
+                    if (c.framesForRetry() catch return oomT()) continue;
                     // (a semantic it reaches can't be compiled: as Python)
                     // (strict: the reason is the error)
                     if (c.failed_semantic) |s| {
@@ -346,6 +348,7 @@ pub const Compiled = struct {
             c.drainQueues() catch |e| {
                 c.forgetModule();
                 if (e == error.Unsupported and c.need_retry) continue;
+                if (e == error.Unsupported and (c.framesForRetry() catch false)) continue;
                 // (it stays generic: as it was compiled)
                 c.typed_params.put(c.a, fnode, null) catch {};
                 py.c.PyErr_Clear();
@@ -381,8 +384,10 @@ pub const Compiled = struct {
             c.need_retry = false;
             const name = c.compileCalled(o, nargs, rt_mask, closure) catch |e| {
                 c.forgetModule();
-                // (a literal made at run time: again; anything else: Python)
+                // (a literal made at run time, a function's variables now in
+                // a frame: again; anything else: Python)
                 if (e == error.Unsupported and c.need_retry) continue;
+                if (e == error.Unsupported and (c.framesForRetry() catch false)) continue;
                 // (why, for strict mode's message: uncompiledReason)
                 var buf: [256]u8 = undefined;
                 noteUncompiled(o, switch (e) {
@@ -429,13 +434,9 @@ pub const Compiled = struct {
                 c.forgetModule();
                 switch (e) {
                     error.Unsupported => {
-                        // (its code needs its frame: compiled for the first
-                        // time, it can have one; again)
-                        if (c.need_frames and !(c.layoutOf(fnode) catch return oomA()).heap) {
-                            c.need_frames = false;
-                            c.heapFunction(fnode) catch return oomA();
-                            continue :attempt;
-                        }
+                        // (code needing its function's frame: compiled for
+                        // the first time, the function can have one; again)
+                        if (c.framesForRetry() catch return oomA()) continue :attempt;
                         // (as a thunk's: a literal made at run time, or a
                         // semantic run as Python, and compiled again)
                         if (c.need_retry) continue :attempt;
@@ -1312,6 +1313,7 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
                     break comp.compileThunk(n, @enumFromInt(site.which), owner) catch |e| {
                         comp.forgetModule();
                         if (e == error.Unsupported and comp.need_retry) continue;
+                        if (e == error.Unsupported and (comp.framesForRetry() catch false)) continue;
                         // (a node it can't be: an error if it's ever run)
                         py.c.PyErr_Clear();
                         break null;
@@ -1341,6 +1343,7 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
                     break comp.compileCalled(o, s.nargs, s.rt_mask, false) catch |e| {
                         comp.forgetModule();
                         if (e == error.Unsupported and comp.need_retry) continue;
+                        if (e == error.Unsupported and (comp.framesForRetry() catch false)) continue;
                         py.c.PyErr_Clear();
                         break null;
                     };

@@ -167,13 +167,20 @@ def str_method(a, b):
         return (a.split(), a.split("a"), a.split("a", 1), a.split(None, 1), a.split(maxsplit=0) if False else a.split(None, 0))
     if b == 8:
         return a.split("")
+    if b == 9:
+        return (a.partition("a"), a.rpartition("a"), a.partition("é"), a.rpartition("zz"), a.partition(" "))
+    if b == 10:
+        return a.partition("")
     return "|".join([a, a.upper() if a.isascii() else a, "é"])
 
 
 def test_str_methods():
     p = _program(str_method)
     texts = ("abcab", "aébécé", "  a b\tc\n", "　é a\xa0b ", "", "aaaa", "é", "  ")
-    same_in_both(p, [(t, i) for i in range(10) for t in texts])
+    same_in_both(p, [(t, i) for i in range(12) for t in texts])
+    # (partition's, natively: strict)
+    strict = _program(str_method, strict=True)
+    assert [strict.call("f", t, 9) for t in texts] == [str_method(t, 9) for t in texts]
 
 
 def float_of(a, b):
@@ -249,6 +256,30 @@ def test_percent_format():
         except zrun.StrictError as e:
             raise AssertionError(f"{FORMATS[i]!r} % {v!r}: {e}") from None
         assert got == want, (v, FORMATS[i])
+
+
+def power(a, b):
+    return a**b
+
+
+def test_powers():
+    # (natively: ints exactly, floats as CPython's float_pow (the C
+    # library's pow, its special cases and errors); a complex result or an
+    # int beyond 128 bits, Python's)
+    p = _program(power)
+    vals = [0, 1, -1, 2, -2, 3, 10, 63, 64, 127, 200, -3, 0.0, -0.0, 0.5, -0.5, 1.5, -2.5, 2.0, 1e308, -1e308, 1e-308,
+            float("inf"), float("-inf"), float("nan"), 2**62, 2**70, True]
+    # (an int to a huge int power: Python's own result too big to make)
+    same_in_both(p, [(a, b) for a in vals for b in vals if not (isinstance(a, int) and isinstance(b, int) and abs(b) > 300 and abs(a) > 1)])
+    # (strict: no Python, the reference mode's results and errors; ints
+    # handed over by call() are I64s, 2 ** 64 an overflow)
+    strict = _program(power, strict=True)
+    for a, b in [(2, 10), (2, 64), (-3, 3), (2.0, 0.5), (10, -2), (0.0, -1), (1e308, 2.0)]:
+        try:
+            got = outcome(strict, "compiled", a, b)
+        except zrun.StrictError as e:
+            raise AssertionError(f"{a!r} ** {b!r}: {e}") from None
+        assert got == outcome(p, "python", a, b), (a, b)
 
 
 def hex_of(a, b):
