@@ -4149,13 +4149,8 @@ pub fn flushOutput() void {
     out_buf.clearRetainingCapacity();
 }
 
-fn writeAll(fd: i32, bytes: []const u8) void {
-    var rest = bytes;
-    while (rest.len > 0) {
-        const n = std.c.write(fd, rest.ptr, rest.len);
-        if (n <= 0) return;
-        rest = rest[@intCast(n)..];
-    }
+fn writeAll(fd: u32, bytes: []const u8) void {
+    @import("stdio.zig").writeAll(fd, bytes);
 }
 
 /// Text to the standard output (fd 1) or error (2): Python's sys.stdout
@@ -4166,7 +4161,7 @@ fn emit(ctx: *Ctx, node: u32, fd: u32, text: []const u8) bool {
         if (fd == 1) {
             out_buf.appendSlice(allocator, text) catch return oomFail(ctx, node);
             const tty = out_tty orelse blk: {
-                const t = std.c.isatty(1) != 0;
+                const t = @import("stdio.zig").isTerminal(1);
                 out_tty = t;
                 break :blk t;
             };
@@ -5091,8 +5086,9 @@ pub fn findLibm() void {
             }
         },
         .windows => {
-            // (the Universal CRT's: Python's math is it, loaded already)
-            const h = win.GetModuleHandleA("ucrtbase.dll") orelse return;
+            // (the Universal CRT's: Python's math is it, loaded already; a
+            // standalone program's, loaded now)
+            const h = win.GetModuleHandleA("ucrtbase.dll") orelse (if (standalone) win.LoadLibraryA("ucrtbase.dll") else null) orelse return;
             inline for (@typeInfo(Libm).@"struct".fields) |fd| {
                 const p = win.GetProcAddress(h, fd.name) orelse return;
                 @field(t, fd.name) = @ptrCast(@alignCast(p));
@@ -5106,6 +5102,7 @@ pub fn findLibm() void {
 const win = struct {
     extern "kernel32" fn GetModuleHandleA(name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
 };
 
 /// A number as math's functions take it (an int, a bool, a float), or null

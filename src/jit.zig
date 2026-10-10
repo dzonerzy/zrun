@@ -220,8 +220,14 @@ pub fn lookup(view: *const LlvmView, name: [:0]const u8) usize {
 /// A module compiled to an object file for this process (taking it and
 /// its context): the bytes (free them with freeBytes).
 pub fn emitObject(view: *const LlvmView, module: c.LLVMModuleRef, opt_level: u32, err: []u8) error{Compile}![]u8 {
+    return emitObjectFor(view, module, opt_level, null, err);
+}
+
+/// emitObject's for a target (LLVM's triple: its baseline CPU), or null:
+/// this machine (its CPU)
+pub fn emitObjectFor(view: *const LlvmView, module: c.LLVMModuleRef, opt_level: u32, triple: ?[*:0]const u8, err: []u8) error{Compile}![]u8 {
     var n: usize = 0;
-    const p = view.emit_object(@ptrCast(module), opt_level, null, null, null, &n, err.ptr, err.len) orelse return error.Compile;
+    const p = view.emit_object(@ptrCast(module), opt_level, triple, null, null, &n, err.ptr, err.len) orelse return error.Compile;
     return p[0..n];
 }
 

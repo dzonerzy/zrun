@@ -893,6 +893,8 @@ const Job = struct {
     view: *const llvm.LlvmView,
     module: llvm.c.LLVMModuleRef,
     opt: u32,
+    /// The target (LLVM's triple), or null: this machine
+    triple: ?[*:0]const u8 = null,
     /// Where the object is kept (owned), or null
     path: ?[]u8,
     /// Someone waits for it (`done`, then `bytes`: null with LLVM's error
@@ -905,7 +907,7 @@ const Job = struct {
     done: std.atomic.Value(bool) = .init(false),
 
     fn work(self: *Job) void {
-        if (llvm.emitObject(self.view, self.module, self.opt, &self.err)) |bytes| {
+        if (llvm.emitObjectFor(self.view, self.module, self.opt, self.triple, &self.err)) |bytes| {
             if (self.path) |p| cache.write(p, bytes);
             if (self.waited) self.bytes = bytes else llvm.freeBytes(self.view, bytes);
         } else |_| {}
@@ -983,11 +985,16 @@ pub fn waitJobs() callconv(.c) void {
 /// the caller's to free once done), kept at `path` (taken); null if it
 /// can't be (LLVM can't read its copy; out of memory).
 fn inBackground(view: *const llvm.LlvmView, module: llvm.c.LLVMModuleRef, opt: u32, path: ?[]u8, waited: bool) ?*Job {
+    return inBackgroundFor(view, module, opt, null, path, waited);
+}
+
+/// inBackground's for a target (LLVM's triple), or null: this machine
+fn inBackgroundFor(view: *const llvm.LlvmView, module: llvm.c.LLVMModuleRef, opt: u32, triple: ?[*:0]const u8, path: ?[]u8, waited: bool) ?*Job {
     const job = allocator.create(Job) catch {
         if (path) |p| allocator.free(p);
         return null;
     };
-    job.* = .{ .view = view, .module = module, .opt = opt, .path = path, .waited = waited };
+    job.* = .{ .view = view, .module = module, .opt = opt, .triple = triple, .path = path, .waited = waited };
     if (!submit(job)) {
         // (done here, then)
         if (!waited) {
@@ -1180,7 +1187,7 @@ fn oomT() ?Thunk {
 /// time, all of it (standalone_build.zig), its objects (owned: deinit and
 /// destroy); null with an exception (zrun.CompileError when the program
 /// can't be).
-pub fn buildStandalone(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject, seed: *const [32]u8, opt: u32, max_depth: u64, path: []const u8, prune: bool, setup: ?*PyObject) ?*standalone_build.Build {
+pub fn buildStandalone(data: *program_mod.Data, lang: compile_mod.LangView, python: *PythonSet, compile_error: *PyObject, seed: *const [32]u8, opt: u32, max_depth: u64, path: []const u8, prune: bool, setup: ?*PyObject, triple: ?[:0]const u8) ?*standalone_build.Build {
     var aot: Aot = .{};
     const c = prepare(data, lang, python, compile_error, seed, opt, &aot) orelse return null;
     defer c.destroy();
@@ -1189,6 +1196,7 @@ pub fn buildStandalone(data: *program_mod.Data, lang: compile_mod.LangView, pyth
         return null;
     };
     b.* = standalone_build.Build.init(c.view, opt);
+    b.triple = triple;
     if (!aheadOfTime(c, b, &aot, data, max_depth, path, compile_error, prune, setup)) {
         b.deinit();
         allocator.destroy(b);
@@ -1328,7 +1336,7 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
                 j.* = .{ .view = self.b.view, .module = null, .opt = h.opt, .path = null, .waited = true, .bytes = bytes, .cached = true };
                 j.done.store(true, .release);
                 break :blk j;
-            } else inBackground(self.b.view, h.module, h.opt, cache.pathFor(allocator, h.key), true) orelse return error.OutOfMemory;
+            } else inBackgroundFor(self.b.view, h.module, h.opt, if (self.b.triple) |t| t.ptr else null, cache.pathFor(allocator, h.key), true) orelse return error.OutOfMemory;
             try self.jobs.append(allocator, job);
         }
 
@@ -1367,7 +1375,7 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
             try self.b.keepNames(m);
             const opt = optFor(m, self.b.opt);
             const text = jit_f("LLVMPrintModuleToString")(m.mod);
-            const key = cache.keyOf(std.mem.span(text), opt);
+            const key = cache.keyFor(std.mem.span(text), opt, self.b.triple);
             jit_f("LLVMDisposeMessage")(text);
             // (one cached: the module itself freed with the next one's start)
             const bytes = cache.objectOf(allocator, key);

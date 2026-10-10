@@ -145,9 +145,20 @@ pub fn salt() *const [32]u8 {
 pub const Key = [32]u8;
 
 pub fn keyOf(ir_text: []const u8, opt: u32) Key {
+    return keyFor(ir_text, opt, null);
+}
+
+/// keyOf's for a target (LLVM's triple: a standalone build's for another
+/// machine), or null: this one
+pub fn keyFor(ir_text: []const u8, opt: u32, triple: ?[]const u8) Key {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     h.update(salt());
     h.update(std.mem.asBytes(&opt));
+    if (triple) |t| {
+        h.update("target ");
+        h.update(t);
+        h.update("\n");
+    }
     h.update(ir_text);
     var digest: Key = undefined;
     h.final(&digest);

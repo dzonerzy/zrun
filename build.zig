@@ -64,36 +64,31 @@ pub fn build(b: *std.Build) void {
         user_lib_mod.linkSystemLibrary(lib_name, .{ .use_pkg_config = .no });
     }
 
-    // The runtime of programs compiled to run without Python (`zig build
-    // rt`): the helpers, as a static library
-    const rt_mod = b.createModule(.{
-        .root_source_file = b.path("src/rt.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = strip,
-        .link_libc = true,
-        .imports = &.{
-            .{ .name = "PyOZ", .module = pyoz_dep.module("PyOZ") },
-        },
-    });
-    rt_mod.addIncludePath(b.path("vendor/llvm/include"));
-    // (the same, in a process without Python: no path falls back to it)
+    // The runtime of programs compiled to run without Python: the helpers,
+    // as a static library (the same code, in a process without Python: no
+    // path falls back to it)
     const rt_options = b.addOptions();
     rt_options.addOption([]const u8, "version", @import("build.zig.zon").version);
     rt_options.addOption(bool, "standalone", true);
-    rt_mod.addOptions("build_options", rt_options);
-    const rt_lib = b.addLibrary(.{ .name = "zrun_rt", .linkage = .static, .root_module = rt_mod });
-    // (a section per function and datum: a program linked with it keeps
-    // only what it calls, --gc-sections)
-    rt_lib.link_function_sections = true;
-    rt_lib.link_data_sections = true;
+    rt_options.addOption(bool, "has_rt", false);
+    // `zig build rt`: for this target
+    const rt_lib = runtime(b, target, optimize, strip, pyoz_dep, rt_options);
     const rt_step = b.step("rt", "The runtime of programs compiled to run without Python");
     rt_step.dependOn(&b.addInstallArtifact(rt_lib, .{}).step);
-    // (in the extension, for zrun.build_native to link with: Linux's)
-    const has_rt = target.result.os.tag == .linux;
-    build_options.addOption(bool, "has_rt", has_rt);
-    rt_options.addOption(bool, "has_rt", false);
-    if (has_rt) user_lib_mod.addAnonymousImport("zrun_rt_archive", .{ .root_source_file = rt_lib.getEmittedBin() });
+    // One in the extension for each target zrun.build_native makes programs
+    // for (x86-64 Linux and Windows: LLVM's x86 backend, zgram's), for any
+    // machine of it (a wheel's: the baseline CPU), the Python headers its
+    // shared code declares with vendored (the build's own may be another
+    // target's)
+    build_options.addOption(bool, "has_rt", true);
+    for ([_][2][]const u8{ .{ "linux", "x86_64-linux-gnu" }, .{ "windows", "x86_64-windows-gnu" } }) |rt| {
+        const query = std.Target.Query.parse(.{ .arch_os_abi = rt[1], .cpu_features = "baseline" }) catch unreachable;
+        const rt_target = b.resolveTargetQuery(query);
+        const include: []const []const u8 = &.{b.pathFromRoot(b.fmt("vendor/python/{s}/include", .{rt[0]}))};
+        const dep = b.dependency("PyOZ", .{ .target = rt_target, .optimize = optimize, .abi3 = true, .@"python-include-dirs" = include });
+        const lib_rt = runtime(b, rt_target, optimize, true, dep, rt_options);
+        user_lib_mod.addAnonymousImport(b.fmt("zrun_rt_{s}", .{rt[0]}), .{ .root_source_file = lib_rt.getEmittedBin() });
+    }
 
     // Zig's own tests: those of the parts with no Python (floatfmt's
     // digits against glibc's printf)
@@ -112,4 +107,26 @@ pub fn build(b: *std.Build) void {
         .dest_sub_path = b.fmt("zrun{s}", .{ext}),
     });
     b.getInstallStep().dependOn(&install.step);
+}
+
+/// The runtime of standalone programs for a target, as a static library
+fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, pyoz_dep: *std.Build.Dependency, options: *std.Build.Step.Options) *std.Build.Step.Compile {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/rt.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "PyOZ", .module = pyoz_dep.module("PyOZ") },
+        },
+    });
+    mod.addIncludePath(b.path("vendor/llvm/include"));
+    mod.addOptions("build_options", options);
+    const lib = b.addLibrary(.{ .name = "zrun_rt", .linkage = .static, .root_module = mod });
+    // (a section per function and datum: a program linked with it keeps
+    // only what it calls, --gc-sections)
+    lib.link_function_sections = true;
+    lib.link_data_sections = true;
+    return lib;
 }

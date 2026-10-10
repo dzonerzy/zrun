@@ -241,8 +241,9 @@ fn rtMain(desc: *const Desc, argc: c_int, argv: [*]const [*:0]const u8) callconv
 /// The language's setup, if the build has one: its code called (compiled
 /// ahead for two values) with the program's path, a str, and its
 /// arguments, a list of strs. False with the error in `ctx`.
-fn runSetup(desc: *const Desc, ctx: *Ctx, args: []const [*:0]const u8) bool {
+fn runSetup(desc: *const Desc, ctx: *Ctx, argv: []const [*:0]const u8) bool {
     if (desc.setup == 0) return true;
+    const args = programArgs(argv) orelse return helpers.fail(ctx, 0, "out of memory", .{});
     const callee = desc.objects[desc.setup - 1];
     const code_p = calledOf(callee, 2, 0) orelse return helpers.fail(ctx, 0, "the setup wasn't compiled ahead of time", .{});
     const code: Helper = @ptrCast(@alignCast(code_p));
@@ -251,7 +252,7 @@ fn runSetup(desc: *const Desc, ctx: *Ctx, args: []const [*:0]const u8) bool {
     var given = [2]Value{ Value.obj(.str, &path.head), Value.obj(.list, &list.head) };
     defer for (given) |v| value.decref(v);
     for (args) |a| {
-        const s = value.newStr(std.mem.span(a)) orelse return helpers.fail(ctx, 0, "out of memory", .{});
+        const s = value.newStr(a) orelse return helpers.fail(ctx, 0, "out of memory", .{});
         if (!value.listPush(list, Value.obj(.str, &s.head))) return helpers.fail(ctx, 0, "out of memory", .{});
     }
     var out: Value = Value.none_v;
@@ -264,13 +265,30 @@ fn runSetup(desc: *const Desc, ctx: *Ctx, args: []const [*:0]const u8) bool {
     };
 }
 
-fn writeErr(s: []const u8) void {
-    var rest = s;
-    while (rest.len > 0) {
-        const n = std.c.write(2, rest.ptr, rest.len);
-        if (n <= 0) return;
-        rest = rest[@intCast(n)..];
+/// The program's arguments (the program's name not among them), as UTF-8:
+/// main's on POSIX; on Windows its command line's, UTF-16 (main's are the
+/// code page's), or null
+fn programArgs(argv: []const [*:0]const u8) ?[]const []const u8 {
+    if (@import("builtin").os.tag != .windows) {
+        const out = allocator.alloc([]const u8, argv.len) catch return null;
+        for (argv, out) |a, *o| o.* = std.mem.span(a);
+        return out;
     }
+    var n: c_int = 0;
+    const wide = win.CommandLineToArgvW(win.GetCommandLineW(), &n) orelse return null;
+    const count: usize = @intCast(@max(n, 1));
+    const out = allocator.alloc([]const u8, count - 1) catch return null;
+    for (out, wide[1..count]) |*o, w| o.* = std.unicode.utf16LeToUtf8Alloc(allocator, std.mem.span(w)) catch return null;
+    return out;
+}
+
+const win = struct {
+    extern "kernel32" fn GetCommandLineW() callconv(.winapi) [*:0]const u16;
+    extern "shell32" fn CommandLineToArgvW(line: [*:0]const u16, n: *c_int) callconv(.winapi) ?[*]const [*:0]const u16;
+};
+
+fn writeErr(s: []const u8) void {
+    @import("stdio.zig").writeAll(2, s);
 }
 
 /// The line and column (1-based, in characters) of a source offset

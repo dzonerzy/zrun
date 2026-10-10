@@ -192,6 +192,9 @@ pub const Build = struct {
     arena: std.heap.ArenaAllocator,
     view: *const llvm.LlvmView,
     opt: u32,
+    /// The target the objects are for (LLVM's triple: any machine of it),
+    /// or null: this machine
+    triple: ?[:0]const u8 = null,
     /// The objects compiled (the image's last)
     objects: std.ArrayListUnmanaged([]u8) = .empty,
     /// Every module's names for addresses
@@ -219,7 +222,7 @@ pub const Build = struct {
     pub fn emit(self: *Build, m: *ir.Module) Error!void {
         try self.keepNames(m);
         var err: [2048]u8 = @splat(0);
-        const bytes = llvm.emitObject(self.view, m.take(), self.opt, &err) catch return self.rejected(&err);
+        const bytes = llvm.emitObjectFor(self.view, m.take(), self.opt, if (self.triple) |t| t.ptr else null, &err) catch return self.rejected(&err);
         defer llvm.freeBytes(self.view, bytes);
         try self.addObject(bytes);
     }

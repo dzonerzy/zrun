@@ -72,7 +72,7 @@ fn stop(comptime name: []const u8) fn () callconv(.c) noreturn {
     return struct {
         fn f() callconv(.c) noreturn {
             const msg = "zrun: " ++ name ++ "(): a Python C API function, called in a runtime without Python (a path of the compiled code a strict language's never takes)\n";
-            _ = std.c.write(2, msg, msg.len);
+            @import("stdio.zig").writeAll(2, msg);
             std.c.abort();
         }
     }.f;

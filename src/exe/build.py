@@ -352,15 +352,17 @@ def build_executable(language, source, output, target=None, path=None, python=No
     return output
 
 
-def build_native(language, source, output, path=None, runtime=None, prune=False, left_out=None, setup=None):
+def build_native(language, source, output, path=None, runtime=None, prune=False, left_out=None, setup=None, target=None, zig_target=None):
     """A standalone program: a strict language's program compiled ahead of
     time, all of it (prune: the library functions it can name), linked
-    with zrun's runtime (`runtime`: libzrun_rt.a's bytes) by the ziglang
-    package's Zig. No Python in it. `setup` (a function, or
-    'module:function') compiled with it, called with the program's path
-    and arguments as it starts. Returns its path."""
+    with zrun's runtime (`runtime`: the target's libzrun_rt's bytes) by the
+    ziglang package's Zig (`zig_target`: its name of the target). No
+    Python in it. `setup` (a function, or 'module:function') compiled with
+    it, called with the program's path and arguments as it starts.
+    `target`: 'x86_64-linux' or 'x86_64-windows', any machine of it (None:
+    this machine, its CPU's code). Returns its path."""
     if not runtime:
-        raise ValueError("this zrun has no runtime for standalone programs (one is in zrun's Linux builds)")
+        raise ValueError("this zrun has no runtime for standalone programs")
     import zrun
 
     lang = language if isinstance(language, zrun.Language) else getattr(importlib.import_module(language_of(language)[0]), language_of(language)[1])
@@ -378,25 +380,37 @@ def build_native(language, source, output, path=None, runtime=None, prune=False,
     else:
         name, text = "program", source
     name = path or name
-    objects = lang.load(text, name).native_objects(prune=bool(prune), left_out=left_out, setup=setup)
+    objects = lang.load(text, name).native_objects(prune=bool(prune), left_out=left_out, setup=setup, target=target)
     try:
         import ziglang  # noqa: F401
     except ImportError:
         raise RuntimeError("making standalone programs needs Zig: pip install ziglang (or zrun-py[exe])") from None
+    windows = "windows" in zig_target
+    # (a Windows program's name: Windows runs it by its .exe)
+    if windows and not os.path.splitext(output)[1]:
+        output += ".exe"
     with tempfile.TemporaryDirectory() as tmp:
         files = []
         for i, o in enumerate(objects):
             files.append(os.path.join(tmp, f"part{i}.o"))
             with open(files[-1], "wb") as f:
                 f.write(o)
-        rt = os.path.join(tmp, "libzrun_rt.a")
+        rt = os.path.join(tmp, "zrun_rt.lib" if windows else "libzrun_rt.a")
         with open(rt, "wb") as f:
             f.write(runtime)
         out = f"{output}.{os.getpid()}.tmp"
         # (Zig's caches: its own for this build, the builds' shared one)
         env = dict(os.environ, ZIG_LOCAL_CACHE_DIR=os.path.join(tmp, "zig-cache"), ZIG_GLOBAL_CACHE_DIR=os.path.join(cache_dir(), "zig"))
-        # (only what the program reaches of the runtime: a section each)
-        subprocess.run([sys.executable, "-m", "ziglang", "cc", "-s", "-Wl,--gc-sections", "-o", out, *files, rt, "-lc", "-lm"], check=True, cwd=tmp, env=env)
+        # (only what the program reaches of the runtime: a section each;
+        # Windows' linker keeps only that by default)
+        flags = ["-s"] if windows else ["-s", "-Wl,--gc-sections"]
+        # (Windows' arguments read as UTF-16: CommandLineToArgvW's)
+        libs = ["-lc", "-lshell32"] if windows else ["-lc", "-lm"]
+        # (the objects named in a file: Windows' command lines are short)
+        rsp = os.path.join(tmp, "objects.rsp")
+        with open(rsp, "w", encoding="utf-8") as f:
+            f.write("\n".join('"' + p.replace("\\", "/") + '"' for p in [*files, rt]))
+        subprocess.run([sys.executable, "-m", "ziglang", "cc", "-target", zig_target, *flags, "-o", out, "@" + rsp, *libs], check=True, cwd=tmp, env=env)
         os.chmod(out, 0o755)
         os.replace(out, output)
     return output

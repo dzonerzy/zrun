@@ -13,9 +13,10 @@ pub const panic = std.debug.FullPanic(stop);
 
 fn stop(msg: []const u8, _: ?usize) noreturn {
     @branchHint(.cold);
-    _ = std.c.write(2, "zrun: ", 6);
-    _ = std.c.write(2, msg.ptr, msg.len);
-    _ = std.c.write(2, "\n", 1);
+    const stdio = @import("stdio.zig");
+    stdio.writeAll(2, "zrun: ");
+    stdio.writeAll(2, msg);
+    stdio.writeAll(2, "\n");
     std.c.abort();
 }
 

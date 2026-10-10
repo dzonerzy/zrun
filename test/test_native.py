@@ -20,8 +20,8 @@ LUA_TESTS = os.path.join(HERE, "..", "examples", "lua", "tests")
 HAVE_ZIGLANG = importlib.util.find_spec("ziglang") is not None
 
 pytestmark = pytest.mark.skipif(
-    sys.platform != "linux" or (not HAVE_ZIGLANG and shutil.which("zig") is None),
-    reason="standalone programs: Linux, with Zig",
+    sys.platform not in ("linux", "win32") or (not HAVE_ZIGLANG and shutil.which("zig") is None),
+    reason="standalone programs: Linux or Windows, with Zig",
 )
 
 
@@ -160,6 +160,21 @@ def test_setup_not_compiled(tmp_path, monkeypatch):
         lua.lang.load("print(1)", "x.lua").native_objects(setup=setup)
     with pytest.raises(TypeError, match="setup must be a Python function"):
         lua.lang.load("print(1)", "x.lua").native_objects(setup=print)
+
+
+@pytest.mark.parametrize("target", ["x86_64-linux", "x86_64-windows"])
+def test_targets(zig, tmp_path, target):
+    # (a program for another machine: Linux's or Windows' executable, from
+    # either; run where it can be)
+    src = open(os.path.join(HERE, "..", "examples", "tiny", "fib.tiny")).read()
+    exe = zrun.build_native(tiny.lang, src, str(tmp_path / "fib"), path="fib.tiny", target=target)
+    windows = target == "x86_64-windows"
+    assert exe.endswith(".exe") == windows
+    with open(exe, "rb") as f:
+        assert f.read(4)[: 2 if windows else 4] == (b"MZ" if windows else b"\x7fELF")
+    if (sys.platform == "win32") == windows:
+        r = subprocess.run([exe], capture_output=True, text=True, timeout=60)
+        assert (r.returncode, r.stdout.replace("\r\n", "\n")) == (0, "".join(f"{n}\n" for n in (0, 1, 1, 2, 3, 5, 8, 13, 21, 34)))
 
 
 def test_not_strict(tmp_path):

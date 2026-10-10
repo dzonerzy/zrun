@@ -118,7 +118,9 @@ jobs:
 
             - name: Install wheel
               shell: bash
-              run: python -m pip install --no-deps dist/*.whl && python -m pip install pytest pytest-timeout
+              # (ziglang: standalone programs' tests link with it, as
+              # zrun.build_native does)
+              run: python -m pip install --no-deps dist/*.whl && python -m pip install pytest pytest-timeout ziglang
 
             - name: Run tests
               timeout-minutes: 20
