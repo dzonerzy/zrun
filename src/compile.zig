@@ -801,6 +801,50 @@ const max_constant_depth = 64;
 
 /// A Python value as a native one all through (the lists, dicts and tuples
 /// in it native too, not Python's), immortal: a constant of the process.
+/// Whether a module's table holds plain values only (None, bools, ints,
+/// floats, strs, tuples of them): a set, a dict or list of them. Anything
+/// else (a table that isn't one of those too) isn't.
+fn plainTable(o: *PyObject) Error!bool {
+    const t = ph.typeOf(o);
+    const is = struct {
+        fn ty(x: *py.c.PyTypeObject, comptime name: [:0]const u8) bool {
+            return x == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject(name))));
+        }
+        fn plain(x: *PyObject) bool {
+            const xt = ph.typeOf(x);
+            if (x == py.Py_None() or ty(xt, "PyBool_Type") or ty(xt, "PyLong_Type") or ty(xt, "PyFloat_Type") or ty(xt, "PyUnicode_Type")) return true;
+            if (!ty(xt, "PyTuple_Type")) return false;
+            const n: usize = @intCast(py.c.PyTuple_Size(x));
+            for (0..n) |i| if (!plain(py.c.PyTuple_GetItem(x, @intCast(i)).?)) return false;
+            return true;
+        }
+    };
+    if (is.ty(t, "PyDict_Type")) {
+        var pos: py.Py_ssize_t = 0;
+        var key: ?*PyObject = null;
+        var val: ?*PyObject = null;
+        while (py.c.PyDict_Next(o, &pos, @ptrCast(&key), @ptrCast(&val)) != 0) if (!is.plain(key.?) or !is.plain(val.?)) return false;
+        return true;
+    }
+    if (is.ty(t, "PyList_Type")) {
+        const n: usize = @intCast(py.c.PyList_Size(o));
+        for (0..n) |i| if (!is.plain(py.c.PyList_GetItem(o, @intCast(i)).?)) return false;
+        return true;
+    }
+    if (is.ty(t, "PySet_Type")) {
+        const it = py.c.PyObject_GetIter(o) orelse return error.Python;
+        defer py.Py_DecRef(it);
+        var ok = true;
+        while (py.c.PyIter_Next(it)) |item| {
+            defer py.Py_DecRef(item);
+            if (!is.plain(item)) ok = false;
+        }
+        return ok;
+    }
+    // (a tuple, frozenset...: as before)
+    return true;
+}
+
 fn constantNative(o: *PyObject, depth: usize) Error!Value {
     if (depth > max_constant_depth) {
         ph.raise(py.PyExc_ValueError(), "a zrun.comptime result nested more than {d} deep (or holding itself)", .{max_constant_depth});
@@ -829,6 +873,31 @@ fn constantNative(o: *PyObject, depth: usize) Error!Value {
         for (tu.slice()) |*slot| slot.* = Value.none_v;
         for (tu.slice(), 0..) |*slot, i| slot.* = try constantNative(py.c.PyTuple_GetItem(o, @intCast(i)).?, depth + 1);
         break :blk Value.obj(.tuple, &tu.head);
+    } else if (t == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PySet_Type"))))) blk: {
+        const s = set_mod.new() orelse return error.OutOfMemory;
+        const it = py.c.PyObject_GetIter(o) orelse return error.Python;
+        defer py.Py_DecRef(it);
+        while (py.c.PyIter_Next(it)) |item| {
+            defer py.Py_DecRef(item);
+            if (!set_mod.add(s, try constantNative(item, depth + 1))) return error.OutOfMemory;
+        }
+        if (py.c.PyErr_Occurred() != null) return error.Python;
+        break :blk Value.obj(.set, &s.head);
+    } else if (try recordOf(@ptrCast(@alignCast(t)))) |rt| blk: {
+        // (a record of a record class: its fields, natively)
+        const r = value.newRecord(rt) orelse return error.OutOfMemory;
+        for (rt.fields, r.fields()) |name, *slot| {
+            const name_o = ph.newString(name) orelse return error.Python;
+            defer py.Py_DecRef(name_o);
+            const fo = py.c.PyObject_GetAttr(o, name_o) orelse {
+                if (py.c.PyErr_ExceptionMatches(py.PyExc_AttributeError()) == 0) return error.Python;
+                py.c.PyErr_Clear();
+                continue;
+            };
+            defer py.Py_DecRef(fo);
+            slot.* = try constantNative(fo, depth + 1);
+        }
+        break :blk Value.obj(.record, &r.head);
     } else value.fromBorrowed(o) orelse return error.Python;
     if (value.counted(v.tag)) v.ptr().rc = value.IMMORTAL;
     return v;
@@ -4390,6 +4459,14 @@ const Gen = struct {
     /// makes it).
     fn frozenTable(self: *Gen, o: *PyObject, at: u32) Error!SVal {
         const t = ph.typeOf(o);
+        // (a strict language's table holding more than plain values
+        // (records, sets, tables): native all through, a constant made once
+        // as a zrun.comptime result is; else what's in it would stay
+        // Python's)
+        if (self.c.lang.strict and !try plainTable(o)) {
+            const shape: Shape = if (t == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyDict_Type"))))) .dict else if (t == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyList_Type"))))) .list else .any;
+            return .{ .dyn = try self.comptimeConst(o, shape) };
+        }
         if (t == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PyDict_Type"))))) {
             const d = try self.a().create(SDict);
             d.* = .{ .frozen = o };
@@ -6777,6 +6854,24 @@ const Gen = struct {
                     try self.drop(obj);
                     try self.check(ok);
                     return self.iterationOf(inst, .{ .dyn = try self.loadOut(.list) });
+                }
+                // (a known one: its keys, values or (key, value) pairs,
+                // known; the dict keeps its references, each target taking
+                // its own: forLoop's copyOf)
+                if (obj == .dict) {
+                    const d = obj.dict;
+                    const items = try self.a().alloc(SVal, d.keys.items.len);
+                    for (items, d.keys.items, d.values.items) |*slot, key, val| slot.* = switch (w) {
+                        0 => blk: {
+                            const pair = try self.a().alloc(SVal, 2);
+                            pair[0] = key;
+                            pair[1] = val;
+                            break :blk .{ .tuple = pair };
+                        },
+                        1 => key,
+                        else => val,
+                    };
+                    return .{ .known = .{ .items = items } };
                 }
                 // (a known one: its method, as any call of it)
                 return self.iterationOf(inst, try self.methodCall(inst, obj, name, &.{}, e.pos));
@@ -10756,8 +10851,8 @@ const Gen = struct {
         var it = switch (try self.iteration(inst, g.iter)) {
             .known => |known| {
                 for (known.items) |item| {
-                    if (item == .dyn) try self.increfDyn(item.dyn);
-                    try self.assign(inst, g.target, item, pos);
+                    // (the target's own copy: forLoop's)
+                    try self.assign(inst, g.target, try self.copyOf(item), pos);
                     try self.compFiltered(inst, gens, level, g.ifs, pos, sink);
                 }
                 try self.releaseIterated(inst, known.of);

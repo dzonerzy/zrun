@@ -11,6 +11,7 @@ program runs is allowed."""
 import functools
 import importlib.util
 import os
+from dataclasses import dataclass
 
 import pytest
 import zrun
@@ -209,6 +210,62 @@ def test_type_of_a_known_value_and_one_of_run_time():
     p = lang.load("fn f(a, b) { return a + b; }", "type.tiny")
     for a, b in [(1, 2), (1, 2.5), (1, "x"), (1.5, 2.5)]:
         assert p.call("f", a, b) == p.call("f", a, b, mode="python")
+
+
+@dataclass
+class Command:
+    name: str
+    options: set
+    roles: dict
+    sub: dict
+
+
+# (a table only read holding records, sets, tables: native all through in
+# a strict language, a constant)
+COMMANDS = {
+    "git": Command("git", {"-c", "-C"}, {"-C": "cwd"}, {"log": Command("log", {"-n"}, {}, {})}),
+    "cp": Command("cp", {"-t"}, {"-t": "write"}, {}),
+}
+
+
+def test_a_module_table_of_records_only_read():
+    lang = _language(True)
+
+    @lang.eval("BinOp")
+    def binop(node, rt):
+        name = rt.eval(node.left)
+        opt = rt.eval(node.right)
+        if name not in COMMANDS:
+            return None
+        c = COMMANDS[name]
+        subs = sorted([k for k, v in c.sub.items()])
+        return [c.name, opt in c.options, c.roles.get(opt, "plain"), subs, len(COMMANDS)]
+
+    p = lang.load("fn f(a, b) { return a + b; }", "records.tiny")
+    for a, b in [("git", "-C"), ("git", "-x"), ("cp", "-t"), ("rm", "-f")]:
+        assert p.call("f", a, b) == p.call("f", a, b, mode="python")
+
+
+def pairs(d):
+    out = []
+    for k, v in d.items():
+        out.append(k + "=" + v)
+    return out
+
+
+def test_items_of_a_known_dict():
+    # (a dict known while compiling, given to a helper: its items unrolled,
+    # its values' references its own)
+    lang = _language(True)
+
+    @lang.eval("BinOp")
+    def binop(node, rt):
+        a = rt.eval(node.left)
+        b = rt.eval(node.right)
+        return pairs({"a": a, "b": b}) + [k for k in {"x": a}.keys()] + [v for k, v in {"y": b}.items()]
+
+    p = lang.load("fn f(a, b) { return a + b; }", "items.tiny")
+    assert p.call("f", "1", "2") == p.call("f", "1", "2", mode="python") == ["a=1", "b=2", "x", "2"]
 
 
 KEYWORDS = {"if", "else", "while", 3, (1, "x")}

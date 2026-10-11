@@ -38,6 +38,7 @@ Everything in [Writing fast semantics](writing-fast-semantics.md#what-compiles),
 - output: `print(...)`, `sys.stdout.write(s)`, `sys.stderr.write(s)` (to whatever `sys.stdout` is when they run)
 - exceptions of Python's builtin classes and zrun's: raised, caught, their `args` and `str()`
 - the module's tables and records the semantics read and change: made native when the program is compiled (`program.report()["module_state"]` says which)
+- a module's table the semantics only read, with records, sets or tables in it (a command table, a list of rules): native all through, made once, a constant of the code (what's in it is the module's when the program is compiled: change it in Python after, and compiled code doesn't see it)
 
 ## Fixing what strict mode refuses
 

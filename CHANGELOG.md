@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A strict language's module table only read is native all through**: records of record classes, sets, lists and dicts in it, made once, a constant of the code (standalone programs carry it in their image). Before, what was in it stayed Python's, and strict mode refused it.
+
+### Fixed
+- **`d.items()`, `.keys()`, `.values()` of a dict known while compiling** (a literal given to a helper) went into Python: they're its known items now.
+- **A comprehension unrolled over known tuples** gave the target the tuple's references without its own (as `for` did, fixed in 0.7.1).
+
 ## [0.7.1] - 2026-10-11
 
 ### Added

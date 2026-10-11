@@ -13,7 +13,7 @@ import sys
 import pytest
 import zrun
 from conftest import HERE
-from test_strict import tiny
+from test_strict import COMMANDS, tiny
 
 LUA_TESTS = os.path.join(HERE, "..", "examples", "lua", "tests")
 
@@ -287,6 +287,27 @@ def test_module_set_standalone(zig, tmp_path, capsys):
     src = "let i = 0;\nwhile i < 3 { print(i + 2); i = i + 1; }\n"
     assert native(lang, src, tmp_path) == compiled(lang, src, capsys) == (
         0, "False 3 ['if', 'while']\nTrue 3 ['if', 'while']\nFalse 3 ['if', 'while']\n", "")
+
+
+def test_module_records_standalone(zig, tmp_path, capsys):
+    """A module's table of records only read: a constant in the image"""
+    lang = zrun.Language(tiny.PARSER, tiny.RULES, strict=True)
+    lang.function("FuncDef")
+    lang.exec("While")(tiny.while_)
+    lang.exec(["Let", "Assign"])(tiny.assign)
+    lang.eval("BinOp")(tiny.binop)
+
+    @lang.eval("Call")
+    def call(node, rt):
+        x = rt.eval(node.args[0])
+        name = "git" if x == 2 else "cp"
+        c = COMMANDS[name]
+        print(c.name, sorted([o for o in c.options]), c.roles.get("-t", "plain"), sorted([k for k in c.sub]))
+        return 0
+
+    src = "let i = 0;\nwhile i < 2 { print(i + 2); i = i + 1; }\n"
+    assert native(lang, src, tmp_path) == compiled(lang, src, capsys) == (
+        0, "git ['-C', '-c'] plain ['log']\ncp ['-t'] write []\n", "")
 
 
 def test_rt_parse_actions_standalone(zig, tmp_path, capsys):
