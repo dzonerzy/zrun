@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Reading input and the system natively**, so a standalone program can be a tool (vetter's hook is one): `sys.stdin.read()`, `open(path, encoding="utf-8").read()` (`newline=""` keeping line ends; `"rb"` for bytes), `os.getenv()`, `os.getcwd()`, `os.path.isfile()`, `isdir()`, `exists()`, `realpath()` (`src/osio.zig`: POSIX's calls, Windows' wide ones). Their errors are Python's, native: `FileNotFoundError`, `IsADirectoryError`, `NotADirectoryError`, `PermissionError`, `OSError` with `errno`, `strerror`, `filename` and `[Errno 2] No such file or directory: 'x'`; a file that isn't UTF-8 a `UnicodeDecodeError` with Python's five arguments and words. In the compiled mode stdin is `sys.stdin`'s (read through Python, as output is written); the rest native in both. `open()` of another encoding (the locale's) stays Python's.
 - **`sys.platform` and `os.name` in a standalone program** are the system's it runs on (read in a function): a build for Windows made on Linux sees `win32` and `nt`.
 
+### Changed
+- **Methods of values known only at run time are dispatched by number**: the compiled code gives the method's number (`helpers.Method`, from its name when compiling) and the runtime compares numbers, where it compared the name with each method's in turn (a str's `split()` went through some 40 string comparisons). vetter's policy matching: about 10% faster.
+- **A loop over a tuple goes over it in place**: no list copied from it first.
+- **`zrun.configure(perf_map=True)` names each compiled function after its Python function** (`zr…_h29 match_program (policy.py:490)`), so a profile says which code is hot.
+
 ### Fixed
 - **Strict: a call of a helper inside `try: ... except Exception:`** was refused ("catches rt.tail_call as an exception") in the compiled mode, the call's code ready for jumps it never makes; the code for them is made only when the helper can make one now, as standalone builds did.
 - **`d.items()`, `.keys()`, `.values()` of a dict known while compiling** (a literal given to a helper) went into Python: they're its known items now.

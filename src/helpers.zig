@@ -1482,12 +1482,80 @@ fn setResult(ctx: *Ctx, node: u32, s: ?*set_mod.Set, out: *Value) bool {
     return true;
 }
 
+/// The methods zr_call_method does natively, by number: the compiled code
+/// gives a call's (methodOf its name, when compiling), and the helpers
+/// compare numbers, not names (`other`: none of them)
+pub const Method = enum(u32) {
+    other,
+    // sets'
+    add,
+    discard,
+    remove,
+    pop,
+    clear,
+    copy,
+    update,
+    @"union",
+    intersection,
+    difference,
+    symmetric_difference,
+    intersection_update,
+    difference_update,
+    symmetric_difference_update,
+    issubset,
+    issuperset,
+    isdisjoint,
+    // strs', bytes'
+    find,
+    rfind,
+    count,
+    index,
+    rindex,
+    startswith,
+    endswith,
+    partition,
+    rpartition,
+    replace,
+    split,
+    join,
+    strip,
+    lstrip,
+    rstrip,
+    lower,
+    upper,
+    isupper,
+    islower,
+    isdigit,
+    isalpha,
+    isalnum,
+    isspace,
+    encode,
+    decode,
+    hex,
+    // others'
+    get,
+    extend,
+    to_bytes,
+    is_integer,
+};
+
+const method_names = std.StaticStringMap(Method).initComptime(blk: {
+    const fields = @typeInfo(Method).@"enum".fields;
+    var kvs: [fields.len]struct { []const u8, Method } = undefined;
+    for (fields, 0..) |f, i| kvs[i] = .{ f.name, @enumFromInt(f.value) };
+    break :blk kvs;
+});
+
+/// A method name's number (`other`: not one zr_call_method knows)
+pub fn methodOf(name: []const u8) Method {
+    return method_names.get(name) orelse .other;
+}
+
 /// A set's method, natively (null: not one of those; Python's then). Its
 /// errors that Python words (a missing item's KeyError) are Python's, on a
 /// copy: nothing changed by then.
-fn setMethod(ctx: *Ctx, node: u32, v: Value, name: []const u8, args: []const Value, out: *Value) ?bool {
+fn setMethod(ctx: *Ctx, node: u32, v: Value, name: []const u8, mid: Method, args: []const Value, out: *Value) ?bool {
     const s = setOf(v);
-    const eq = std.mem.eql;
     const python = struct {
         fn call(c: *Ctx, n: u32, sv: Value, nm: []const u8, a: []const Value, o: *Value) bool {
             gil.allowBegin();
@@ -1498,26 +1566,26 @@ fn setMethod(ctx: *Ctx, node: u32, v: Value, name: []const u8, args: []const Val
         }
     };
     out.* = Value.none_v;
-    if (args.len == 1 and (eq(u8, name, "add") or eq(u8, name, "discard") or eq(u8, name, "remove"))) {
+    if (args.len == 1 and (mid == .add or mid == .discard or mid == .remove)) {
         const x = args[0];
         if (!value.hashable(x)) return unhashableItem(ctx, node, x);
-        if (eq(u8, name, "add")) return set_mod.add(s, x) or oomFail(ctx, node);
-        if (set_mod.discard(s, x) or eq(u8, name, "discard")) return true;
+        if (mid == .add) return set_mod.add(s, x) or oomFail(ctx, node);
+        if (set_mod.discard(s, x) or mid == .discard) return true;
         return python.call(ctx, node, v, name, args, out);
     }
     if (args.len == 0) {
-        if (eq(u8, name, "pop")) {
+        if (mid == .pop) {
             out.* = set_mod.pop(s) orelse return python.call(ctx, node, v, name, args, out);
             return true;
         }
-        if (eq(u8, name, "clear")) return set_mod.clear(s) or oomFail(ctx, node);
-        if (eq(u8, name, "copy")) return setResult(ctx, node, set_mod.copy(s), out);
+        if (mid == .clear) return set_mod.clear(s) or oomFail(ctx, node);
+        if (mid == .copy) return setResult(ctx, node, set_mod.copy(s), out);
     }
-    if (eq(u8, name, "update")) {
+    if (mid == .update) {
         for (args) |x| if (!setUpdate(ctx, node, s, x)) return false;
         return true;
     }
-    if (eq(u8, name, "union")) {
+    if (mid == .@"union") {
         const r = set_mod.copy(s) orelse return oomFail(ctx, node);
         out.* = Value.obj(.set, &r.head);
         for (args) |x| if (!setUpdate(ctx, node, r, x)) return false;
@@ -1527,15 +1595,15 @@ fn setMethod(ctx: *Ctx, node: u32, v: Value, name: []const u8, args: []const Val
     const other = args[0];
     // (another iterable's items, in its order, for what Python goes over
     // them for: intersection, difference)
-    if (other.kind() != .set and (eq(u8, name, "intersection") or eq(u8, name, "difference") or eq(u8, name, "intersection_update") or eq(u8, name, "difference_update"))) {
+    if (other.kind() != .set and (mid == .intersection or mid == .difference or mid == .intersection_update or mid == .difference_update)) {
         var l = Value.none_v;
         if (!zr_items(ctx, node, other.tag, other.bits, &l)) return false;
         defer value.decref(l);
         const items = @as(*value.List, @ptrCast(@alignCast(l.ptr()))).slice();
         for (items) |x| if (!value.hashable(x)) return unhashableItem(ctx, node, x);
-        if (eq(u8, name, "intersection")) return setResult(ctx, node, set_mod.intersectionItems(s, items), out);
-        if (eq(u8, name, "intersection_update")) return set_mod.intersectionUpdateItems(s, items) or oomFail(ctx, node);
-        if (eq(u8, name, "difference_update")) return set_mod.differenceUpdateItems(s, items) or oomFail(ctx, node);
+        if (mid == .intersection) return setResult(ctx, node, set_mod.intersectionItems(s, items), out);
+        if (mid == .intersection_update) return set_mod.intersectionUpdateItems(s, items) or oomFail(ctx, node);
+        if (mid == .difference_update) return set_mod.differenceUpdateItems(s, items) or oomFail(ctx, node);
         // (a copy less them: Python's way with an iterable)
         const r = set_mod.copy(s) orelse return oomFail(ctx, node);
         out.* = Value.obj(.set, &r.head);
@@ -1545,21 +1613,21 @@ fn setMethod(ctx: *Ctx, node: u32, v: Value, name: []const u8, args: []const Val
     // one first, where Python's result is the same)
     const os: *set_mod.Set = if (other.kind() == .set) setOf(other) else newSetOf(ctx, node, other) orelse return false;
     defer if (other.kind() != .set) value.decref(Value.obj(.set, &os.head));
-    if (eq(u8, name, "intersection")) return setResult(ctx, node, set_mod.intersection(s, os), out);
-    if (eq(u8, name, "difference")) return setResult(ctx, node, set_mod.difference(s, os), out);
-    if (eq(u8, name, "symmetric_difference")) return setResult(ctx, node, set_mod.symmetricDifference(s, os), out);
-    if (eq(u8, name, "intersection_update")) return set_mod.intersectionUpdate(s, os) or oomFail(ctx, node);
-    if (eq(u8, name, "difference_update")) return set_mod.differenceUpdate(s, os) or oomFail(ctx, node);
-    if (eq(u8, name, "symmetric_difference_update")) return set_mod.symmetricUpdate(s, os) or oomFail(ctx, node);
-    if (eq(u8, name, "issubset")) {
+    if (mid == .intersection) return setResult(ctx, node, set_mod.intersection(s, os), out);
+    if (mid == .difference) return setResult(ctx, node, set_mod.difference(s, os), out);
+    if (mid == .symmetric_difference) return setResult(ctx, node, set_mod.symmetricDifference(s, os), out);
+    if (mid == .intersection_update) return set_mod.intersectionUpdate(s, os) or oomFail(ctx, node);
+    if (mid == .difference_update) return set_mod.differenceUpdate(s, os) or oomFail(ctx, node);
+    if (mid == .symmetric_difference_update) return set_mod.symmetricUpdate(s, os) or oomFail(ctx, node);
+    if (mid == .issubset) {
         out.* = Value.boolean(set_mod.isSubset(s, os));
         return true;
     }
-    if (eq(u8, name, "issuperset")) {
+    if (mid == .issuperset) {
         out.* = Value.boolean(set_mod.isSubset(os, s));
         return true;
     }
-    if (eq(u8, name, "isdisjoint")) {
+    if (mid == .isdisjoint) {
         var it = set_mod.iterate(if (s.used <= os.used) s else os);
         const big = if (s.used <= os.used) os else s;
         while (it.next()) |x| if (set_mod.contains(big, x)) {
@@ -1650,7 +1718,7 @@ export fn zr_inplace(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u
             else => {
                 var r = Value.none_v;
                 const upd = value.literal("update") orelse return oomFail(ctx, node);
-                if (!zr_call_method(ctx, node, a.tag, a.bits, upd, @ptrCast(&b), 1, &r)) return false;
+                if (!zr_call_method(ctx, node, a.tag, a.bits, upd, @intFromEnum(Method.update), @ptrCast(&b), 1, &r)) return false;
                 value.decref(r);
             },
         }
@@ -1762,12 +1830,12 @@ const bytes_space = " \t\n\r\x0b\x0c";
 
 /// A Python bytes' method, natively (null: not one of these, or arguments
 /// Python takes otherwise: Python's then, its errors on a copy)
-fn bytesMethod(ctx: *Ctx, node: u32, v: Value, name: []const u8, args: []const Value, out: *Value) ?bool {
+fn bytesMethod(ctx: *Ctx, node: u32, v: Value, name: []const u8, mid: Method, args: []const Value, out: *Value) ?bool {
     const s = pyBytesOf(v) orelse return null;
     const eq = std.mem.eql;
     var nb: [1]u8 = undefined;
     // find, rfind, count, index, rindex (no start, end: Python's for those)
-    inline for (.{ "find", "rfind", "count", "index", "rindex" }) |m| if (eq(u8, name, m) and args.len == 1) {
+    inline for (.{ "find", "rfind", "count", "index", "rindex" }) |m| if (mid == @field(Method, m) and args.len == 1) {
         const needle = byteNeedle(args[0], &nb) orelse return null;
         if (comptime eq(u8, m, "count")) {
             out.* = Value.pint(if (needle.len == 0) @intCast(s.len + 1) else @intCast(std.mem.count(u8, s, needle)));
@@ -1784,7 +1852,7 @@ fn bytesMethod(ctx: *Ctx, node: u32, v: Value, name: []const u8, args: []const V
         }
         return null;
     };
-    if ((eq(u8, name, "startswith") or eq(u8, name, "endswith")) and args.len == 1) {
+    if ((mid == .startswith or mid == .endswith) and args.len == 1) {
         const start = name[0] == 's';
         const one = struct {
             fn f(hay: []const u8, x: []const u8, st: bool) bool {
@@ -1807,7 +1875,7 @@ fn bytesMethod(ctx: *Ctx, node: u32, v: Value, name: []const u8, args: []const V
         }
         return null;
     }
-    if (eq(u8, name, "decode") and args.len <= 1) {
+    if (mid == .decode and args.len <= 1) {
         const enc = if (args.len == 0) "utf-8" else blk: {
             if (args[0].kind() != .str) return null;
             break :blk @as(*value.Str, @ptrCast(args[0].ptr())).bytes();
@@ -1839,7 +1907,7 @@ fn bytesMethod(ctx: *Ctx, node: u32, v: Value, name: []const u8, args: []const V
         }
         return null;
     }
-    if (eq(u8, name, "hex") and args.len == 0) {
+    if (mid == .hex and args.len == 0) {
         const m = allocator.alloc(u8, s.len * 2) catch return oomFail(ctx, node);
         defer allocator.free(m);
         const digits = "0123456789abcdef";
@@ -1851,14 +1919,14 @@ fn bytesMethod(ctx: *Ctx, node: u32, v: Value, name: []const u8, args: []const V
         out.* = Value.obj(.str, &r.head);
         return true;
     }
-    if ((eq(u8, name, "upper") or eq(u8, name, "lower")) and args.len == 0) {
+    if ((mid == .upper or mid == .lower) and args.len == 0) {
         const r = value.newOwnedBytes(s.len) orelse return oomFail(ctx, node);
         const m = value.bytesMemory(r);
         for (s, m) |c, *d| d.* = if (name[0] == 'u') std.ascii.toUpper(c) else std.ascii.toLower(c);
         out.* = Value.obj(.bytes, &r.head);
         return true;
     }
-    if ((eq(u8, name, "strip") or eq(u8, name, "lstrip") or eq(u8, name, "rstrip")) and args.len <= 1) {
+    if ((mid == .strip or mid == .lstrip or mid == .rstrip) and args.len <= 1) {
         const chars = if (args.len == 0 or args[0].kind() == .none) bytes_space else pyBytesOf(args[0]) orelse return null;
         var lo: usize = 0;
         var hi: usize = s.len;
@@ -1870,7 +1938,7 @@ fn bytesMethod(ctx: *Ctx, node: u32, v: Value, name: []const u8, args: []const V
         }
         return bytesResult(ctx, node, value.bytesSlice(@ptrCast(@alignCast(v.ptr())), lo, hi), out);
     }
-    if (eq(u8, name, "split") and args.len == 1) {
+    if (mid == .split and args.len == 1) {
         const sep = pyBytesOf(args[0]) orelse return null;
         if (sep.len == 0) return null;
         const l = value.newList(0) orelse return oomFail(ctx, node);
@@ -1883,7 +1951,7 @@ fn bytesMethod(ctx: *Ctx, node: u32, v: Value, name: []const u8, args: []const V
         }
         return true;
     }
-    if (eq(u8, name, "replace") and args.len == 2) {
+    if (mid == .replace and args.len == 2) {
         const old = pyBytesOf(args[0]) orelse return null;
         const new = pyBytesOf(args[1]) orelse return null;
         if (old.len == 0) return null;
@@ -1893,7 +1961,7 @@ fn bytesMethod(ctx: *Ctx, node: u32, v: Value, name: []const u8, args: []const V
         out.* = Value.obj(.bytes, &r.head);
         return true;
     }
-    if (eq(u8, name, "join") and args.len == 1) {
+    if (mid == .join and args.len == 1) {
         var l = Value.none_v;
         if (!zr_items(ctx, node, args[0].tag, args[0].bits, &l)) return false;
         defer value.decref(l);
@@ -3673,15 +3741,28 @@ export fn zr_unpack(ctx: *Ctx, node: u32, t: u64, bits: u64, n: u64, out: [*]Val
 /// The length of a list (its items' count), for loops over it.
 export fn zr_list_len(t: u64, bits: u64) callconv(.c) u64 {
     const v = Value{ .tag = t, .bits = bits };
+    if (v.kind() == .tuple) return @as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).len;
     return @as(*value.List, @ptrCast(@alignCast(v.ptr()))).len;
 }
 
-/// A list's i-th item (a new reference), for loops over it.
+/// A list's (or a tuple's) i-th item (a new reference), for loops over it.
 export fn zr_list_at(t: u64, bits: u64, i: u64, out: *Value) callconv(.c) void {
     const v = Value{ .tag = t, .bits = bits };
-    const x = @as(*value.List, @ptrCast(@alignCast(v.ptr()))).items.?[i];
+    const x = if (v.kind() == .tuple) @as(*value.Tuple, @ptrCast(@alignCast(v.ptr()))).slice()[i] else @as(*value.List, @ptrCast(@alignCast(v.ptr()))).items.?[i];
     value.incref(x);
     out.* = x;
+}
+
+/// What a loop goes over (zr_list_len, zr_list_at read it): a list or a
+/// tuple itself (a tuple doesn't change: no copy), else zr_items' list.
+export fn zr_iter_items(ctx: *Ctx, node: u32, t: u64, bits: u64, out: *Value) callconv(.c) bool {
+    const v = Value{ .tag = t, .bits = bits };
+    if (v.kind() == .tuple) {
+        value.incref(v);
+        out.* = v;
+        return true;
+    }
+    return zr_items(ctx, node, t, bits, out);
 }
 
 /// list.append(x) (borrowing x)
@@ -3725,21 +3806,23 @@ export fn zr_extend_items(ctx: *Ctx, node: u32, t: u64, bits: u64, items: [*]con
     defer value.decref(lv);
     var r = Value.none_v;
     const ext = value.literal("extend") orelse return oomFail(ctx, node);
-    if (!zr_call_method(ctx, node, t, bits, ext, @ptrCast(&lv), 1, &r)) return false;
+    if (!zr_call_method(ctx, node, t, bits, ext, @intFromEnum(Method.extend), @ptrCast(&lv), 1, &r)) return false;
     value.decref(r);
     return true;
 }
 
 /// A method of a value called with arguments, as Python does it (for
 /// methods that don't change the value: str's, a dict's get...).
-export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value.Str, args: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
+export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value.Str, method: u32, args: [*]const Value, n: u64, out: *Value) callconv(.c) bool {
     const v = Value{ .tag = t, .bits = bits };
+    // (the method by its number: methodOf(name), made when compiling)
+    const mid: Method = @enumFromInt(method);
     // A set's methods: natively (Python would change a copy)
-    if (v.kind() == .set) if (setMethod(ctx, node, v, name.bytes(), args[0..n], out)) |ok| return ok;
-    if (v.kind() == .bytes) if (bytesMethod(ctx, node, v, name.bytes(), args[0..n], out)) |ok| return ok;
+    if (v.kind() == .set) if (setMethod(ctx, node, v, name.bytes(), mid, args[0..n], out)) |ok| return ok;
+    if (v.kind() == .bytes) if (bytesMethod(ctx, node, v, name.bytes(), mid, args[0..n], out)) |ok| return ok;
     // An int's to_bytes(length, byteorder[, signed]): natively; else Python's
     // (signed given back as the keyword it was)
-    if (value.wide(v) != null and std.mem.eql(u8, name.bytes(), "to_bytes")) {
+    if (value.wide(v) != null and mid == .to_bytes) {
         if (toBytes(ctx, node, v, args[0..n], out)) |ok| return ok;
         if (n == 3) {
             gil.allowBegin();
@@ -3758,7 +3841,7 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
         }
     }
     // A dict's get(): natively (Python would see a copy)
-    if (v.kind() == .dict and std.mem.eql(u8, name.bytes(), "get") and (n == 1 or n == 2)) {
+    if (v.kind() == .dict and mid == .get and (n == 1 or n == 2)) {
         const d: *value.Dict = @ptrCast(@alignCast(v.ptr()));
         if (value.hashable(args[0])) {
             const x = value.dictGet(d, args[0]) orelse (if (n == 2) args[1] else Value.none_v);
@@ -3783,8 +3866,8 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
     // from index(): Python's ValueError, its words (an error: what strict
     // mode allows)
     if ((v.kind() == .list or v.kind() == .tuple) and n == 1 and args[0].kind() != .host) {
-        const is_index = std.mem.eql(u8, name.bytes(), "index");
-        if (is_index or std.mem.eql(u8, name.bytes(), "count")) {
+        const is_index = mid == .index;
+        if (is_index or mid == .count) {
             var count: i64 = 0;
             for (itemsOfSeq(v), 0..) |x, i| {
                 if (x.kind() == .host) break;
@@ -3806,12 +3889,12 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
         }
     }
     // A float's is_integer(), hex()
-    if (v.kind() == .float and n == 0 and std.mem.eql(u8, name.bytes(), "is_integer")) {
+    if (v.kind() == .float and n == 0 and mid == .is_integer) {
         const x = v.asFloat();
         out.* = Value.boolean(std.math.isFinite(x) and @floor(x) == x);
         return true;
     }
-    if (v.kind() == .float and n == 0 and std.mem.eql(u8, name.bytes(), "hex")) {
+    if (v.kind() == .float and n == 0 and mid == .hex) {
         var buf: [32]u8 = undefined;
         const r = value.newStr(floatHex(v.asFloat(), &buf)) orelse return oomFail(ctx, node);
         out.* = Value.obj(.str, &r.head);
@@ -3824,10 +3907,10 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
     // A str's common methods, natively (lower() and upper() of any; the
     // others of an ASCII one)
     if (v.kind() == .str) {
-        if (strMethod(ctx, node, @ptrCast(v.ptr()), name.bytes(), args[0..n], out)) |ok| return ok;
+        if (strMethod(ctx, node, @ptrCast(v.ptr()), mid, args[0..n], out)) |ok| return ok;
     }
     // A dict's pop(): natively
-    if (v.kind() == .dict and std.mem.eql(u8, name.bytes(), "pop") and (n == 1 or n == 2) and value.hashable(args[0])) {
+    if (v.kind() == .dict and mid == .pop and (n == 1 or n == 2) and value.hashable(args[0])) {
         const d: *value.Dict = @ptrCast(@alignCast(v.ptr()));
         if (value.dictGet(d, args[0])) |x| {
             value.incref(x);
@@ -3844,7 +3927,7 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
     // A list's extend() by a list or tuple, its pop(): natively
     if (v.kind() == .list) {
         const l: *value.List = @ptrCast(@alignCast(v.ptr()));
-        if (std.mem.eql(u8, name.bytes(), "extend") and n == 1 and (args[0].kind() == .list or args[0].kind() == .tuple)) {
+        if (mid == .extend and n == 1 and (args[0].kind() == .list or args[0].kind() == .tuple)) {
             // (a copy of the items first: a list extended by itself)
             const src = if (args[0].kind() == .list) @as(*value.List, @ptrCast(@alignCast(args[0].ptr()))).slice() else @as(*value.Tuple, @ptrCast(@alignCast(args[0].ptr()))).slice();
             const count = src.len;
@@ -3857,7 +3940,7 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
             out.* = Value.none_v;
             return true;
         }
-        if (std.mem.eql(u8, name.bytes(), "pop") and (n == 0 or (n == 1 and isInt(args[0])))) {
+        if (mid == .pop and (n == 0 or (n == 1 and isInt(args[0])))) {
             if (l.len == 0) return failAs(ctx, node, .IndexError, null, "pop from empty list", .{});
             const at = if (n == 0) l.len - 1 else index(args[0].asInt(), l.len) orelse return failAs(ctx, node, .IndexError, null, "pop index out of range", .{});
             const items = l.items.?;
@@ -4000,12 +4083,13 @@ fn strCase(ctx: *Ctx, node: u32, s: *value.Str, upper: bool, out: *Value) bool {
     return true;
 }
 
-fn strMethod(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []const Value, out: *Value) ?bool {
+fn strMethod(ctx: *Ctx, node: u32, s: *value.Str, mid: Method, args: []const Value, out: *Value) ?bool {
+    if (mid == .other) return null;
     // lower(), upper() beyond ASCII: Python's tables, natively
-    if (args.len == 0 and s.chars != s.len and (std.mem.eql(u8, name, "lower") or std.mem.eql(u8, name, "upper")))
-        return strCase(ctx, node, s, std.mem.eql(u8, name, "upper"), out);
+    if (args.len == 0 and s.chars != s.len and (mid == .lower or mid == .upper))
+        return strCase(ctx, node, s, mid == .upper, out);
     // encode() (UTF-8; ASCII and Latin-1 of strs they hold): a bytes
-    if (std.mem.eql(u8, name, "encode") and args.len <= 1) {
+    if (mid == .encode and args.len <= 1) {
         const enc = if (args.len == 0) "utf-8" else blk: {
             if (args[0].kind() != .str) return null;
             break :blk @as(*value.Str, @ptrCast(args[0].ptr())).bytes();
@@ -4034,8 +4118,8 @@ fn strMethod(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []cons
         }
         return null;
     }
-    if (strMethodAny(ctx, node, s, name, args, out)) |ok| return ok;
-    return strMethodAscii(ctx, node, s, name, args, out);
+    if (strMethodAny(ctx, node, s, mid, args, out)) |ok| return ok;
+    return strMethodAscii(ctx, node, s, mid, args, out);
 }
 
 /// Python's whitespace (str.isspace(), str.split(), str.strip()): these
@@ -4065,8 +4149,7 @@ fn cpBefore(b: []const u8, end: usize) struct { cp: u21, n: usize } {
 /// A str method of any str (UTF-8: substrings found by their bytes,
 /// indexes in code points; whitespace Python's), as Python does it; null
 /// for one (or arguments) not done here.
-fn strMethodAny(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []const Value, out: *Value) ?bool {
-    const eq = std.mem.eql;
+fn strMethodAny(ctx: *Ctx, node: u32, s: *value.Str, mid: Method, args: []const Value, out: *Value) ?bool {
     const b = s.bytes();
     const strOf = struct {
         fn f(x: Value) ?[]const u8 {
@@ -4103,10 +4186,10 @@ fn strMethodAny(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []c
 
     // partition(sep), rpartition(sep): (before, sep, after) at the first
     // (last) sep; not found: (s, "", "") (("", "", s))
-    if ((eq(u8, name, "partition") or eq(u8, name, "rpartition")) and args.len == 1) {
+    if ((mid == .partition or mid == .rpartition) and args.len == 1) {
         const sep = strOf(args[0]) orelse return failAs(ctx, node, .TypeError, null, "must be str, not {s}", .{value.typeName(args[0])});
         if (sep.len == 0) return failAs(ctx, node, .ValueError, null, "empty separator", .{});
-        const last = eq(u8, name, "rpartition");
+        const last = mid == .rpartition;
         const at = if (last) std.mem.lastIndexOf(u8, b, sep) else std.mem.indexOf(u8, b, sep);
         const parts: [3][]const u8 = if (at) |i| .{ b[0..i], sep, b[i + sep.len ..] } else if (last) .{ "", "", b } else .{ b, "", "" };
         const t = value.newTuple(3) orelse return oomFail(ctx, node);
@@ -4122,14 +4205,13 @@ fn strMethodAny(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []c
         return true;
     }
     // find, rfind, index, rindex, count (sub[, start[, end]])
-    const finds = [_][]const u8{ "find", "rfind", "index", "rindex", "count" };
-    for (finds) |m| if (eq(u8, name, m) and args.len >= 1 and args.len <= 3) {
+    if ((mid == .find or mid == .rfind or mid == .index or mid == .rindex or mid == .count) and args.len >= 1 and args.len <= 3) {
         const sub = strOf(args[0]) orelse return null;
         const lo = (Bound.of(s, if (args.len > 1) args[1] else null, 0) orelse return null) orelse return null;
         const hi_raw = (Bound.of(s, if (args.len > 2) args[2] else null, s.len) orelse return null) orelse return null;
         const hi = @min(hi_raw, s.len);
-        const is_count = eq(u8, m, "count");
-        const is_index = eq(u8, m, "index") or eq(u8, m, "rindex");
+        const is_count = mid == .count;
+        const is_index = mid == .index or mid == .rindex;
         // (a start past the end: nothing there, not even "")
         if (lo > s.len or lo > hi) {
             if (is_count) {
@@ -4145,7 +4227,7 @@ fn strMethodAny(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []c
             out.* = Value.pint(if (sub.len == 0) chars(hay) + 1 else @intCast(std.mem.count(u8, hay, sub)));
             return true;
         }
-        const from_end = m[0] == 'r';
+        const from_end = mid == .rfind or mid == .rindex;
         const at = if (from_end) std.mem.lastIndexOf(u8, hay, sub) else std.mem.indexOf(u8, hay, sub);
         if (at) |i| {
             out.* = Value.pint(chars(b[0 .. lo + i]));
@@ -4154,10 +4236,10 @@ fn strMethodAny(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []c
         if (is_index) return failAs(ctx, node, .ValueError, null, "substring not found", .{});
         out.* = Value.pint(-1);
         return true;
-    };
+    }
     // startswith, endswith (a str or a tuple of them)
-    if ((eq(u8, name, "startswith") or eq(u8, name, "endswith")) and args.len == 1) {
-        const starts = eq(u8, name, "startswith");
+    if ((mid == .startswith or mid == .endswith) and args.len == 1) {
+        const starts = mid == .startswith;
         const one = [1]Value{args[0]};
         const subs: []const Value = if (args[0].kind() == .tuple) @as(*value.Tuple, @ptrCast(@alignCast(args[0].ptr()))).slice() else &one;
         for (subs) |x| {
@@ -4171,7 +4253,7 @@ fn strMethodAny(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []c
         return true;
     }
     // replace(old, new): every one; old "": new around every code point
-    if (eq(u8, name, "replace") and args.len == 2) {
+    if (mid == .replace and args.len == 2) {
         const old = strOf(args[0]) orelse return null;
         const new = strOf(args[1]) orelse return null;
         var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -4198,7 +4280,7 @@ fn strMethodAny(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []c
     }
     // strip, lstrip, rstrip ([chars]): Python's whitespace, or the code
     // points of chars
-    if ((eq(u8, name, "strip") or eq(u8, name, "lstrip") or eq(u8, name, "rstrip")) and args.len <= 1) {
+    if ((mid == .strip or mid == .lstrip or mid == .rstrip) and args.len <= 1) {
         const set: ?[]const u8 = if (args.len == 1 and args[0].kind() != .none) (strOf(args[0]) orelse return null) else null;
         const inSet = struct {
             fn f(cp: u21, chars_: ?[]const u8) bool {
@@ -4210,12 +4292,12 @@ fn strMethodAny(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []c
         }.f;
         var lo: usize = 0;
         var hi: usize = b.len;
-        if (name[0] != 'r') while (lo < hi) {
+        if (mid != .rstrip) while (lo < hi) {
             const c = cpAt(b, lo);
             if (!inSet(c.cp, set)) break;
             lo += c.n;
         };
-        if (name[0] != 'l') while (hi > lo) {
+        if (mid != .lstrip) while (hi > lo) {
             const c = cpBefore(b, hi);
             if (!inSet(c.cp, set)) break;
             hi -= c.n;
@@ -4223,7 +4305,7 @@ fn strMethodAny(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []c
         return newStrValue(ctx, node, out, b[lo..hi]);
     }
     // split(sep[, maxsplit]), split() / split(None[, maxsplit]): a list
-    if (eq(u8, name, "split") and args.len <= 2) {
+    if (mid == .split and args.len <= 2) {
         const sep: ?[]const u8 = if (args.len >= 1 and args[0].kind() != .none) (strOf(args[0]) orelse return null) else null;
         var maxsplit: i64 = -1;
         if (args.len == 2) {
@@ -4277,7 +4359,7 @@ fn strMethodAny(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []c
         return true;
     }
     // join (any str between them)
-    if (eq(u8, name, "join") and args.len == 1 and (args[0].kind() == .list or args[0].kind() == .tuple)) {
+    if (mid == .join and args.len == 1 and (args[0].kind() == .list or args[0].kind() == .tuple)) {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(allocator);
         for (itemsOfSeq(args[0]), 0..) |x, i| {
@@ -4293,8 +4375,7 @@ fn strMethodAny(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []c
 
 /// A str method of an ASCII str (one byte one character, Python's case
 /// rules plain); null for one not done here.
-fn strMethodAscii(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []const Value, out: *Value) ?bool {
-    const eq = std.mem.eql;
+fn strMethodAscii(ctx: *Ctx, node: u32, s: *value.Str, mid: Method, args: []const Value, out: *Value) ?bool {
     const b = s.bytes();
     if (s.chars != s.len) return null;
     const strArg = struct {
@@ -4311,35 +4392,35 @@ fn strMethodAscii(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: [
         }
     }.str;
     if (args.len == 0) {
-        if (eq(u8, name, "lower") or eq(u8, name, "upper")) {
+        if (mid == .lower or mid == .upper) {
             const buf = allocator.alloc(u8, b.len) catch return oomFail(ctx, node);
             defer allocator.free(buf);
-            for (b, buf) |c, *d| d.* = if (eq(u8, name, "lower")) std.ascii.toLower(c) else std.ascii.toUpper(c);
+            for (b, buf) |c, *d| d.* = if (mid == .lower) std.ascii.toLower(c) else std.ascii.toUpper(c);
             return result(ctx, node, out, buf);
         }
-        if (eq(u8, name, "strip") or eq(u8, name, "lstrip") or eq(u8, name, "rstrip")) {
+        if (mid == .strip or mid == .lstrip or mid == .rstrip) {
             const ws = " \t\n\r\x0b\x0c\x1c\x1d\x1e\x1f";
-            const t = if (eq(u8, name, "strip")) std.mem.trim(u8, b, ws) else if (eq(u8, name, "lstrip")) std.mem.trimStart(u8, b, ws) else std.mem.trimEnd(u8, b, ws);
+            const t = if (mid == .strip) std.mem.trim(u8, b, ws) else if (mid == .lstrip) std.mem.trimStart(u8, b, ws) else std.mem.trimEnd(u8, b, ws);
             return result(ctx, node, out, t);
         }
         const preds = .{ .{ "isdigit", std.ascii.isDigit }, .{ "isalpha", std.ascii.isAlphabetic }, .{ "isalnum", std.ascii.isAlphanumeric }, .{ "isspace", isPySpace } };
-        inline for (preds) |p| if (eq(u8, name, p[0])) {
+        inline for (preds) |p| if (mid == @field(Method, p[0])) {
             var all = b.len > 0;
             for (b) |c| all = all and p[1](c);
             out.* = Value.boolean(all);
             return true;
         };
-        if (eq(u8, name, "isupper") or eq(u8, name, "islower")) {
+        if (mid == .isupper or mid == .islower) {
             // (cased characters all upper (lower), and at least one)
             var cased = false;
             var ok = true;
             for (b) |c| {
                 if (std.ascii.isUpper(c)) {
                     cased = true;
-                    if (eq(u8, name, "islower")) ok = false;
+                    if (mid == .islower) ok = false;
                 } else if (std.ascii.isLower(c)) {
                     cased = true;
-                    if (eq(u8, name, "isupper")) ok = false;
+                    if (mid == .isupper) ok = false;
                 }
             }
             out.* = Value.boolean(cased and ok);
@@ -4348,7 +4429,7 @@ fn strMethodAscii(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: [
         return null;
     }
     if (args.len == 1) {
-        if (eq(u8, name, "join") and (args[0].kind() == .list or args[0].kind() == .tuple)) {
+        if (mid == .join and (args[0].kind() == .list or args[0].kind() == .tuple)) {
             const items = if (args[0].kind() == .list) @as(*value.List, @ptrCast(@alignCast(args[0].ptr()))).slice() else @as(*value.Tuple, @ptrCast(@alignCast(args[0].ptr()))).slice();
             var buf: std.ArrayListUnmanaged(u8) = .empty;
             defer buf.deinit(allocator);
@@ -4361,17 +4442,17 @@ fn strMethodAscii(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: [
             return result(ctx, node, out, buf.items);
         }
         const sub = strArg(args[0]) orelse return null;
-        if (eq(u8, name, "startswith")) {
+        if (mid == .startswith) {
             out.* = Value.boolean(std.mem.startsWith(u8, b, sub));
             return true;
         }
-        if (eq(u8, name, "endswith")) {
+        if (mid == .endswith) {
             out.* = Value.boolean(std.mem.endsWith(u8, b, sub));
             return true;
         }
-        if (eq(u8, name, "find") or eq(u8, name, "count")) {
+        if (mid == .find or mid == .count) {
             // (the other str may be non-ASCII: then never found in ASCII)
-            if (eq(u8, name, "find")) {
+            if (mid == .find) {
                 out.* = Value.pint(if (std.mem.indexOf(u8, b, sub)) |i| @intCast(i) else -1);
             } else {
                 out.* = Value.pint(@intCast(if (sub.len == 0) b.len + 1 else std.mem.count(u8, b, sub)));
@@ -6437,23 +6518,23 @@ export fn zr_concat(ctx: *Ctx, node: u32, items: [*]const Value, n: u64, out: *V
 
 /// The helpers compiled code calls, by name
 const helper_names = [_][]const u8{
-    "zr_incref",      "zr_decref",        "zr_fail",       "zr_unset",         "zr_overflow",
-    "zr_write",       "zr_print",         "zr_platform",   "zr_binary",        "zr_compare",
-    "zr_unary",       "zr_truthy",        "zr_function",   "zr_call",          "zr_object",
-    "zr_frame_new",   "zr_frame_release", "zr_free",       "zr_list",          "zr_tuple",
-    "zr_dict",        "zr_record",        "zr_is_record",  "zr_getattr",       "zr_setattr",
-    "zr_getitem",     "zr_setitem",       "zr_items",      "zr_wrapping",      "zr_read",
-    "zr_parse",       "zr_native_fail",   "zr_call_site",  "zr_host_jump",     "zr_host_failed",
-    "zr_bury",        "zr_list_len",      "zr_list_at",    "zr_append",        "zr_call_method",
-    "zr_call_python", "zr_is_type",       "zr_global",     "zr_format",        "zr_concat",
-    "zr_unpack",      "zr_varargs",       "zr_record_new", "zr_isinstance",    "zr_call_seq",
-    "zr_slice",       "zr_type",          "zr_builtin",    "zr_range",         "zr_cell",
-    "zr_frame_of",    "zr_extend_items",  "zr_tail_set",   "zr_tail_resolve",  "zr_tail_take",
-    "zr_tail_put",    "zr_tail_clear",    "zr_int_base",   "zr_utf8_len",      "zr_min_max",
-    "zr_math",        "zr_huge_int",      "zr_dict_view",  "zr_new_exception", "zr_call_plain",
-    "zr_int_base_of", "zr_float_hex",     "zr_delitem",    "zr_closure",       "zr_set_global",
-    "zr_set",         "zr_to_set",        "zr_inplace",    "zr_lib",           "zr_sorted",
-    "zr_type_name",   "zr_exc_wrap",
+    "zr_incref",      "zr_decref",        "zr_fail",         "zr_unset",      "zr_overflow",
+    "zr_write",       "zr_print",         "zr_platform",     "zr_binary",     "zr_compare",
+    "zr_unary",       "zr_truthy",        "zr_function",     "zr_call",       "zr_object",
+    "zr_frame_new",   "zr_frame_release", "zr_free",         "zr_list",       "zr_tuple",
+    "zr_dict",        "zr_record",        "zr_is_record",    "zr_getattr",    "zr_setattr",
+    "zr_getitem",     "zr_setitem",       "zr_items",        "zr_iter_items", "zr_wrapping",
+    "zr_read",        "zr_parse",         "zr_native_fail",  "zr_call_site",  "zr_host_jump",
+    "zr_host_failed", "zr_bury",          "zr_list_len",     "zr_list_at",    "zr_append",
+    "zr_call_method", "zr_call_python",   "zr_is_type",      "zr_global",     "zr_format",
+    "zr_concat",      "zr_unpack",        "zr_varargs",      "zr_record_new", "zr_isinstance",
+    "zr_call_seq",    "zr_slice",         "zr_type",         "zr_builtin",    "zr_range",
+    "zr_cell",        "zr_frame_of",      "zr_extend_items", "zr_tail_set",   "zr_tail_resolve",
+    "zr_tail_take",   "zr_tail_put",      "zr_tail_clear",   "zr_int_base",   "zr_utf8_len",
+    "zr_min_max",     "zr_math",          "zr_huge_int",     "zr_dict_view",  "zr_new_exception",
+    "zr_call_plain",  "zr_int_base_of",   "zr_float_hex",    "zr_delitem",    "zr_closure",
+    "zr_set_global",  "zr_set",           "zr_to_set",       "zr_inplace",    "zr_lib",
+    "zr_sorted",      "zr_type_name",     "zr_exc_wrap",
 };
 
 /// The names compiled code calls them by, and their addresses

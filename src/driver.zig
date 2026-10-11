@@ -553,11 +553,18 @@ pub const Compiled = struct {
             if (!std.mem.startsWith(u8, k.*, self.compiler.m.prefix)) continue;
             const z = allocator.dupeZ(u8, k.*) catch return;
             const addr = llvm.lookup(self.view, z);
-            if (addr == 0) {
-                allocator.free(z);
-                continue;
-            }
-            perf_syms.put(allocator, addr, z) catch return;
+            allocator.free(z);
+            if (addr == 0) continue;
+            // (a Python function's code: its name and where it is, after
+            // the symbol)
+            const func = for (self.compiler.helper_fns.items) |h| {
+                if (std.mem.eql(u8, h.name, k.*)) break h.func;
+            } else null;
+            const shown = if (func) |f|
+                std.fmt.allocPrintSentinel(allocator, "{s} {s} ({s}:{d})", .{ k.*, f.qualname, std.fs.path.basename(f.file), f.first_line }, 0) catch return
+            else
+                allocator.dupeZ(u8, k.*) catch return;
+            perf_syms.put(allocator, addr, shown) catch return;
         }
         const addrs = allocator.dupe(usize, perf_syms.keys()) catch return;
         defer allocator.free(addrs);

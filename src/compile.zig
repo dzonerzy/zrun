@@ -2033,11 +2033,12 @@ pub const Compiler = struct {
         .{ "zr_native_fail", "bpili" },
         .{ "zr_setitem", "bpillllll" },
         .{ "zr_items", "bpillp" },
+        .{ "zr_iter_items", "bpillp" },
         .{ "zr_list_len", "lll" },
         .{ "zr_list_at", "vlllp" },
         .{ "zr_append", "bpillll" },
         .{ "zr_extend_items", "bpillpl" },
-        .{ "zr_call_method", "bpillpplp" },
+        .{ "zr_call_method", "bpillpiplp" },
         .{ "zr_call_python", "bpilplp" },
         .{ "zr_global", "bpilpp" },
         .{ "zr_record_new", "bpipp" },
@@ -6907,7 +6908,7 @@ const Gen = struct {
             else => {
                 const slots = try self.a().alloc(ir.Value, 1);
                 slots[0] = try self.tempSlot(inst);
-                try self.storeSlot(slots[0], try self.itemsOf(inst, v));
+                try self.storeSlot(slots[0], try self.loopItemsOf(inst, v));
                 return .{ .runtime = .{ .kind = .plain, .slots = slots } };
             },
         }
@@ -8051,7 +8052,9 @@ const Gen = struct {
         try self.noteShape(args);
         const arr = try self.valueArray(args, inst.node);
         const s = try self.c.m.string(name);
-        const ok = self.call("zr_call_method", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, s, arr, self.k(@intCast(args.len)), self.out });
+        // (the method by number: the runtime compares numbers, not names)
+        const mid = self.k32(@intFromEnum(helpers.methodOf(name)));
+        const ok = self.call("zr_call_method", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, s, mid, arr, self.k(@intCast(args.len)), self.out });
         try self.dropArray(arr, args.len);
         try self.drop(.{ .dyn = d });
         try self.check(ok);
@@ -10322,6 +10325,17 @@ const Gen = struct {
         try self.drop(.{ .dyn = d });
         try self.check(ok);
         return self.loadOut(.list);
+    }
+
+    /// What a loop over a value goes over (an owned reference: a list, or
+    /// a tuple itself, read by zr_list_len and zr_list_at only).
+    fn loopItemsOf(self: *Gen, inst: *Inst, v: SVal) Error!Dyn {
+        const d = try self.materialize(v, inst.node);
+        if (d.shape == .list) return d;
+        const ok = self.call("zr_iter_items", &.{ self.ctx, self.k32(inst.node), d.tag, d.bits, self.out });
+        try self.drop(.{ .dyn = d });
+        try self.check(ok);
+        return self.loadOut(.any);
     }
 
     /// A helper function (one a semantic calls), read once for the
