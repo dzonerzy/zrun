@@ -159,6 +159,7 @@ What `rt` offers:
 | `rt.scope(node)`, `rt.symbol(node)`, `rt.type_of(node)`, `rt.fresh(node)` | zrules' view of names and types; new loop variables each time round |
 | `rt.u8(data, i)` ... `rt.i64be(data, i)` | integers read from data, bounds checked |
 | `rt.wrapping_add(a, b)`, `_sub`, `_mul`, `_shl`, `_shr`, `_ushr` | 64-bit arithmetic that wraps around |
+| `rt.parse(grammar, text, start=None, recover=False)` | text parsed with a zgram grammar while the program runs, its tree read as the program's ([Parsing at run time](#parsing-at-run-time)) |
 
 Tail calls are the language's to decide: a semantic calls `rt.tail_call(f, args)` where the language returns a call's result as it is (Lua's `return f(x)`), and the function is left before the call is made, in every mode, so `return loop(n - 1)` runs in constant stack and errors' call stacks keep one frame for the chain. The semantics' `finally` blocks run before the call; an `except` catching `zrun.TailCall` (or `Exception`) takes it, the call not made. At the top level, outside any function, it's a call whose result is returned.
 
@@ -186,6 +187,31 @@ def crc32(node, rt):
 ```
 
 Lists, dicts and tuples in a result are native at run time, all through, and read-only: a semantic changing one isn't compiled (it runs as Python, where each call makes its own). Given values known only at run time, the function is called as any function is. The reference mode calls it as ever. A function that raises while compiling raises when the code runs it, as the reference mode does (in strict mode, it's a `CompileError`).
+
+### Parsing at run time
+
+A program can parse text while it runs, with any zgram grammar: data it reads (JSON, a config, a packet's text), a command line it vets, source in another language. `rt.parse(grammar, text)` returns the tree's root, read as the program's own nodes are: `node.kind`, the labelled fields (converted as the grammar's `->` actions say), `text`, `span`, `start`, `end`, `children`, `parent`.
+
+```python
+JSON = zgram.compile(json_grammar)          # a module's parser: known when compiling
+
+@lang.eval("Load")
+def load(node, rt):
+    try:
+        root = rt.parse(JSON, rt.eval(node.path_text))
+    except zgram.ParseError as e:           # a ValueError: e.line, e.column, e.offset, e.message
+        rt.error(node, f"bad JSON at {e.line}:{e.column}: {e.message}")
+    return total(root)
+
+def total(n):                                # an ordinary helper: compiled with the semantic
+    if n.kind == "number":
+        return float(n.text)
+    return sum(total(c) for c in n.children)
+```
+
+`start=` picks the start rule; with `recover=True` a syntax error doesn't raise: the result is `(root, errors)`, the broken text error nodes (kind `"<error>"`), each error `(offset, line, column, message)`.
+
+The grammar must be known when compiling (a module-level parser). Compiled code then parses with no Python: zgram's parser is called natively (`GrammarParser.capsule`), the tree is read natively (a parsed node is a value of its own, kept alive by what refers to it), its syntax error is a native `zgram.ParseError`; it runs in strict languages, in `map()` without the GIL, and in standalone programs, where zgram builds the grammar's parsers ahead of time and `build_native` links them with zgram's runtime. A parsed node handed to Python is a `zrun.Node` like the program's (its tree parsed once more in Python for it).
 
 ## Modes
 

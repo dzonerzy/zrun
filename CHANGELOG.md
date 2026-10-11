@@ -5,6 +5,14 @@ All notable changes to zrun are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Needs zgram 0.6.0 (its parsers built ahead of time, `GrammarParser.capsule`).
+
+### Added
+- **`rt.parse(grammar, text, start=None, recover=False)`: parsing at run time.** A program parses text with any zgram grammar while it runs (data, a command line, another language's source) and reads the tree as its own: `node.kind`, the labelled fields converted as the grammar's actions say, `text`, `span`, `children`, `parent`. A syntax error raises `zgram.ParseError`; with `recover=True` the result is `(root, errors)`. In compiled code it needs no Python: zgram's parser called natively, the tree read natively (a parsed node is a value of its own), the error a native `zgram.ParseError` whose line, column, offset and message compiled code reads; so it runs in strict languages, in `map()` without the GIL, and in standalone programs, which link the grammars' parsers zgram builds ahead of time and zgram's runtime (Linux and Windows).
+- **Fields of nodes known only at run time made natively**: `-> str`, `-> int`, `-> float`, `-> unquote`, the constants, `-> list`, `-> tuple`, `-> dict`, `-> first`, as zgram's `parse_ast` makes them (Python's conversion only for an int or float spelled unusually).
+
 ## [0.6.0] - 2026-10-10
 
 Needs zgram 0.5.2, as 0.5.0 did.
