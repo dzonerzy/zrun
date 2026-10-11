@@ -190,7 +190,7 @@ Lists, dicts and tuples in a result are native at run time, all through, and rea
 
 ### Parsing at run time
 
-A program can parse text while it runs, with any zgram grammar: data it reads (JSON, a config, a packet's text), a command line it vets, source in another language. `rt.parse(grammar, text)` returns the tree's root, read as the program's own nodes are: `node.kind`, the labelled fields (converted as the grammar's `->` actions say), `text`, `span`, `start`, `end`, `children`, `parent`.
+A program can parse text while it runs, with any zgram grammar: data it reads (JSON, a config, a packet's text), a command line it vets, source in another language. `rt.parse(grammar, text)` returns the tree's root, read as the program's own nodes are: `node.kind`, the labelled fields (converted as the grammar's `->` actions say), `text`, `span`, `start`, `end`, `children`, `parent`, and `node.find(rule)`: the node and its descendants of that rule, in order (as zgram's `Node.find`; natively one pass over the subtree, which follows the node in the tree).
 
 ```python
 JSON = zgram.compile(json_grammar)          # a module's parser: known when compiling

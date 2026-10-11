@@ -3900,6 +3900,10 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
         out.* = Value.obj(.str, &r.head);
         return true;
     }
+    // node.find(rule) of a node known only at run time: natively
+    if (mid == .find and n == 1 and (v.kind() == .pnode or v.kind() == .node)) {
+        if (@import("bridge.zig").nodeFind(ctx, node, v, args[0], out)) |ok| return ok;
+    }
     // rt.load(), rt.store() of an rt handed over: natively
     if (v.kind() == .rt) {
         if (@import("bridge.zig").rtValueMethod(ctx, node, v, name.bytes(), args[0..n], out)) |ok| return ok;

@@ -223,6 +223,44 @@ def test_parsed_nodes_kept(mode):
             ("value", "1", 1), ("value", "[2, 3]", 7), ("value", "4", 2), ("value", "1", 0)]
 
 
+def found(rt, s):
+    """node.find(rule) of a parsed tree, of a part of it, of a rule it
+    hasn't, and of one of the grammar's that isn't there"""
+    root = rt.parse(JSON, s)
+    inner = root.children[0].children[1]
+    return ([n.text.strip() for n in root.find("number")], [n.text.strip() for n in inner.find("value")],
+            len(root.find("nothing")), len(inner.find("object")), [n.rule for n in root.find("value")][:2])
+
+
+def make_found():
+    lang = zrun.Language(tiny.PARSER, tiny.RULES, strict=True)
+    lang.function("FuncDef")
+    lang.exec("Return")(tiny.return_)
+
+    @lang.eval("Call")
+    def call(node, rt):
+        return found(rt, rt.eval(node.args[0]))
+
+    return lang
+
+
+@pytest.mark.parametrize("mode", ["python", "compiled"])
+def test_node_find(mode):
+    """node.find(): the node and its descendants of a rule, in order, as
+    zgram's Node.find (natively in compiled code)"""
+    program = make_found().load('fn f(s) { return print(s); }', "found.tiny")
+    text = '[1, [2, {"a": 3}], 4]'
+    want = zgram_found(text)
+    assert program.call("f", text, mode=mode) == want
+
+
+def zgram_found(s):
+    root = JSON.parse(s)
+    inner = root.children()[0].children()[1]
+    return ([n.text().strip() for n in root.find("number")], [n.text().strip() for n in inner.find("value")],
+            0, len(inner.find("object")), [n.rule() for n in root.find("value")][:2])
+
+
 def test_actions_without_python(capsys):
     program = alang.load(ASOURCE, "a.prog")
     program.run(mode="compiled", report=True)

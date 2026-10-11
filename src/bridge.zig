@@ -84,6 +84,48 @@ pub fn nodeAttr(ctx: *Ctx, idx: u32, name: *const value.Str, out: *Value) ?bool 
     return attrIn(ctx, nodeSource(ctx, idx), idx, name, out);
 }
 
+/// node.find(rule) of a node only known at run time (the program's, or a
+/// parsed one): the node and its descendants of that rule, in order, as
+/// zgram's Node.find gives them (a new list; none of a rule the grammar
+/// hasn't). The subtree's nodes follow it: one pass over them, a value made
+/// only for those found. Null: not a node, or not a str.
+pub fn nodeFind(ctx: *Ctx, at: u32, v: Value, rule: Value, out: *Value) ?bool {
+    if (rule.kind() != .str) return null;
+    var src: Source = undefined;
+    var idx: u32 = undefined;
+    switch (v.kind()) {
+        .pnode => {
+            const p: *const value.PNode = @ptrCast(@alignCast(v.ptr()));
+            const t: *ptree.Tree = @ptrCast(@alignCast(p.tree));
+            src = .{ .data = t.data, .cache = &t.cache, .parsed = t, .at = at };
+            idx = p.idx;
+        },
+        .node => {
+            src = nodeSource(ctx, at);
+            idx = @intCast(v.bits);
+        },
+        else => return null,
+    }
+    const d = src.data;
+    const l = value.newList(0) orelse return helpers.fail(ctx, at, "out of memory", .{});
+    out.* = Value.obj(.list, &l.head);
+    const name = @as(*const value.Str, @ptrCast(rule.ptr())).bytes();
+    const rid = for (d.grammar.rule_names, 0..) |r, i| {
+        if (std.mem.eql(u8, r, name)) break i;
+    } else return true;
+    var i = idx;
+    const stop = d.end(idx);
+    while (i < stop) : (i += 1) {
+        if (d.rule(i) != rid) continue;
+        const x = src.node(i) orelse return helpers.fail(ctx, at, "out of memory", .{});
+        if (!value.listPush(l, x)) {
+            value.decref(x);
+            return helpers.fail(ctx, at, "out of memory", .{});
+        }
+    }
+    return true;
+}
+
 /// node.name of a node of a tree parsed while the program runs (a PNode),
 /// read the same way; errors at the program's node `at`.
 pub fn parsedAttr(ctx: *Ctx, p: *const value.PNode, at: u32, name: *const value.Str, out: *Value) ?bool {

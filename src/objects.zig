@@ -393,6 +393,8 @@ fn nodeGetattro(obj: ?*PyObject, name_obj: ?*PyObject) callconv(.c) ?*PyObject {
     if (ctx.data.grammar.field_ids.get(name)) |field| return fieldOf(state, ctx, n.idx, field);
     if (meta(n, name)) |result| return result;
     if (py.c.PyErr_Occurred() != null) return null;
+    // (its methods: find)
+    if (std.mem.eql(u8, name, "find")) return py.c.PyObject_GenericGetAttr(obj, name_obj);
     // No such field: say which it has
     const data = ctx.data;
     const rid = data.rule(n.idx);
@@ -484,6 +486,43 @@ fn nodeRepr(obj: ?*PyObject) callconv(.c) ?*PyObject {
     return py.c.PyUnicode_FromFormat("<%U %R%s>", kind, text, dots.ptr);
 }
 
+/// node.find(rule): the node and its descendants of that rule, in order
+/// (zgram's Node.find; none of a rule the grammar hasn't): a list
+fn nodeFind(obj: ?*PyObject, arg: ?*PyObject) callconv(.c) ?*PyObject {
+    const n: *NodeObject = @ptrCast(@alignCast(obj.?));
+    const name = ph.utf8(arg.?, "a rule name") orelse return null;
+    const state = n.state orelse {
+        ph.raise(py.PyExc_RuntimeError(), "this node's program is gone", .{});
+        return null;
+    };
+    const ctx = n.ctx.?;
+    const data = ctx.data;
+    const list = py.c.PyList_New(0) orelse return null;
+    const rid = for (data.grammar.rule_names, 0..) |r, i| {
+        if (std.mem.eql(u8, r, name)) break i;
+    } else return list;
+    var i = n.idx;
+    const stop = data.end(n.idx);
+    while (i < stop) : (i += 1) {
+        if (data.rule(i) != rid) continue;
+        const x = newNode(state, ctx, i) orelse {
+            py.Py_DecRef(list);
+            return null;
+        };
+        defer py.Py_DecRef(x);
+        if (py.c.PyList_Append(list, x) != 0) {
+            py.Py_DecRef(list);
+            return null;
+        }
+    }
+    return list;
+}
+
+var node_methods = [_]py.c.PyMethodDef{
+    .{ .ml_name = "find", .ml_meth = @ptrCast(@constCast(&nodeFind)), .ml_flags = py.c.METH_O, .ml_doc = null },
+    .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
+};
+
 var node_slots = [_]py.c.PyType_Slot{
     .{ .slot = py.c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&nodeDealloc)) },
     .{ .slot = py.c.Py_tp_traverse, .pfunc = @ptrCast(@constCast(&nodeTraverse)) },
@@ -492,7 +531,8 @@ var node_slots = [_]py.c.PyType_Slot{
     .{ .slot = py.c.Py_tp_richcompare, .pfunc = @ptrCast(@constCast(&nodeRichcompare)) },
     .{ .slot = py.c.Py_tp_hash, .pfunc = @ptrCast(@constCast(&nodeHash)) },
     .{ .slot = py.c.Py_tp_repr, .pfunc = @ptrCast(@constCast(&nodeRepr)) },
-    .{ .slot = py.c.Py_tp_doc, .pfunc = @ptrCast(@constCast("A node of the program. Its fields are its labelled children (node.cond), converted as the grammar's -> actions say; a label that repeats is a list. Also: kind (its action's class, else its rule), rule, text, span, start, end, index, children, parent, fields (a field of the same name comes first).")) },
+    .{ .slot = py.c.Py_tp_methods, .pfunc = @ptrCast(@constCast(&node_methods)) },
+    .{ .slot = py.c.Py_tp_doc, .pfunc = @ptrCast(@constCast("A node of the program. Its fields are its labelled children (node.cond), converted as the grammar's -> actions say; a label that repeats is a list. Also: kind (its action's class, else its rule), rule, text, span, start, end, index, children, parent, fields (a field of the same name comes first); find(rule): it and its descendants of that rule, in order.")) },
     .{ .slot = 0, .pfunc = null },
 };
 
