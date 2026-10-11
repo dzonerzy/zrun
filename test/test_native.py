@@ -319,3 +319,82 @@ def test_rt_parse_actions_standalone(zig, tmp_path, capsys):
     lang.exec("Program")(tp.aprogram)
     lang.exec("Show")(tp.show)
     assert native(lang, tp.ASOURCE, tmp_path) == compiled(lang, tp.ASOURCE, capsys)
+
+
+def system_io(node, rt):
+    from os import getcwd, getenv
+    from os.path import exists, isdir, isfile, realpath
+
+    rt.eval(node.args[0])
+    print(getenv("ZRUN_TEST_VALUE"), getenv("ZRUN_TEST_UNSET"), getenv("ZRUN_TEST_UNSET", "else"))
+    print(getcwd() == realpath("."), realpath("sub/../a.txt") == realpath("a.txt"),
+          realpath("nope/x") == realpath(".") + "/nope/x")
+    print(isfile("a.txt"), isdir("a.txt"), exists("a.txt"), isdir("sub"), isfile("sub"), exists("nope"))
+    print(repr(open("lines.txt", encoding="utf-8").read()), repr(open("lines.txt", encoding="utf-8", newline="").read()))
+    print(open("a.txt", "rb").read())
+    print(repr(sys.stdin.read()))
+    try:
+        open("nope", encoding="utf-8").read()
+    except FileNotFoundError as e:
+        print("missing", e.errno, e.filename, str(e))
+    try:
+        open("sub", encoding="utf-8").read()
+    except IsADirectoryError as e:
+        print("directory", e.errno, str(e))
+    try:
+        open("bad.txt", encoding="utf-8").read()
+    except UnicodeDecodeError as e:
+        print("not utf-8", str(e))
+    return 0
+
+
+SYSTEM_IO = ("ü-value None else\nTrue True True\nTrue False True True False False\n"
+             "'one\\ntwo\\nthree\\n' 'one\\r\\ntwo\\rthree\\n'\nb'a\\xc3\\xbc'\n'in\\nput ü'\n"
+             "missing 2 nope [Errno 2] No such file or directory: 'nope'\n"
+             "directory 21 [Errno 21] Is a directory: 'sub'\n"
+             "not utf-8 'utf-8' codec can't decode byte 0xff in position 2: invalid start byte\n")
+
+
+def platform_names(node, rt):
+    from os import name
+
+    rt.eval(node.args[0])
+    print(sys.platform, name, os.name == "nt")
+    return 0
+
+
+def test_platform_standalone(zig, tmp_path, capsys):
+    """sys.platform, os.name in a standalone program: the system's it runs
+    on (a build for another one: that one's), here as Python's"""
+    lang = zrun.Language(tiny.PARSER, tiny.RULES, strict=True)
+    lang.eval("Call")(platform_names)
+    src = "print(0);\n"
+    assert native(lang, src, tmp_path) == compiled(lang, src, capsys) == (
+        0, f"{sys.platform} {os.name} {os.name == 'nt'}\n", "")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="POSIX's paths and errors")
+def test_system_io(zig, tmp_path, capsys, monkeypatch):
+    """os.getenv(), os.getcwd(), os.path's, open(...).read(), sys.stdin.read():
+    natively, in the compiled mode as in Python, and in a standalone
+    program (the same output)"""
+    import io
+
+    lang = zrun.Language(tiny.PARSER, tiny.RULES, strict=True)
+    lang.eval("Call")(system_io)
+    work = tmp_path / "work"
+    (work / "sub").mkdir(parents=True)
+    (work / "a.txt").write_bytes("aü".encode())
+    (work / "lines.txt").write_bytes(b"one\r\ntwo\rthree\n")
+    (work / "bad.txt").write_bytes(b"ok\xffno")
+    monkeypatch.chdir(work)
+    monkeypatch.setenv("ZRUN_TEST_VALUE", "ü-value")
+    monkeypatch.delenv("ZRUN_TEST_UNSET", raising=False)
+    src = "print(0);\n"
+    for mode in ("python", "compiled"):
+        monkeypatch.setattr(sys, "stdin", io.StringIO("in\nput ü"))
+        lang.load(src, "prog.tiny").run(mode=mode)
+        assert capsys.readouterr().out == SYSTEM_IO, mode
+    exe = zrun.build_native(lang, src, str(tmp_path / "prog"), path="prog.tiny")
+    r = subprocess.run([exe], input="in\r\nput ü".encode(), capture_output=True, timeout=300)
+    assert (r.returncode, r.stdout.decode(), r.stderr.decode()) == (0, SYSTEM_IO, "")

@@ -36,6 +36,7 @@ Everything in [Writing fast semantics](writing-fast-semantics.md#what-compiles),
 - builtins: `len`, `int` (a base too), `float`, `str`, `repr`, `bool`, `abs`, `min`, `max`, `sorted`, `chr`, `ord`, `isinstance`, `type`, `range`, `zip`, `enumerate`, `print`
 - `math`'s functions, `struct.pack` / `unpack`, `int.from_bytes` / `to_bytes`, `zlib.crc32` / `adler32`, `bytes.fromhex`
 - output: `print(...)`, `sys.stdout.write(s)`, `sys.stderr.write(s)` (to whatever `sys.stdout` is when they run)
+- input and the system: `sys.stdin.read()` (whatever `sys.stdin` is), `open(path, encoding="utf-8").read()` (`newline=""` too), `open(path, "rb").read()`, `os.getenv()`, `os.getcwd()`, `os.path.isfile()` / `isdir()` / `exists()` / `realpath()`; their errors Python's (`FileNotFoundError` and its `errno`, `filename`; `UnicodeDecodeError`); `sys.platform`, `os.name` read in a function: in a standalone program, the system's it runs on
 - exceptions of Python's builtin classes and zrun's: raised, caught, their `args` and `str()`
 - the module's tables and records the semantics read and change: made native when the program is compiled (`program.report()["module_state"]` says which)
 - a module's table the semantics only read, with records, sets or tables in it (a command table, a list of rules): native all through, made once, a constant of the code (what's in it is the module's when the program is compiled: change it in Python after, and compiled code doesn't see it)

@@ -1995,6 +1995,7 @@ pub const Compiler = struct {
         .{ "zr_unset", "bpip" },
         .{ "zr_overflow", "bpi" },
         .{ "zr_write", "bpiillp" },
+        .{ "zr_platform", "bpiip" },
         .{ "zr_print", "bpiiplllllllp" },
         .{ "zr_binary", "bpiillllp" },
         .{ "zr_compare", "bpiillllp" },
@@ -5599,8 +5600,9 @@ const Gen = struct {
         for (ds) |d| try self.drop(.{ .dyn = d });
         // (a helper that can't leave by a jump: no code for one, each way
         // releasing all that's held here; a standalone build's, its size:
-        // the JIT's code as fast either way)
-        if (c.aot == null or try c.mayJump(func)) try self.statusJumps(status, at) else try self.statusChecked(status);
+        // the JIT's code as fast either way; a strict language's: a jump
+        // that never comes isn't refused, through an `except Exception`)
+        if ((c.aot == null and !c.lang.strict) or try c.mayJump(func)) try self.statusJumps(status, at) else try self.statusChecked(status);
         return .{ .dyn = try self.loadOut(.any) };
     }
 
@@ -7083,6 +7085,7 @@ const Gen = struct {
             },
             .global => |name| return self.global(inst, name, e.pos),
             .attr => |x| {
+                if (try self.platformRead(inst, e)) |which| return self.platformValue(inst, which);
                 // type(v).__name__: natively (zr_type_name)
                 if (std.mem.eql(u8, x.name, "__name__") and x.obj.kind == .call and x.obj.kind.call.args.len == 1 and x.obj.kind.call.keywords.len == 0 and x.obj.kind.call.func.kind == .global) {
                     const callee = try self.global(inst, x.obj.kind.call.func.kind.global, e.pos);
@@ -7118,7 +7121,10 @@ const Gen = struct {
                 return v;
             },
             .starred => return c.unsupportedAt(inst.func, e.pos, "*unpacking is compiled among a call's arguments only", .{}),
-            .import_ => |x| return self.importValue(inst, x, e.pos),
+            .import_ => |x| {
+                if (try self.platformRead(inst, e)) |which| return self.platformValue(inst, which);
+                return self.importValue(inst, x, e.pos);
+            },
             // A function defined in a semantic or helper (lambda lifted:
             // front.Reader.nestedDef): a helper, given its arguments and the
             // variables around it that it reads
@@ -8189,12 +8195,13 @@ const Gen = struct {
     // ------------------------------------------------------------------
 
     /// A call expression of a semantic.
-    /// Whether an expression is sys.stdout (1) or sys.stderr (2), read as
-    /// it's written (`sys.stdout`, `from sys import stdout`); null if not
+    /// Whether an expression is sys.stdin (0), sys.stdout (1) or sys.stderr
+    /// (2), read as it's written (`sys.stdout`, `from sys import stdout`);
+    /// null if not
     fn stdFile(self: *Gen, inst: *Inst, e: *const front.Expr) Error!?u32 {
         const fdOf = struct {
             fn f(name: []const u8) ?u32 {
-                return if (std.mem.eql(u8, name, "stdout")) 1 else if (std.mem.eql(u8, name, "stderr")) 2 else null;
+                return if (std.mem.eql(u8, name, "stdin")) 0 else if (std.mem.eql(u8, name, "stdout")) 1 else if (std.mem.eql(u8, name, "stderr")) 2 else null;
             }
         }.f;
         switch (e.kind) {
@@ -8213,6 +8220,94 @@ const Gen = struct {
         }
     }
 
+    /// Whether an expression is sys.platform (0) or os.name (1), read as
+    /// it's written (`sys.platform`, `from os import name`) in a standalone
+    /// build: the system's it runs on, not the one building it (null: not
+    /// those, or the JIT's: Python's, a constant)
+    fn platformRead(self: *Gen, inst: *Inst, e: *const front.Expr) Error!?u32 {
+        if (self.c.aot == null) return null;
+        const which = struct {
+            fn f(module: []const u8, name: []const u8) ?u32 {
+                if (std.mem.eql(u8, module, "sys") and std.mem.eql(u8, name, "platform")) return 0;
+                if (std.mem.eql(u8, module, "os") and std.mem.eql(u8, name, "name")) return 1;
+                return null;
+            }
+        }.f;
+        switch (e.kind) {
+            .import_ => |im| return if (im.attr) |name| which(im.module, name) else null,
+            .attr => |at| {
+                if (at.obj.kind != .global and at.obj.kind != .import_) return null;
+                inline for (.{ "sys", "os" }) |module| if (which(module, at.name) != null) {
+                    const m = try self.expr(inst, at.obj);
+                    defer self.drop(m) catch {};
+                    if (m != .py) return null;
+                    const mo = py.c.PyImport_ImportModule(module) orelse return error.Python;
+                    defer py.Py_DecRef(mo);
+                    return if (m.py == mo) which(module, at.name) else null;
+                };
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    fn platformValue(self: *Gen, inst: *Inst, which: u32) Error!SVal {
+        try self.callCheck("zr_platform", &.{ self.ctx, self.k32(inst.node), self.k32(which), self.out });
+        return .{ .dyn = try self.loadOut(.str) };
+    }
+
+    const ReadOf = struct { which: helpers.Lib, callee: *PyObject, path: ?*const front.Expr, flag: u32 };
+
+    /// Whether an expression is what `.read()` of reads natively: sys.stdin,
+    /// or open(path, mode, encoding=, newline=) with its mode and keywords
+    /// constants: "rb", or text (mode "r" or "rt", the default) of
+    /// encoding="utf-8", newline None or "" (its file's lines as they
+    /// are); null if not (another open(): Python's, its encoding the
+    /// locale's)
+    fn readOf(self: *Gen, inst: *Inst, e: *const front.Expr) Error!?ReadOf {
+        if (try self.stdFile(inst, e)) |fd| {
+            if (fd != 0) return null;
+            const sys = py.c.PyImport_ImportModule("sys") orelse return error.Python;
+            defer py.Py_DecRef(sys);
+            _ = try self.c.objectIndex(sys);
+            return .{ .which = .read_stdin, .callee = sys, .path = null, .flag = 2 };
+        }
+        if (e.kind != .call) return null;
+        const oc = e.kind.call;
+        if (oc.func.kind != .global or oc.args.len < 1 or oc.args.len > 2) return null;
+        const f = try self.expr(inst, oc.func);
+        defer self.drop(f) catch {};
+        if (f != .py or !isBuiltin(f.py, "open")) return null;
+        var as_bytes = false;
+        if (oc.args.len == 2) {
+            if (oc.args[1].kind != .str) return null;
+            const mode = oc.args[1].kind.str;
+            if (std.mem.eql(u8, mode, "rb")) as_bytes = true else if (!std.mem.eql(u8, mode, "r") and !std.mem.eql(u8, mode, "rt")) return null;
+        }
+        var utf8 = false;
+        var newline_kept = false;
+        for (oc.keywords) |kw| {
+            if (as_bytes) return null;
+            if (std.mem.eql(u8, kw.name, "encoding")) {
+                if (kw.value.kind != .str) return null;
+                const enc = kw.value.kind.str;
+                if (!std.ascii.eqlIgnoreCase(enc, "utf-8") and !std.ascii.eqlIgnoreCase(enc, "utf8")) return null;
+                utf8 = true;
+            } else if (std.mem.eql(u8, kw.name, "newline")) {
+                switch (kw.value.kind) {
+                    .none => newline_kept = false,
+                    .str => |s| if (s.len == 0) {
+                        newline_kept = true;
+                    } else return null,
+                    else => return null,
+                }
+            } else return null;
+        }
+        if (!as_bytes and !utf8) return null;
+        _ = try self.c.objectIndex(f.py);
+        return .{ .which = if (as_bytes) .read_bytes else .read_text, .callee = f.py, .path = oc.args[0], .flag = @intFromBool(newline_kept) };
+    }
+
     fn callExpr(self: *Gen, inst: *Inst, func_e: *const front.Expr, args_e: []const *const front.Expr, kws: []const front.Keyword, pos: front.Pos) Error!SVal {
         const c = self.c;
         // obj.name(...): a method of a value, or an attribute of rt, a node,
@@ -8225,7 +8320,15 @@ const Gen = struct {
         if (func_e.kind == .attr) {
             // sys.stdout.write(s), sys.stderr.write(s): natively (zr_write;
             // sys.stdout as it is when it's written, as Python looks it up)
-            if (std.mem.eql(u8, func_e.kind.attr.name, "write") and args_e.len == 1 and kws.len == 0) if (try self.stdFile(inst, func_e.kind.attr.obj)) |fd| {
+            // open(path, ...).read(), sys.stdin.read(): natively (zr_lib;
+            // osio.zig)
+            if (std.mem.eql(u8, func_e.kind.attr.name, "read") and args_e.len == 0 and kws.len == 0) if (try self.readOf(inst, func_e.kind.attr.obj)) |r| {
+                var path: [1]SVal = undefined;
+                if (r.path) |p| path[0] = try self.operand(inst, p);
+                self.taken(mark);
+                return self.libCall(inst, r.which, r.callee, path[0..@intFromBool(r.path != null)], r.flag);
+            };
+            if (std.mem.eql(u8, func_e.kind.attr.name, "write") and args_e.len == 1 and kws.len == 0) if (try self.stdFile(inst, func_e.kind.attr.obj)) |fd| if (fd != 0) {
                 const v = try self.operand(inst, args_e[0]);
                 self.taken(mark);
                 const d = try self.materialize(v, inst.node);
@@ -8338,6 +8441,7 @@ const Gen = struct {
             for (kws) |kw| {
                 if (std.mem.eql(u8, kw.name, "file")) {
                     fd = try self.stdFile(inst, kw.value) orelse break :print;
+                    if (fd == 0) break :print;
                 } else if (!std.mem.eql(u8, kw.name, "sep") and !std.mem.eql(u8, kw.name, "end") and !std.mem.eql(u8, kw.name, "flush")) break :print;
             }
             for (kws) |kw| {
@@ -9193,6 +9297,11 @@ const Gen = struct {
                 };
                 return self.callHelper(func, inst.node, args);
             }
+        }
+        // The system's: os.getenv(), os.getcwd(), os.path's, natively
+        // (osio.zig; Python functions some of them, not compiled)
+        inline for (.{ .{ "os", "getenv", helpers.Lib.getenv }, .{ "os", "getcwd", helpers.Lib.getcwd }, .{ "os.path", "isfile", helpers.Lib.isfile }, .{ "os.path", "isdir", helpers.Lib.isdir }, .{ "os.path", "exists", helpers.Lib.exists }, .{ "os.path", "realpath", helpers.Lib.realpath } }) |l| {
+            if (isModuleAttr(o, l[0], l[1])) return self.libCall(inst, l[2], o, args, 2);
         }
         const pt = try pyTypes();
         // A bound method of a Python function: the function, its object

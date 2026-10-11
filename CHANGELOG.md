@@ -12,8 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`repr()` natively**: of a str (Python's quotes, and its escapes for every character it doesn't print: `'​'`), an int, a float, a bool, None, and of lists, tuples, dicts and sets of them; `print()` and `str()` of containers write their strs the same way (beyond ASCII they went into Python).
 - **`<<` and `>>` of ints natively** (in 128 bits, past them Python's; a negative count Python's ValueError).
 - **A strict language's module table only read is native all through**: records of record classes, sets, lists and dicts in it, made once, a constant of the code (standalone programs carry it in their image). Before, what was in it stayed Python's, and strict mode refused it.
+- **Reading input and the system natively**, so a standalone program can be a tool (vetter's hook is one): `sys.stdin.read()`, `open(path, encoding="utf-8").read()` (`newline=""` keeping line ends; `"rb"` for bytes), `os.getenv()`, `os.getcwd()`, `os.path.isfile()`, `isdir()`, `exists()`, `realpath()` (`src/osio.zig`: POSIX's calls, Windows' wide ones). Their errors are Python's, native: `FileNotFoundError`, `IsADirectoryError`, `NotADirectoryError`, `PermissionError`, `OSError` with `errno`, `strerror`, `filename` and `[Errno 2] No such file or directory: 'x'`; a file that isn't UTF-8 a `UnicodeDecodeError` with Python's five arguments and words. In the compiled mode stdin is `sys.stdin`'s (read through Python, as output is written); the rest native in both. `open()` of another encoding (the locale's) stays Python's.
+- **`sys.platform` and `os.name` in a standalone program** are the system's it runs on (read in a function): a build for Windows made on Linux sees `win32` and `nt`.
 
 ### Fixed
+- **Strict: a call of a helper inside `try: ... except Exception:`** was refused ("catches rt.tail_call as an exception") in the compiled mode, the call's code ready for jumps it never makes; the code for them is made only when the helper can make one now, as standalone builds did.
 - **`d.items()`, `.keys()`, `.values()` of a dict known while compiling** (a literal given to a helper) went into Python: they're its known items now.
 - **A comprehension unrolled over known tuples** gave the target the tuple's references without its own (as `for` did, fixed in 0.7.1).
 

@@ -48,13 +48,23 @@ pub const Kind = enum(u8) {
     /// zgram.ParseError (a ValueError): rt.parse's syntax error; its value
     /// (line, column, offset, message)
     ParseError,
+    /// open()'s and the others': (errno, strerror, filename) their
+    /// arguments
+    OSError,
+    FileNotFoundError,
+    IsADirectoryError,
+    NotADirectoryError,
+    PermissionError,
+    /// sys.exit(): its code the argument
+    SystemExit,
 
     /// The kind it's a subclass of (null: BaseException)
     pub fn parent(k: Kind) ?Kind {
         return switch (k) {
             .BaseException => null,
-            .Exception => .BaseException,
-            .ArithmeticError, .LookupError, .ValueError, .TypeError, .AttributeError, .NameError, .RuntimeError, .AssertionError, .StopIteration, .BufferError, .ZrunError, .Throw, .StructError => .Exception,
+            .Exception, .SystemExit => .BaseException,
+            .ArithmeticError, .LookupError, .ValueError, .TypeError, .AttributeError, .NameError, .RuntimeError, .AssertionError, .StopIteration, .BufferError, .ZrunError, .Throw, .StructError, .OSError => .Exception,
+            .FileNotFoundError, .IsADirectoryError, .NotADirectoryError, .PermissionError => .OSError,
             .ZeroDivisionError, .OverflowError, .FloatingPointError, .IntegerOverflow => .ArithmeticError,
             .IndexError, .KeyError => .LookupError,
             .UnicodeError, .ParseError => .ValueError,

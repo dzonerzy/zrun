@@ -15,6 +15,7 @@ const types = @import("types.zig");
 const value = @import("value.zig");
 const gil = @import("gil.zig");
 const errors = @import("errors.zig");
+const osio = @import("osio.zig");
 const gc = @import("gc.zig");
 const ptree = @import("ptree.zig");
 const utab = @import("unicode.zig");
@@ -466,7 +467,7 @@ fn pythonBinary(ctx: *Ctx, node: u32, op: Op, a: Value, b: Value, out: *Value) b
         stat("binary {s} {s} {s}", .{ statType(a, &b1), @tagName(op), statType(b, &b2) });
     }
     var objs: [2]*PyObject = undefined;
-    if (!objects(ctx, node,&.{ a, b }, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node, &.{ a, b }, &objs)) return failPython(ctx, node);
     defer for (objs) |o| py.Py_DecRef(o);
     const x = objs[0];
     const y = objs[1];
@@ -1133,7 +1134,7 @@ export fn zr_compare(ctx: *Ctx, node: u32, cmp_code: u32, ta: u64, ba: u64, tb: 
         stat("compare {s} {s} {s}", .{ statType(a, &b1), @tagName(cmp), statType(b, &b2) });
     }
     var objs: [2]*PyObject = undefined;
-    if (!objects(ctx, node,&.{ a, b }, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node, &.{ a, b }, &objs)) return failPython(ctx, node);
     defer for (objs) |o| py.Py_DecRef(o);
     const r: c_int = switch (cmp) {
         .in, .not_in => py.c.PySequence_Contains(objs[1], objs[0]),
@@ -1239,7 +1240,7 @@ export fn zr_unary(ctx: *Ctx, node: u32, op_code: u32, t: u64, bits: u64, out: *
         },
     }
     var objs: [1]*PyObject = undefined;
-    if (!objects(ctx, node,&.{a}, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node, &.{a}, &objs)) return failPython(ctx, node);
     defer py.Py_DecRef(objs[0]);
     const r = switch (op) {
         .neg => py.c.PyNumber_Negative(objs[0]),
@@ -2078,7 +2079,30 @@ fn pythonsOrder(ctx: *Ctx, node: u32, keys: []const Value, reverse: bool, perm: 
 }
 
 /// The library functions done natively (zr_lib)
-pub const Lib = enum(u32) { bytes_of, fromhex, from_bytes, unpack, unpack_from, pack, crc32, adler32, calcsize };
+pub const Lib = enum(u32) {
+    bytes_of,
+    fromhex,
+    from_bytes,
+    unpack,
+    unpack_from,
+    pack,
+    crc32,
+    adler32,
+    calcsize,
+    // the system's (osio.zig): os.getenv(), os.getcwd(), os.path's
+    getenv,
+    getcwd,
+    isfile,
+    isdir,
+    exists,
+    realpath,
+    // open(path, ...).read() (`signed`: 1 newline="", lines kept as
+    // they are; else their ends made "\n"), its bytes ("rb"), and
+    // sys.stdin.read()
+    read_text,
+    read_bytes,
+    read_stdin,
+};
 
 /// A library function of Python's (objects[callee_index]) natively, as
 /// Python computes it; what it doesn't take natively (other kinds of
@@ -2242,7 +2266,170 @@ fn libNative(ctx: *Ctx, node: u32, which: Lib, a: []const Value, signed: u32, ou
             return structPack(ctx, node, fmt, a[1..], out);
         },
         .calcsize => return null,
+        .getenv => {
+            if (a.len < 1 or a.len > 2 or a[0].kind() != .str) return null;
+            const v = osio.getenv(allocator, strBytes(a[0])) catch return oomFail(ctx, node);
+            if (v) |s| {
+                defer allocator.free(s);
+                return strResult(ctx, node, s, out);
+            }
+            const d = if (a.len == 2) a[1] else Value.none_v;
+            value.incref(d);
+            out.* = d;
+            return true;
+        },
+        .getcwd => {
+            if (a.len != 0) return null;
+            const s = osio.getcwd(allocator) catch |e| return osFail(ctx, node, e, null);
+            defer allocator.free(s);
+            return strResult(ctx, node, s, out);
+        },
+        .isfile, .isdir, .exists => {
+            if (a.len != 1 or a[0].kind() != .str) return null;
+            const k = osio.kindOf(allocator, strBytes(a[0])) catch return oomFail(ctx, node);
+            out.* = Value.boolean(switch (which) {
+                .isfile => k == .file,
+                .isdir => k == .dir,
+                else => k != .none,
+            });
+            return true;
+        },
+        .realpath => {
+            if (a.len != 1 or a[0].kind() != .str) return null;
+            const s = osio.realpath(allocator, strBytes(a[0])) catch |e| return osFail(ctx, node, e, null);
+            defer allocator.free(s);
+            return strResult(ctx, node, s, out);
+        },
+        .read_text, .read_bytes => {
+            if (a.len != 1 or a[0].kind() != .str) return failAs(ctx, node, .TypeError, null, "expected str, bytes or os.PathLike object, not {s}", .{value.typeName(if (a.len > 0) a[0] else Value.none_v)});
+            const data = osio.readFile(allocator, strBytes(a[0])) catch |e| return osFail(ctx, node, e, a[0]);
+            defer allocator.free(data);
+            if (which == .read_bytes) return bytesResult(ctx, node, value.bytesOf(data), out);
+            return textResult(ctx, node, data, signed != 1, out);
+        },
+        .read_stdin => {
+            if (a.len != 0) return failAs(ctx, node, .TypeError, null, "read() takes no arguments here", .{});
+            if (!standalone) {
+                // (sys.stdin as it is now, as Python looks it up: I/O, what
+                // strict mode allows)
+                gil.allowBegin();
+                defer gil.allowEnd();
+                const file = py.c.PySys_GetObject("stdin") orelse return failAs(ctx, node, .RuntimeError, null, "lost sys.stdin", .{});
+                return fromResult(ctx, node, py.c.PyObject_CallMethod(file, "read", null), out);
+            }
+            flushOutput();
+            const data = osio.readStdin(allocator) catch |e| return osFail(ctx, node, e, null);
+            defer allocator.free(data);
+            return textResult(ctx, node, data, true, out);
+        },
     }
+}
+
+fn strBytes(v: Value) []const u8 {
+    return @as(*value.Str, @ptrCast(v.ptr())).bytes();
+}
+
+fn strResult(ctx: *Ctx, node: u32, s: []const u8, out: *Value) bool {
+    const r = value.newStr(s) orelse return oomFail(ctx, node);
+    out.* = Value.obj(.str, &r.head);
+    return true;
+}
+
+/// An OSError of the errno osio failed with (FileNotFoundError...: the
+/// class Python makes of it), its file's name the third argument
+fn osFail(ctx: *Ctx, node: u32, e: osio.Error, filename: ?Value) bool {
+    if (e == error.OutOfMemory) return oomFail(ctx, node);
+    const errno = osio.last_errno;
+    const kind: errors.Kind = switch (errno) {
+        2 => .FileNotFoundError,
+        20 => .NotADirectoryError,
+        21 => .IsADirectoryError,
+        1, 13 => .PermissionError,
+        else => .OSError,
+    };
+    const t = value.newTuple(if (filename != null) 3 else 2) orelse return oomFail(ctx, node);
+    const tv = Value.obj(.tuple, &t.head);
+    defer value.decref(tv);
+    t.slice()[0] = Value.pint(errno);
+    const words = value.newStr(osio.errorWords(errno)) orelse return oomFail(ctx, node);
+    t.slice()[1] = Value.obj(.str, &words.head);
+    if (filename) |f| {
+        value.incref(f);
+        t.slice()[2] = f;
+    }
+    const x = value.newExc(@intFromEnum(kind), tv, Value.none_v, Value.none_v, node) orelse return oomFail(ctx, node);
+    const xv = Value.obj(.exc, &x.head);
+    defer value.decref(xv);
+    return raiseExc(ctx, node, xv);
+}
+
+/// A file's text (UTF-8, its line ends made "\n" when `universal`, as
+/// Python's text mode reads them); not UTF-8: Python's UnicodeDecodeError
+fn textResult(ctx: *Ctx, node: u32, data: []const u8, universal: bool, out: *Value) bool {
+    if (!std.unicode.utf8ValidateSlice(data)) return utf8Fail(ctx, node, data);
+    if (!universal or std.mem.indexOfScalar(u8, data, '\r') == null) return strResult(ctx, node, data, out);
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    buf.ensureTotalCapacity(allocator, data.len) catch return oomFail(ctx, node);
+    var i: usize = 0;
+    while (i < data.len) : (i += 1) {
+        if (data[i] == '\r') {
+            buf.appendAssumeCapacity('\n');
+            if (i + 1 < data.len and data[i + 1] == '\n') i += 1;
+        } else buf.appendAssumeCapacity(data[i]);
+    }
+    return strResult(ctx, node, buf.items, out);
+}
+
+/// Python's UnicodeDecodeError of bytes that aren't UTF-8, its words for
+/// the first bad sequence
+fn utf8Fail(ctx: *Ctx, node: u32, data: []const u8) bool {
+    var i: usize = 0;
+    while (i < data.len) {
+        const b = data[i];
+        if (b < 0x80) {
+            i += 1;
+            continue;
+        }
+        const len: usize = if (b >= 0xC2 and b <= 0xDF) 2 else if (b >= 0xE0 and b <= 0xEF) 3 else if (b >= 0xF0 and b <= 0xF4) 4 else 0;
+        const reason, const end = blk: {
+            if (len == 0) break :blk .{ "invalid start byte", i + 1 };
+            var k: usize = 1;
+            while (k < len) : (k += 1) {
+                if (i + k >= data.len) break :blk .{ "unexpected end of data", data.len };
+                const c = data[i + k];
+                const lo: u8, const hi: u8 = if (k > 1) .{ 0x80, 0xBF } else switch (b) {
+                    0xE0 => .{ 0xA0, 0xBF },
+                    0xED => .{ 0x80, 0x9F },
+                    0xF0 => .{ 0x90, 0xBF },
+                    0xF4 => .{ 0x80, 0x8F },
+                    else => .{ 0x80, 0xBF },
+                };
+                if (c < lo or c > hi) break :blk .{ "invalid continuation byte", i + k };
+            }
+            i += len;
+            continue;
+        };
+        // (Python's five arguments: encoding, object, start, end, reason)
+        const t = value.newTuple(5) orelse return oomFail(ctx, node);
+        const tv = Value.obj(.tuple, &t.head);
+        defer value.decref(tv);
+        const items = t.slice();
+        for (items) |*x| x.* = Value.none_v;
+        const enc = value.newStr("utf-8") orelse return oomFail(ctx, node);
+        items[0] = Value.obj(.str, &enc.head);
+        const obj = value.bytesOf(data) orelse return oomFail(ctx, node);
+        items[1] = Value.obj(.bytes, &obj.head);
+        items[2] = Value.pint(@intCast(i));
+        items[3] = Value.pint(@intCast(end));
+        const why = value.newStr(reason) orelse return oomFail(ctx, node);
+        items[4] = Value.obj(.str, &why.head);
+        const x = value.newExc(@intFromEnum(errors.Kind.UnicodeDecodeError), tv, Value.none_v, Value.none_v, node) orelse return oomFail(ctx, node);
+        const xv = Value.obj(.exc, &x.head);
+        defer value.decref(xv);
+        return raiseExc(ctx, node, xv);
+    }
+    return fail(ctx, node, "not UTF-8", .{});
 }
 
 // ----------------------------------------------------------------------
@@ -2897,7 +3084,7 @@ export fn zr_isinstance(ctx: *Ctx, node: u32, t: u64, bits: u64, cls_index: u64,
     gil.ensureAt(@src(), node, ctx.object(cls_index));
     const v = Value{ .tag = t, .bits = bits };
     var objs: [1]*PyObject = undefined;
-    if (!objects(ctx, node,&.{v}, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node, &.{v}, &objs)) return failPython(ctx, node);
     defer py.Py_DecRef(objs[0]);
     const r = py.c.PyObject_IsInstance(objs[0], ctx.object(cls_index));
     if (r < 0) return failPython(ctx, node);
@@ -3030,7 +3217,7 @@ export fn zr_getattr(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value
         stat("getattr {s}.{s}", .{ statType(v, &b), name.bytes() });
     }
     var objs: [1]*PyObject = undefined;
-    if (!objects(ctx, node,&.{v}, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node, &.{v}, &objs)) return failPython(ctx, node);
     defer py.Py_DecRef(objs[0]);
     const key = ph.newString(name.bytes()) orelse return failPython(ctx, node);
     defer py.Py_DecRef(key);
@@ -3188,7 +3375,7 @@ export fn zr_getitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
         stat("getitem {s}[{s}]", .{ statType(v, &b1), statType(k, &b2) });
     }
     var objs: [2]*PyObject = undefined;
-    if (!objects(ctx, node,&.{ v, k }, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node, &.{ v, k }, &objs)) return failPython(ctx, node);
     defer for (objs) |o| py.Py_DecRef(o);
     return fromResult(ctx, node, py.c.PyObject_GetItem(objs[0], objs[1]), out);
 }
@@ -3198,7 +3385,7 @@ export fn zr_getitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
 /// it, its error the same.
 export fn zr_wrapping(ctx: *Ctx, node: u32, op: u32, at: u64, ab: u64, bt: u64, bb: u64, out: *Value) callconv(.c) bool {
     var objs: [2]*PyObject = undefined;
-    if (!objects(ctx, node,&.{ .{ .tag = at, .bits = ab }, .{ .tag = bt, .bits = bb } }, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node, &.{ .{ .tag = at, .bits = ab }, .{ .tag = bt, .bits = bb } }, &objs)) return failPython(ctx, node);
     defer for (objs) |o| py.Py_DecRef(o);
     return fromResult(ctx, node, @import("wrapping.zig").ofPython(@enumFromInt(op), objs[0], objs[1]), out);
 }
@@ -3208,7 +3395,7 @@ export fn zr_wrapping(ctx: *Ctx, node: u32, op: u32, at: u64, ab: u64, bt: u64, 
 export fn zr_read(ctx: *Ctx, node: u32, r: u32, dt: u64, db: u64, at: u64, ab: u64, out: *Value) callconv(.c) bool {
     const read: @import("bytes.zig").Read = @enumFromInt(r);
     var objs: [2]*PyObject = undefined;
-    if (!objects(ctx, node,&.{ .{ .tag = dt, .bits = db }, .{ .tag = at, .bits = ab } }, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node, &.{ .{ .tag = dt, .bits = db }, .{ .tag = at, .bits = ab } }, &objs)) return failPython(ctx, node);
     defer for (objs) |o| py.Py_DecRef(o);
     return fromResult(ctx, node, @import("bytes.zig").read(read, objs[0], objs[1]), out);
 }
@@ -3248,7 +3435,7 @@ export fn zr_setitem(ctx: *Ctx, node: u32, t: u64, bits: u64, kt: u64, kb: u64, 
         // (a Python object: itself changed, as Python does it)
         .host => {
             var objs: [3]*PyObject = undefined;
-            if (!objects(ctx, node,&.{ v, k, x }, &objs)) return failPython(ctx, node);
+            if (!objects(ctx, node, &.{ v, k, x }, &objs)) return failPython(ctx, node);
             defer for (objs) |o| py.Py_DecRef(o);
             if (py.c.PyObject_SetItem(objs[0], objs[1], objs[2]) != 0) return failPython(ctx, node);
             return true;
@@ -3326,7 +3513,7 @@ export fn zr_items(ctx: *Ctx, node: u32, t: u64, bits: u64, out: *Value) callcon
         stat("items {s}", .{statType(v, &b)});
     }
     var objs: [1]*PyObject = undefined;
-    if (!objects(ctx, node,&.{v}, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node, &.{v}, &objs)) return failPython(ctx, node);
     defer py.Py_DecRef(objs[0]);
     const seq = py.c.PySequence_List(objs[0]);
     return fromResult(ctx, node, seq, out);
@@ -3376,7 +3563,7 @@ export fn zr_dict_view(ctx: *Ctx, node: u32, which: u32, t: u64, bits: u64, out:
         gil.ensureNamed(@src(), node, std.fmt.bufPrint(&nb, "{s}.{s}", .{ value.typeName(v), names[which] }) catch names[which]);
     } else gil.ensure(@src());
     var objs: [1]*PyObject = undefined;
-    if (!objects(ctx, node,&.{v}, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node, &.{v}, &objs)) return failPython(ctx, node);
     defer py.Py_DecRef(objs[0]);
     const view = py.c.PyObject_CallMethod(objs[0], names[which].ptr, null) orelse return failPython(ctx, node);
     defer py.Py_DecRef(view);
@@ -3469,7 +3656,7 @@ export fn zr_unpack(ctx: *Ctx, node: u32, t: u64, bits: u64, n: u64, out: [*]Val
     gil.ensureAt(@src(), node, null);
     const f = unpacker(n) orelse return failPython(ctx, node);
     var objs: [1]*PyObject = undefined;
-    if (!objects(ctx, node,&.{v}, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node, &.{v}, &objs)) return failPython(ctx, node);
     defer py.Py_DecRef(objs[0]);
     const r = py.c.PyObject_CallFunctionObjArgs(f, objs[0], @as(?*PyObject, null)) orelse return failPython(ctx, node);
     defer py.Py_DecRef(r);
@@ -3504,7 +3691,7 @@ export fn zr_append(ctx: *Ctx, node: u32, t: u64, bits: u64, xt: u64, xb: u64) c
     if (v.kind() != .list) {
         // (a Python object's append(), or Python's error)
         var objs: [2]*PyObject = undefined;
-        if (!objects(ctx, node,&.{ v, x }, &objs)) return failPython(ctx, node);
+        if (!objects(ctx, node, &.{ v, x }, &objs)) return failPython(ctx, node);
         defer for (objs) |o| py.Py_DecRef(o);
         const r = py.c.PyObject_CallMethod(objs[0], "append", "(O)", objs[1]) orelse return failPython(ctx, node);
         py.Py_DecRef(r);
@@ -4407,6 +4594,20 @@ fn emit(ctx: *Ctx, node: u32, fd: u32, text: []const u8) bool {
     return true;
 }
 
+/// sys.platform (0), os.name (1) of the system this runs on (a standalone
+/// build's: its target's)
+export fn zr_platform(ctx: *Ctx, node: u32, which: u32, out: *Value) callconv(.c) bool {
+    const tag = @import("builtin").os.tag;
+    const s: []const u8 = if (which == 1) (if (tag == .windows) "nt" else "posix") else switch (tag) {
+        .windows => "win32",
+        .macos => "darwin",
+        else => @tagName(tag),
+    };
+    const r = value.literal(s) orelse return oomFail(ctx, node);
+    out.* = Value.obj(.str, &r.head);
+    return true;
+}
+
 /// sys.stdout.write(s) (fd 1), sys.stderr.write(s) (2): the str written,
 /// its length in characters the result.
 export fn zr_write(ctx: *Ctx, node: u32, fd: u32, t: u64, bits: u64, out: *Value) callconv(.c) bool {
@@ -4674,6 +4875,31 @@ fn reprInto(ctx: *Ctx, v: Value, buf: *std.ArrayListUnmanaged(u8)) bool {
 fn excStr(ctx: *Ctx, e: *value.Exc, buf: *std.ArrayListUnmanaged(u8)) bool {
     const args = @as(*value.Tuple, @ptrCast(@alignCast(e.args.ptr()))).slice();
     if (args.len == 0) return true;
+    // (an OSError of an errno and its words, a file's name after them:
+    // `[Errno 2] No such file or directory: 'x'`, as Python writes it)
+    if ((args.len == 2 or args.len == 3) and @as(errors.Kind, @enumFromInt(e.kind)).isA(.OSError)) {
+        buf.appendSlice(allocator, "[Errno ") catch return false;
+        if (!strInto(ctx, args[0], buf)) return false;
+        buf.appendSlice(allocator, "] ") catch return false;
+        if (!strInto(ctx, args[1], buf)) return false;
+        if (args.len == 3) {
+            buf.appendSlice(allocator, ": ") catch return false;
+            return reprInto(ctx, args[2], buf);
+        }
+        return true;
+    }
+    // (a UnicodeDecodeError of its five: the bad bytes and why)
+    if (args.len == 5 and e.kind == @intFromEnum(errors.Kind.UnicodeDecodeError) and args[1].kind() == .bytes and isInt(args[2]) and isInt(args[3])) {
+        const start = args[2].asInt();
+        const end = args[3].asInt();
+        const data = anyBytes(args[1]).?;
+        buf.append(allocator, '\'') catch return false;
+        if (!strInto(ctx, args[0], buf)) return false;
+        if (end - start == 1 and start >= 0 and start < data.len) {
+            buf.print(allocator, "' codec can't decode byte 0x{x:0>2} in position {d}: ", .{ data[@intCast(start)], start }) catch return false;
+        } else buf.print(allocator, "' codec can't decode bytes in position {d}-{d}: ", .{ start, end - 1 }) catch return false;
+        return strInto(ctx, args[4], buf);
+    }
     if (args.len == 1) {
         if (e.kind == @intFromEnum(errors.Kind.KeyError)) return reprInto(ctx, args[0], buf);
         return strInto(ctx, args[0], buf);
@@ -4783,6 +5009,25 @@ fn excAttr(v: Value, name: []const u8, out: *Value) bool {
             out.* = items[i];
             return true;
         };
+    }
+    // (an OSError's errno, strerror, filename; SystemExit's code)
+    const args = @as(*value.Tuple, @ptrCast(@alignCast(e.args.ptr()))).slice();
+    if (kind.isA(.OSError)) inline for (.{ "errno", "strerror", "filename" }, 0..) |field, i| if (eq(u8, name, field)) {
+        const x = if (args.len >= 2 and i < args.len) args[i] else Value.none_v;
+        value.incref(x);
+        out.* = x;
+        return true;
+    };
+    if (kind == .UnicodeDecodeError and args.len == 5) inline for (.{ "encoding", "object", "start", "end", "reason" }, 0..) |field, i| if (eq(u8, name, field)) {
+        value.incref(args[i]);
+        out.* = args[i];
+        return true;
+    };
+    if (kind == .SystemExit and eq(u8, name, "code")) {
+        const x = if (args.len == 1) args[0] else if (args.len == 0) Value.none_v else e.args;
+        value.incref(x);
+        out.* = x;
+        return true;
     }
     const r: Value = if (eq(u8, name, "args")) e.args else if (kind == .Throw and eq(u8, name, "value")) e.value else if ((kind == .Throw or kind == .ZrunError) and eq(u8, name, "message")) e.message else if (kind == .ZrunError and eq(u8, name, "diagnostic")) v else if (eq(u8, name, "__cause__")) e.cause else return false;
     value.incref(r);
@@ -4895,7 +5140,7 @@ export fn zr_slice(ctx: *Ctx, node: u32, t: u64, bits: u64, lt: u64, lb: u64, ht
         return true;
     }
     var objs: [4]*PyObject = undefined;
-    if (!objects(ctx, node,&.{ v, bounds[0], bounds[1], bounds[2] }, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node, &.{ v, bounds[0], bounds[1], bounds[2] }, &objs)) return failPython(ctx, node);
     defer for (objs) |o| py.Py_DecRef(o);
     const sl = py.c.PySlice_New(objs[1], objs[2], objs[3]) orelse return failPython(ctx, node);
     defer py.Py_DecRef(sl);
@@ -5717,7 +5962,7 @@ export fn zr_utf8_len(ctx: *Ctx, node: u32, t: u64, bits: u64, out: *Value) call
     }
     gil.ensureAt(@src(), node, null);
     var objs: [1]*PyObject = undefined;
-    if (!objects(ctx, node,&.{v}, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node, &.{v}, &objs)) return failPython(ctx, node);
     defer py.Py_DecRef(objs[0]);
     const encoded = py.c.PyObject_CallMethod(objs[0], "encode", "s", "utf-8") orelse return failPython(ctx, node);
     defer py.Py_DecRef(encoded);
@@ -5921,7 +6166,7 @@ export fn zr_format(ctx: *Ctx, node: u32, t: u64, bits: u64, conversion: u32, sp
     }
     gil.ensureAt(@src(), node, null);
     var objs: [1]*PyObject = undefined;
-    if (!objects(ctx, node,&.{v}, &objs)) return failPython(ctx, node);
+    if (!objects(ctx, node, &.{v}, &objs)) return failPython(ctx, node);
     var o = objs[0];
     defer py.Py_DecRef(o);
     if (conversion != 0) {
@@ -6192,30 +6437,23 @@ export fn zr_concat(ctx: *Ctx, node: u32, items: [*]const Value, n: u64, out: *V
 
 /// The helpers compiled code calls, by name
 const helper_names = [_][]const u8{
-    "zr_incref",   "zr_decref",     "zr_fail",       "zr_unset",         "zr_overflow",
-    "zr_write",    "zr_print",
-    "zr_binary",   "zr_compare",    "zr_unary",      "zr_truthy",        "zr_function",
-    "zr_call",     "zr_object",     "zr_frame_new",  "zr_frame_release", "zr_free",
-    "zr_list",     "zr_tuple",      "zr_dict",       "zr_record",        "zr_is_record",
-    "zr_getattr",  "zr_setattr",    "zr_getitem",    "zr_setitem",       "zr_items",
-    "zr_wrapping", "zr_read", "zr_parse", "zr_native_fail", "zr_call_site", "zr_host_jump", "zr_host_failed", "zr_bury",
-    "zr_list_len", "zr_list_at",    "zr_append",     "zr_call_method",   "zr_call_python",
-    "zr_is_type",  "zr_global",     "zr_format",     "zr_concat",        "zr_unpack",
-    "zr_varargs",  "zr_record_new", "zr_isinstance", "zr_call_seq",      "zr_slice",
-    "zr_type",     "zr_builtin",    "zr_range",      "zr_cell",          "zr_frame_of",
-    "zr_extend_items", "zr_tail_set", "zr_tail_resolve", "zr_tail_take", "zr_tail_put", "zr_tail_clear",
-    "zr_int_base", "zr_utf8_len", "zr_min_max", "zr_math", "zr_huge_int", "zr_dict_view",
-    "zr_new_exception", "zr_call_plain", "zr_int_base_of", "zr_float_hex",
-    "zr_delitem",
-    "zr_closure",
-    "zr_set_global",
-    "zr_set",
-    "zr_to_set",
-    "zr_inplace",
-    "zr_lib",
-    "zr_sorted",
-    "zr_type_name",
-    "zr_exc_wrap",
+    "zr_incref",      "zr_decref",        "zr_fail",       "zr_unset",         "zr_overflow",
+    "zr_write",       "zr_print",         "zr_platform",   "zr_binary",        "zr_compare",
+    "zr_unary",       "zr_truthy",        "zr_function",   "zr_call",          "zr_object",
+    "zr_frame_new",   "zr_frame_release", "zr_free",       "zr_list",          "zr_tuple",
+    "zr_dict",        "zr_record",        "zr_is_record",  "zr_getattr",       "zr_setattr",
+    "zr_getitem",     "zr_setitem",       "zr_items",      "zr_wrapping",      "zr_read",
+    "zr_parse",       "zr_native_fail",   "zr_call_site",  "zr_host_jump",     "zr_host_failed",
+    "zr_bury",        "zr_list_len",      "zr_list_at",    "zr_append",        "zr_call_method",
+    "zr_call_python", "zr_is_type",       "zr_global",     "zr_format",        "zr_concat",
+    "zr_unpack",      "zr_varargs",       "zr_record_new", "zr_isinstance",    "zr_call_seq",
+    "zr_slice",       "zr_type",          "zr_builtin",    "zr_range",         "zr_cell",
+    "zr_frame_of",    "zr_extend_items",  "zr_tail_set",   "zr_tail_resolve",  "zr_tail_take",
+    "zr_tail_put",    "zr_tail_clear",    "zr_int_base",   "zr_utf8_len",      "zr_min_max",
+    "zr_math",        "zr_huge_int",      "zr_dict_view",  "zr_new_exception", "zr_call_plain",
+    "zr_int_base_of", "zr_float_hex",     "zr_delitem",    "zr_closure",       "zr_set_global",
+    "zr_set",         "zr_to_set",        "zr_inplace",    "zr_lib",           "zr_sorted",
+    "zr_type_name",   "zr_exc_wrap",
 };
 
 /// The names compiled code calls them by, and their addresses
