@@ -42,7 +42,8 @@ def zig(monkeypatch, tmp_path_factory):
 def native(lang, source, tmp_path, name="prog.tiny"):
     """The program built standalone and run: (exit code, out, err)."""
     exe = zrun.build_native(lang, source, str(tmp_path / "prog"), path=name)
-    r = subprocess.run([exe], capture_output=True, text=True, timeout=300)
+    # (its output is UTF-8, whatever Windows' code page is)
+    r = subprocess.run([exe], capture_output=True, text=True, encoding="utf-8", timeout=300)
     return r.returncode, r.stdout, r.stderr
 
 
