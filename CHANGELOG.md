@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-10-12
+
+### Fixed
+- **A known list changed by a helper inside its caller's run-time control flow** (`if a == "yes": push(out, x)`, a loop over run-time items calling it) was changed while compiling: once, whichever path ran (`len(out)` 1 with `a` "no"). The change is the run's now, the list made at run time. The same when a helper had returned from inside a loop on some paths before changing it: then also "LLVM rejected the compiled program: Instruction does not dominate all uses". Known dicts' items set (`d[k] = v`) likewise.
+
 ## [0.7.2] - 2026-10-11
 
 ### Added

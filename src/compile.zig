@@ -3550,15 +3550,22 @@ const Gen = struct {
     /// of their own, no return from inside one, no loop since they
     /// started): run-time control flow around them only, so every path
     /// their code is on from here is this one (the variables can refer to
-    /// the run-time object from here).
+    /// the run-time object from here). The semantics they called, running
+    /// here, too: code after a return from inside a callee's run-time
+    /// control flow is on some of its callers' paths only (one whose
+    /// variable let go of the container, moved, as much).
     fn straightFor(self: *Gen, ptr: *const anyopaque) bool {
+        var referred = false;
         for (self.insts.items) |inst| {
-            const refers = for (inst.locals) |l| switch (l) {
-                .static => |sv| if (refersTo(sv, ptr, 4)) break true,
-                else => {},
-            } else false;
-            if (!refers) continue;
-            if (inst.dyn_depth > 0 or inst.result_slot != null or inst.loop_level0 != self.loop_level) return false;
+            if (!referred) {
+                referred = for (inst.locals) |l| switch (l) {
+                    .static => |sv| if (refersTo(sv, ptr, 4)) break true,
+                    else => {},
+                } else false;
+                if (!referred) continue;
+                if (inst.loop_level0 != self.loop_level) return false;
+            }
+            if (inst.dyn_depth > 0 or inst.result_slot != null) return false;
         }
         return true;
     }
@@ -3588,6 +3595,19 @@ const Gen = struct {
             };
         }
         return false;
+    }
+
+    /// Whether a known list or dict can be changed here while compiling:
+    /// this code runs on every path of the semantics whose variables refer
+    /// to it (straightFor: none in run-time control flow, after a return
+    /// from inside one or in a loop since, nor the semantics they called
+    /// running here: a helper appending to its caller's list inside the
+    /// caller's `if` is in it). Else the change is the run's, the container
+    /// made at run time.
+    fn changesKnown(self: *Gen, inst: *const Inst, obj: SVal) bool {
+        if (inst.dyn_depth > 0 or inst.result_slot != null) return false;
+        const ptr = containerPtr(obj) orelse return true;
+        return self.straightFor(ptr);
     }
 
     /// Inside run-time control flow (after a return from inside it too: the
@@ -6561,7 +6581,7 @@ const Gen = struct {
         _ = pos;
         try self.refuseComptimeChange(obj, "an item set in");
         switch (obj) {
-            .list, .dict => if (inst.dyn_depth == 0 and key.isStatic() and isScalar(key)) {
+            .list, .dict => if (self.changesKnown(inst, obj) and key.isStatic() and isScalar(key)) {
                 if (obj == .dict) return self.sdictSet(obj.dict, key, v);
                 const items = obj.list.items.items;
                 if (intOf(key)) |ki| {
@@ -7968,25 +7988,27 @@ const Gen = struct {
         const c = self.c;
         const eq = std.mem.eql;
         for (mutating_methods) |m| if (eq(u8, name, m)) try self.refuseComptimeChange(obj, "a method changing");
-        // A known list or dict changed while nothing runs at run time: now
-        if (inst.dyn_depth == 0) {
-            switch (obj) {
-                // (not a list put inside itself: at run time, its cycle
-                // the run's)
-                .list => |l| if (eq(u8, name, "append") and args.len == 1 and !holdsList(args[0], l)) {
-                    try l.items.append(self.a(), args[0]);
-                    return .none;
-                } else if (eq(u8, name, "extend") and args.len == 1 and args[0] == .list and args[0].list != l and args[0].list.frozen == null and !self.aliased(args[0].list)) {
-                    // (by a list made here: its items, theirs now)
-                    try l.items.appendSlice(self.a(), args[0].list.items.items);
-                    args[0].list.taken = true;
-                    return .none;
-                },
-                .dict => |d| if (eq(u8, name, "get") and args.len >= 1 and args.len <= 2 and args[0].isStatic()) {
-                    if (d.find(args[0])) |i| return self.copyOf(d.values.items[i]);
-                    return if (args.len == 2) args[1] else SVal.none;
-                },
-                else => {},
+        // A known list changed on every path that refers to it: now
+        if (obj == .list and self.changesKnown(inst, obj)) {
+            const l = obj.list;
+            // (not a list put inside itself: at run time, its cycle the
+            // run's)
+            if (eq(u8, name, "append") and args.len == 1 and !holdsList(args[0], l)) {
+                try l.items.append(self.a(), args[0]);
+                return .none;
+            } else if (eq(u8, name, "extend") and args.len == 1 and args[0] == .list and args[0].list != l and args[0].list.frozen == null and !self.aliased(args[0].list)) {
+                // (by a list made here: its items, theirs now)
+                try l.items.appendSlice(self.a(), args[0].list.items.items);
+                args[0].list.taken = true;
+                return .none;
+            }
+        }
+        // A known dict read while nothing runs at run time: now
+        if (inst.dyn_depth == 0 and obj == .dict) {
+            const d = obj.dict;
+            if (eq(u8, name, "get") and args.len >= 1 and args.len <= 2 and args[0].isStatic()) {
+                if (d.find(args[0])) |i| return self.copyOf(d.values.items[i]);
+                return if (args.len == 2) args[1] else SVal.none;
             }
         }
         // Known str methods on known arguments: Python's result now

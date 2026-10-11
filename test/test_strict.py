@@ -289,3 +289,71 @@ def test_a_module_set_only_read():
     p = lang.load("fn f(a, b) { return a + b; }", "set.tiny")
     for a, b in [("if", "x"), (3, "while"), ((1, "x"), 4), ("", 3)]:
         assert p.call("f", a, b) == p.call("f", a, b, mode="python")
+
+
+@dataclass
+class Finding:
+    kind: str
+    text: str
+
+
+def add_once(out, kind, text):
+    for f in out:
+        if f.kind == kind and f.text == text:
+            return
+    out.append(Finding(kind, text))
+
+
+def test_a_known_list_changed_after_a_return_from_a_loop():
+    # a helper returning from inside a loop on some paths, the list it was
+    # given changed after (on the others): the caller's list is the run's,
+    # whichever path ran (it was the change's on all: a value LLVM rejected)
+    lang = _language(True)
+
+    @lang.eval("BinOp")
+    def binop(node, rt):
+        a = rt.eval(node.left)
+        b = rt.eval(node.right)
+        out = [Finding("x", a)]
+        add_once(out, "x", b)
+        add_once(out, "y", b)
+        add_once(out, "y", b)
+        return [f.kind + "=" + f.text for f in out]
+
+    p = lang.load("fn f(a, b) { return a + b; }", "once.tiny")
+    for a, b in [("1", "1"), ("1", "2")]:
+        assert p.call("f", a, b) == p.call("f", a, b, mode="python")
+    assert p.call("f", "1", "2") == ["x=1", "x=2", "y=2"]
+
+
+def push(out, s):
+    out.append(s)
+
+
+def test_a_known_list_a_helper_changes_in_its_callers_flow():
+    # a helper changing its caller's list, called inside the caller's `if`
+    # or loop over run-time items: the change the run's, on the paths it's
+    # on (it was made while compiling: once, whichever ran)
+    lang = _language(True)
+
+    @lang.eval("BinOp")
+    def binop(node, rt):
+        a = rt.eval(node.left)
+        b = rt.eval(node.right)
+        out = []
+        if a == "yes":
+            push(out, "if")
+        for c in b:
+            if c == "x":
+                push(out, c)
+        seen = []
+        for c in "axbx":
+            if c == b:
+                add_once(seen, "c", c)
+        return [len(out), out, [f.text for f in seen]]
+
+    p = lang.load("fn f(a, b) { return a + b; }", "flow.tiny")
+    for a, b in [("yes", "axbx"), ("no", ""), ("no", "x"), ("yes", "b")]:
+        assert p.call("f", a, b) == p.call("f", a, b, mode="python")
+    assert p.call("f", "no", "axbx") == [2, ["x", "x"], []]
+    assert p.call("f", "yes", "x") == [2, ["if", "x"], ["x"]]
