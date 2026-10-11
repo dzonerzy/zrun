@@ -440,6 +440,15 @@ def build_native(language, source, output, path=None, runtime=None, prune=False,
         rt = os.path.join(tmp, "zrun_rt.lib" if windows else "libzrun_rt.a")
         with open(rt, "wb") as f:
             f.write(runtime)
+        # (zgram's runtime: rt.parse's grammars parse with it; a program
+        # parsing nothing takes nothing of it)
+        archives = [rt]
+        import zgram
+
+        if hasattr(zgram, "native_runtime"):
+            archives.append(os.path.join(tmp, "zgram_rt.lib" if windows else "libzgram_rt.a"))
+            with open(archives[-1], "wb") as f:
+                f.write(zgram.native_runtime(target="x86_64-windows" if windows else "x86_64-linux"))
         out = f"{output}.{os.getpid()}.tmp"
         # (Zig's caches: its own for this build, the builds' shared one)
         env = dict(os.environ, ZIG_LOCAL_CACHE_DIR=os.path.join(tmp, "zig-cache"), ZIG_GLOBAL_CACHE_DIR=os.path.join(cache_dir(), "zig"))
@@ -453,7 +462,7 @@ def build_native(language, source, output, path=None, runtime=None, prune=False,
         # (the objects named in a file: Windows' command lines are short)
         rsp = os.path.join(tmp, "objects.rsp")
         with open(rsp, "w", encoding="utf-8") as f:
-            f.write("\n".join('"' + p.replace("\\", "/") + '"' for p in [*files, rt]))
+            f.write("\n".join('"' + p.replace("\\", "/") + '"' for p in [*files, *archives]))
         subprocess.run([sys.executable, "-m", "ziglang", "cc", "-target", zig_target, *flags, "-o", out, "@" + rsp, *libs], check=True, cwd=tmp, env=env)
         os.chmod(out, 0o755)
         os.replace(out, output)

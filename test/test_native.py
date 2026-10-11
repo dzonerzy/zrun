@@ -250,3 +250,28 @@ def test_lua(zig, tmp_path, name, monkeypatch):
     code, out, err = native(module.lang, src, tmp_path, name)
     expected = open(os.path.join(LUA_TESTS, name[:-4] + ".expected")).read()
     assert out + (err.split("\n")[0] + "\n" if err else "") == expected
+
+
+def test_rt_parse_standalone(zig, tmp_path, capsys):
+    """rt.parse in a standalone program: the grammar's parsers built ahead
+    of time by zgram and linked with its runtime; the same output as
+    compiled here, syntax errors (caught) and recovery included."""
+    import test_parse as tp
+    from zrules import Rules
+
+    lang = zrun.Language(tp.PARSER, Rules(tp.PARSER, []), strict=True)
+    for kind, f in (("Program", tp.program), ("Sum", tp.sum_), ("Keys", tp.keys), ("Bad", tp.bad),
+                    ("Rec", tp.rec), ("Depth", tp.depth)):
+        lang.exec(kind)(f)
+    assert native(lang, tp.SOURCE, tmp_path) == compiled(lang, tp.SOURCE, capsys) == (0, tp.EXPECTED, "")
+
+
+def test_rt_parse_actions_standalone(zig, tmp_path, capsys):
+    """Fields made by the grammar's actions, natively in a standalone program"""
+    import test_parse as tp
+    from zrules import Rules
+
+    lang = zrun.Language(tp.APARSER, Rules(tp.APARSER, []), strict=True)
+    lang.exec("Program")(tp.aprogram)
+    lang.exec("Show")(tp.show)
+    assert native(lang, tp.ASOURCE, tmp_path) == compiled(lang, tp.ASOURCE, capsys)

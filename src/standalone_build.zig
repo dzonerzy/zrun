@@ -454,7 +454,13 @@ pub const Build = struct {
         shared: bool = false,
         /// The top level's names (standalone.Desc.names)
         names: []const u8 = "",
+        /// The grammars rt.parse parses with: their parsers' indices in
+        /// `objects`, the names their objects (linked) define them under,
+        /// zrun's view of their rules (describeGrammar)
+        parsers: []const ParserMade = &.{},
     };
+
+    pub const ParserMade = struct { object: usize, symbol: [:0]const u8, grammar: []const u8 };
 
     /// The grammar, as the standalone runtime reads nodes with it
     /// (standalone.makeData reads it)
@@ -596,6 +602,22 @@ pub const Build = struct {
         const called_ty = L("LLVMStructTypeInContext")(ctx, &called_fields, called_fields.len, 0);
         const thunks = try self.constGlobal(&m, "zr_img_thunks", L("LLVMConstArray2")(entry_ty, thunk_vals.ptr, thunk_vals.len));
         const called = try self.constGlobal(&m, "zr_img_called", L("LLVMConstArray2")(called_ty, called_vals.ptr, called_vals.len));
+        // The grammars rt.parse parses with (standalone.ParserEntry): the
+        // parser's stand-in, its descriptor (its object's), zgram's
+        // runtime's functions, zrun's view of its rules
+        const parser_vals = try self.a().alloc(ir.Value, p.parsers.len);
+        for (p.parsers, parser_vals) |pm, *slot| {
+            const descriptor = L("LLVMAddGlobal")(m.mod, t.i8, pm.symbol.ptr);
+            var fields = [_]ir.Value{
+                at(&m, globals[object_items[pm.object]]),               descriptor,
+                try self.codeRef(&m, &fns, "zgram_parse", void_fn),     try self.codeRef(&m, &fns, "zgram_tree_free", void_fn),
+                try self.constBytes(&m, pm.grammar),                    ir.Module.kInt(t.i64, pm.grammar.len),
+            };
+            slot.* = L("LLVMConstStructInContext")(ctx, &fields, fields.len, 0);
+        }
+        var parser_fields = [_]ir.Type{ t.ptr, t.ptr, t.ptr, t.ptr, t.ptr, t.i64 };
+        const parser_ty = L("LLVMStructTypeInContext")(ctx, &parser_fields, parser_fields.len, 0);
+        const parsers = try self.constGlobal(&m, "zr_img_parsers", L("LLVMConstArray2")(parser_ty, parser_vals.ptr, parser_vals.len));
 
         // The program, and main
         const main_fn = try self.codeRef(&m, &fns, p.main_name, void_fn);
@@ -614,6 +636,7 @@ pub const Build = struct {
             init_fn,                                                ir.Module.kInt(t.i64, @intFromBool(p.pruned)),
             ir.Module.kInt(t.i64, p.setup),
             try self.constBytes(&m, p.names),             ir.Module.kInt(t.i64, p.names.len),
+            parsers,                                      ir.Module.kInt(t.i64, p.parsers.len),
         };
         const desc = try self.constGlobal(&m, "zr_img_program", L("LLVMConstStructInContext")(ctx, &desc_fields, desc_fields.len, 0));
         {

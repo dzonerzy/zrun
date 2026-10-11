@@ -1085,6 +1085,9 @@ pub const Compiler = struct {
     /// The module state the code refers to, adopted natively (adopt.zig):
     /// shared by every run (frozen before runs on several threads)
     adopted: std.ArrayListUnmanaged(value.Value) = .empty,
+    /// The grammars rt.parse parses with (their parsers' indices among the
+    /// objects): a standalone build links their parsers (driver.zig)
+    parse_grammars: std.ArrayListUnmanaged(usize) = .empty,
     /// Language functions' speculations (Speculation), by node
     speculations: std.AutoHashMapUnmanaged(u32, *Speculation) = .empty,
     /// Functions' typed entries (Gen.typedParams), worked out
@@ -8466,6 +8469,7 @@ const Gen = struct {
         };
         _ = @import("parse.zig").nativeGrammar(parser) orelse return error.Python;
         const idx = try c.objectIndex(parser);
+        if (std.mem.indexOfScalar(usize, c.parse_grammars.items, idx) == null) try c.parse_grammars.append(c.a, idx);
         const start_v = switch (start) {
             .none => self.f.intToPtr(self.k(0)),
             .str => |s| try c.m.string(s),

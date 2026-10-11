@@ -1645,8 +1645,26 @@ fn aheadOfTime(c: *Compiled, b: *standalone_build.Build, aot: *Aot, data: *progr
         names.appendSlice(ba, std.mem.asBytes(&len)) catch return oomB();
         names.appendSlice(ba, sym.name) catch return oomB();
     }
+    // The grammars rt.parse parses with: each one's parsers built ahead of
+    // time by zgram (an object defining it as `zrun_grammar_<k>`, linked
+    // with zgram's runtime), zrun's view of its rules
+    const parsers = ba.alloc(standalone_build.Build.ParserMade, comp.parse_grammars.items.len) catch return oomB();
+    for (comp.parse_grammars.items, parsers, 0..) |idx, *pm, k| {
+        const parser = comp.objects.items[idx];
+        const g = @import("ptree.zig").grammarOf(parser) orelse return oomB();
+        const symbol = std.fmt.allocPrintSentinel(ba, "zrun_grammar_{d}", .{k}, 0) catch return oomB();
+        const target: ?[]const u8 = if (b.triple) |t| (if (std.mem.indexOf(u8, t, "windows") != null) "x86_64-windows" else "x86_64-linux") else null;
+        const object = py.c.PyObject_CallMethod(parser, "native_object", "ss", symbol.ptr, if (target) |t| t.ptr else null) orelse return false;
+        defer py.Py_DecRef(object);
+        var ptr: [*]u8 = undefined;
+        var len: py.Py_ssize_t = 0;
+        if (py.c.PyBytes_AsStringAndSize(object, @ptrCast(&ptr), &len) != 0) return false;
+        b.addObject(ptr[0..@intCast(len)]) catch return oomB();
+        pm.* = .{ .object = idx, .symbol = symbol, .grammar = b.describeGrammar(g.rules) catch return oomB() };
+    }
     b.emitImage(&aot.notes, .{
         .main_name = main_name,
+        .parsers = parsers,
         .globals = c.globals,
         .max_depth = max_depth,
         .objects = comp.objects.items,

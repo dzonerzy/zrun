@@ -66,6 +66,22 @@ pub const Desc = extern struct {
     /// bytes (a library's zrun_call finds a function by them)
     names: [*]const u8,
     names_len: u64,
+    /// The grammars rt.parse parses with (ParserEntry each)
+    parsers: [*]const ParserEntry,
+    parsers_len: u64,
+};
+
+/// A grammar rt.parse parses with: its parser's stand-in (what the code
+/// gives zr_parse), its descriptor (its linked object's), zgram's runtime's
+/// zgram_parse and zgram_tree_free, zrun's view of its rules (described as
+/// the program's grammar is)
+pub const ParserEntry = extern struct {
+    standin: *const anyopaque,
+    descriptor: *const anyopaque,
+    parse: *const anyopaque,
+    tree_free: *const anyopaque,
+    grammar: [*]const u8,
+    grammar_len: u64,
 };
 
 /// A symbol: its scope node (NONE: global), the node whose frame holds its
@@ -98,10 +114,48 @@ pub fn programData() *const program_mod.Data {
 
 /// The grammar and the tree made from the image's descriptions
 fn makeData(desc: *const Desc) void {
-    grammar = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+    decodeGrammar(&grammar, desc.grammar[0..desc.grammar_len]);
     const a = grammar.arena.allocator();
+    const src = desc.source[0..desc.source_len];
+    var line_starts: std.ArrayListUnmanaged(u32) = .empty;
+    line_starts.append(a, 0) catch oom();
+    for (src, 0..) |ch, i| if (ch == '\n') line_starts.append(a, @intCast(i + 1)) catch oom();
+    data = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .grammar = &grammar,
+        .nodes = desc.nodes[0..desc.nodes_len],
+        .input = src,
+        .parents = @constCast(desc.parents[0..desc.nodes_len]),
+        .sym_of = &.{},
+        .functions = &.{},
+        .line_starts = line_starts.items,
+    };
+}
+
+/// The grammars rt.parse parses with, ready for zr_parse (found by their
+/// parsers' stand-ins, as the JIT finds them by the parsers)
+fn makeParsers(desc: *const Desc) void {
+    const ptree = @import("ptree.zig");
+    for (desc.parsers[0..desc.parsers_len]) |e| {
+        const rules = allocator.create(grammar_mod.Grammar) catch oom();
+        decodeGrammar(rules, e.grammar[0..e.grammar_len]);
+        const g = allocator.create(ptree.Grammar) catch oom();
+        g.* = .{
+            .descriptor = @ptrCast(e.descriptor),
+            .parse = @ptrCast(@alignCast(e.parse)),
+            .tree_free = @ptrCast(@alignCast(e.tree_free)),
+            .rules = rules,
+        };
+        ptree.addGrammar(e.standin, g) catch oom();
+    }
+}
+
+/// A grammar as standalone_build.describeGrammar described it
+fn decodeGrammar(out: *grammar_mod.Grammar, g: []const u8) void {
+    out.* = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+    const grammar_p = out;
+    const a = grammar_p.arena.allocator();
     var at: usize = 0;
-    const g = desc.grammar[0..desc.grammar_len];
     const u = struct {
         fn int(comptime T: type, b: []const u8, pos: *usize) T {
             const x = std.mem.readInt(T, b[pos.*..][0..@sizeOf(T)], .little);
@@ -136,27 +190,13 @@ fn makeData(desc: *const Desc) void {
     const field_names = a.alloc([]const u8, n_fields) catch oom();
     for (field_names, 0..) |*f, i| {
         f.* = u.str(g, &at);
-        grammar.field_ids.put(a, f.*, @intCast(i + 1)) catch oom();
+        grammar_p.field_ids.put(a, f.*, @intCast(i + 1)) catch oom();
     }
-    grammar.rule_names = rule_names;
-    grammar.kind_names = kind_names;
-    grammar.actions = actions;
-    grammar.labels = labels;
-    grammar.field_names = field_names;
-    const src = desc.source[0..desc.source_len];
-    var line_starts: std.ArrayListUnmanaged(u32) = .empty;
-    line_starts.append(a, 0) catch oom();
-    for (src, 0..) |ch, i| if (ch == '\n') line_starts.append(a, @intCast(i + 1)) catch oom();
-    data = .{
-        .arena = std.heap.ArenaAllocator.init(allocator),
-        .grammar = &grammar,
-        .nodes = desc.nodes[0..desc.nodes_len],
-        .input = src,
-        .parents = @constCast(desc.parents[0..desc.nodes_len]),
-        .sym_of = &.{},
-        .functions = &.{},
-        .line_starts = line_starts.items,
-    };
+    grammar_p.rule_names = rule_names;
+    grammar_p.kind_names = kind_names;
+    grammar_p.actions = actions;
+    grammar_p.labels = labels;
+    grammar_p.field_names = field_names;
 }
 
 fn oom() noreturn {
@@ -236,6 +276,7 @@ var no_node: u8 = 0;
 fn startProgram(desc: *const Desc, argc: c_int, argv: [*]const [*:0]const u8) bool {
     program = desc;
     makeData(desc);
+    makeParsers(desc);
     desc.init();
     run_objects = .{ .items = @ptrCast(@constCast(desc.objects[0..desc.objects_len])), .capacity = desc.objects_len };
     run_ctx = Ctx{
