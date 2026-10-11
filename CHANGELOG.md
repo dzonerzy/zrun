@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A module's set the semantics only read is native** (`x in KEYWORDS`, iterating it), a constant of the code made once, as its lists and dicts are: strict languages use one, and standalone programs carry it in their image. (A frozenset stays Python's: natively it would be a `set`.)
+
 ### Fixed
 - **A parsed node's reference counted by compiled code** (`rt.parse`): the inline counting left parsed nodes out, so a child node kept past its `children` list (in a record, say) was freed under it and the program crashed. The inline count now tests the runtime's own list of counted kinds.
 - **`type(x) is C` with `x` an rt method or control value known while compiling** crashed the compiler (the Lua example built standalone with `prune=True`); it's compared at run time now.

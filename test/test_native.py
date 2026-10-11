@@ -267,6 +267,28 @@ def test_rt_parse_standalone(zig, tmp_path, capsys):
     assert native(lang, tp.SOURCE, tmp_path) == compiled(lang, tp.SOURCE, capsys) == (0, tp.EXPECTED, "")
 
 
+WORDS = {"if", "while", 3}
+
+
+def test_module_set_standalone(zig, tmp_path, capsys):
+    """A module's set only read: a constant in the executable's image"""
+    lang = zrun.Language(tiny.PARSER, tiny.RULES, strict=True)
+    lang.function("FuncDef")
+    lang.exec("While")(tiny.while_)
+    lang.exec(["Let", "Assign"])(tiny.assign)
+    lang.eval("BinOp")(tiny.binop)
+
+    @lang.eval("Call")
+    def call(node, rt):
+        x = rt.eval(node.args[0])
+        print(x in WORDS, len(WORDS), sorted([w for w in WORDS if w != 3]))
+        return 0
+
+    src = "let i = 0;\nwhile i < 3 { print(i + 2); i = i + 1; }\n"
+    assert native(lang, src, tmp_path) == compiled(lang, src, capsys) == (
+        0, "False 3 ['if', 'while']\nTrue 3 ['if', 'while']\nFalse 3 ['if', 'while']\n", "")
+
+
 def test_rt_parse_actions_standalone(zig, tmp_path, capsys):
     """Fields made by the grammar's actions, natively in a standalone program"""
     import test_parse as tp

@@ -209,3 +209,26 @@ def test_type_of_a_known_value_and_one_of_run_time():
     p = lang.load("fn f(a, b) { return a + b; }", "type.tiny")
     for a, b in [(1, 2), (1, 2.5), (1, "x"), (1.5, 2.5)]:
         assert p.call("f", a, b) == p.call("f", a, b, mode="python")
+
+
+KEYWORDS = {"if", "else", "while", 3, (1, "x")}
+
+
+def test_a_module_set_only_read():
+    # a module's set the semantics only read (`in`, iteration): native, a
+    # constant of the code, as its lists and dicts are
+    lang = _language(True)
+
+    @lang.eval("BinOp")
+    def binop(node, rt):
+        a = rt.eval(node.left)
+        b = rt.eval(node.right)
+        n = 0
+        for k in KEYWORDS:
+            if k == b:
+                n += 1
+        return [a in KEYWORDS, b not in KEYWORDS, n, len(KEYWORDS)]
+
+    p = lang.load("fn f(a, b) { return a + b; }", "set.tiny")
+    for a, b in [("if", "x"), (3, "while"), ((1, "x"), 4), ("", 3)]:
+        assert p.call("f", a, b) == p.call("f", a, b, mode="python")

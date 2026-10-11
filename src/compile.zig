@@ -34,6 +34,7 @@ const value = @import("value.zig");
 const objects_mod = @import("objects.zig");
 const types_mod = @import("types.zig");
 const adopt_mod = @import("adopt.zig");
+const set_mod = @import("set.zig");
 const Aot = @import("standalone_build.zig").Aot;
 const Value = value.Value;
 
@@ -482,7 +483,7 @@ fn scanners() error{Python}!void {
             \\        tree = ast.parse(inspect.getsource(mod))
             \\    except Exception:
             \\        return frozenset()
-            \\    cands = {k for k, v in g.items() if type(v) in (dict, list, tuple, frozenset)}
+            \\    cands = {k for k, v in g.items() if type(v) in (dict, list, tuple, set, frozenset)}
             \\    parents = {}
             \\    for node in ast.walk(tree):
             \\        for ch in ast.iter_child_nodes(node):
@@ -3265,8 +3266,8 @@ const Gen = struct {
         return .{ .tag = self.k(@intCast(v.tag)), .bits = self.c.m.addrOf(v.bits, .{ .value = v.tag }), .shape = shape };
     }
 
-    /// A Python list or dict as a native one (its items as values are:
-    /// lists and dicts in it Python's).
+    /// A Python list, dict or set as a native one (its items as values
+    /// are: lists and dicts in it Python's).
     fn nativeCopy(o: *PyObject) Error!Value {
         if (py.PyList_Check(o)) {
             const n: usize = @intCast(py.c.PyList_Size(o));
@@ -3276,6 +3277,28 @@ const Gen = struct {
                 if (!value.listPush(l, x)) return error.OutOfMemory;
             }
             return Value.obj(.list, &l.head);
+        }
+        if (ph.typeOf(o) == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PySet_Type"))))) {
+            const s = set_mod.new() orelse return error.OutOfMemory;
+            const sv = Value.obj(.set, &s.head);
+            const it = py.c.PyObject_GetIter(o) orelse {
+                value.decref(sv);
+                return error.Python;
+            };
+            defer py.Py_DecRef(it);
+            while (py.c.PyIter_Next(it)) |item| {
+                defer py.Py_DecRef(item);
+                const x = value.fromBorrowed(item) orelse {
+                    value.decref(sv);
+                    return error.Python;
+                };
+                defer value.decref(x);
+                if (!set_mod.add(s, x)) {
+                    value.decref(sv);
+                    return error.OutOfMemory;
+                }
+            }
+            return sv;
         }
         const d = value.newDict() orelse return error.OutOfMemory;
         var pos: py.Py_ssize_t = 0;
@@ -4370,6 +4393,8 @@ const Gen = struct {
             for (0..n) |i| try l.items.append(self.a(), try self.constant(py.c.PyList_GetItem(o, @intCast(i)).?, at));
             return .{ .list = l };
         }
+        // (a set: native, made once for the process, its address a constant)
+        if (t == @as(*py.c.PyTypeObject, @ptrCast(@alignCast(py.types.typeObject("PySet_Type"))))) return .{ .dyn = try self.frozenConst(o, .any) };
         return self.constant(o, at);
     }
 
