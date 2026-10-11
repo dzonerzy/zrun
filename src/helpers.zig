@@ -17,6 +17,7 @@ const gil = @import("gil.zig");
 const errors = @import("errors.zig");
 const gc = @import("gc.zig");
 const ptree = @import("ptree.zig");
+const casemap = @import("casemap.zig");
 
 const Value = value.Value;
 const Tag = value.Tag;
@@ -662,6 +663,11 @@ export fn zr_binary(ctx: *Ctx, node: u32, op_code: u32, ta: u64, ba: u64, tb: u6
                 // (bool & bool is a bool)
                 out.* = if (a.kind() == .bool and b.kind() == .bool) Value.boolean(r != 0) else mk(r);
                 return true;
+            },
+            // (in 128 bits: past them, Python's)
+            .lshift, .rshift => {
+                if (y < 0) return failAs(ctx, node, .ValueError, null, "negative shift count", .{});
+                return wideBinary(ctx, node, op, a, b, out);
             },
             else => {},
         }
@@ -3628,8 +3634,8 @@ export fn zr_call_method(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const v
     if (v.kind() == .rt) {
         if (@import("bridge.zig").rtValueMethod(ctx, node, v, name.bytes(), args[0..n], out)) |ok| return ok;
     }
-    // A str's common methods, natively (an ASCII one: Unicode's case
-    // rules are Python's)
+    // A str's common methods, natively (lower() and upper() of any; the
+    // others of an ASCII one)
     if (v.kind() == .str) {
         if (strMethod(ctx, node, @ptrCast(v.ptr()), name.bytes(), args[0..n], out)) |ok| return ok;
     }
@@ -3712,7 +3718,105 @@ fn callMethodPython(ctx: *Ctx, node: u32, v: Value, name: *const value.Str, args
 
 /// A str method natively (true / false: an error), or null for one (or
 /// arguments, or a str) not done here.
+/// The mapping of a character in a case table (casemap.zig), or null.
+fn caseMapOf(table: []const casemap.Map, cp: u21) ?*const casemap.Map {
+    var lo: usize = 0;
+    var hi: usize = table.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (table[mid].cp == cp) return &table[mid];
+        if (table[mid].cp < cp) lo = mid + 1 else hi = mid;
+    }
+    return null;
+}
+
+fn inCaseRanges(rs: []const casemap.Range, cp: u21) bool {
+    var lo: usize = 0;
+    var hi: usize = rs.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (cp < rs[mid].lo) hi = mid else if (cp > rs[mid].hi) lo = mid + 1 else return true;
+    }
+    return false;
+}
+
+/// A str's characters (its UTF-8 read as it was written: a lone surrogate
+/// too).
+fn codepoints(b: []const u8, out: *std.ArrayListUnmanaged(u21)) !void {
+    var i: usize = 0;
+    while (i < b.len) {
+        const c0 = b[i];
+        const n: usize = if (c0 < 0x80) 1 else if (c0 < 0xE0) 2 else if (c0 < 0xF0) 3 else 4;
+        var cp: u21 = switch (n) {
+            1 => c0,
+            2 => c0 & 0x1F,
+            3 => c0 & 0x0F,
+            else => c0 & 0x07,
+        };
+        for (1..n) |k| cp = (cp << 6) | (b[i + k] & 0x3F);
+        try out.append(allocator, cp);
+        i += n;
+    }
+}
+
+fn appendCodepoint(buf: *std.ArrayListUnmanaged(u8), cp: u21) !void {
+    if (cp < 0x80) {
+        try buf.append(allocator, @intCast(cp));
+    } else if (cp < 0x800) {
+        try buf.appendSlice(allocator, &.{ @intCast(0xC0 | (cp >> 6)), @intCast(0x80 | (cp & 0x3F)) });
+    } else if (cp < 0x10000) {
+        try buf.appendSlice(allocator, &.{ @intCast(0xE0 | (cp >> 12)), @intCast(0x80 | ((cp >> 6) & 0x3F)), @intCast(0x80 | (cp & 0x3F)) });
+    } else {
+        try buf.appendSlice(allocator, &.{ @intCast(0xF0 | (cp >> 18)), @intCast(0x80 | ((cp >> 12) & 0x3F)), @intCast(0x80 | ((cp >> 6) & 0x3F)), @intCast(0x80 | (cp & 0x3F)) });
+    }
+}
+
+/// A capital sigma at cps[i] lowercased: ς when it ends a word (CPython's
+/// handle_capital_sigma: a cased character before it, case-ignorable ones
+/// between, and none after), else σ.
+fn lowerSigma(cps: []const u21, i: usize) u21 {
+    var j = i;
+    var before: ?u21 = null;
+    while (j > 0) {
+        j -= 1;
+        if (!inCaseRanges(&casemap.case_ignorable, cps[j])) {
+            before = cps[j];
+            break;
+        }
+    }
+    var final = before != null and inCaseRanges(&casemap.cased, before.?);
+    if (final and i + 1 < cps.len) {
+        var k = i + 1;
+        while (k < cps.len and inCaseRanges(&casemap.case_ignorable, cps[k])) k += 1;
+        final = k == cps.len or !inCaseRanges(&casemap.cased, cps[k]);
+    }
+    return if (final) 0x3C2 else 0x3C3;
+}
+
+/// s.lower() or s.upper() as Python does them (casemap.zig's tables)
+fn strCase(ctx: *Ctx, node: u32, s: *value.Str, upper: bool, out: *Value) bool {
+    var cps: std.ArrayListUnmanaged(u21) = .empty;
+    defer cps.deinit(allocator);
+    codepoints(s.bytes(), &cps) catch return oomFail(ctx, node);
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    const table: []const casemap.Map = if (upper) &casemap.upper else &casemap.lower;
+    for (cps.items, 0..) |cp, i| {
+        if (!upper and cp == 0x3A3) {
+            appendCodepoint(&buf, lowerSigma(cps.items, i)) catch return oomFail(ctx, node);
+        } else if (caseMapOf(table, cp)) |m| {
+            for (m.to[0..m.len]) |c| appendCodepoint(&buf, c) catch return oomFail(ctx, node);
+        } else appendCodepoint(&buf, cp) catch return oomFail(ctx, node);
+    }
+    const r = value.newStr(buf.items) orelse return oomFail(ctx, node);
+    out.* = Value.obj(.str, &r.head);
+    return true;
+}
+
 fn strMethod(ctx: *Ctx, node: u32, s: *value.Str, name: []const u8, args: []const Value, out: *Value) ?bool {
+    // lower(), upper() beyond ASCII: Python's tables, natively
+    if (args.len == 0 and s.chars != s.len and (std.mem.eql(u8, name, "lower") or std.mem.eql(u8, name, "upper")))
+        return strCase(ctx, node, s, std.mem.eql(u8, name, "upper"), out);
     // encode() (UTF-8; ASCII and Latin-1 of strs they hold): a bytes
     if (std.mem.eql(u8, name, "encode") and args.len <= 1) {
         const enc = if (args.len == 0) "utf-8" else blk: {

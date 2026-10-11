@@ -16,7 +16,8 @@ from test_strict import tiny
 
 @zrun.comptime
 def crc_table(poly):
-    # (outside the compilable subset: a nested def, a generator)
+    # (a nested def, a generator expression: compiled too, but run once
+    # while compiling)
     def entry(i):
         c = i
         for _ in range(8):
@@ -94,9 +95,18 @@ def test_computed_once_for_its_arguments():
     assert len(CALLS) == n + 1
 
 
+@zrun.comptime
+def counted(n):
+    # (outside the compilable subset: a generator function)
+    def gen():
+        yield from range(n)
+
+    return list(gen())
+
+
 def runtime_argument(node, rt):
     # (its argument known only at run time: called as any function)
-    return len(crc_table(rt.eval(node.left)))
+    return len(counted(rt.eval(node.left) * 256))
 
 
 def test_values_known_only_at_run_time():

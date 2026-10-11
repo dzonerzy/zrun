@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`str.lower()` and `str.upper()` natively for all of Unicode**, as Python does them: each character's full mapping (`'ß'.upper()` is `'SS'`) and a word-final capital sigma (`ς`), from tables `tools/gen_casemap.py` makes from Python's Unicode data (`src/casemap.zig`). Beyond ASCII they went into Python (and strict languages refused them).
+- **`<<` and `>>` of ints natively** (in 128 bits, past them Python's; a negative count Python's ValueError).
 - **A strict language's module table only read is native all through**: records of record classes, sets, lists and dicts in it, made once, a constant of the code (standalone programs carry it in their image). Before, what was in it stayed Python's, and strict mode refused it.
 
 ### Fixed
