@@ -61,8 +61,26 @@ pub const Tag = enum(u64) {
     /// An exception of a class compiled code knows natively (errors.Kind:
     /// Exc)
     exc = 17,
+    /// A node of a tree parsed while the program runs (rt.parse:
+    /// ptree.zig): PNode. (Not 18: a plain int's tag, PINT_TAG)
+    pnode = 19,
     _,
 };
+
+/// A node of a tree compiled code parsed (rt.parse): the tree (a
+/// reference: ptree.Tree), its index there
+pub const PNode = extern struct {
+    head: Obj,
+    tree: *anyopaque,
+    idx: u32,
+};
+
+pub fn newPNode(tree: anytype, idx: u32) ?*PNode {
+    const p: *PNode = @ptrCast(@alignCast(gc.alloc(@sizeOf(PNode)) orelse return null));
+    @import("ptree.zig").retain(tree);
+    p.* = .{ .head = .{ .rc = 1, .kind = @intFromEnum(Tag.pnode) }, .tree = tree, .idx = idx };
+    return p;
+}
 
 /// An exception natively: its kind (errors.Kind), its arguments (a tuple),
 /// for an rt.Throw its value and message, for a zrun.Error its message and
@@ -557,7 +575,7 @@ pub const KIND_FRAME: u32 = 100;
 /// not kind(): reference counts are most of what code does with values)
 /// The counted tags: str..function (4-9), Big, Bytes, Closure, Set; a bit
 /// each
-pub const counted_mask: u64 = 0x3F0 | (1 << @intFromEnum(Tag.big)) | (1 << @intFromEnum(Tag.bytes)) | (1 << @intFromEnum(Tag.closure)) | (1 << @intFromEnum(Tag.set)) | (1 << @intFromEnum(Tag.exc));
+pub const counted_mask: u64 = 0x3F0 | (1 << @intFromEnum(Tag.big)) | (1 << @intFromEnum(Tag.bytes)) | (1 << @intFromEnum(Tag.closure)) | (1 << @intFromEnum(Tag.set)) | (1 << @intFromEnum(Tag.exc)) | (1 << @intFromEnum(Tag.pnode));
 
 pub inline fn counted(tag: u64) bool {
     return tag < 32 and (counted_mask >> @intCast(tag)) & 1 != 0;
@@ -745,6 +763,11 @@ pub fn free(tag: Tag, o: *Obj) void {
             } else allocator.free(@constCast(b.ptr)[0..@max(b.len, 1)]);
             allocator.destroy(b);
         },
+        .pnode => {
+            const p: *PNode = @ptrCast(@alignCast(o));
+            @import("ptree.zig").release(@ptrCast(@alignCast(p.tree)));
+            gc.free(o, @sizeOf(PNode));
+        },
         else => {},
     }
 }
@@ -928,7 +951,7 @@ pub fn typeName(v: Value) []const u8 {
         .function, .closure => "function",
         .set => "set",
         .exc => @as(@import("errors.zig").Kind, @enumFromInt(@as(*Exc, @ptrCast(@alignCast(v.ptr()))).kind)).name(),
-        .node => "Node",
+        .node, .pnode => "Node",
         .host => "object",
         .rt => "CompiledRuntime",
         .big => "int",
@@ -1186,6 +1209,12 @@ pub fn equal(a: Value, b: Value) bool {
             break :blk true;
         },
         .node => a.bits == b.bits,
+        // (the same node of the same tree, as zrun.Node compares)
+        .pnode => blk: {
+            const x: *PNode = @ptrCast(@alignCast(a.ptr()));
+            const y: *PNode = @ptrCast(@alignCast(b.ptr()));
+            break :blk x.tree == y.tree and x.idx == y.idx;
+        },
         // (the same items)
         .set => blk: {
             const x: *set_mod.Set = @ptrCast(@alignCast(a.ptr()));
@@ -1229,6 +1258,12 @@ fn hashOf(tag: u64, bits: u64) u64 {
         .big => return std.hash.Wyhash.hash(2, std.mem.asBytes(&@as(*Big, @ptrCast(@alignCast(v.ptr()))).v)),
         // (bytes: by their bytes, as equal ones are equal)
         .bytes => return std.hash.Wyhash.hash(6, @as(*Bytes, @ptrCast(@alignCast(v.ptr()))).slice()),
+        // (a parsed node: by its tree and index, as equal ones are equal)
+        .pnode => {
+            const p: *PNode = @ptrCast(@alignCast(v.ptr()));
+            const key = [2]u64{ @intFromPtr(p.tree), p.idx };
+            return std.hash.Wyhash.hash(7, std.mem.asBytes(&key));
+        },
         .str => {
             const s: *Str = @ptrCast(v.ptr());
             if (s.hash != 0) return s.hash;
@@ -1442,6 +1477,11 @@ pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
             return o;
         },
         .node => return nodeObject.make(@intCast(v.bits)),
+        // (a parsed tree's node: its tree in Python, made once: parse.zig)
+        .pnode => {
+            const p: *PNode = @ptrCast(@alignCast(v.ptr()));
+            return @import("parse.zig").nodeObject(@ptrCast(@alignCast(p.tree)), p.idx);
+        },
         // (a zrun.Function, as the reference mode gives them)
         .function => return objects.newNativeFunction(@ptrCast(@alignCast(v.ptr())), nodeObject.owner),
         // (a set: a Python set of its items, a copy)
@@ -1476,6 +1516,21 @@ pub fn toPython(v: Value, nodeObject: anytype) ?*PyObject {
             const args = toPython(e.args, nodeObject) orelse return null;
             defer py.Py_DecRef(args);
             const o = py.c.PyObject_Call(cls, args, null) orelse return null;
+            // (rt.parse's syntax error: where, and what, as zgram's has them)
+            if (kind == .ParseError and e.value.kind() == .tuple) {
+                const t: *Tuple = @ptrCast(@alignCast(e.value.ptr()));
+                inline for (.{ "line", "column", "offset", "message" }, 0..) |name, i| {
+                    const a = toPython(t.slice()[i], nodeObject) orelse {
+                        py.Py_DecRef(o);
+                        return null;
+                    };
+                    defer py.Py_DecRef(a);
+                    if (py.c.PyObject_SetAttrString(o, name, a) != 0) {
+                        py.Py_DecRef(o);
+                        return null;
+                    }
+                }
+            }
             if (e.cause.kind() != .none) {
                 const cause = toPython(e.cause, nodeObject) orelse {
                     py.Py_DecRef(o);

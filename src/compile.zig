@@ -130,7 +130,7 @@ pub const Dyn = struct {
     }
 };
 
-pub const RtMethod = enum { eval, exec, loop, load, store, function, call, tail_call, @"error", kind, text, span, scope, symbol, type_of, node_at, fresh, wrapping_add, wrapping_sub, wrapping_mul, wrapping_shl, wrapping_shr, wrapping_ushr, @"u8", @"i8", u16le, u16be, i16le, i16be, u32le, u32be, i32le, i32be, u64le, u64be, i64le, i64be, Return, Break, Continue };
+pub const RtMethod = enum { eval, exec, loop, load, store, function, call, tail_call, @"error", kind, text, span, scope, symbol, type_of, node_at, fresh, parse, wrapping_add, wrapping_sub, wrapping_mul, wrapping_shl, wrapping_shr, wrapping_ushr, @"u8", @"i8", u16le, u16be, i16le, i16be, u32le, u32be, i32le, i32be, u64le, u64be, i64le, i64be, Return, Break, Continue };
 
 /// A list known at compile time (its items may be dynamic): mutable, with
 /// identity (aliases see changes)
@@ -1954,6 +1954,7 @@ pub const Compiler = struct {
         .{ "zr_getitem", "bpillllp" },
         .{ "zr_wrapping", "bpiillllp" },
         .{ "zr_read", "bpiillllp" },
+        .{ "zr_parse", "bpilllpip" },
         .{ "zr_native_fail", "bpili" },
         .{ "zr_setitem", "bpillllll" },
         .{ "zr_items", "bpillp" },
@@ -8256,15 +8257,32 @@ const Gen = struct {
             for (all[0..n], full, 0..) |x, *slot, i| slot.* = x orelse try self.fieldDefault(inst, callee.py, rtype, i, pos);
             return self.pyCall(inst, callee.py, full, pos);
         };
+        // (rt.parse(grammar, text, start=None, recover=False): by name too)
+        const parse_names = [_][]const u8{ "grammar", "text", "start", "recover" };
+        var parse_args: [4]?SVal = @splat(null);
         for (kws) |kw| {
             if (callee == .rt_method and (callee.rt_method == .call or callee.rt_method == .tail_call) and std.mem.eql(u8, kw.name, "receiver")) {
                 receiver = try self.operand(inst, kw.value);
             } else if (callee == .rt_method and callee.rt_method == .@"error" and std.mem.eql(u8, kw.name, "code")) {
                 // (the code isn't kept by compiled errors yet: reported as runtime)
                 try self.drop(try self.expr(inst, kw.value));
+            } else if (callee == .rt_method and callee.rt_method == .parse) {
+                const i = for (parse_names, 0..) |n, j| {
+                    if (std.mem.eql(u8, n, kw.name)) break j;
+                } else return c.unsupportedAt(inst.func, pos, "rt.parse() has no argument {s}", .{kw.name});
+                parse_args[i] = try self.operand(inst, kw.value);
             } else return c.unsupportedAt(inst.func, pos, "the keyword argument {s}= isn't compiled", .{kw.name});
         }
         self.taken(mark);
+        if (callee == .rt_method and callee.rt_method == .parse) {
+            if (args.len > 4) return c.unsupportedAt(inst.func, pos, "rt.parse() takes 4 arguments at most", .{});
+            for (args, 0..) |x, i| {
+                if (parse_args[i] != null) return c.unsupportedAt(inst.func, pos, "rt.parse() given {s} twice", .{parse_names[i]});
+                parse_args[i] = x;
+            }
+            if (parse_args[0] == null or parse_args[1] == null) return c.unsupportedAt(inst.func, pos, "rt.parse() needs a grammar and a text", .{});
+            return self.rtParse(inst, parse_args[0].?, parse_args[1].?, parse_args[2] orelse .none, parse_args[3] orelse .{ .bool = false }, pos);
+        }
         switch (callee) {
             .rt_method => |m| return self.rtCall(inst, m, args, receiver, pos),
             .py => |o| return self.pyCall(inst, o, args, pos),
@@ -8284,7 +8302,7 @@ const Gen = struct {
             .eval, .exec, .loop, .load, .function, .kind, .text, .span, .scope, .symbol, .type_of, .node_at, .fresh => 1,
             .store, .call, .tail_call, .wrapping_add, .wrapping_sub, .wrapping_mul, .wrapping_shl, .wrapping_shr, .wrapping_ushr => 2,
             .@"u8", .@"i8", .u16le, .u16be, .i16le, .i16be, .u32le, .u32be, .i32le, .i32be, .u64le, .u64be, .i64le, .i64be => 2,
-            .@"error" => 2,
+            .@"error", .parse => 2,
             .Return => if (args.len == 0) 0 else 1,
             .Break, .Continue => 0,
         };
@@ -8324,6 +8342,7 @@ const Gen = struct {
                 try self.tailCall(inst, args[0], args[1], receiver);
                 return .none;
             },
+            .parse => return self.rtParse(inst, args[0], args[1], .none, .{ .bool = false }, pos),
             .wrapping_add => return self.wrapping(inst, .add, args[0], args[1]),
             .wrapping_sub => return self.wrapping(inst, .sub, args[0], args[1]),
             .wrapping_mul => return self.wrapping(inst, .mul, args[0], args[1]),
@@ -8435,6 +8454,34 @@ const Gen = struct {
     /// rt.u8(data, i) and the others: a Bytes' bytes at an int offset in
     /// it, read inline; anything else (an error too, as the reference mode
     /// words it) by zr_read.
+    /// rt.parse(grammar, text, start, recover) (ptree.zig): zr_parse, with
+    /// the grammar known when compiling (a module's zgram parser: its
+    /// native parsing made now, parse.nativeGrammar), the start rule and
+    /// recover too; the text when the code runs.
+    fn rtParse(self: *Gen, inst: *Inst, grammar: SVal, text: SVal, start: SVal, recover: SVal, pos: front.Pos) Error!SVal {
+        const c = self.c;
+        const parser = switch (grammar) {
+            .py => |o| o,
+            else => return c.unsupportedAt(inst.func, pos, "rt.parse's grammar must be known when compiling (a module's zgram parser)", .{}),
+        };
+        _ = @import("parse.zig").nativeGrammar(parser) orelse return error.Python;
+        const idx = try c.objectIndex(parser);
+        const start_v = switch (start) {
+            .none => self.f.intToPtr(self.k(0)),
+            .str => |s| try c.m.string(s),
+            else => return c.unsupportedAt(inst.func, pos, "rt.parse's start rule must be known when compiling", .{}),
+        };
+        const rec: i64 = switch (recover) {
+            .bool => |b| @intFromBool(b),
+            else => return c.unsupportedAt(inst.func, pos, "rt.parse's recover must be known when compiling", .{}),
+        };
+        const td = try self.materialize(text, inst.node);
+        const ok = self.call("zr_parse", &.{ self.ctx, self.k32(inst.node), self.objRef(idx), td.tag, td.bits, start_v, self.k32(@intCast(rec)), self.out });
+        try self.drop(.{ .dyn = td });
+        try self.check(ok);
+        return .{ .dyn = try self.loadOut(.any) };
+    }
+
     fn readBytes(self: *Gen, inst: *Inst, r: bytes_mod.Read, data_v: SVal, at_v: SVal) Error!SVal {
         const f = &self.f;
         const m = &self.c.m;

@@ -26,6 +26,7 @@ const types = @import("types.zig");
 const errors = @import("errors.zig");
 const program_mod = @import("program.zig");
 const grammar_mod = @import("grammar.zig");
+const ptree = @import("ptree.zig");
 const compile_mod = @import("compile.zig");
 const driver = @import("driver.zig");
 const standalone = @import("standalone.zig");
@@ -51,12 +52,28 @@ pub const Link = struct {
     error_object: *const fn (program: *anyopaque, idx: u32, message: []const u8, stack: []const helpers.CallEntry) ?*PyObject,
 };
 
-/// The program's tree and what reading it works out: the JIT's program's,
-/// or a standalone one's
-fn nodeSource(ctx: *Ctx) struct { data: *const program_mod.Data, cache: *driver.NodeCache } {
-    if (comptime helpers.standalone) return .{ .data = standalone.programData(), .cache = &standalone.nodes };
+/// A tree nodes only known at run time are read from: the program's (its
+/// nodes values by their index), or one parsed while it runs (rt.parse:
+/// its nodes PNodes); what reading it works out; the node of the program
+/// errors are at
+const Source = struct {
+    data: *const program_mod.Data,
+    cache: *driver.NodeCache,
+    parsed: ?*ptree.Tree = null,
+    at: u32,
+
+    /// Node `idx` as a value (a new reference), or null: out of memory
+    fn node(self: Source, idx: u32) ?Value {
+        if (self.parsed) |t| return ptree.node(t, idx);
+        return .{ .tag = @intFromEnum(value.Tag.node), .bits = idx };
+    }
+};
+
+/// The program's tree: the JIT's program's, or a standalone one's
+fn nodeSource(ctx: *Ctx, at: u32) Source {
+    if (comptime helpers.standalone) return .{ .data = standalone.programData(), .cache = &standalone.nodes, .at = at };
     const link = linkOf(ctx);
-    return .{ .data = link.data, .cache = &link.compiled.nodes };
+    return .{ .data = link.data, .cache = &link.compiled.nodes, .at = at };
 }
 
 /// node.name of a node only known at run time, read from the program's
@@ -64,21 +81,31 @@ fn nodeSource(ctx: *Ctx) struct { data: *const program_mod.Data, cache: *driver.
 /// null for one not read here (Python's Node then: a field whose value an
 /// action makes...).
 pub fn nodeAttr(ctx: *Ctx, idx: u32, name: *const value.Str, out: *Value) ?bool {
-    const src = nodeSource(ctx);
+    return attrIn(ctx, nodeSource(ctx, idx), idx, name, out);
+}
+
+/// node.name of a node of a tree parsed while the program runs (a PNode),
+/// read the same way; errors at the program's node `at`.
+pub fn parsedAttr(ctx: *Ctx, p: *const value.PNode, at: u32, name: *const value.Str, out: *Value) ?bool {
+    const t: *ptree.Tree = @ptrCast(@alignCast(p.tree));
+    return attrIn(ctx, .{ .data = t.data, .cache = &t.cache, .parsed = t, .at = at }, p.idx, name, out);
+}
+
+fn attrIn(ctx: *Ctx, src: Source, idx: u32, name: *const value.Str, out: *Value) ?bool {
     const d = src.data;
     const n = d.nodes[idx];
     const rid = n.ruleId();
     // (what the name is, worked out once: a literal's str is one per name)
-    const attr = src.cache.attrOf(name, d.grammar) orelse return helpers.fail(ctx, idx, "out of memory", .{});
+    const attr = src.cache.attrOf(name, d.grammar) orelse return helpers.fail(ctx, src.at, "out of memory", .{});
     switch (attr) {
-        .field => |field| return fieldValue(ctx, d, idx, rid, field, out),
+        .field => |field| return fieldValue(ctx, src, idx, rid, field, out),
         .kind, .rule => {
             const is_kind = attr == .kind;
-            const s = src.cache.nameStr(if (is_kind) d.grammar.kind_names[rid] else d.grammar.rule_names[rid], rid, is_kind) orelse return helpers.fail(ctx, idx, "out of memory", .{});
+            const s = src.cache.nameStr(if (is_kind) d.grammar.kind_names[rid] else d.grammar.rule_names[rid], rid, is_kind) orelse return helpers.fail(ctx, src.at, "out of memory", .{});
             out.* = Value.obj(.str, &s.head);
         },
         .text => {
-            const s = src.cache.textStr(idx, d) orelse return helpers.fail(ctx, idx, "out of memory", .{});
+            const s = src.cache.textStr(idx, d) orelse return helpers.fail(ctx, src.at, "out of memory", .{});
             value.increfObj(&s.head);
             out.* = Value.obj(.str, &s.head);
         },
@@ -90,21 +117,28 @@ pub fn nodeAttr(ctx: *Ctx, idx: u32, name: *const value.Str, out: *Value) ?bool 
         .index => out.* = Value.pint(idx),
         .parent => {
             const p = d.parents[idx];
-            out.* = if (p == program_mod.NONE) Value.none_v else .{ .tag = @intFromEnum(value.Tag.node), .bits = p };
+            out.* = if (p == program_mod.NONE) Value.none_v else src.node(p) orelse return helpers.fail(ctx, src.at, "out of memory", .{});
         },
         .children => {
             var count: usize = 0;
             var ch = idx + 1;
             const stop = d.end(idx);
             while (ch < stop) : (ch = d.end(ch)) {
-                _ = childValue(d, ch) orelse return null;
-                if (!dropped(d, ch)) count += 1;
+                switch (childKind(d, ch)) {
+                    .action => return null,
+                    .node => count += 1,
+                    .dropped => {},
+                }
             }
-            const l = value.newList(count) orelse return helpers.fail(ctx, idx, "out of memory", .{});
+            const l = value.newList(count) orelse return helpers.fail(ctx, src.at, "out of memory", .{});
             ch = idx + 1;
             while (ch < stop) : (ch = d.end(ch)) {
-                if (dropped(d, ch)) continue;
-                _ = value.listPush(l, childValue(d, ch).?);
+                if (childKind(d, ch) != .node) continue;
+                const v = src.node(ch) orelse {
+                    value.decref(Value.obj(.list, &l.head));
+                    return helpers.fail(ctx, src.at, "out of memory", .{});
+                };
+                _ = value.listPush(l, v);
             }
             out.* = Value.obj(.list, &l.head);
         },
@@ -116,51 +150,54 @@ pub fn nodeAttr(ctx: *Ctx, idx: u32, name: *const value.Str, out: *Value) ?bool 
 /// A node's labelled field: its child (None: none), or a list of them (a
 /// label that repeats); null for a child an action makes a value of
 /// (Python's conversion).
-fn fieldValue(ctx: *Ctx, d: *const program_mod.Data, idx: u32, rid: u32, field: u8, out: *Value) ?bool {
+fn fieldValue(ctx: *Ctx, src: Source, idx: u32, rid: u32, field: u8, out: *Value) ?bool {
+    const d = src.data;
     const label = d.grammar.labelOf(rid, field);
     const many = label != null and label.?.many;
     var count: usize = 0;
-    var only: Value = Value.none_v;
+    var only: u32 = program_mod.NONE;
     var ch = idx + 1;
     const stop = d.end(idx);
     // (the labelled children: nodes; one an action makes a value of:
     // Python's)
     while (ch < stop) : (ch = d.end(ch)) {
         if (d.nodes[ch].fieldId() != field) continue;
-        const v = childValue(d, ch) orelse return null;
-        if (v.kind() == .none) continue;
-        count += 1;
-        only = v;
+        switch (childKind(d, ch)) {
+            .action => return null,
+            .dropped => continue,
+            .node => {
+                count += 1;
+                only = ch;
+            },
+        }
     }
     if (!many and count <= 1) {
-        out.* = only;
+        out.* = if (count == 0) Value.none_v else src.node(only) orelse return helpers.fail(ctx, src.at, "out of memory", .{});
         return true;
     }
-    const l = value.newList(count) orelse return helpers.fail(ctx, idx, "out of memory", .{});
+    const l = value.newList(count) orelse return helpers.fail(ctx, src.at, "out of memory", .{});
     ch = idx + 1;
     while (ch < stop) : (ch = d.end(ch)) {
-        if (d.nodes[ch].fieldId() != field) continue;
-        const v = childValue(d, ch).?;
-        if (v.kind() != .none) _ = value.listPush(l, v);
+        if (d.nodes[ch].fieldId() != field or childKind(d, ch) != .node) continue;
+        const v = src.node(ch) orelse {
+            value.decref(Value.obj(.list, &l.head));
+            return helpers.fail(ctx, src.at, "out of memory", .{});
+        };
+        _ = value.listPush(l, v);
     }
     out.* = Value.obj(.list, &l.head);
     return true;
 }
 
-fn dropped(d: *const program_mod.Data, ch: u32) bool {
-    const crid = d.rule(ch);
-    return crid < d.grammar.actions.len and d.grammar.actions[crid] == .drop;
-}
-
-/// A child's value as a field: the node (None: dropped), or null for one
-/// whose action makes a value (Python's conversion).
-fn childValue(d: *const program_mod.Data, ch: u32) ?Value {
+/// A child as a field: a node, dropped (None), or one whose action makes a
+/// value (Python's conversion)
+fn childKind(d: *const program_mod.Data, ch: u32) enum { node, dropped, action } {
     const crid = d.rule(ch);
     const action: grammar_mod.Action = if (crid < d.grammar.actions.len) d.grammar.actions[crid] else .none;
     return switch (action) {
-        .none, .class => .{ .tag = @intFromEnum(value.Tag.node), .bits = ch },
-        .drop => Value.none_v,
-        else => null,
+        .none, .class => .node,
+        .drop => .dropped,
+        else => .action,
     };
 }
 

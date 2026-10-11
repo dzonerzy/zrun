@@ -16,6 +16,7 @@ const value = @import("value.zig");
 const gil = @import("gil.zig");
 const errors = @import("errors.zig");
 const gc = @import("gc.zig");
+const ptree = @import("ptree.zig");
 
 const Value = value.Value;
 const Tag = value.Tag;
@@ -2882,11 +2883,111 @@ export fn zr_isinstance(ctx: *Ctx, node: u32, t: u64, bits: u64, cls_index: u64,
     return true;
 }
 
+/// rt.parse(grammar, text, start, recover) in compiled code (ptree.zig):
+/// the tree's root (a PNode), or with `recover` (root, errors), each error
+/// (offset, line, column, message); zgram.ParseError for a syntax error.
+/// `start`: the start rule's name (null: the grammar's first).
+export fn zr_parse(ctx: *Ctx, node: u32, parser_index: u64, tt: u64, tb: u64, start: ?*const value.Str, recover: u32, out: *Value) callconv(.c) bool {
+    // (the grammar's native parsing: made when compiling, found by its
+    // parser, no Python)
+    const g = ptree.grammarOf(ctx.object(parser_index)) orelse return fail(ctx, node, "rt.parse: the grammar wasn't prepared for compiled code", .{});
+    const text = Value{ .tag = tt, .bits = tb };
+    if (text.kind() != .str) return failAs(ctx, node, .TypeError, null, "parse input must be str or bytes", .{});
+    const bytes = @as(*value.Str, @ptrCast(text.ptr())).bytes();
+    var start_buf: [256]u8 = undefined;
+    const start_z: ?[*:0]const u8 = if (start) |s| (std.fmt.bufPrintZ(&start_buf, "{s}", .{s.bytes()}) catch
+        return failAs(ctx, node, .ValueError, null, "unknown start rule", .{})).ptr else null;
+    var z: ptree.ZTree = .{};
+    var err: ptree.ZError = undefined;
+    const rc = g.parse(g.descriptor, bytes.ptr, bytes.len, start_z, if (recover != 0) ptree.Z_RECOVER else 0, &z, &err);
+    switch (rc) {
+        ptree.Z_OK => {},
+        ptree.Z_SYNTAX_ERROR => return parseError(ctx, node, &err),
+        ptree.Z_UNKNOWN_START => return failAs(ctx, node, .ValueError, null, "unknown start rule", .{}),
+        ptree.Z_NO_NODES => return failAs(ctx, node, .ValueError, null, "the start rule matched but produced no nodes (is it @silent?)", .{}),
+        else => return fail(ctx, node, "out of memory", .{}),
+    }
+    const errors_n = z.error_count;
+    const errors_at = z.errors;
+    const tree = ptree.newTree(g, z, text, if (start) |s| s.bytes() else null, recover != 0) orelse return fail(ctx, node, "out of memory", .{});
+    // (the root keeps the tree: the tree's own reference given up)
+    const root = ptree.node(tree, 0);
+    ptree.release(tree);
+    const r = root orelse return fail(ctx, node, "out of memory", .{});
+    if (recover == 0) {
+        out.* = r;
+        return true;
+    }
+    const list = value.newList(errors_n) orelse {
+        value.decref(r);
+        return fail(ctx, node, "out of memory", .{});
+    };
+    for (0..errors_n) |i| {
+        const e = errors_at.?[i];
+        const item = errorTuple(e.offset, e.line, e.column, std.mem.sliceTo(&e.message, 0)) orelse {
+            value.decref(Value.obj(.list, &list.head));
+            value.decref(r);
+            return fail(ctx, node, "out of memory", .{});
+        };
+        _ = value.listPush(list, item);
+    }
+    const pair = value.newTuple(2) orelse {
+        value.decref(Value.obj(.list, &list.head));
+        value.decref(r);
+        return fail(ctx, node, "out of memory", .{});
+    };
+    pair.slice()[0] = r;
+    pair.slice()[1] = Value.obj(.list, &list.head);
+    out.* = Value.obj(.tuple, &pair.head);
+    return true;
+}
+
+/// (offset, line, column, message), plain ints and a str
+fn errorTuple(offset: u32, line: u32, column: u32, message: []const u8) ?Value {
+    const msg = value.newStr(message) orelse return null;
+    const t = value.newTuple(4) orelse {
+        value.decref(Value.obj(.str, &msg.head));
+        return null;
+    };
+    t.slice()[0] = Value.pint(offset);
+    t.slice()[1] = Value.pint(line);
+    t.slice()[2] = Value.pint(column);
+    t.slice()[3] = Value.obj(.str, &msg.head);
+    return Value.obj(.tuple, &t.head);
+}
+
+/// rt.parse's syntax error: zgram.ParseError("line L, col C: message"),
+/// its line, column, offset and message (its value: excAttr)
+fn parseError(ctx: *Ctx, node: u32, e: *const ptree.ZError) bool {
+    const message = std.mem.sliceTo(&e.message, 0);
+    var buf: [320]u8 = undefined;
+    const full = std.fmt.bufPrint(&buf, "line {d}, col {d}: {s}", .{ e.line, e.column, message }) catch message;
+    const text = value.newStr(full) orelse return fail(ctx, node, "out of memory", .{});
+    const args = value.newTuple(1) orelse return fail(ctx, node, "out of memory", .{});
+    args.slice()[0] = Value.obj(.str, &text.head);
+    const args_v = Value.obj(.tuple, &args.head);
+    defer value.decref(args_v);
+    const fields = value.newTuple(4) orelse return fail(ctx, node, "out of memory", .{});
+    const fields_v = Value.obj(.tuple, &fields.head);
+    defer value.decref(fields_v);
+    const msg = value.newStr(message) orelse return fail(ctx, node, "out of memory", .{});
+    fields.slice()[0] = Value.pint(e.line);
+    fields.slice()[1] = Value.pint(e.column);
+    fields.slice()[2] = Value.pint(e.offset);
+    fields.slice()[3] = Value.obj(.str, &msg.head);
+    const exc = value.newExc(@intFromEnum(errors.Kind.ParseError), args_v, fields_v, Value.none_v, node) orelse return fail(ctx, node, "out of memory", .{});
+    const exc_v = Value.obj(.exc, &exc.head);
+    defer value.decref(exc_v);
+    return raiseExc(ctx, node, exc_v);
+}
+
 /// v.name
 export fn zr_getattr(ctx: *Ctx, node: u32, t: u64, bits: u64, name: *const value.Str, out: *Value) callconv(.c) bool {
     const v = Value{ .tag = t, .bits = bits };
     // (a node's: from the program's tree)
     if (v.kind() == .node) if (@import("bridge.zig").nodeAttr(ctx, @intCast(v.bits), name, out)) |ok| return ok;
+    // (a node of a tree parsed while running: from that tree)
+    if (v.kind() == .pnode) if (@import("bridge.zig").parsedAttr(ctx, @ptrCast(@alignCast(v.ptr())), node, name, out)) |ok| return ok;
     if (v.kind() == .exc and excAttr(v, name.bytes(), out)) return true;
     if (v.kind() == .record) {
         const r: *value.Record = @ptrCast(@alignCast(v.ptr()));
@@ -4520,6 +4621,15 @@ fn excAttr(v: Value, name: []const u8, out: *Value) bool {
     const e: *value.Exc = @ptrCast(@alignCast(v.ptr()));
     const kind: errors.Kind = @enumFromInt(e.kind);
     const eq = std.mem.eql;
+    // (rt.parse's syntax error: its value's (line, column, offset, message))
+    if (kind == .ParseError and e.value.kind() == .tuple) {
+        const items = @as(*value.Tuple, @ptrCast(@alignCast(e.value.ptr()))).slice();
+        inline for (.{ "line", "column", "offset", "message" }, 0..) |field, i| if (eq(u8, name, field)) {
+            value.incref(items[i]);
+            out.* = items[i];
+            return true;
+        };
+    }
     const r: Value = if (eq(u8, name, "args")) e.args else if (kind == .Throw and eq(u8, name, "value")) e.value else if ((kind == .Throw or kind == .ZrunError) and eq(u8, name, "message")) e.message else if (kind == .ZrunError and eq(u8, name, "diagnostic")) v else if (eq(u8, name, "__cause__")) e.cause else return false;
     value.incref(r);
     out.* = r;
@@ -5907,7 +6017,7 @@ const helper_names = [_][]const u8{
     "zr_call",     "zr_object",     "zr_frame_new",  "zr_frame_release", "zr_free",
     "zr_list",     "zr_tuple",      "zr_dict",       "zr_record",        "zr_is_record",
     "zr_getattr",  "zr_setattr",    "zr_getitem",    "zr_setitem",       "zr_items",
-    "zr_wrapping", "zr_read", "zr_native_fail", "zr_call_site", "zr_host_jump", "zr_host_failed", "zr_bury",
+    "zr_wrapping", "zr_read", "zr_parse", "zr_native_fail", "zr_call_site", "zr_host_jump", "zr_host_failed", "zr_bury",
     "zr_list_len", "zr_list_at",    "zr_append",     "zr_call_method",   "zr_call_python",
     "zr_is_type",  "zr_global",     "zr_format",     "zr_concat",        "zr_unpack",
     "zr_varargs",  "zr_record_new", "zr_isinstance", "zr_call_seq",      "zr_slice",

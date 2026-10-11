@@ -17,6 +17,9 @@ const grammar_mod = @import("grammar.zig");
 const program_mod = @import("program.zig");
 const tree_mod = @import("tree.zig");
 const objects = @import("objects.zig");
+const ptree = @import("ptree.zig");
+const value = @import("value.zig");
+const gil = @import("gil.zig");
 
 const allocator = std.heap.c_allocator;
 
@@ -55,6 +58,43 @@ pub fn grammarOf(parser: *PyObject) ?*grammar_mod.Grammar {
         return null;
     };
     py.Py_IncRef(parser);
+    return g;
+}
+
+/// What compiled code parses a grammar with (ptree.Grammar): zgram's
+/// parsing (the `zgram.grammar.v1` capsule, kept) and zrun's view of its
+/// rules; made once per parser, when compiling (with the GIL). Null with an
+/// exception.
+pub fn nativeGrammar(parser: *PyObject) ?*ptree.Grammar {
+    if (ptree.grammarOf(parser)) |g| return g;
+    const rules = grammarOf(parser) orelse return null;
+    const capsule = py.c.PyObject_GetAttrString(parser, "capsule") orelse {
+        py.c.PyErr_Clear();
+        ph.raise(py.PyExc_ImportError(), "rt.parse in compiled code needs zgram 0.6 or later (GrammarParser.capsule)", .{});
+        return null;
+    };
+    const view: *const ptree.GrammarView = @ptrCast(@alignCast(py.c.PyCapsule_GetPointer(capsule, ptree.GRAMMAR_CAPSULE) orelse {
+        py.Py_DecRef(capsule);
+        return null;
+    }));
+    if (view.abi != ptree.GRAMMAR_ABI) {
+        py.Py_DecRef(capsule);
+        ph.raise(py.PyExc_ImportError(), "zrun parses with zgram's grammars of ABI {d}, this zgram has {d}", .{ ptree.GRAMMAR_ABI, view.abi });
+        return null;
+    }
+    const g = allocator.create(ptree.Grammar) catch {
+        py.Py_DecRef(capsule);
+        _ = py.c.PyErr_NoMemory();
+        return null;
+    };
+    // (the capsule kept: for as long as the process, as the grammar is)
+    g.* = .{ .descriptor = view.descriptor, .parse = view.parse, .tree_free = view.tree_free, .rules = rules, .parser = parser };
+    ptree.addGrammar(parser, g) catch {
+        allocator.destroy(g);
+        py.Py_DecRef(capsule);
+        _ = py.c.PyErr_NoMemory();
+        return null;
+    };
     return g;
 }
 
@@ -104,6 +144,40 @@ fn errorTuple(d: *PyObject) ?*PyObject {
         return null;
     };
     return py.c.Py_BuildValue("(NNNN)", offset, line, column, message);
+}
+
+/// A node of a tree compiled code parsed (ptree.zig) as a zrun.Node: the
+/// tree parsed again in Python, once (the same parser, text, start rule and
+/// recovery: the same tree), kept with the native one.
+pub fn nodeObject(t: *ptree.Tree, idx: u32) ?*PyObject {
+    if (t.py_root == null) {
+        const parser: *PyObject = @ptrCast(@alignCast(t.grammar.parser orelse {
+            ph.raise(py.PyExc_RuntimeError(), "a node of a parsed tree can't go to Python here", .{});
+            return null;
+        }));
+        const g = grammarOf(parser) orelse return null;
+        const text = ph.newString(@as(*value.Str, @ptrCast(t.text.ptr())).bytes()) orelse return null;
+        defer py.Py_DecRef(text);
+        const start: ?*PyObject = if (t.start) |s| ph.newString(s) orelse return null else null;
+        defer if (start) |s| py.Py_DecRef(s);
+        const tree = parseTree(parser, text, start, t.recover) orelse return null;
+        defer py.Py_DecRef(tree);
+        t.py_root = rootOf(parser, g, tree) orelse return null;
+        t.py_drop = dropRoot;
+    }
+    const root: *objects.NodeObject = @ptrCast(@alignCast(t.py_root.?));
+    if (idx == 0) {
+        py.Py_IncRef(@ptrCast(root));
+        return @ptrCast(root);
+    }
+    return objects.newNode(root.state.?, root.ctx.?, idx);
+}
+
+fn dropRoot(root: *anyopaque) void {
+    // (a count, not Python running: as value.zig drops what Python owns)
+    gil.allowBegin();
+    defer gil.allowEnd();
+    py.Py_DecRef(@ptrCast(@alignCast(root)));
 }
 
 /// parser.parse_tree(text, start=start, recover=recover)

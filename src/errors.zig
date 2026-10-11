@@ -45,6 +45,9 @@ pub const Kind = enum(u8) {
     FrozenInstanceError,
     /// struct.error (an Exception)
     StructError,
+    /// zgram.ParseError (a ValueError): rt.parse's syntax error; its value
+    /// (line, column, offset, message)
+    ParseError,
 
     /// The kind it's a subclass of (null: BaseException)
     pub fn parent(k: Kind) ?Kind {
@@ -54,7 +57,7 @@ pub const Kind = enum(u8) {
             .ArithmeticError, .LookupError, .ValueError, .TypeError, .AttributeError, .NameError, .RuntimeError, .AssertionError, .StopIteration, .BufferError, .ZrunError, .Throw, .StructError => .Exception,
             .ZeroDivisionError, .OverflowError, .FloatingPointError, .IntegerOverflow => .ArithmeticError,
             .IndexError, .KeyError => .LookupError,
-            .UnicodeError => .ValueError,
+            .UnicodeError, .ParseError => .ValueError,
             .UnicodeDecodeError, .UnicodeEncodeError => .UnicodeError,
             .UnboundLocalError => .NameError,
             .RecursionError, .NotImplementedError => .RuntimeError,
@@ -75,8 +78,9 @@ pub const Kind = enum(u8) {
             .IntegerOverflow => types.IntegerOverflow,
             .ZrunError => types.Error,
             .Throw => types.Throw,
-            .FrozenInstanceError => moduleClass("dataclasses", "FrozenInstanceError"),
-            .StructError => moduleClass("struct", "error"),
+            .FrozenInstanceError => moduleClass(.FrozenInstanceError, "dataclasses", "FrozenInstanceError"),
+            .StructError => moduleClass(.StructError, "struct", "error"),
+            .ParseError => moduleClass(.ParseError, "zgram", "ParseError"),
             inline else => |t| builtinClass(@tagName(t)),
         };
     }
@@ -99,8 +103,8 @@ fn builtinClass(comptime n: [:0]const u8) ?*PyObject {
 }
 
 /// A module's class, found once (kept)
-fn moduleClass(comptime module: [:0]const u8, comptime n: [:0]const u8) ?*PyObject {
-    const slot = &module_classes[@intFromEnum(if (comptime std.mem.eql(u8, module, "struct")) Kind.StructError else Kind.FrozenInstanceError)];
+fn moduleClass(comptime k: Kind, comptime module: [:0]const u8, comptime n: [:0]const u8) ?*PyObject {
+    const slot = &module_classes[@intFromEnum(k)];
     if (slot.*) |c| return c;
     const m = py.c.PyImport_ImportModule(module) orelse {
         py.c.PyErr_Clear();
