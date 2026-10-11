@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **A parsed node's reference counted by compiled code** (`rt.parse`): the inline counting left parsed nodes out, so a child node kept past its `children` list (in a record, say) was freed under it and the program crashed. The inline count now tests the runtime's own list of counted kinds.
 - **`type(x) is C` with `x` an rt method or control value known while compiling** crashed the compiler (the Lua example built standalone with `prune=True`); it's compared at run time now.
+- **References of known lists' items kept or freed twice** (found porting vetter to the strict subset):
+  - a loop unrolled over a known list of known tuples (`for a, b in [(s, 0)]`) gave the target the tuple's references without its own: they were freed twice (a crash);
+  - a known list holding a known list or dict, made at run time (changed in run-time control flow), kept a reference to the inner one: it was never freed;
+  - a known list inside another, the outer one let go of, kept its items' references; and one moved out of a variable by its last read and used as a temporary (`fields[0].append(x)`) kept its items' too: they're given up after the statement now.
+
+  A program calling such code repeatedly grew without end, and the cycle collector, going over what grew, took a quarter of its time.
 
 ## [0.7.0] - 2026-10-11
 

@@ -2395,6 +2395,10 @@ const Inst = struct {
     /// Slots of values it holds for a while (a run-time loop's items):
     /// None but while held, released with its locals
     temps: std.ArrayListUnmanaged(ir.Value) = .empty,
+    /// Known lists moved out of its variables (their last reads) in the
+    /// statement running: released after it unless something has them
+    /// (releaseMoved)
+    moved: std.ArrayListUnmanaged(*SList) = .empty,
     /// The heap frame this run made (front.Function.makes_frame: the
     /// variables closures read), released with its locals
     heap_frame: ?ir.Value = null,
@@ -3071,7 +3075,9 @@ const Gen = struct {
         while (i > 0) {
             i -= 1;
             switch (held[i]) {
-                .list => |l| if (self.heldListReleased(l)) try self.releaseList(inst, l),
+                .list => |l| if (self.heldListReleased(l)) {
+                    _ = try self.releaseList(inst, l);
+                },
                 else => try self.drop(held[i]),
             }
         }
@@ -3205,7 +3211,7 @@ const Gen = struct {
             .static => |sv| {
                 inst.locals[slot] = .unset;
                 try self.drop(sv);
-                if (sv == .list) try self.releaseList(inst, sv.list);
+                if (sv == .list) _ = try self.releaseList(inst, sv.list);
             },
             .unset => {},
         }
@@ -3367,7 +3373,17 @@ const Gen = struct {
             },
             .list => |l| blk: {
                 if (l.frozen) |o| break :blk if (l.comptime_result) try self.comptimeConst(o, .list) else try self.frozenConst(o, .list);
+                // (a known container in it is made at run time with it, and
+                // what refers to that one then refers to the run-time one,
+                // each with a reference of its own (promote): this list's
+                // item too, given up here: its items are the run-time list's)
+                const was_dyn = try self.a().alloc(bool, l.items.items.len);
+                for (l.items.items, was_dyn) |x, *w| w.* = x == .dyn;
                 const d = try self.buildSequence("zr_list", l.items.items, at, .list);
+                for (l.items.items, was_dyn) |*x, w| if (!w and x.* == .dyn) {
+                    try self.drop(x.*);
+                    x.* = .none;
+                };
                 l.taken = true;
                 try self.promote(v, d);
                 break :blk d;
@@ -5744,10 +5760,7 @@ const Gen = struct {
             .slot => |s| if (!s.heap) try self.dropTemp(s.ptr),
             .static => |sv| {
                 try self.drop(sv);
-                if (sv == .list and std.mem.indexOfScalar(*SList, released.items, sv.list) == null) {
-                    try released.append(self.a(), sv.list);
-                    try self.releaseList(inst, sv.list);
-                }
+                if (sv == .list) try self.releaseNested(inst, sv.list, &released);
             },
             .unset => {},
         };
@@ -5758,17 +5771,34 @@ const Gen = struct {
     /// A known list a semantic's variable refers to, the semantic done: its
     /// items given up if nothing took them and nothing else refers to it
     /// (another semantic running here, what this one returns).
-    fn releaseList(self: *Gen, inst: *Inst, l: *SList) Error!void {
-        if (l.taken or l.frozen != null) return;
-        if (inst.result) |r| if (refersTo(r, l, 4)) return;
+    fn releaseList(self: *Gen, inst: *Inst, l: *SList) Error!bool {
+        if (l.taken or l.frozen != null) return false;
+        if (inst.result) |r| if (refersTo(r, l, 4)) return false;
         for (self.insts.items) |other| {
             if (other == inst) continue;
             for (other.locals) |x| switch (x) {
-                .static => |sv| if (refersTo(sv, l, 4)) return,
+                .static => |sv| if (refersTo(sv, l, 4)) return false,
                 else => {},
             };
         }
         for (l.items.items) |item| try self.drop(item);
+        // (a known list in it no variable refers to any more: its items too,
+        // `fields = [[]]; fields[0].append(x)`)
+        for (l.items.items) |item| if (item == .list and !self.aliased(item.list)) {
+            _ = try self.releaseList(inst, item.list);
+        };
+        return true;
+    }
+
+    /// releaseList of a list all of a semantic's variables let go of at
+    /// once (releaseLocals), and of the known lists in it: their items'
+    /// references too (`fields = [[]]; fields[0].append(x)`), each list
+    /// once (`released`).
+    fn releaseNested(self: *Gen, inst: *Inst, l: *SList, released: *std.ArrayListUnmanaged(*SList)) Error!void {
+        if (std.mem.indexOfScalar(*SList, released.items, l) != null) return;
+        try released.append(self.a(), l);
+        if (!try self.releaseList(inst, l)) return;
+        for (l.items.items) |item| if (item == .list) try self.releaseNested(inst, item.list, released);
     }
 
     /// A slot holding None from the function's start (whichever path
@@ -5819,6 +5849,23 @@ const Gen = struct {
     }
 
     fn stmt(self: *Gen, inst: *Inst, s: front.Stmt) Error!void {
+        try self.stmtOf(inst, s);
+        try self.releaseMoved(inst);
+    }
+
+    /// The known lists moved out of variables in a statement, done: those
+    /// nothing took, no variable refers to and the semantic doesn't return
+    /// are temporaries, their items' references given up
+    /// (`fields[0].append(x)`, the last read of fields)
+    fn releaseMoved(self: *Gen, inst: *Inst) Error!void {
+        defer inst.moved.clearRetainingCapacity();
+        for (inst.moved.items) |l| {
+            if (l.taken or self.aliased(l)) continue;
+            if (try self.releaseList(inst, l)) l.taken = true;
+        }
+    }
+
+    fn stmtOf(self: *Gen, inst: *Inst, s: front.Stmt) Error!void {
         const outer = self.pos;
         self.pos = s.pos;
         defer self.pos = outer;
@@ -6619,8 +6666,9 @@ const Gen = struct {
         var broke = false;
         for (items) |item| {
             const next = try self.f.label("next");
-            if (item == .dyn) try self.increfDyn(item.dyn);
-            try self.assign(inst, target, item, pos);
+            // (the target's own copy: the container keeps its item, a known
+            // tuple's references too: `for a, b in [(s, 0)]`)
+            try self.assign(inst, target, try self.copyOf(item), pos);
             try inst.loops.append(self.a(), .{ .brk = exit, .cont = next, .tries = self.tries.items.len, .unrolled = iter_e, .dyn_depth = inst.dyn_depth, .in_try = inst.in_try });
             try self.stmts(inst, body);
             _ = inst.loops.pop();
@@ -6655,7 +6703,7 @@ const Gen = struct {
                     .static => |sv| if (refersTo(sv, l, 4)) return,
                     else => {},
                 };
-                try self.releaseList(inst, l);
+                _ = try self.releaseList(inst, l);
                 l.taken = true;
             },
             else => {},
@@ -6925,10 +6973,15 @@ const Gen = struct {
                 return self.outOfLine(inst.func, inst.node, args);
             },
             .local => |slot| {
-                // (its last read: its value moved out, the local done with)
+                // (its last read: its value moved out, the local done with;
+                // a known list or dict stays, released with the variable:
+                // the references of its items are its own, nothing taking
+                // them as it's moved (`fields[0].append(x)`))
                 if (inst.locals[slot] == .static and inst.dyn_depth == 0 and try self.c.isMove(inst.func, e)) {
                     const v = inst.locals[slot].static;
                     inst.locals[slot] = .unset;
+                    // (a known list: a temporary unless something takes it)
+                    if (v == .list) try inst.moved.append(self.a(), v.list);
                     return v;
                 }
                 return self.readLocal(inst, slot, e.pos);
