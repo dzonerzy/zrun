@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-11
+
 ### Added
 - **A module's set the semantics only read is native** (`x in KEYWORDS`, iterating it), a constant of the code made once, as its lists and dicts are: strict languages use one, and standalone programs carry it in their image. (A frozenset stays Python's: natively it would be a `set`.)
 
