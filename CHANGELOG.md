@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-11
+
 Needs zgram 0.6.0 (its parsers built ahead of time, `GrammarParser.capsule`).
 
 ### Added
