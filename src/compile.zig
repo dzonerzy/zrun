@@ -9710,9 +9710,9 @@ const Gen = struct {
         if (args.len == 1 and (args[0] == .dyn or isScalar(args[0]) or args[0] == .list or args[0] == .dict)) {
             inline for (@typeInfo(helpers.Builtin).@"enum".fields) |fd| {
                 const module: ?[*:0]const u8 = comptime if (std.mem.eql(u8, fd.name, "floor") or std.mem.eql(u8, fd.name, "ceil")) "math" else if (std.mem.eql(u8, fd.name, "fspath")) "os" else null;
-                // (a known list or dict: id()'s only, made the run-time
-                // object every reference to it is from then)
-                const takes_containers = comptime std.mem.eql(u8, fd.name, "id");
+                // (a known list or dict: id()'s and repr()'s only, made the
+                // run-time object every reference to it is from then)
+                const takes_containers = comptime std.mem.eql(u8, fd.name, "id") or std.mem.eql(u8, fd.name, "repr");
                 if ((args[0] != .list and args[0] != .dict or takes_containers) and (if (module) |m| isModuleAttr(o, m, fd.name) else isBuiltin(o, fd.name))) {
                     const d = try self.materialize(args[0], inst.node);
                     const idx = try c.objectIndex(o);

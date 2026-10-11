@@ -17,7 +17,7 @@ const gil = @import("gil.zig");
 const errors = @import("errors.zig");
 const gc = @import("gc.zig");
 const ptree = @import("ptree.zig");
-const casemap = @import("casemap.zig");
+const utab = @import("unicode.zig");
 
 const Value = value.Value;
 const Tag = value.Tag;
@@ -3718,8 +3718,8 @@ fn callMethodPython(ctx: *Ctx, node: u32, v: Value, name: *const value.Str, args
 
 /// A str method natively (true / false: an error), or null for one (or
 /// arguments, or a str) not done here.
-/// The mapping of a character in a case table (casemap.zig), or null.
-fn caseMapOf(table: []const casemap.Map, cp: u21) ?*const casemap.Map {
+/// The mapping of a character in a case table (unicode.zig), or null.
+fn caseMapOf(table: []const utab.Map, cp: u21) ?*const utab.Map {
     var lo: usize = 0;
     var hi: usize = table.len;
     while (lo < hi) {
@@ -3730,7 +3730,7 @@ fn caseMapOf(table: []const casemap.Map, cp: u21) ?*const casemap.Map {
     return null;
 }
 
-fn inCaseRanges(rs: []const casemap.Range, cp: u21) bool {
+fn inCaseRanges(rs: []const utab.Range, cp: u21) bool {
     var lo: usize = 0;
     var hi: usize = rs.len;
     while (lo < hi) {
@@ -3779,28 +3779,28 @@ fn lowerSigma(cps: []const u21, i: usize) u21 {
     var before: ?u21 = null;
     while (j > 0) {
         j -= 1;
-        if (!inCaseRanges(&casemap.case_ignorable, cps[j])) {
+        if (!inCaseRanges(&utab.case_ignorable, cps[j])) {
             before = cps[j];
             break;
         }
     }
-    var final = before != null and inCaseRanges(&casemap.cased, before.?);
+    var final = before != null and inCaseRanges(&utab.cased, before.?);
     if (final and i + 1 < cps.len) {
         var k = i + 1;
-        while (k < cps.len and inCaseRanges(&casemap.case_ignorable, cps[k])) k += 1;
-        final = k == cps.len or !inCaseRanges(&casemap.cased, cps[k]);
+        while (k < cps.len and inCaseRanges(&utab.case_ignorable, cps[k])) k += 1;
+        final = k == cps.len or !inCaseRanges(&utab.cased, cps[k]);
     }
     return if (final) 0x3C2 else 0x3C3;
 }
 
-/// s.lower() or s.upper() as Python does them (casemap.zig's tables)
+/// s.lower() or s.upper() as Python does them (unicode.zig's tables)
 fn strCase(ctx: *Ctx, node: u32, s: *value.Str, upper: bool, out: *Value) bool {
     var cps: std.ArrayListUnmanaged(u21) = .empty;
     defer cps.deinit(allocator);
     codepoints(s.bytes(), &cps) catch return oomFail(ctx, node);
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
-    const table: []const casemap.Map = if (upper) &casemap.upper else &casemap.lower;
+    const table: []const utab.Map = if (upper) &utab.upper else &utab.lower;
     for (cps.items, 0..) |cp, i| {
         if (!upper and cp == 0x3A3) {
             appendCodepoint(&buf, lowerSigma(cps.items, i)) catch return oomFail(ctx, node);
@@ -4462,9 +4462,8 @@ fn anyStr(ctx: *Ctx, v: Value, buf: *std.ArrayListUnmanaged(u8), repr: bool) boo
 }
 
 /// str() (repr: repr()) of a value as Python writes it, natively: NotNative
-/// when a part of it isn't written natively (a host object, a str repr()
-/// would escape beyond ASCII, a record of a Python class...: Python's
-/// then). Without Python, every value is (those Python alone knows by
+/// when a part of it isn't written natively (a host object, a record of a
+/// Python class...: Python's then). Without Python, every value is (those Python alone knows by
 /// their kind). `seen`: the containers being written (one inside itself
 /// is `[...]`, as Python's).
 fn nativeStr(v: Value, buf: *std.ArrayListUnmanaged(u8), repr: bool, seen: *std.ArrayListUnmanaged(usize)) error{ OutOfMemory, NotNative }!void {
@@ -4475,8 +4474,7 @@ fn nativeStr(v: Value, buf: *std.ArrayListUnmanaged(u8), repr: bool, seen: *std.
         .str => {
             const s = @as(*value.Str, @ptrCast(v.ptr())).bytes();
             if (!repr) return buf.appendSlice(allocator, s);
-            if (!standalone) for (s) |ch| if (ch >= 0x80) return error.NotNative;
-            return quoted(s, buf, false);
+            return strRepr(s, buf);
         },
         .bytes => {
             const b: *value.Bytes = @ptrCast(@alignCast(v.ptr()));
@@ -4577,10 +4575,49 @@ fn nativeStr(v: Value, buf: *std.ArrayListUnmanaged(u8), repr: bool, seen: *std.
     }
 }
 
+/// A str's repr(), as Python writes it: between ' (" when the text has '
+/// and not "), \\ and the quote escaped, \t \n \r, what isn't printable as
+/// \xhh, \uhhhh or \Uhhhhhhhh (unicode.zig's not_printable).
+fn strRepr(s: []const u8, buf: *std.ArrayListUnmanaged(u8)) !void {
+    const has_single = std.mem.indexOfScalar(u8, s, '\'') != null;
+    const has_double = std.mem.indexOfScalar(u8, s, '"') != null;
+    const q: u21 = if (has_single and !has_double) '"' else '\'';
+    var cps: std.ArrayListUnmanaged(u21) = .empty;
+    defer cps.deinit(allocator);
+    try codepoints(s, &cps);
+    try buf.append(allocator, @intCast(q));
+    for (cps.items) |c| {
+        if (c == '\\') {
+            try buf.appendSlice(allocator, "\\\\");
+        } else if (c == q) {
+            try buf.append(allocator, '\\');
+            try buf.append(allocator, @intCast(c));
+        } else if (c == '\t') {
+            try buf.appendSlice(allocator, "\\t");
+        } else if (c == '\n') {
+            try buf.appendSlice(allocator, "\\n");
+        } else if (c == '\r') {
+            try buf.appendSlice(allocator, "\\r");
+        } else if (c < 0x20 or c == 0x7f) {
+            try buf.print(allocator, "\\x{x:0>2}", .{c});
+        } else if (c < 0x80) {
+            try buf.append(allocator, @intCast(c));
+        } else if (inCaseRanges(&utab.not_printable, c)) {
+            if (c < 0x100) {
+                try buf.print(allocator, "\\x{x:0>2}", .{c});
+            } else if (c < 0x10000) {
+                try buf.print(allocator, "\\u{x:0>4}", .{c});
+            } else try buf.print(allocator, "\\U{x:0>8}", .{c});
+        } else try appendCodepoint(buf, c);
+    }
+    try buf.append(allocator, @intCast(q));
+}
+
 /// A str's (bytes: a bytes') repr() between quotes, as Python writes it:
-/// ' unless the text has ' and not ", escapes for what isn't printable
-/// (beyond ASCII: a str's characters as they are; a bytes' \x escapes)
+/// ' unless the text has ' and not ", escapes for what isn't printable (a
+/// bytes': \x escapes beyond ASCII)
 fn quoted(s: []const u8, buf: *std.ArrayListUnmanaged(u8), is_bytes: bool) !void {
+    if (!is_bytes) return strRepr(s, buf);
     const has_single = std.mem.indexOfScalar(u8, s, '\'') != null;
     const has_double = std.mem.indexOfScalar(u8, s, '"') != null;
     const q: u8 = if (has_single and !has_double) '"' else '\'';
@@ -4622,11 +4659,8 @@ fn pythonStr(ctx: *Ctx, v: Value, buf: *std.ArrayListUnmanaged(u8), repr: bool) 
 /// repr() of a key (a KeyError's str): natively for strs and ints
 fn reprInto(ctx: *Ctx, v: Value, buf: *std.ArrayListUnmanaged(u8)) bool {
     if (v.kind() == .str) {
-        var tmp: [1024]u8 = undefined;
-        if (pyRepr(@as(*value.Str, @ptrCast(v.ptr())).bytes(), &tmp)) |r| {
-            buf.appendSlice(allocator, r) catch return false;
-            return true;
-        }
+        strRepr(@as(*value.Str, @ptrCast(v.ptr())).bytes(), buf) catch return false;
+        return true;
     }
     if (value.wide(v)) |x| if (v.kind() != .bool) {
         buf.print(allocator, "{d}", .{x}) catch return false;
@@ -4927,7 +4961,7 @@ export fn zr_range(ctx: *Ctx, node: u32, args: [*]const Value, n: u64, out: *[3]
 /// The builtins zr_builtin does natively, by code
 /// The builtins zr_builtin does natively for native values (floor and ceil:
 /// math's)
-pub const Builtin = enum(u32) { int, float, len, abs, str, bool, list, floor, ceil, chr, ord, id, fspath };
+pub const Builtin = enum(u32) { int, float, len, abs, str, bool, list, floor, ceil, chr, ord, id, fspath, repr };
 
 /// A builtin of one argument (`code`), natively for native values, as
 /// Python does it; anything else (and the errors) by the builtin itself
@@ -4953,7 +4987,7 @@ pub export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: 
                 out.* = Value.float(@floatFromInt(x));
                 return true;
             },
-            .str => {
+            .str, .repr => {
                 var buf: [48]u8 = undefined;
                 const s = value.newStr(std.fmt.bufPrint(&buf, "{d}", .{x}) catch unreachable) orelse return oomFail(ctx, node);
                 out.* = Value.obj(.str, &s.head);
@@ -5193,6 +5227,33 @@ pub export fn zr_builtin(ctx: *Ctx, node: u32, code: u32, callee_index: u64, t: 
             // (a dict's keys, a str's characters: a new list, as a loop
             // over them sees them)
             .dict, .str, .set => return zr_items(ctx, node, v.tag, v.bits, out),
+            else => {},
+        },
+        // (repr() of a str: Python's quotes and escapes; of an int, a
+        // float, a bool, None: their str())
+        .repr => switch (v.kind()) {
+            .str => {
+                var buf: std.ArrayListUnmanaged(u8) = .empty;
+                defer buf.deinit(allocator);
+                strRepr(@as(*value.Str, @ptrCast(v.ptr())).bytes(), &buf) catch return oomFail(ctx, node);
+                const r = value.newStr(buf.items) orelse return oomFail(ctx, node);
+                out.* = Value.obj(.str, &r.head);
+                return true;
+            },
+            .int, .bool, .float, .none => return zr_builtin(ctx, node, @intFromEnum(Builtin.str), callee_index, t, bits, out),
+            // (a list, tuple, dict, set...: written natively where it can
+            // be, as print() writes it)
+            .list, .tuple, .dict, .set => {
+                var buf: std.ArrayListUnmanaged(u8) = .empty;
+                defer buf.deinit(allocator);
+                var seen: std.ArrayListUnmanaged(usize) = .empty;
+                defer seen.deinit(allocator);
+                if (nativeStr(v, &buf, true, &seen)) |_| {
+                    const r = value.newStr(buf.items) orelse return oomFail(ctx, node);
+                    out.* = Value.obj(.str, &r.head);
+                    return true;
+                } else |e| if (e == error.OutOfMemory) return oomFail(ctx, node);
+            },
             else => {},
         },
     }
