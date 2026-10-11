@@ -103,6 +103,21 @@ pub const Grammar = struct {
         return g;
     }
 
+    /// One more rule, "<error>": what error nodes are (zgram's recovery
+    /// gives them the rule count as their rule id), for trees parsed with
+    /// recover=True
+    pub fn addErrorRule(self: *Grammar) !void {
+        const a = self.arena.allocator();
+        const name: []const u8 = "<error>";
+        const kind = py.PyUnicode_FromStringAndSize(name.ptr, @intCast(name.len)) orelse return error.Python;
+        errdefer py.Py_DecRef(kind);
+        self.rule_names = try std.mem.concat(a, []const u8, &.{ self.rule_names, &.{name} });
+        self.kind_names = try std.mem.concat(a, []const u8, &.{ self.kind_names, &.{name} });
+        self.actions = try std.mem.concat(a, Action, &.{ self.actions, &.{.none} });
+        self.labels = try std.mem.concat(a, []const Label, &.{ self.labels, &.{&.{}} });
+        self.kinds = try std.mem.concat(a, *PyObject, &.{ self.kinds, &.{kind} });
+    }
+
     pub fn ruleCount(self: *const Grammar) usize {
         return self.rule_names.len;
     }

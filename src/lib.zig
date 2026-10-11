@@ -33,6 +33,7 @@ const gc = @import("gc.zig");
 const aot = @import("aot.zig");
 const cache = @import("cache.zig");
 const value_mod = @import("value.zig");
+const parse_mod = @import("parse.zig");
 
 const allocator = std.heap.c_allocator;
 const NONE = program_mod.NONE;
@@ -3225,6 +3226,14 @@ const Runtime = struct {
     /// arithmetic wrapping around; `rt.wrapping_shl(a, n)`,
     /// `rt.wrapping_shr`, `rt.wrapping_ushr`: 64-bit shifts by n modulo 64
     /// (wrapping.zig).
+    /// `rt.parse(grammar, text, start=None, recover=False)`: text parsed
+    /// with a zgram parser while the program runs, its tree read as the
+    /// program's (parse.zig)
+    pub fn parse(self: *Runtime, args: pyoz.Args(struct { grammar: *PyObject, text: *PyObject, start: ?*PyObject = null, recover: bool = false })) ?*PyObject {
+        _ = self;
+        return parse_mod.parsePython(args.value.grammar, args.value.text, args.value.start, args.value.recover);
+    }
+
     pub fn wrapping_add(self: *Runtime, a: *PyObject, b: *PyObject) ?*PyObject {
         _ = self;
         return @import("wrapping.zig").ofPython(.add, a, b);

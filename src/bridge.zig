@@ -1345,6 +1345,19 @@ fn rtNodeAt(self: ?*PyObject, x: ?*PyObject) callconv(.c) ?*PyObject {
     return r.ctx.?.node_maker.make(@intCast(i));
 }
 
+/// rt.parse(grammar, text, start=None, recover=False) (parse.zig): in a
+/// semantic run as Python, as the reference mode's
+fn rtParse(self: ?*PyObject, args: ?*PyObject, kwargs: ?*PyObject) callconv(.c) ?*PyObject {
+    _ = live(self) orelse return null;
+    var grammar: ?*PyObject = null;
+    var text: ?*PyObject = null;
+    var start: ?*PyObject = null;
+    var recover: c_int = 0;
+    var kwlist = [_:null]?[*:0]u8{ @constCast("grammar"), @constCast("text"), @constCast("start"), @constCast("recover"), null };
+    if (py.c.PyArg_ParseTupleAndKeywords(args, kwargs, "OO|Op", @ptrCast(&kwlist), &grammar, &text, &start, &recover) == 0) return null;
+    return @import("parse.zig").parsePython(grammar.?, text.?, start, recover != 0);
+}
+
 /// rt.wrapping_add(a, b) and the others (wrapping.zig)
 fn rtWrapping(comptime op: @import("wrapping.zig").Op) fn (?*PyObject, ?*PyObject) callconv(.c) ?*PyObject {
     return struct {
@@ -1477,6 +1490,7 @@ var methods = [_]py.c.PyMethodDef{
     method("type_of", rtTypeOf, py.c.METH_O),
     method("node_at", rtNodeAt, py.c.METH_O),
     method("fresh", rtFresh, py.c.METH_O),
+    method("parse", rtParse, py.c.METH_VARARGS | py.c.METH_KEYWORDS),
     method("wrapping_add", rtWrapping(.add), py.c.METH_VARARGS),
     method("wrapping_sub", rtWrapping(.sub), py.c.METH_VARARGS),
     method("wrapping_mul", rtWrapping(.mul), py.c.METH_VARARGS),
