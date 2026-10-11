@@ -115,3 +115,71 @@ error 1 6 5 expected ':'
 def test_parse_in_every_mode(mode, capsys):
     lang.load(SOURCE, "data.prog").run(mode=mode)
     assert capsys.readouterr().out == EXPECTED
+
+
+def test_compiled_without_python(capsys):
+    program = lang.load(SOURCE, "data.prog")
+    program.run(mode="compiled", report=True)
+    assert program.report()["python_crossings"] == {}
+    assert lang.python_semantics() == {}
+
+
+# Fields whose values the grammar's actions make: the same values in every
+# mode, natively in compiled code
+ACTIONS = zgram.compile(r"""
+record  = ws 'rec' ws name:name ws n:int ws f:float ws s:qstr ws flags:flags ws pairs:pairs ws first:firstof ws
+name    = [a-z]+                                       -> str
+int     = '-'? [0-9_]+                                 -> int
+float   = '-'? [0-9]+ '.' [0-9]+ ('e' '-'? [0-9]+)?    -> float
+qstr    = '"' ('\\' . | [^"\\])* '"'                   -> unquote
+flags   = '[' flag* ']'                                -> tuple
+@silent flag = ws (yes | no | nil)
+yes     = 'yes'                                        -> True
+no      = 'no'                                         -> False
+nil     = 'nil'                                        -> None
+pairs   = '{' (ws pair)* ws '}'                        -> dict
+pair    = name ws '=' ws int                           -> tuple
+firstof = '<' ws int (ws int)* ws '>'                  -> first
+@silent ws = [ \t\n]*
+""")
+
+AGRAMMAR = r"""
+program = ws (body:stmt ws)*                         -> Program
+stmt    = 'show' ws text:string ws ';'               -> Show
+string  = '"' ('\\' . | [^"\\])* '"'                 -> unquote
+@silent ws = [ \t\n]*
+"""
+APARSER = zgram.compile(AGRAMMAR)
+alang = zrun.Language(APARSER, Rules(APARSER, []))
+
+
+@alang.exec("Program")
+def aprogram(node, rt):
+    for s in node.body:
+        rt.exec(s)
+
+
+@alang.exec("Show")
+def show(node, rt):
+    r = rt.parse(ACTIONS, node.text)
+    print(r.name, r.n, r.n + 1, r.f, r.s, len(r.s), r.flags, r.pairs, r.first)
+
+
+ASOURCE = r"""
+show "rec abc 1_000 2.5e-3 \"a\\tb\\u00e9\\ud83d\\ude00\" [yes no nil] {x = 1 y = -2} <7 8 9>";
+show "rec z -42 0.1 \"\" [] {} <0>";
+"""
+
+
+@pytest.mark.parametrize("mode", ["python", "compiled"])
+def test_actions(mode, capsys):
+    alang.load(ASOURCE, "a.prog").run(mode=mode)
+    assert capsys.readouterr().out == (
+        "abc 1000 1001 0.0025 a\tbé😀 5 (True, False, None) {'x': 1, 'y': -2} 7\n"
+        "z -42 -41 0.1  0 () {} 0\n")
+
+
+def test_actions_without_python(capsys):
+    program = alang.load(ASOURCE, "a.prog")
+    program.run(mode="compiled", report=True)
+    assert program.report()["python_crossings"] == {}

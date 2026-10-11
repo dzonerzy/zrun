@@ -120,26 +120,7 @@ fn attrIn(ctx: *Ctx, src: Source, idx: u32, name: *const value.Str, out: *Value)
             out.* = if (p == program_mod.NONE) Value.none_v else src.node(p) orelse return helpers.fail(ctx, src.at, "out of memory", .{});
         },
         .children => {
-            var count: usize = 0;
-            var ch = idx + 1;
-            const stop = d.end(idx);
-            while (ch < stop) : (ch = d.end(ch)) {
-                switch (childKind(d, ch)) {
-                    .action => return null,
-                    .node => count += 1,
-                    .dropped => {},
-                }
-            }
-            const l = value.newList(count) orelse return helpers.fail(ctx, src.at, "out of memory", .{});
-            ch = idx + 1;
-            while (ch < stop) : (ch = d.end(ch)) {
-                if (childKind(d, ch) != .node) continue;
-                const v = src.node(ch) orelse {
-                    value.decref(Value.obj(.list, &l.head));
-                    return helpers.fail(ctx, src.at, "out of memory", .{});
-                };
-                _ = value.listPush(l, v);
-            }
+            const l = childList(src, idx, null) orelse return null;
             out.* = Value.obj(.list, &l.head);
         },
         .other => return null,
@@ -154,51 +135,209 @@ fn fieldValue(ctx: *Ctx, src: Source, idx: u32, rid: u32, field: u8, out: *Value
     const d = src.data;
     const label = d.grammar.labelOf(rid, field);
     const many = label != null and label.?.many;
-    var count: usize = 0;
-    var only: u32 = program_mod.NONE;
-    var ch = idx + 1;
-    const stop = d.end(idx);
-    // (the labelled children: nodes; one an action makes a value of:
-    // Python's)
-    while (ch < stop) : (ch = d.end(ch)) {
-        if (d.nodes[ch].fieldId() != field) continue;
-        switch (childKind(d, ch)) {
-            .action => return null,
-            .dropped => continue,
-            .node => {
-                count += 1;
-                only = ch;
-            },
-        }
-    }
-    if (!many and count <= 1) {
-        out.* = if (count == 0) Value.none_v else src.node(only) orelse return helpers.fail(ctx, src.at, "out of memory", .{});
+    const l = childList(src, idx, field) orelse return null;
+    if (many or l.len > 1) {
+        out.* = Value.obj(.list, &l.head);
         return true;
     }
-    const l = value.newList(count) orelse return helpers.fail(ctx, src.at, "out of memory", .{});
-    ch = idx + 1;
-    while (ch < stop) : (ch = d.end(ch)) {
-        if (d.nodes[ch].fieldId() != field or childKind(d, ch) != .node) continue;
-        const v = src.node(ch) orelse {
-            value.decref(Value.obj(.list, &l.head));
-            return helpers.fail(ctx, src.at, "out of memory", .{});
-        };
-        _ = value.listPush(l, v);
-    }
-    out.* = Value.obj(.list, &l.head);
+    // (one: the child itself; none: None)
+    out.* = if (l.len == 1) l.slice()[0] else Value.none_v;
+    if (l.len == 1) value.incref(out.*);
+    value.decref(Value.obj(.list, &l.head));
+    _ = ctx;
     return true;
 }
 
-/// A child as a field: a node, dropped (None), or one whose action makes a
-/// value (Python's conversion)
-fn childKind(d: *const program_mod.Data, ch: u32) enum { node, dropped, action } {
+/// The values of a node's children (those labelled `field`, or all), as
+/// the grammar's actions make them, dropped ones left out: a new list, or
+/// null (out of memory, or a value only Python's conversion makes: an int
+/// or float spelled unusually, an action only Python knows).
+fn childList(src: Source, idx: u32, field: ?u8) ?*value.List {
+    const d = src.data;
+    const l = value.newList(0) orelse return null;
+    var ch = idx + 1;
+    const stop = d.end(idx);
+    while (ch < stop) : (ch = d.end(ch)) {
+        if (field) |f| if (d.nodes[ch].fieldId() != f) continue;
+        const v = (childValue(src, ch) orelse {
+            value.decref(Value.obj(.list, &l.head));
+            return null;
+        }) orelse continue;
+        if (!value.listPush(l, v)) {
+            value.decref(v);
+            value.decref(Value.obj(.list, &l.head));
+            return null;
+        }
+    }
+    return l;
+}
+
+/// A child's value, as the grammar's action makes it (as zgram's parse_ast
+/// does): the node itself, a scalar of its text, a constant, its children's
+/// values; null (no value) for a dropped one; an outer null: not natively
+/// (childList's).
+fn childValue(src: Source, ch: u32) ??Value {
+    const d = src.data;
     const crid = d.rule(ch);
     const action: grammar_mod.Action = if (crid < d.grammar.actions.len) d.grammar.actions[crid] else .none;
+    const text = d.text(ch);
     return switch (action) {
-        .none, .class => .node,
-        .drop => .dropped,
-        else => .action,
+        .none, .class => src.node(ch) orelse return @as(??Value, null),
+        .drop => @as(?Value, null),
+        .true_ => Value.boolean(true),
+        .false_ => Value.boolean(false),
+        .none_ => Value.none_v,
+        .str => strValue(text) orelse return @as(??Value, null),
+        .unquote => blk: {
+            const s = unquoted(text) orelse return @as(??Value, null);
+            defer allocator.free(s);
+            break :blk strValue(s) orelse return @as(??Value, null);
+        },
+        .int => Value.int(intOf(text) orelse return @as(??Value, null)),
+        .float => Value.float(floatOf(text) orelse return @as(??Value, null)),
+        .list, .tuple, .dict, .first => blk: {
+            const l = childList(src, ch, null) orelse return @as(??Value, null);
+            const lv = Value.obj(.list, &l.head);
+            switch (action) {
+                .list => break :blk lv,
+                .first => {
+                    defer value.decref(lv);
+                    if (l.len == 0) break :blk Value.none_v;
+                    value.incref(l.slice()[0]);
+                    break :blk l.slice()[0];
+                },
+                .tuple => {
+                    defer value.decref(lv);
+                    const t = value.newTuple(l.len) orelse return @as(??Value, null);
+                    for (l.slice(), t.slice()) |x, *slot| {
+                        value.incref(x);
+                        slot.* = x;
+                    }
+                    break :blk Value.obj(.tuple, &t.head);
+                },
+                else => {
+                    // (pairs: the children that are 2-tuples, as parse_ast)
+                    defer value.decref(lv);
+                    const dict = value.newDict() orelse return @as(??Value, null);
+                    const dv = Value.obj(.dict, &dict.head);
+                    for (l.slice()) |x| {
+                        if (x.kind() != .tuple) continue;
+                        const pair = @as(*value.Tuple, @ptrCast(@alignCast(x.ptr()))).slice();
+                        if (pair.len != 2) continue;
+                        if (!value.hashable(pair[0]) or !value.dictSet(dict, pair[0], pair[1])) {
+                            value.decref(dv);
+                            return @as(??Value, null);
+                        }
+                    }
+                    break :blk dv;
+                },
+            }
+        },
     };
+}
+
+fn strValue(s: []const u8) ?Value {
+    const v = value.newStr(s) orelse return null;
+    return Value.obj(.str, &v.head);
+}
+
+/// Python's int(text), base 10, for what fits 64 bits: blanks around, a
+/// sign, digits with single `_` between them; null for anything else
+fn intOf(text: []const u8) ?i64 {
+    const t = std.mem.trim(u8, text, " \t\n\r\x0b\x0c");
+    if (t.len == 0) return null;
+    var i: usize = 0;
+    var neg = false;
+    if (t[0] == '+' or t[0] == '-') {
+        neg = t[0] == '-';
+        i = 1;
+    }
+    if (i == t.len) return null;
+    var acc: i128 = 0;
+    var last_digit = false;
+    while (i < t.len) : (i += 1) {
+        const ch = t[i];
+        if (ch == '_' and last_digit and i + 1 < t.len and std.ascii.isDigit(t[i + 1])) {
+            last_digit = false;
+            continue;
+        }
+        if (!std.ascii.isDigit(ch)) return null;
+        acc = acc * 10 + (ch - '0');
+        if (acc > std.math.maxInt(i64) + 1) return null;
+        last_digit = true;
+    }
+    if (neg) acc = -acc;
+    return std.math.cast(i64, acc);
+}
+
+/// Python's float(text) for the usual spellings (a sign, digits, a point,
+/// an exponent; inf, nan): correctly rounded as Python's; null for others
+fn floatOf(text: []const u8) ?f64 {
+    const t = std.mem.trim(u8, text, " \t\n\r\x0b\x0c");
+    if (t.len == 0 or std.mem.indexOfScalar(u8, t, '_') != null) return null;
+    for (t) |ch| if (!(std.ascii.isDigit(ch) or ch == '.' or ch == 'e' or ch == 'E' or ch == '+' or ch == '-')) {
+        const body = if (t[0] == '+' or t[0] == '-') t[1..] else t;
+        const neg = t[0] == '-';
+        if (std.ascii.eqlIgnoreCase(body, "inf") or std.ascii.eqlIgnoreCase(body, "infinity"))
+            return if (neg) -std.math.inf(f64) else std.math.inf(f64);
+        if (std.ascii.eqlIgnoreCase(body, "nan")) return std.math.nan(f64);
+        return null;
+    };
+    return std.fmt.parseFloat(f64, t) catch null;
+}
+
+/// `-> unquote` as zgram does it (its unquote): the quotes off, escapes
+/// \n \t \r \b \f \0 \xHH \uHHHH (surrogate pairs joined) and \c (c);
+/// null for a lone surrogate (Python's str has it, UTF-8 doesn't) or no
+/// memory. The caller frees it.
+fn unquoted(text: []const u8) ?[]u8 {
+    const inner = if (text.len >= 2) text[1 .. text.len - 1] else "";
+    const out = allocator.alloc(u8, inner.len) catch return null;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < inner.len) {
+        if (inner[i] != '\\' or i + 1 == inner.len) {
+            out[n] = inner[i];
+            n += 1;
+            i += 1;
+            continue;
+        }
+        const esc = inner[i + 1];
+        i += 2;
+        var cp: u21 = switch (esc) {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            'b' => 0x08,
+            'f' => 0x0C,
+            '0' => 0,
+            'x', 'u' => blk: {
+                const digits: usize = if (esc == 'x') 2 else 4;
+                if (i + digits > inner.len) break :blk esc;
+                const v = std.fmt.parseInt(u16, inner[i..][0..digits], 16) catch break :blk esc;
+                i += digits;
+                break :blk v;
+            },
+            else => esc,
+        };
+        if (cp >= 0xD800 and cp < 0xDC00 and i + 6 <= inner.len and inner[i] == '\\' and inner[i + 1] == 'u') {
+            if (std.fmt.parseInt(u16, inner[i + 2 ..][0..4], 16)) |low| {
+                if (low >= 0xDC00 and low < 0xE000) {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                    i += 6;
+                }
+            } else |_| {}
+        }
+        if (cp >= 0xD800 and cp < 0xE000) {
+            allocator.free(out);
+            return null;
+        }
+        n += std.unicode.utf8Encode(cp, out[n..]) catch {
+            allocator.free(out);
+            return null;
+        };
+    }
+    return allocator.realloc(out, n) catch out[0..n];
 }
 
 fn linkOf(ctx: *Ctx) *const Link {
