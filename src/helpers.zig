@@ -25,6 +25,10 @@ const allocator = std.heap.c_allocator;
 /// A frame of the language's call stack: the function called, where
 pub const CallEntry = extern struct { name: *value.Str, node: u32 };
 
+/// The calls' room a context of this thread made, kept when it's done for
+/// the next one (Ctx.deinit): not made again for each program.call
+threadlocal var spare_calls: ?[]CallEntry = null;
+
 /// The execution context of a run (or a call) of compiled code
 pub const Ctx = struct {
     /// Makes a Node object for a node index (the program's), for host
@@ -116,7 +120,11 @@ pub const Ctx = struct {
     pub fn deinit(self: *Ctx) void {
         self.drainGraveyard();
         self.graveyard.deinit(allocator);
-        if (self.calls_room > 0) allocator.free(self.calls[0..self.calls_room]);
+        if (self.calls_room > 0) {
+            // (kept for the thread's next context: one each program.call)
+            const calls = self.calls[0..self.calls_room];
+            if (spare_calls == null) spare_calls = calls else allocator.free(calls);
+        }
         self.calls_room = 0;
         self.clearError();
         self.exc_msg.deinit(allocator);
@@ -2564,8 +2572,16 @@ fn callOnce(ctx: *Ctx, node: u32, ft: u64, fb: u64, args: [*]const Value, nargs:
                 return fail(ctx, node, "call stack too deep (more than {d} calls)", .{ctx.max_depth});
             // (room for the deepest stack made once: a call just stores)
             if (ctx.calls_room == 0) {
-                ctx.calls = (allocator.alloc(CallEntry, ctx.max_depth) catch return fail(ctx, node, "out of memory", .{})).ptr;
-                ctx.calls_room = ctx.max_depth;
+                // (the thread's last context's, if it's this size)
+                if (spare_calls) |s| if (s.len == ctx.max_depth) {
+                    spare_calls = null;
+                    ctx.calls = s.ptr;
+                    ctx.calls_room = s.len;
+                };
+                if (ctx.calls_room == 0) {
+                    ctx.calls = (allocator.alloc(CallEntry, ctx.max_depth) catch return fail(ctx, node, "out of memory", .{})).ptr;
+                    ctx.calls_room = ctx.max_depth;
+                }
             }
             ctx.calls[ctx.depth] = .{ .name = fo.name, .node = node };
             ctx.depth += 1;
