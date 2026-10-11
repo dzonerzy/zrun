@@ -40,12 +40,24 @@ const win = struct {
     extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) i32;
     extern "kernel32" fn GetStdHandle(which: u32) callconv(.winapi) HANDLE;
     extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+    extern "kernel32" fn WriteFile(h: HANDLE, buf: [*]const u8, n: u32, written: ?*u32, overlapped: ?*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn CreateDirectoryW(name: [*:0]const u16, sa: ?*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn SetFileAttributesW(name: [*:0]const u16, attrs: u32) callconv(.winapi) i32;
+    extern "kernel32" fn MoveFileExW(from: [*:0]const u16, to: [*:0]const u16, flags: u32) callconv(.winapi) i32;
+    extern "kernel32" fn GetFileSizeEx(h: HANDLE, size: *i64) callconv(.winapi) i32;
+    extern "kernel32" fn GetSystemTimePreciseAsFileTime(t: *u64) callconv(.winapi) void;
 
     const INVALID_ATTRIBUTES: u32 = 0xFFFFFFFF;
     const DIRECTORY: u32 = 0x10;
+    const READONLY: u32 = 0x1;
     const GENERIC_READ: u32 = 0x80000000;
+    const GENERIC_WRITE: u32 = 0x40000000;
+    const FILE_APPEND_DATA: u32 = 0x4;
     const SHARE_ALL: u32 = 0x7;
+    const CREATE_ALWAYS: u32 = 2;
     const OPEN_EXISTING: u32 = 3;
+    const OPEN_ALWAYS: u32 = 4;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
     const BACKUP_SEMANTICS: u32 = 0x02000000;
     const ERROR_BROKEN_PIPE: u32 = 109;
 
@@ -313,4 +325,157 @@ fn readAllWin(a: std.mem.Allocator, h: win.HANDLE) Error![]u8 {
         out.items.len += n;
     }
     return out.toOwnedSlice(a);
+}
+
+fn posixErrno() i32 {
+    return @intFromEnum(std.c.errno(-1));
+}
+
+/// `data` written to the file (created if it isn't there; `append`: after
+/// what it has, else in its place)
+pub fn writeFile(a: std.mem.Allocator, path: []const u8, data: []const u8, append: bool) Error!void {
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return failed(22);
+    if (windows) {
+        const w = try win.wide(a, path);
+        defer a.free(w);
+        const h = win.CreateFileW(w.ptr, if (append) win.FILE_APPEND_DATA else win.GENERIC_WRITE, win.SHARE_ALL, null, if (append) win.OPEN_ALWAYS else win.CREATE_ALWAYS, 0, null);
+        if (h == win.INVALID) return failed(win.errnoOf(win.GetLastError()));
+        defer _ = win.CloseHandle(h);
+        var rest = data;
+        while (rest.len > 0) {
+            var n: u32 = 0;
+            if (win.WriteFile(h, rest.ptr, @intCast(@min(rest.len, 1 << 30)), &n, null) == 0) return failed(win.errnoOf(win.GetLastError()));
+            rest = rest[n..];
+        }
+        return;
+    }
+    const z = try a.dupeZ(u8, path);
+    defer a.free(z);
+    const fd = std.c.open(z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = append, .TRUNC = !append, .CLOEXEC = true }, @as(std.c.mode_t, 0o666));
+    if (fd < 0) return failed(posixErrno());
+    defer _ = std.c.close(fd);
+    var rest = data;
+    while (rest.len > 0) {
+        const n = std.c.write(fd, rest.ptr, rest.len);
+        if (n < 0) {
+            if (std.c.errno(-1) == .INTR) continue;
+            return failed(posixErrno());
+        }
+        rest = rest[@intCast(n)..];
+    }
+}
+
+fn mkdirOne(a: std.mem.Allocator, path: []const u8, mode: u32) Error!void {
+    if (windows) {
+        const w = try win.wide(a, path);
+        defer a.free(w);
+        if (win.CreateDirectoryW(w.ptr, null) == 0) return failed(win.errnoOf(win.GetLastError()));
+        return;
+    }
+    const z = try a.dupeZ(u8, path);
+    defer a.free(z);
+    if (std.c.mkdir(z.ptr, @intCast(mode)) != 0) return failed(posixErrno());
+}
+
+/// os.makedirs(path, mode, exist_ok): the directories it's under made
+/// (Python's: their mode the default), then it, with `mode`; one there
+/// already, an error (EEXIST) unless exist_ok and it's a directory
+pub fn makedirs(a: std.mem.Allocator, path: []const u8, mode: u32, exist_ok: bool) Error!void {
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return failed(22);
+    const trimmed = std.mem.trimEnd(u8, path, if (windows) "/\\" else "/");
+    if (trimmed.len == 0) return failed(17);
+    // (each one above it, from the top: made where it isn't)
+    var i: usize = 1;
+    while (i < trimmed.len) : (i += 1) {
+        const c = trimmed[i];
+        if (c != '/' and !(windows and c == '\\')) continue;
+        const head = trimmed[0..i];
+        // (a drive's root, C:: there already)
+        if (windows and head.len == 2 and head[1] == ':') continue;
+        if (try kindOf(a, head) != .none) continue;
+        mkdirOne(a, head, 0o777) catch |e| {
+            if (e == error.OutOfMemory or last_errno != 17) return e;
+        };
+    }
+    mkdirOne(a, trimmed, mode) catch |e| {
+        if (e == error.OutOfMemory) return e;
+        if (exist_ok and try kindOf(a, trimmed) == .dir) return;
+        return e;
+    };
+}
+
+/// os.chmod(path, mode) (Windows: its read-only flag, the owner's write
+/// bit's, as Python's)
+pub fn chmod(a: std.mem.Allocator, path: []const u8, mode: u32) Error!void {
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return failed(22);
+    if (windows) {
+        const w = try win.wide(a, path);
+        defer a.free(w);
+        const attrs = win.GetFileAttributesW(w.ptr);
+        if (attrs == win.INVALID_ATTRIBUTES) return failed(win.errnoOf(win.GetLastError()));
+        const now_attrs = if (mode & 0o200 != 0) attrs & ~win.READONLY else attrs | win.READONLY;
+        if (win.SetFileAttributesW(w.ptr, now_attrs) == 0) return failed(win.errnoOf(win.GetLastError()));
+        return;
+    }
+    const z = try a.dupeZ(u8, path);
+    defer a.free(z);
+    if (std.c.chmod(z.ptr, @intCast(mode)) != 0) return failed(posixErrno());
+}
+
+/// os.path.getsize(path): its size in bytes (symbolic links followed)
+pub fn getsize(a: std.mem.Allocator, path: []const u8) Error!u64 {
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return failed(22);
+    if (windows) {
+        const w = try win.wide(a, path);
+        defer a.free(w);
+        const h = win.CreateFileW(w.ptr, 0, win.SHARE_ALL, null, win.OPEN_EXISTING, win.BACKUP_SEMANTICS, null);
+        if (h == win.INVALID) return failed(win.errnoOf(win.GetLastError()));
+        defer _ = win.CloseHandle(h);
+        var size: i64 = 0;
+        if (win.GetFileSizeEx(h, &size) == 0) return failed(win.errnoOf(win.GetLastError()));
+        return @intCast(size);
+    }
+    const z = try a.dupeZ(u8, path);
+    defer a.free(z);
+    if (linux) {
+        const l = std.os.linux;
+        var st: l.Statx = undefined;
+        const e = l.errno(l.statx(l.AT.FDCWD, z.ptr, 0, .{ .SIZE = true }, &st));
+        if (e != .SUCCESS) return failed(@intFromEnum(e));
+        return st.size;
+    }
+    var st: std.c.Stat = undefined;
+    if (std.c.stat(z.ptr, &st) != 0) return failed(posixErrno());
+    return @intCast(st.size);
+}
+
+/// os.replace(src, dst): src renamed dst, one there replaced
+pub fn replace(a: std.mem.Allocator, src: []const u8, dst: []const u8) Error!void {
+    if (std.mem.indexOfScalar(u8, src, 0) != null or std.mem.indexOfScalar(u8, dst, 0) != null) return failed(22);
+    if (windows) {
+        const ws = try win.wide(a, src);
+        defer a.free(ws);
+        const wd = try win.wide(a, dst);
+        defer a.free(wd);
+        if (win.MoveFileExW(ws.ptr, wd.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) return failed(win.errnoOf(win.GetLastError()));
+        return;
+    }
+    const zs = try a.dupeZ(u8, src);
+    defer a.free(zs);
+    const zd = try a.dupeZ(u8, dst);
+    defer a.free(zd);
+    if (std.c.rename(zs.ptr, zd.ptr) != 0) return failed(posixErrno());
+}
+
+/// time.time(): seconds since the epoch
+pub fn now() f64 {
+    if (windows) {
+        var t: u64 = 0;
+        win.GetSystemTimePreciseAsFileTime(&t);
+        // (100 ns since 1601)
+        return @as(f64, @floatFromInt(t -% 116444736000000000)) / 1e7;
+    }
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    return @as(f64, @floatFromInt(ts.sec)) + @as(f64, @floatFromInt(ts.nsec)) / 1e9;
 }

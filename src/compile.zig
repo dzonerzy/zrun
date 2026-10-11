@@ -8268,13 +8268,20 @@ const Gen = struct {
     /// are); null if not (another open(): Python's, its encoding the
     /// locale's)
     fn readOf(self: *Gen, inst: *Inst, e: *const front.Expr) Error!?ReadOf {
-        if (try self.stdFile(inst, e)) |fd| {
+        return self.openOf(inst, e, false);
+    }
+
+    /// The same for `.write(text)` (`writing`): open(path, "w" or "a",
+    /// encoding="utf-8", newline=), text written to it natively
+    /// (Lib.write_text: its flag's bits 1 append, 2 newline="")
+    fn openOf(self: *Gen, inst: *Inst, e: *const front.Expr, writing: bool) Error!?ReadOf {
+        if (!writing) if (try self.stdFile(inst, e)) |fd| {
             if (fd != 0) return null;
             const sys = py.c.PyImport_ImportModule("sys") orelse return error.Python;
             defer py.Py_DecRef(sys);
             _ = try self.c.objectIndex(sys);
             return .{ .which = .read_stdin, .callee = sys, .path = null, .flag = 2 };
-        }
+        };
         if (e.kind != .call) return null;
         const oc = e.kind.call;
         if (oc.func.kind != .global or oc.args.len < 1 or oc.args.len > 2) return null;
@@ -8282,7 +8289,13 @@ const Gen = struct {
         defer self.drop(f) catch {};
         if (f != .py or !isBuiltin(f.py, "open")) return null;
         var as_bytes = false;
-        if (oc.args.len == 2) {
+        var append = false;
+        if (writing) {
+            if (oc.args.len != 2 or oc.args[1].kind != .str) return null;
+            const mode = oc.args[1].kind.str;
+            const eq = std.mem.eql;
+            if (eq(u8, mode, "a") or eq(u8, mode, "at")) append = true else if (!eq(u8, mode, "w") and !eq(u8, mode, "wt")) return null;
+        } else if (oc.args.len == 2) {
             if (oc.args[1].kind != .str) return null;
             const mode = oc.args[1].kind.str;
             if (std.mem.eql(u8, mode, "rb")) as_bytes = true else if (!std.mem.eql(u8, mode, "r") and !std.mem.eql(u8, mode, "rt")) return null;
@@ -8308,6 +8321,7 @@ const Gen = struct {
         }
         if (!as_bytes and !utf8) return null;
         _ = try self.c.objectIndex(f.py);
+        if (writing) return .{ .which = .write_text, .callee = f.py, .path = oc.args[0], .flag = @as(u32, @intFromBool(append)) | @as(u32, @intFromBool(newline_kept)) << 1 };
         return .{ .which = if (as_bytes) .read_bytes else .read_text, .callee = f.py, .path = oc.args[0], .flag = @intFromBool(newline_kept) };
     }
 
@@ -8330,6 +8344,14 @@ const Gen = struct {
                 if (r.path) |p| path[0] = try self.operand(inst, p);
                 self.taken(mark);
                 return self.libCall(inst, r.which, r.callee, path[0..@intFromBool(r.path != null)], r.flag);
+            };
+            if (std.mem.eql(u8, func_e.kind.attr.name, "write") and args_e.len == 1 and kws.len == 0) if (try self.openOf(inst, func_e.kind.attr.obj, true)) |w| {
+                var both: [2]SVal = undefined;
+                both[0] = try self.operand(inst, w.path.?);
+                try self.inflight.append(self.a(), both[0]);
+                both[1] = try self.operand(inst, args_e[0]);
+                self.taken(mark);
+                return self.libCall(inst, w.which, w.callee, &both, w.flag);
             };
             if (std.mem.eql(u8, func_e.kind.attr.name, "write") and args_e.len == 1 and kws.len == 0) if (try self.stdFile(inst, func_e.kind.attr.obj)) |fd| if (fd != 0) {
                 const v = try self.operand(inst, args_e[0]);
@@ -9303,7 +9325,7 @@ const Gen = struct {
         }
         // The system's: os.getenv(), os.getcwd(), os.path's, natively
         // (osio.zig; Python functions some of them, not compiled)
-        inline for (.{ .{ "os", "getenv", helpers.Lib.getenv }, .{ "os", "getcwd", helpers.Lib.getcwd }, .{ "os.path", "isfile", helpers.Lib.isfile }, .{ "os.path", "isdir", helpers.Lib.isdir }, .{ "os.path", "exists", helpers.Lib.exists }, .{ "os.path", "realpath", helpers.Lib.realpath } }) |l| {
+        inline for (.{ .{ "os", "getenv", helpers.Lib.getenv }, .{ "os", "getcwd", helpers.Lib.getcwd }, .{ "os.path", "isfile", helpers.Lib.isfile }, .{ "os.path", "isdir", helpers.Lib.isdir }, .{ "os.path", "exists", helpers.Lib.exists }, .{ "os.path", "realpath", helpers.Lib.realpath }, .{ "os", "makedirs", helpers.Lib.makedirs }, .{ "os", "chmod", helpers.Lib.chmod }, .{ "os.path", "getsize", helpers.Lib.getsize }, .{ "os", "replace", helpers.Lib.replace }, .{ "time", "time", helpers.Lib.time_now } }) |l| {
             if (isModuleAttr(o, l[0], l[1])) return self.libCall(inst, l[2], o, args, 2);
         }
         const pt = try pyTypes();

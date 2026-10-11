@@ -1,5 +1,6 @@
 """src/unicode.zig from this Python's Unicode data: str.lower(),
-str.upper() and repr() as Python does them, natively.
+str.upper(), str.isalpha(), str.isalnum() and repr() as Python does them,
+natively.
 
     python tools/gen_unicode.py > src/unicode.zig
 
@@ -78,11 +79,11 @@ def range_table(name, rs):
 
 
 def main():
-    print(f"""//! str.lower(), str.upper() and repr() as Python {sys.version_info.major}.{sys.version_info.minor} does them (Unicode
-//! {unicodedata.unidata_version}): each character's full mapping, the characters
-//! Cased and Case_Ignorable (a capital sigma ending a word lowercases to ς), and
-//! those not printable (repr() escapes them). Made by tools/gen_unicode.py: not
-//! edited by hand.
+    print(f"""//! str.lower(), str.upper(), str.isalpha(), str.isalnum() and repr() as Python
+//! {sys.version_info.major}.{sys.version_info.minor} does them (Unicode {unicodedata.unidata_version}): each character's full mapping, the
+//! characters Cased and Case_Ignorable (a capital sigma ending a word lowercases
+//! to ς), those not printable (repr() escapes them), alphabetic, alphanumeric.
+//! Made by tools/gen_unicode.py: not edited by hand.
 
 /// A character's mapping: len characters (1 to 3)
 pub const Map = struct {{ cp: u21, len: u8, to: [3]u21 }};
@@ -100,6 +101,12 @@ pub const Range = struct {{ lo: u21, hi: u21 }};
     print()
     # (surrogates aren't printable: repr() writes \udxxx)
     print(range_table("not_printable", ranges(lambda c: not c.isprintable(), surrogates=True)))
+    print()
+    # (str.isalpha(), str.isalnum(): a regular expression's \w is isalnum()'s
+    # and _)
+    print(range_table("alpha", ranges(str.isalpha)))
+    print()
+    print(range_table("alnum", ranges(str.isalnum)))
 
 
 if __name__ == "__main__":

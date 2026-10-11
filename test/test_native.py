@@ -373,6 +373,67 @@ def test_platform_standalone(zig, tmp_path, capsys):
         0, f"{sys.platform} {os.name} {os.name == 'nt'}\n", "")
 
 
+def system_writes(node, rt):
+    from os import chmod, makedirs, replace
+    from os.path import getsize, isdir
+    from time import time
+
+    rt.eval(node.args[0])
+    makedirs("out/deep/er", 0o700, True)
+    makedirs("out/deep/er", 0o700, True)
+    print(isdir("out/deep/er"))
+    try:
+        makedirs("out/deep/er", 0o700, False)
+    except FileExistsError as e:
+        print("exists", e.errno, str(e))
+    print(open("out/log.txt", "w", encoding="utf-8").write("one ü\n"))
+    print(open("out/log.txt", "a", encoding="utf-8").write("two\n"))
+    print(repr(open("out/log.txt", encoding="utf-8").read()), getsize("out/log.txt"))
+    chmod("out/log.txt", 0o600)
+    replace("out/log.txt", "out/moved.txt")
+    print(repr(open("out/moved.txt", encoding="utf-8").read()))
+    try:
+        replace("out/nope.txt", "out/x.txt")
+    except FileNotFoundError as e:
+        print("missing", e.filename, e.filename2, str(e))
+    try:
+        getsize("out/nope.txt")
+    except OSError as e:
+        print("size", e.errno)
+    print(time() > 1.7e9)
+    return 0
+
+
+SYSTEM_WRITES = ("True\nexists 17 [Errno 17] File exists: 'out/deep/er'\n6\n4\n'one ü\\ntwo\\n' 11\n"
+                 "'one ü\\ntwo\\n'\n"
+                 "missing out/nope.txt out/x.txt [Errno 2] No such file or directory: 'out/nope.txt' -> 'out/x.txt'\n"
+                 "size 2\nTrue\n")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="POSIX's paths and errors")
+def test_system_writes(zig, tmp_path, capsys, monkeypatch):
+    """open(..., "w" / "a").write(), os.makedirs(), os.chmod(),
+    os.path.getsize(), os.replace(), time.time(): natively, as Python
+    does them, in the compiled mode and a standalone program"""
+    lang = zrun.Language(tiny.PARSER, tiny.RULES, strict=True)
+    lang.eval("Call")(system_writes)
+    src = "print(0);\n"
+    for mode in ("python", "compiled"):
+        work = tmp_path / mode
+        work.mkdir()
+        monkeypatch.chdir(work)
+        lang.load(src, "prog.tiny").run(mode=mode)
+        assert capsys.readouterr().out == SYSTEM_WRITES, mode
+        assert oct((work / "out" / "deep" / "er").stat().st_mode & 0o777) == "0o700"
+        assert oct((work / "out" / "moved.txt").stat().st_mode & 0o777) == "0o600"
+    exe = zrun.build_native(lang, src, str(tmp_path / "prog"), path="prog.tiny")
+    work = tmp_path / "native"
+    work.mkdir()
+    r = subprocess.run([exe], cwd=work, capture_output=True, timeout=300)
+    assert (r.returncode, r.stdout.decode(), r.stderr.decode()) == (0, SYSTEM_WRITES, "")
+    assert oct((work / "out" / "moved.txt").stat().st_mode & 0o777) == "0o600"
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="POSIX's paths and errors")
 def test_system_io(zig, tmp_path, capsys, monkeypatch):
     """os.getenv(), os.getcwd(), os.path's, open(...).read(), sys.stdin.read():

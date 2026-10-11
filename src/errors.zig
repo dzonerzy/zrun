@@ -52,6 +52,7 @@ pub const Kind = enum(u8) {
     /// arguments
     OSError,
     FileNotFoundError,
+    FileExistsError,
     IsADirectoryError,
     NotADirectoryError,
     PermissionError,
@@ -64,7 +65,7 @@ pub const Kind = enum(u8) {
             .BaseException => null,
             .Exception, .SystemExit => .BaseException,
             .ArithmeticError, .LookupError, .ValueError, .TypeError, .AttributeError, .NameError, .RuntimeError, .AssertionError, .StopIteration, .BufferError, .ZrunError, .Throw, .StructError, .OSError => .Exception,
-            .FileNotFoundError, .IsADirectoryError, .NotADirectoryError, .PermissionError => .OSError,
+            .FileNotFoundError, .FileExistsError, .IsADirectoryError, .NotADirectoryError, .PermissionError => .OSError,
             .ZeroDivisionError, .OverflowError, .FloatingPointError, .IntegerOverflow => .ArithmeticError,
             .IndexError, .KeyError => .LookupError,
             .UnicodeError, .ParseError => .ValueError,

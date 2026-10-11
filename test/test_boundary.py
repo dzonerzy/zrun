@@ -323,7 +323,13 @@ def make_lang():
             out = []
             for w in words:
                 out.append((w.lower(), w.upper(), w.strip(), w.isupper(), w.islower(), w.isdigit(), w.isspace(), w.startswith("A"), w.endswith("é"), w.find("b"), w.count(""), w[1:3], w[::-1], [c for c in w]))
+                # (a start and an end: of s[start:end], past it nothing)
+                out.append([(w.startswith(p, i), w.startswith(p, i, j), w.endswith(p, i, j), w.startswith((p, "x"), i))
+                            for p in ("", "b", "é", "A") for i in (-9, -1, 0, 1, 2, 3, 9) for j in (-2, 1, 3, 9)])
             out.append("-".join(words))
+            # (splitlines(): Python's line boundaries)
+            for t in ("a\nb\r\nc\rd\x0be\x0cf\x1cg\x1dh\x1ei\x85j k l\n", "", "\n", "x", "\r\n\r\n", "é\n\nü"):
+                out.append((t.splitlines(), t.splitlines(True)))
             nums = []
             for t in (" -1_000 ", "+42", "007", "\x0b9\x0c"):
                 nums.append(int(t))

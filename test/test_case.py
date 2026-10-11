@@ -1,4 +1,4 @@
-"""str.lower(), str.upper() and repr() natively (src/unicode.zig, made from
+"""str.lower(), str.upper(), isalpha(), isalnum() and repr() natively (src/unicode.zig, made from
 Python's Unicode data by tools/gen_unicode.py): the same as Python's for
 every character, the final sigma's context, quotes and escapes, and strings
 mixing them; in a strict language (no Python)."""
@@ -12,7 +12,7 @@ from conftest import tiny
 
 
 def cases(s):
-    return [s.lower(), s.upper(), repr(s), repr([s, 1, 2.5, None, True])]
+    return [s.lower(), s.upper(), repr(s), repr([s, 1, 2.5, None, True]), s.isalpha(), s.isalnum()]
 
 
 def make():
@@ -34,7 +34,7 @@ def program():
 
 # (the tables are this Python's: another's Unicode may map a few more)
 GENERATED = open(__file__.replace("test/test_case.py", "src/unicode.zig"), encoding="utf-8").read()
-SAME_UNICODE = f"(Unicode\n//! {unicodedata.unidata_version})" in GENERATED
+SAME_UNICODE = f"(Unicode {unicodedata.unidata_version})" in GENERATED
 other_unicode = pytest.mark.skipif(not SAME_UNICODE, reason="unicode.zig made from another Unicode version")
 
 

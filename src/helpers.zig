@@ -1517,6 +1517,7 @@ pub const Method = enum(u32) {
     rpartition,
     replace,
     split,
+    splitlines,
     join,
     strip,
     lstrip,
@@ -2170,6 +2171,16 @@ pub const Lib = enum(u32) {
     read_text,
     read_bytes,
     read_stdin,
+    // open(path, "w" or "a", encoding="utf-8").write(text) (`signed`'s
+    // bits: 1 append, 2 newline="", line ends as they are; else "\n"
+    // written as the system's), os.makedirs(), os.chmod(),
+    // os.path.getsize(), os.replace(), time.time()
+    write_text,
+    makedirs,
+    chmod,
+    getsize,
+    replace,
+    time_now,
 };
 
 /// A library function of Python's (objects[callee_index]) natively, as
@@ -2390,6 +2401,56 @@ fn libNative(ctx: *Ctx, node: u32, which: Lib, a: []const Value, signed: u32, ou
             defer allocator.free(data);
             return textResult(ctx, node, data, true, out);
         },
+        .write_text => {
+            if (a.len != 2 or a[0].kind() != .str) return failAs(ctx, node, .TypeError, null, "expected str, bytes or os.PathLike object, not {s}", .{value.typeName(if (a.len > 0) a[0] else Value.none_v)});
+            if (a[1].kind() != .str) return failAs(ctx, node, .TypeError, null, "write() argument must be str, not {s}", .{value.typeName(a[1])});
+            const s: *value.Str = @ptrCast(a[1].ptr());
+            const text = s.bytes();
+            // (text mode on Windows: each "\n" written "\r\n", as Python's)
+            const translate = @import("builtin").os.tag == .windows and signed & 2 == 0 and std.mem.indexOfScalar(u8, text, '\n') != null;
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer buf.deinit(allocator);
+            if (translate) for (text) |c| {
+                if (c == '\n') buf.append(allocator, '\r') catch return oomFail(ctx, node);
+                buf.append(allocator, c) catch return oomFail(ctx, node);
+            };
+            osio.writeFile(allocator, strBytes(a[0]), if (translate) buf.items else text, signed & 1 != 0) catch |e| return osFail(ctx, node, e, a[0]);
+            out.* = Value.pint(@intCast(s.chars));
+            return true;
+        },
+        // os.makedirs(name, mode=0o777, exist_ok=False), its arguments by
+        // position
+        .makedirs => {
+            if (a.len < 1 or a.len > 3 or a[0].kind() != .str) return null;
+            if (a.len >= 2 and !isInt(a[1])) return null;
+            const mode: u32 = if (a.len >= 2) @intCast(a[1].asInt() & 0o7777) else 0o777;
+            osio.makedirs(allocator, strBytes(a[0]), mode, a.len == 3 and value.truthy(a[2])) catch |e| return osFail(ctx, node, e, a[0]);
+            out.* = Value.none_v;
+            return true;
+        },
+        .chmod => {
+            if (a.len != 2 or a[0].kind() != .str or !isInt(a[1])) return null;
+            osio.chmod(allocator, strBytes(a[0]), @intCast(a[1].asInt() & 0o7777)) catch |e| return osFail(ctx, node, e, a[0]);
+            out.* = Value.none_v;
+            return true;
+        },
+        .getsize => {
+            if (a.len != 1 or a[0].kind() != .str) return null;
+            const n = osio.getsize(allocator, strBytes(a[0])) catch |e| return osFail(ctx, node, e, a[0]);
+            out.* = Value.pint(@intCast(n));
+            return true;
+        },
+        .replace => {
+            if (a.len != 2 or a[0].kind() != .str or a[1].kind() != .str) return null;
+            osio.replace(allocator, strBytes(a[0]), strBytes(a[1])) catch |e| return osFail2(ctx, node, e, a[0], a[1]);
+            out.* = Value.none_v;
+            return true;
+        },
+        .time_now => {
+            if (a.len != 0) return null;
+            out.* = Value.float(osio.now());
+            return true;
+        },
     }
 }
 
@@ -2407,23 +2468,36 @@ fn strResult(ctx: *Ctx, node: u32, s: []const u8, out: *Value) bool {
 /// class Python makes of it), its file's name the third argument
 fn osFail(ctx: *Ctx, node: u32, e: osio.Error, filename: ?Value) bool {
     if (e == error.OutOfMemory) return oomFail(ctx, node);
+    return osFail2(ctx, node, e, filename, null);
+}
+
+/// osFail's, with a second file name (os.replace's destination): Python's
+/// five arguments then (errno, strerror, filename, winerror, filename2)
+fn osFail2(ctx: *Ctx, node: u32, e: osio.Error, filename: ?Value, filename2: ?Value) bool {
+    if (e == error.OutOfMemory) return oomFail(ctx, node);
     const errno = osio.last_errno;
     const kind: errors.Kind = switch (errno) {
         2 => .FileNotFoundError,
+        17 => .FileExistsError,
         20 => .NotADirectoryError,
         21 => .IsADirectoryError,
         1, 13 => .PermissionError,
         else => .OSError,
     };
-    const t = value.newTuple(if (filename != null) 3 else 2) orelse return oomFail(ctx, node);
+    const t = value.newTuple(if (filename2 != null) 5 else if (filename != null) 3 else 2) orelse return oomFail(ctx, node);
     const tv = Value.obj(.tuple, &t.head);
     defer value.decref(tv);
+    for (t.slice()) |*x| x.* = Value.none_v;
     t.slice()[0] = Value.pint(errno);
     const words = value.newStr(osio.errorWords(errno)) orelse return oomFail(ctx, node);
     t.slice()[1] = Value.obj(.str, &words.head);
     if (filename) |f| {
         value.incref(f);
         t.slice()[2] = f;
+    }
+    if (filename2) |f| {
+        value.incref(f);
+        t.slice()[4] = f;
     }
     const x = value.newExc(@intFromEnum(kind), tv, Value.none_v, Value.none_v, node) orelse return oomFail(ctx, node);
     const xv = Value.obj(.exc, &x.head);
@@ -4188,6 +4262,62 @@ fn strMethodAny(ctx: *Ctx, node: u32, s: *value.Str, mid: Method, args: []const 
         }
     }.of;
 
+    // isalpha(), isalnum() of a str beyond ASCII: Python's tables
+    // (unicode.zig's)
+    if ((mid == .isalpha or mid == .isalnum) and args.len == 0 and s.chars != s.len) {
+        const rs: []const utab.Range = if (mid == .isalpha) &utab.alpha else &utab.alnum;
+        var all = b.len > 0;
+        var it = std.unicode.Utf8View.initUnchecked(b).iterator();
+        while (it.nextCodepoint()) |cp| if (!inCaseRanges(rs, cp)) {
+            all = false;
+            break;
+        };
+        out.* = Value.boolean(all);
+        return true;
+    }
+    // splitlines(keepends=False): at Python's line boundaries (\n, \r,
+    // \r\n, \v, \f, \x1c-\x1e, \x85, U+2028, U+2029), no last empty line
+    if (mid == .splitlines and args.len <= 1) {
+        const keep = args.len == 1 and value.truthy(args[0]);
+        const l = value.newList(0) orelse return oomFail(ctx, node);
+        const lv = Value.obj(.list, &l.head);
+        var start: usize = 0;
+        var i: usize = 0;
+        while (i < b.len) {
+            const n: usize = if (b[i] == '\r' and i + 1 < b.len and b[i + 1] == '\n') 2 else switch (b[i]) {
+                '\n', '\r', 0x0b, 0x0c, 0x1c, 0x1d, 0x1e => 1,
+                0xC2 => if (i + 1 < b.len and b[i + 1] == 0x85) 2 else 0,
+                0xE2 => if (i + 2 < b.len and b[i + 1] == 0x80 and (b[i + 2] == 0xA8 or b[i + 2] == 0xA9)) 3 else 0,
+                else => 0,
+            };
+            if (n == 0) {
+                i += 1;
+                continue;
+            }
+            const line = value.newStr(b[start..if (keep) i + n else i]) orelse {
+                value.decref(lv);
+                return oomFail(ctx, node);
+            };
+            if (!value.listPush(l, Value.obj(.str, &line.head))) {
+                value.decref(lv);
+                return oomFail(ctx, node);
+            }
+            i += n;
+            start = i;
+        }
+        if (start < b.len) {
+            const line = value.newStr(b[start..]) orelse {
+                value.decref(lv);
+                return oomFail(ctx, node);
+            };
+            if (!value.listPush(l, Value.obj(.str, &line.head))) {
+                value.decref(lv);
+                return oomFail(ctx, node);
+            }
+        }
+        out.* = lv;
+        return true;
+    }
     // partition(sep), rpartition(sep): (before, sep, after) at the first
     // (last) sep; not found: (s, "", "") (("", "", s))
     if ((mid == .partition or mid == .rpartition) and args.len == 1) {
@@ -4241,14 +4371,22 @@ fn strMethodAny(ctx: *Ctx, node: u32, s: *value.Str, mid: Method, args: []const 
         out.* = Value.pint(-1);
         return true;
     }
-    // startswith, endswith (a str or a tuple of them)
-    if ((mid == .startswith or mid == .endswith) and args.len == 1) {
+    // startswith, endswith (a str or a tuple of them[, start[, end]]: of
+    // s[start:end], a start past its end matching nothing, "" not even)
+    if ((mid == .startswith or mid == .endswith) and args.len >= 1 and args.len <= 3) {
         const starts = mid == .startswith;
+        const lo = (Bound.of(s, if (args.len > 1) args[1] else null, 0) orelse return null) orelse return null;
+        const hi = @min((Bound.of(s, if (args.len > 2) args[2] else null, s.len) orelse return null) orelse return null, s.len);
+        if (lo > hi) {
+            out.* = Value.boolean(false);
+            return true;
+        }
+        const window = b[lo..hi];
         const one = [1]Value{args[0]};
         const subs: []const Value = if (args[0].kind() == .tuple) @as(*value.Tuple, @ptrCast(@alignCast(args[0].ptr()))).slice() else &one;
         for (subs) |x| {
             const sub = strOf(x) orelse return null;
-            if (if (starts) std.mem.startsWith(u8, b, sub) else std.mem.endsWith(u8, b, sub)) {
+            if (if (starts) std.mem.startsWith(u8, window, sub) else std.mem.endsWith(u8, window, sub)) {
                 out.* = Value.boolean(true);
                 return true;
             }
@@ -4962,14 +5100,19 @@ fn excStr(ctx: *Ctx, e: *value.Exc, buf: *std.ArrayListUnmanaged(u8)) bool {
     if (args.len == 0) return true;
     // (an OSError of an errno and its words, a file's name after them:
     // `[Errno 2] No such file or directory: 'x'`, as Python writes it)
-    if ((args.len == 2 or args.len == 3) and @as(errors.Kind, @enumFromInt(e.kind)).isA(.OSError)) {
+    // (five: a second name after ` -> `, os.replace's)
+    if ((args.len == 2 or args.len == 3 or args.len == 5) and @as(errors.Kind, @enumFromInt(e.kind)).isA(.OSError)) {
         buf.appendSlice(allocator, "[Errno ") catch return false;
         if (!strInto(ctx, args[0], buf)) return false;
         buf.appendSlice(allocator, "] ") catch return false;
         if (!strInto(ctx, args[1], buf)) return false;
-        if (args.len == 3) {
+        if (args.len >= 3 and args[2].kind() != .none) {
             buf.appendSlice(allocator, ": ") catch return false;
-            return reprInto(ctx, args[2], buf);
+            if (!reprInto(ctx, args[2], buf)) return false;
+            if (args.len == 5 and args[4].kind() != .none) {
+                buf.appendSlice(allocator, " -> ") catch return false;
+                return reprInto(ctx, args[4], buf);
+            }
         }
         return true;
     }
@@ -5097,8 +5240,8 @@ fn excAttr(v: Value, name: []const u8, out: *Value) bool {
     }
     // (an OSError's errno, strerror, filename; SystemExit's code)
     const args = @as(*value.Tuple, @ptrCast(@alignCast(e.args.ptr()))).slice();
-    if (kind.isA(.OSError)) inline for (.{ "errno", "strerror", "filename" }, 0..) |field, i| if (eq(u8, name, field)) {
-        const x = if (args.len >= 2 and i < args.len) args[i] else Value.none_v;
+    if (kind.isA(.OSError)) inline for (.{ "errno", "strerror", "filename", "winerror", "filename2" }, 0..) |field, i| if (eq(u8, name, field)) {
+        const x = if (args.len >= 2 and i < args.len and i != 3) args[i] else Value.none_v;
         value.incref(x);
         out.* = x;
         return true;
