@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A parsed node's reference counted by compiled code** (`rt.parse`): the inline counting left parsed nodes out, so a child node kept past its `children` list (in a record, say) was freed under it and the program crashed. The inline count now tests the runtime's own list of counted kinds.
+- **`type(x) is C` with `x` an rt method or control value known while compiling** crashed the compiler (the Lua example built standalone with `prune=True`); it's compared at run time now.
+
 ## [0.7.0] - 2026-10-11
 
 Needs zgram 0.6.0 (its parsers built ahead of time, `GrammarParser.capsule`).

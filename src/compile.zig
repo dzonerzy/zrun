@@ -130,7 +130,7 @@ pub const Dyn = struct {
     }
 };
 
-pub const RtMethod = enum { eval, exec, loop, load, store, function, call, tail_call, @"error", kind, text, span, scope, symbol, type_of, node_at, fresh, parse, wrapping_add, wrapping_sub, wrapping_mul, wrapping_shl, wrapping_shr, wrapping_ushr, @"u8", @"i8", u16le, u16be, i16le, i16be, u32le, u32be, i32le, i32be, u64le, u64be, i64le, i64be, Return, Break, Continue };
+pub const RtMethod = enum { eval, exec, loop, load, store, function, call, tail_call, @"error", kind, text, span, scope, symbol, type_of, node_at, fresh, parse, wrapping_add, wrapping_sub, wrapping_mul, wrapping_shl, wrapping_shr, wrapping_ushr, u8, i8, u16le, u16be, i16le, i16be, u32le, u32be, i32le, i32be, u64le, u64be, i64le, i64be, Return, Break, Continue };
 
 /// A list known at compile time (its items may be dynamic): mutable, with
 /// identity (aliases see changes)
@@ -1810,7 +1810,8 @@ pub const Compiler = struct {
         const blocks0 = self.helper_blocks;
         const h = try self.a.create(HelperSpec);
         h.* = .{ .func = s.func, .args = s.args, .name = "", .semantic = s.semantic, .layout = s.layout };
-        h.name = try self.helperName("s", h);        try self.helper_fns.append(self.a, h);
+        h.name = try self.helperName("s", h);
+        try self.helper_fns.append(self.a, h);
         try self.helper_queue.append(self.a, h);
         try self.drainQueues();
         // (code too big to be worth compiling: LLVM's time grows with it,
@@ -2037,7 +2038,7 @@ pub const Compiler = struct {
         self.sadd = self.m.intrinsic("llvm.sadd.with.overflow", &i64s);
         self.ssub = self.m.intrinsic("llvm.ssub.with.overflow", &i64s);
         self.smul = self.m.intrinsic("llvm.smul.with.overflow", &i64s);
-        // Reference counts, inline: the runtime's objects (tags 4 to 9)
+        // Reference counts, inline: the runtime's objects (value.counted_mask)
         // counted here, unless immortal; Python objects (10) by the runtime
         try self.refcountFunction("zr_inc", "zr_incref", false);
         try self.refcountFunction("zr_dec", "zr_decref", true);
@@ -2057,11 +2058,10 @@ pub const Compiler = struct {
         const other = try f.label("other");
         const python = try f.label("python");
         const done = try f.label("done");
-        // (counted: str..function (4-9), a Big (13), Bytes (14), a Closure
-        // (15), a set (16), an exception (17))
-        const k = f.sub(tag, m.k64(4));
-        const big_or_bytes = f.icmp(jit_c.LLVMIntULT, f.sub(tag, m.k64(@intFromEnum(value.Tag.big))), m.k64(5));
-        try f.condBr(f.or_(f.icmp(jit_c.LLVMIntULT, k, m.k64(6)), big_or_bytes), counted, other);
+        // (counted: value.counted_mask's tags, a bit each: tags under 32)
+        const bit = f.and_(f.lshr(m.k64(@bitCast(value.counted_mask)), f.and_(tag, m.k64(31))), m.k64(1));
+        const is_counted = f.and_(f.icmp(jit_c.LLVMIntULT, tag, m.k64(32)), f.icmp(jit_c.LLVMIntNE, bit, m.k64(0)));
+        try f.condBr(is_counted, counted, other);
         try f.block(counted);
         const p = f.intToPtr(bits);
         const rc = f.load(t.i64, p);
@@ -3413,7 +3413,8 @@ const Gen = struct {
                 .dict => |x| x.made_at,
                 else => NONE,
             };
-            try self.c.lang.escaping.put(std.heap.c_allocator, .{ .origin = origin, .unit = self.unit, .at = made_at }, {});            self.c.need_retry = true;
+            try self.c.lang.escaping.put(std.heap.c_allocator, .{ .origin = origin, .unit = self.unit, .at = made_at }, {});
+            self.c.need_retry = true;
             return self.c.unsupported("a list or dict escapes inside run-time control flow: compiled again, made at run time", .{});
         }
         for (self.insts.items) |inst| {
@@ -8304,7 +8305,7 @@ const Gen = struct {
         const want: usize = switch (m) {
             .eval, .exec, .loop, .load, .function, .kind, .text, .span, .scope, .symbol, .type_of, .node_at, .fresh => 1,
             .store, .call, .tail_call, .wrapping_add, .wrapping_sub, .wrapping_mul, .wrapping_shl, .wrapping_shr, .wrapping_ushr => 2,
-            .@"u8", .@"i8", .u16le, .u16be, .i16le, .i16be, .u32le, .u32be, .i32le, .i32be, .u64le, .u64be, .i64le, .i64be => 2,
+            .u8, .i8, .u16le, .u16be, .i16le, .i16be, .u32le, .u32be, .i32le, .i32be, .u64le, .u64be, .i64le, .i64be => 2,
             .@"error", .parse => 2,
             .Return => if (args.len == 0) 0 else 1,
             .Break, .Continue => 0,
@@ -8352,7 +8353,7 @@ const Gen = struct {
             .wrapping_shl => return self.wrapping(inst, .shl, args[0], args[1]),
             .wrapping_shr => return self.wrapping(inst, .shr, args[0], args[1]),
             .wrapping_ushr => return self.wrapping(inst, .ushr, args[0], args[1]),
-            .@"u8", .@"i8", .u16le, .u16be, .i16le, .i16be, .u32le, .u32be, .i32le, .i32be, .u64le, .u64be, .i64le, .i64be => return self.readBytes(inst, std.meta.stringToEnum(bytes_mod.Read, @tagName(m)).?, args[0], args[1]),
+            .u8, .i8, .u16le, .u16be, .i16le, .i16be, .u32le, .u32be, .i32le, .i32be, .u64le, .u64be, .i64le, .i64be => return self.readBytes(inst, std.meta.stringToEnum(bytes_mod.Read, @tagName(m)).?, args[0], args[1]),
             .@"error" => {
                 const n = switch (args[0]) {
                     .node => |x| x,
@@ -9840,10 +9841,11 @@ const Gen = struct {
             if (be) |x| vb = try self.expr(inst, x);
             va = try self.expr(inst, ae);
         }
-        // Known values: as type() and `is` do it
-        if (va != .dyn and (vb == null or vb.? != .dyn)) {
-            const ta = (try self.builtinCall(inst, type_obj, &.{va}, pos)).?;
-            const tb = if (vb) |bv| (try self.builtinCall(inst, type_obj, &.{bv}, pos)).? else SVal{ .py = cls.? };
+        // Known values: as type() and `is` do it (one whose class isn't
+        // known while compiling, an rt method...: at run time, below)
+        if (va != .dyn and (vb == null or vb.? != .dyn)) known: {
+            const ta = try self.builtinCall(inst, type_obj, &.{va}, pos) orelse break :known;
+            const tb = if (vb) |bv| try self.builtinCall(inst, type_obj, &.{bv}, pos) orelse break :known else SVal{ .py = cls.? };
             return try self.compare(inst, op, ta, tb);
         }
         // (one known, the other not: the known one a run-time value too,
@@ -10578,8 +10580,8 @@ const Gen = struct {
             try f.br(join);
             try f.block(join);
             // (made first, then stored: the union written as it's read else)
-        const joined = try self.loadSlot(slot, if (n.shape == v.dyn.shape) n.shape else .any);
-        v = .{ .dyn = joined };
+            const joined = try self.loadSlot(slot, if (n.shape == v.dyn.shape) n.shape else .any);
+            v = .{ .dyn = joined };
         }
         return v;
     }

@@ -571,10 +571,10 @@ pub const KIND_FRAME: u32 = 100;
 // Reference counting
 // ----------------------------------------------------------------------
 
-/// A tag of a counted object: str..function (4-9), a Big (13). (By tags,
-/// not kind(): reference counts are most of what code does with values)
-/// The counted tags: str..function (4-9), Big, Bytes, Closure, Set; a bit
-/// each
+/// The counted tags: str..function (4-9), Big, Bytes, Closure, Set, Exc,
+/// PNode; a bit each (by tags, not kind(): reference counts are most of
+/// what code does with values). The compiled code's inline counts
+/// (compile.zig's zr_inc / zr_dec) test this mask too.
 pub const counted_mask: u64 = 0x3F0 | (1 << @intFromEnum(Tag.big)) | (1 << @intFromEnum(Tag.bytes)) | (1 << @intFromEnum(Tag.closure)) | (1 << @intFromEnum(Tag.set)) | (1 << @intFromEnum(Tag.exc)) | (1 << @intFromEnum(Tag.pnode));
 
 pub inline fn counted(tag: u64) bool {

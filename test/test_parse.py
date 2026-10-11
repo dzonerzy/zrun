@@ -1,9 +1,12 @@
 """rt.parse: text parsed with a zgram grammar while the program runs, its
 tree read as the program's: the same in every mode."""
 
+from dataclasses import dataclass
+
 import pytest
 import zgram
 import zrun
+from conftest import tiny
 from zrules import Rules
 
 # The data: JSON, its rules labelled, an action or two
@@ -177,6 +180,47 @@ def test_actions(mode, capsys):
     assert capsys.readouterr().out == (
         "abc 1000 1001 0.0025 a\tbé😀 5 (True, False, None) {'x': 1, 'y': -2} 7\n"
         "z -42 -41 0.1  0 () {} 0\n")
+
+
+# A node of a tree parsed from a function's argument, kept in records: its
+# reference counted by the compiled code inline (a child's only other
+# reference, its `children` list's, gone at once)
+@dataclass
+class Kept:
+    node: object
+    n: int
+
+
+def kept(rt, text):
+    root = rt.parse(JSON, text)
+    out = []
+    for c in root.children[0].children:
+        out.append(Kept(c, len(c.text)))
+    k = Kept(root.children[0], 0)
+    k.node = root.children[0].children[0]
+    out.append(k)
+    return [(r.node.rule, r.node.text.strip(), r.n) for r in out]
+
+
+def make_kept():
+    lang = zrun.Language(tiny.PARSER, tiny.RULES, strict=True)
+    lang.function("FuncDef")
+    lang.exec("Return")(tiny.return_)
+
+    # (every call is kept(): the program calls tiny's one builtin name)
+    @lang.eval("Call")
+    def call(node, rt):
+        return kept(rt, rt.eval(node.args[0]))
+
+    return lang
+
+
+@pytest.mark.parametrize("mode", ["python", "compiled"])
+def test_parsed_nodes_kept(mode):
+    program = make_kept().load('fn f(s) { return print(s); }', "kept.tiny")
+    for _ in range(3):
+        assert program.call("f", "[1, [2, 3], 4]", mode=mode) == [
+            ("value", "1", 1), ("value", "[2, 3]", 7), ("value", "4", 2), ("value", "1", 0)]
 
 
 def test_actions_without_python(capsys):
