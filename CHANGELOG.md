@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-10-11
+
 ### Added
 - **`str.lower()` and `str.upper()` natively for all of Unicode**, as Python does them: each character's full mapping (`'ß'.upper()` is `'SS'`) and a word-final capital sigma (`ς`), from tables `tools/gen_unicode.py` makes from Python's Unicode data (`src/unicode.zig`). Beyond ASCII they went into Python (and strict languages refused them).
 - **`repr()` natively**: of a str (Python's quotes, and its escapes for every character it doesn't print: `'​'`), an int, a float, a bool, None, and of lists, tuples, dicts and sets of them; `print()` and `str()` of containers write their strs the same way (beyond ASCII they went into Python).
