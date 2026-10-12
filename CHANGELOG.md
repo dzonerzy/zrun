@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-10-13
+
 ### Fixed
 - **Known lists and dicts in a helper's `try` body**, after a call there that may fail: a known dict the helper was given, made a run-time one there (passed to a function that isn't inlined), was released after the try on every path, the ones an error took to the handlers too ("LLVM rejected the compiled program: Instruction does not dominate all uses"); a known list of its caller's changed there was changed while compiling (a `try: n = int(s); out.append(n)` in a helper: `out` one long even when `int()` failed). A try's body is run-time control flow for them now, as an `if`'s is: the change the run's, the container made at run time. (vetter's hook: a log line written through the same helper from a second place.)
 
