@@ -326,6 +326,55 @@ def test_a_known_list_changed_after_a_return_from_a_loop():
     assert p.call("f", "1", "2") == ["x=1", "x=2", "y=2"]
 
 
+def joined(d):
+    out = ""
+    for k in d:
+        out += k
+    return out
+
+
+def logged(text, entry):
+    try:
+        n = int(text)
+        s = joined(entry)
+        if n > 1:
+            s = s + "!"
+    except ValueError:
+        pass
+
+
+def filled(out, text):
+    try:
+        n = int(text)
+        out.append(n)
+    except ValueError:
+        pass
+
+
+def test_known_containers_in_a_helpers_try():
+    # a helper's try body, after a call that may fail: a known dict it's
+    # given made a run-time one there (it escapes), and a known list of its
+    # caller's changed there: on the paths that get that far only (the dict
+    # made there was released after the try, on every path: a value LLVM
+    # rejected; the list's change was made while compiling)
+    lang = _language(True)
+
+    @lang.eval("BinOp")
+    def binop(node, rt):
+        a = rt.eval(node.left)
+        b = rt.eval(node.right)
+        logged(a, {"t": 1, "a": b})
+        out = []
+        filled(out, a)
+        return [len(out), out]
+
+    p = lang.load("fn f(a, b) { return a + b; }", "try.tiny")
+    for a, b in [("5", "x"), ("x", "y"), ("1", "")]:
+        assert p.call("f", a, b) == p.call("f", a, b, mode="python")
+    assert p.call("f", "x", "y") == [0, []]
+    assert p.call("f", "5", "y") == [1, [5]]
+
+
 def push(out, s):
     out.append(s)
 

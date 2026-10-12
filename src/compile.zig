@@ -3565,7 +3565,7 @@ const Gen = struct {
                 if (!referred) continue;
                 if (inst.loop_level0 != self.loop_level) return false;
             }
-            if (inst.dyn_depth > 0 or inst.result_slot != null) return false;
+            if (inst.dyn_depth > 0 or inst.result_slot != null or inst.in_try > 0) return false;
         }
         return true;
     }
@@ -3605,16 +3605,17 @@ const Gen = struct {
     /// caller's `if` is in it). Else the change is the run's, the container
     /// made at run time.
     fn changesKnown(self: *Gen, inst: *const Inst, obj: SVal) bool {
-        if (inst.dyn_depth > 0 or inst.result_slot != null) return false;
+        if (inst.dyn_depth > 0 or inst.result_slot != null or inst.in_try > 0) return false;
         const ptr = containerPtr(obj) orelse return true;
         return self.straightFor(ptr);
     }
 
     /// Inside run-time control flow (after a return from inside it too: the
-    /// rest runs on some paths only).
+    /// rest runs on some paths only; in a try's body: an error before here
+    /// leaves it, to its handlers and what follows them).
     fn inFlow(self: *Gen) bool {
         if (self.loop_level > 0) return true;
-        for (self.insts.items) |inst| if (inst.dyn_depth > 0 or inst.result_slot != null) return true;
+        for (self.insts.items) |inst| if (inst.dyn_depth > 0 or inst.result_slot != null or inst.in_try > 0) return true;
         return false;
     }
 
